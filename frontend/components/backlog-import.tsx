@@ -1,0 +1,531 @@
+"use client";
+import { useEffect, useMemo, useState } from "react";
+import { useT } from "@/lib/i18n";
+import {
+  api,
+  BACKLOG_STATUSES,
+  BacklogImportResult,
+  BacklogImportRow,
+  BacklogStatus,
+} from "@/lib/api";
+import { parseCsv } from "@/lib/csv-parse";
+import { DateFormat, parseDate, sniffDateFormat } from "@/lib/dates";
+
+// Wizard state machine: pick → map → result. Modal-style overlay; the
+// parent decides when to mount/unmount via the `onClose` callback.
+
+type TargetField =
+  | "skip"
+  | "domain"
+  | "status"
+  | "registrar"
+  | "expiration_date"
+  | "comments"
+  | "desired_price"
+  | "max_price";
+
+const TARGET_FIELDS: TargetField[] = [
+  "skip",
+  "domain",
+  "status",
+  "registrar",
+  "expiration_date",
+  "comments",
+  "desired_price",
+  "max_price",
+];
+
+const DATE_FORMAT_OPTIONS: DateFormat[] = [
+  "auto",
+  "iso",
+  "dmy_dot",
+  "dmy_slash",
+  "dmy_dash",
+  "mdy_slash",
+  "month_name",
+];
+
+// Header-name → field guesses. Lowercase matched substring against the
+// source header. The first field that matches wins, so order matters
+// (longer / more specific terms first).
+const HEADER_HINTS: { needle: string; field: TargetField }[] = [
+  { needle: "expiration", field: "expiration_date" },
+  { needle: "expires", field: "expiration_date" },
+  { needle: "expiry", field: "expiration_date" },
+  { needle: "expire", field: "expiration_date" },
+  { needle: "registrar", field: "registrar" },
+  { needle: "registry", field: "registrar" },
+  { needle: "desired", field: "desired_price" },
+  { needle: "max", field: "max_price" },
+  { needle: "comment", field: "comments" },
+  { needle: "note", field: "comments" },
+  { needle: "status", field: "status" },
+  { needle: "domain", field: "domain" },
+  { needle: "name", field: "domain" },
+];
+
+function autoMap(headers: string[]): TargetField[] {
+  const used = new Set<TargetField>();
+  return headers.map((h) => {
+    const low = h.toLowerCase();
+    for (const hint of HEADER_HINTS) {
+      if (low.includes(hint.needle) && !used.has(hint.field)) {
+        used.add(hint.field);
+        return hint.field;
+      }
+    }
+    return "skip";
+  });
+}
+
+function parsePrice(raw: string): number | null {
+  const cleaned = raw.replace(/[^\d.,-]/g, "").replace(/,/g, ".");
+  if (!cleaned) return null;
+  const n = parseFloat(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+export function BacklogImport({
+  onClose,
+  onImported,
+}: {
+  onClose: () => void;
+  onImported: () => void;
+}) {
+  const { t } = useT();
+  const ts = t.pages.backlog.importDialog;
+
+  const [step, setStep] = useState<"pick" | "map" | "result">("pick");
+  const [error, setError] = useState<string | null>(null);
+  const [headers, setHeaders] = useState<string[]>([]);
+  const [rows, setRows] = useState<string[][]>([]);
+  const [mapping, setMapping] = useState<TargetField[]>([]);
+  const [defaultRegistrar, setDefaultRegistrar] = useState<string>("");
+  const [defaultStatus, setDefaultStatus] = useState<BacklogStatus>("backlog");
+  const [dateFormat, setDateFormat] = useState<DateFormat>("auto");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<BacklogImportResult | null>(null);
+  // Live import-row cap fetched from Settings → Others. Null = still
+  // loading; the parser falls back to its built-in default if the fetch
+  // fails so the wizard isn't bricked by a transient API blip.
+  const [maxRows, setMaxRows] = useState<number | null>(null);
+
+  function reset() {
+    setStep("pick");
+    setError(null);
+    setHeaders([]);
+    setRows([]);
+    setMapping([]);
+    setDefaultRegistrar("");
+    setDefaultStatus("backlog");
+    setDateFormat("auto");
+    setResult(null);
+  }
+
+  // Close-on-Escape — convenient for a modal.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && !busy) onClose();
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [busy, onClose]);
+
+  // Fetch the live import-row cap on mount. Cheap (3-key JSON) and lets
+  // the user change the cap in Settings → Others without a page reload.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getBacklogImportLimit()
+      .then((d) => {
+        if (!cancelled) setMaxRows(d.rows);
+      })
+      .catch(() => {
+        // Silent — parser default kicks in.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleFile(file: File) {
+    setError(null);
+    try {
+      const text = await file.text();
+      const parsed = parseCsv(text, maxRows ? { maxRows } : undefined);
+      if (parsed.headers.length === 0 || parsed.rows.length === 0) {
+        setError(ts.emptyFile);
+        return;
+      }
+      if (parsed.truncated) {
+        setError(ts.fileTruncated(parsed.rows.length));
+      }
+      setHeaders(parsed.headers);
+      setRows(parsed.rows);
+      const auto = autoMap(parsed.headers);
+      setMapping(auto);
+      // Sniff date format from the column auto-mapped to expiration_date.
+      const expIdx = auto.indexOf("expiration_date");
+      if (expIdx >= 0) {
+        const samples = parsed.rows.slice(0, 50).map((r) => r[expIdx] || "");
+        setDateFormat(sniffDateFormat(samples));
+      }
+      setStep("map");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  // Each target field can be mapped at most once — picking a field on one
+  // column auto-resets any other column that already had it (silently).
+  function setColumnMapping(colIdx: number, target: TargetField) {
+    setMapping((prev) => {
+      const next = [...prev];
+      if (target !== "skip") {
+        for (let i = 0; i < next.length; i++) {
+          if (i !== colIdx && next[i] === target) next[i] = "skip";
+        }
+      }
+      next[colIdx] = target;
+      return next;
+    });
+  }
+
+  const domainColIdx = mapping.indexOf("domain");
+  const canImport = domainColIdx >= 0 && rows.length > 0;
+  const previewRows = rows.slice(0, 5);
+
+  // Build the final payload by walking each row and applying the mapping.
+  // Done inside the import handler so we don't hold a giant in-memory copy
+  // during the editing step.
+  function buildPayload(): BacklogImportRow[] {
+    const payload: BacklogImportRow[] = [];
+    for (const row of rows) {
+      const out: BacklogImportRow = { domain: "" };
+      for (let i = 0; i < mapping.length; i++) {
+        const target = mapping[i];
+        const cell = (row[i] ?? "").trim();
+        if (target === "skip") continue;
+        if (target === "domain") out.domain = cell;
+        else if (target === "status") {
+          const s = cell.toLowerCase().replace(/\s+/g, "_");
+          if (BACKLOG_STATUSES.includes(s as BacklogStatus)) {
+            out.status = s as BacklogStatus;
+          }
+        } else if (target === "registrar") out.registrar = cell;
+        else if (target === "comments") out.comments = cell;
+        else if (target === "expiration_date") {
+          const iso = parseDate(cell, dateFormat);
+          out.expiration_date = iso;
+        } else if (target === "desired_price") {
+          out.desired_price = parsePrice(cell);
+        } else if (target === "max_price") {
+          out.max_price = parsePrice(cell);
+        }
+      }
+      // Apply defaults for unmapped fields.
+      if (out.registrar === undefined && defaultRegistrar.trim()) {
+        out.registrar = defaultRegistrar.trim();
+      }
+      if (out.status === undefined) out.status = defaultStatus;
+      payload.push(out);
+    }
+    return payload;
+  }
+
+  async function handleImport() {
+    if (!canImport) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const payload = buildPayload();
+      const res = await api.importBacklog(payload);
+      setResult(res);
+      setStep("result");
+      onImported();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const dateColIdx = mapping.indexOf("expiration_date");
+  const dateColumnSample = useMemo(() => {
+    if (dateColIdx < 0) return null;
+    return previewRows.map((r) => r[dateColIdx] || "");
+  }, [previewRows, dateColIdx]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center p-4 bg-black/50 overflow-y-auto"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !busy) onClose();
+      }}
+    >
+      <div className="w-full max-w-3xl rounded-lg border dark:border-neutral-800 bg-white dark:bg-neutral-950 shadow-xl mt-12 mb-12">
+        <div className="px-5 py-3 border-b dark:border-neutral-800 flex items-center justify-between">
+          <h2 className="text-base font-semibold">{ts.title}</h2>
+          <button
+            type="button"
+            onClick={() => (busy ? null : onClose())}
+            disabled={busy}
+            aria-label={ts.close}
+            className="text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 disabled:opacity-50"
+          >
+            ✕
+          </button>
+        </div>
+
+        {error && (
+          <div className="mx-5 mt-4 text-sm rounded-md px-3 py-2 bg-red-50 text-red-800 dark:bg-red-950/40 dark:text-red-300">
+            {error}
+          </div>
+        )}
+
+        {step === "pick" && (
+          <div className="p-5 space-y-3">
+            <h3 className="text-sm font-semibold">{ts.step1Heading}</h3>
+            <p className="text-xs text-neutral-500 dark:text-neutral-400">
+              {ts.fileHint}
+            </p>
+            <input
+              type="file"
+              accept=".csv,.txt,.tsv,text/csv,text/plain"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleFile(f);
+              }}
+              className="block text-sm"
+            />
+          </div>
+        )}
+
+        {step === "map" && (
+          <div className="p-5 space-y-5">
+            <div className="space-y-2">
+              <h3 className="text-sm font-semibold">{ts.step2Heading}</h3>
+              <p className="text-xs text-neutral-500 dark:text-neutral-400">
+                {ts.step2Intro(headers.length)}
+              </p>
+              <div className="grid grid-cols-1 gap-2">
+                {headers.map((h, i) => (
+                  <div
+                    key={i}
+                    className="flex items-center gap-3 rounded-md border dark:border-neutral-800 px-3 py-2"
+                  >
+                    <span className="font-mono text-xs text-neutral-700 dark:text-neutral-300 flex-1 truncate">
+                      {h || `(column ${i + 1})`}
+                    </span>
+                    <span className="text-xs text-neutral-400">→</span>
+                    <select
+                      value={mapping[i] || "skip"}
+                      onChange={(e) =>
+                        setColumnMapping(i, e.target.value as TargetField)
+                      }
+                      className="text-sm rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 outline-none"
+                    >
+                      {TARGET_FIELDS.map((f) => (
+                        <option key={f} value={f}>
+                          {ts.targetFields[f]}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+              {domainColIdx < 0 && (
+                <p className="text-xs text-amber-700 dark:text-amber-400">
+                  {ts.domainNotMapped}
+                </p>
+              )}
+            </div>
+
+            {/* Date format dropdown — only shown when a column is mapped to expiration_date. */}
+            {dateColIdx >= 0 && (
+              <div className="space-y-2">
+                <label className="text-sm font-medium">
+                  {ts.dateFormatLabel}
+                </label>
+                <select
+                  value={dateFormat}
+                  onChange={(e) => setDateFormat(e.target.value as DateFormat)}
+                  className="text-sm rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 outline-none w-full"
+                >
+                  {DATE_FORMAT_OPTIONS.map((f) => (
+                    <option key={f} value={f}>
+                      {ts.dateFormatOptions[f]}
+                    </option>
+                  ))}
+                </select>
+                {dateColumnSample && (
+                  <p className="text-xs text-neutral-500 dark:text-neutral-400">
+                    {dateColumnSample
+                      .filter(Boolean)
+                      .slice(0, 3)
+                      .map((s) => {
+                        const parsed = parseDate(s, dateFormat);
+                        return parsed ? `${s} → ${parsed}` : `${s} → ?`;
+                      })
+                      .join("  ·  ")}
+                  </p>
+                )}
+              </div>
+            )}
+
+            <div className="space-y-3">
+              <h3 className="text-sm font-semibold">{ts.defaultsHeading}</h3>
+              <p className="text-xs text-neutral-500 dark:text-neutral-400">
+                {ts.defaultsHint}
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-neutral-500 dark:text-neutral-400">
+                    {ts.defaultRegistrar}
+                  </span>
+                  <input
+                    type="text"
+                    value={defaultRegistrar}
+                    onChange={(e) => setDefaultRegistrar(e.target.value)}
+                    disabled={mapping.includes("registrar")}
+                    placeholder="GoDaddy"
+                    className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none disabled:opacity-50"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-neutral-500 dark:text-neutral-400">
+                    {ts.defaultStatus}
+                  </span>
+                  <select
+                    value={defaultStatus}
+                    onChange={(e) =>
+                      setDefaultStatus(e.target.value as BacklogStatus)
+                    }
+                    disabled={mapping.includes("status")}
+                    className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none disabled:opacity-50"
+                  >
+                    {BACKLOG_STATUSES.map((s) => (
+                      <option key={s} value={s}>
+                        {t.pages.backlog.statusLabels[s]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <h3 className="text-sm font-semibold">{ts.previewHeading}</h3>
+              <div className="overflow-x-auto rounded-md border dark:border-neutral-800">
+                <table className="w-full text-xs">
+                  <thead className="bg-neutral-100 dark:bg-neutral-900">
+                    <tr>
+                      {headers.map((h, i) => (
+                        <th
+                          key={i}
+                          className="px-2 py-1 text-left font-medium font-mono"
+                        >
+                          {h || `(col ${i + 1})`}
+                          <div className="text-[10px] font-normal text-neutral-500">
+                            {ts.targetFields[mapping[i] || "skip"]}
+                          </div>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {previewRows.map((r, ri) => (
+                      <tr
+                        key={ri}
+                        className="border-t dark:border-neutral-800"
+                      >
+                        {headers.map((_, ci) => (
+                          <td
+                            key={ci}
+                            className="px-2 py-1 align-top whitespace-nowrap"
+                          >
+                            {(r[ci] ?? "").slice(0, 60)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={onClose}
+                disabled={busy}
+                className="text-sm px-3 py-1.5 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+              >
+                {ts.cancel}
+              </button>
+              <button
+                type="button"
+                onClick={handleImport}
+                disabled={!canImport || busy}
+                className="text-sm px-4 py-1.5 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+              >
+                {busy ? ts.importing : ts.importBtn(rows.length)}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step === "result" && result && (
+          <div className="p-5 space-y-3">
+            <h3 className="text-sm font-semibold">{ts.result.heading}</h3>
+            <ul className="text-sm space-y-1">
+              <li className="text-green-700 dark:text-green-400">
+                {ts.result.inserted(result.inserted)}
+              </li>
+              {result.skipped_duplicates > 0 && (
+                <li className="text-neutral-600 dark:text-neutral-400">
+                  {ts.result.skippedDupes(result.skipped_duplicates)}
+                </li>
+              )}
+              {result.skipped_invalid > 0 && (
+                <li className="text-amber-700 dark:text-amber-400">
+                  {ts.result.skippedInvalid(result.skipped_invalid)}
+                </li>
+              )}
+            </ul>
+            {result.errors.length > 0 && (
+              <div className="text-xs space-y-1">
+                <div className="font-medium">{ts.result.errorsHeading}</div>
+                <ul className="list-disc list-inside text-neutral-600 dark:text-neutral-400">
+                  {result.errors.map((e, i) => (
+                    <li key={i}>
+                      row {e.row_index + 2}: {e.message}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => {
+                  reset();
+                }}
+                className="text-sm px-3 py-1.5 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+              >
+                {t.pages.backlog.importBtn}
+              </button>
+              <button
+                type="button"
+                onClick={onClose}
+                className="text-sm px-4 py-1.5 rounded-md bg-blue-600 text-white hover:bg-blue-700"
+              >
+                {ts.close}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

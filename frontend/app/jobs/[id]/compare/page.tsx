@@ -1,0 +1,518 @@
+"use client";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, use, useEffect, useMemo, useState } from "react";
+import { useT } from "@/lib/i18n";
+import {
+  api,
+  JobDetail,
+  RunSummaryResponse,
+  RunSummaryDomain,
+} from "@/lib/api";
+import {
+  FinalBucket,
+  formatScore,
+  isLowConfidence,
+  labelToBucket,
+  pillToneWithConfidence,
+} from "@/lib/score";
+
+const CRITERIA_ORDER = ["backlinks", "refdomains", "anchors", "keywords", "wayback"] as const;
+
+export default function ComparePage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = use(params);
+  return (
+    <Suspense fallback={null}>
+      <CompareInner jobId={parseInt(id, 10)} />
+    </Suspense>
+  );
+}
+
+function CompareInner({ jobId }: { jobId: number }) {
+  const { t } = useT();
+  const ts = t.pages.jobs.compare;
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  const [job, setJob] = useState<JobDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [runA, setRunA] = useState<RunSummaryResponse | null>(null);
+  const [runB, setRunB] = useState<RunSummaryResponse | null>(null);
+  const [loadingPair, setLoadingPair] = useState(false);
+
+  const aId = useMemo(() => {
+    const v = searchParams.get("a");
+    return v ? parseInt(v, 10) : null;
+  }, [searchParams]);
+  const bId = useMemo(() => {
+    const v = searchParams.get("b");
+    return v ? parseInt(v, 10) : null;
+  }, [searchParams]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getJob(jobId)
+      .then((d) => {
+        if (cancelled) return;
+        setJob(d);
+        // Default to the latest two runs if no params provided.
+        if ((aId === null || bId === null) && d.runs.length >= 2) {
+          const params = new URLSearchParams(searchParams.toString());
+          if (aId === null) params.set("a", String(d.runs[0].id));
+          if (bId === null) params.set("b", String(d.runs[1].id));
+          router.replace(`/jobs/${jobId}/compare?${params.toString()}`);
+        }
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setError(e.message);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId]);
+
+  useEffect(() => {
+    if (aId === null || bId === null) return;
+    let cancelled = false;
+    setLoadingPair(true);
+    Promise.all([api.getRunSummary(aId), api.getRunSummary(bId)])
+      .then(([a, b]) => {
+        if (cancelled) return;
+        setRunA(a);
+        setRunB(b);
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setError(e.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingPair(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [aId, bId]);
+
+  function setRun(side: "a" | "b", runId: number) {
+    const p = new URLSearchParams(searchParams.toString());
+    p.set(side, String(runId));
+    router.replace(`/jobs/${jobId}/compare?${p.toString()}`);
+  }
+
+  if (error) {
+    return (
+      <div className="space-y-4">
+        <Link
+          href={`/jobs/${jobId}`}
+          className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+        >
+          {ts.backLink}
+        </Link>
+        <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-800 dark:bg-red-900/30 dark:text-red-300">
+          {error}
+        </div>
+      </div>
+    );
+  }
+  if (!job) {
+    return <div className="text-sm text-neutral-500">{t.common.loading}</div>;
+  }
+  if (job.runs.length < 2) {
+    return (
+      <div className="space-y-4">
+        <Link
+          href={`/jobs/${jobId}`}
+          className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+        >
+          {ts.backLink}
+        </Link>
+        <p className="text-sm text-neutral-600 dark:text-neutral-400">
+          {ts.notEnoughRuns}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <Link
+        href={`/jobs/${jobId}`}
+        className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+      >
+        {ts.backLink}
+      </Link>
+
+      <header className="space-y-2">
+        <h1 className="text-2xl font-semibold">
+          {ts.title(job.name || `Job #${job.id}`)}
+        </h1>
+        <p className="text-sm text-neutral-600 dark:text-neutral-400">
+          {ts.intro}
+        </p>
+      </header>
+
+      <section className="grid gap-4 md:grid-cols-2">
+        <RunPicker
+          label={ts.runA}
+          jobRuns={job.runs}
+          value={aId}
+          otherValue={bId}
+          onChange={(id) => setRun("a", id)}
+        />
+        <RunPicker
+          label={ts.runB}
+          jobRuns={job.runs}
+          value={bId}
+          otherValue={aId}
+          onChange={(id) => setRun("b", id)}
+        />
+      </section>
+
+      {loadingPair && !runA && !runB && (
+        <p className="text-sm text-neutral-500">{t.common.loading}</p>
+      )}
+
+      {runA && runB && (
+        <CompareTable
+          jobId={jobId}
+          runA={runA}
+          runB={runB}
+        />
+      )}
+    </div>
+  );
+}
+
+function RunPicker({
+  label,
+  jobRuns,
+  value,
+  otherValue,
+  onChange,
+}: {
+  label: string;
+  jobRuns: { id: number; name: string; status: string; finished_at: string | null }[];
+  value: number | null;
+  otherValue: number | null;
+  onChange: (runId: number) => void;
+}) {
+  const { t } = useT();
+  const runLabel = t.pages.jobs.detail.runLabel;
+  return (
+    <div className="space-y-1">
+      <label className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
+        {label}
+      </label>
+      <select
+        value={value ?? ""}
+        onChange={(e) => onChange(parseInt(e.target.value, 10))}
+        className="w-full rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-500/40"
+      >
+        {value === null && <option value="">—</option>}
+        {jobRuns.map((r) => (
+          <option key={r.id} value={r.id} disabled={r.id === otherValue}>
+            {runLabel(r.id, r.name)} · {r.status}
+            {r.finished_at ? ` · ${new Date(r.finished_at).toLocaleString()}` : ""}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+// Per-criterion verdicts come straight from the criterion judges and still
+// use "high_quality"/"mixed"/"low_quality" labels — keep the original pill
+// for those columns.
+const VERDICT_TONE: Record<string, string> = {
+  high_quality: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300",
+  mixed: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
+  low_quality: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
+  quality: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300",
+};
+
+function VerdictPill({ value }: { value: string | null }) {
+  if (!value) return <span className="text-neutral-400 dark:text-neutral-600">—</span>;
+  const tone =
+    VERDICT_TONE[value] ||
+    "bg-neutral-100 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300";
+  const short = value.replace("_quality", "").replace("quality", "good");
+  return (
+    <span className={`text-xs px-2 py-0.5 rounded-full ${tone}`} title={value}>
+      {short}
+    </span>
+  );
+}
+
+// Final-assessment pill: score-aware. Numeric scores get rendered as a
+// percentage with bucket tone; the pill greys out when the AI's confidence
+// in its sub-verdicts was too low to trust the aggregate.
+function FinalCompareCell({
+  value,
+}: {
+  value: {
+    final_summary: string | null;
+    final_score: number | null;
+    final_confidence: number | null;
+    final_bucket: string;
+  } | null;
+}) {
+  if (!value) return <span className="text-neutral-400 dark:text-neutral-600">—</span>;
+  const bucket: FinalBucket | null =
+    value.final_bucket === "good" ||
+    value.final_bucket === "mixed" ||
+    value.final_bucket === "low_quality"
+      ? value.final_bucket
+      : labelToBucket(value.final_summary);
+  if (!bucket) {
+    return <span className="text-neutral-400 dark:text-neutral-600">—</span>;
+  }
+  const tone = pillToneWithConfidence(bucket, value.final_confidence);
+  const display =
+    value.final_score != null ? formatScore(value.final_score) : bucket;
+  const titleSuffix =
+    value.final_confidence != null
+      ? ` · ${Math.round(value.final_confidence * 100)}% confidence${
+          isLowConfidence(value.final_confidence) ? " (low — greyed)" : ""
+        }`
+      : "";
+  return (
+    <span
+      className={`text-xs px-2 py-0.5 rounded-full ${tone}`}
+      title={
+        value.final_score != null
+          ? `Score ${display} · ${bucket}${titleSuffix}`
+          : `${bucket}${titleSuffix}`
+      }
+    >
+      {display}
+    </span>
+  );
+}
+
+function CompareTable({
+  jobId,
+  runA,
+  runB,
+}: {
+  jobId: number;
+  runA: RunSummaryResponse;
+  runB: RunSummaryResponse;
+}) {
+  const { t } = useT();
+  const ts = t.pages.jobs.compare;
+  const runLabel = t.pages.jobs.detail.runLabel;
+  // Resolve user-facing labels for the two runs once. Falls back to
+  // "Run #N" when the user hasn't named the run.
+  const aLabel = runLabel(runA.run_id, runA.name);
+  const bLabel = runLabel(runB.run_id, runB.name);
+
+  // Pair domains by name. A domain may exist in only one run (e.g. user
+  // changed the domain list between runs); show those rows with a missing
+  // marker on the empty side.
+  const byDomainA = new Map(runA.domains.map((d) => [d.domain, d]));
+  const byDomainB = new Map(runB.domains.map((d) => [d.domain, d]));
+  const allDomains = Array.from(
+    new Set([...byDomainA.keys(), ...byDomainB.keys()]),
+  ).sort();
+
+  return (
+    <section className="space-y-3">
+      <Legend aLabel={aLabel} bLabel={bLabel} />
+      <div className="overflow-x-auto rounded-md border dark:border-neutral-800">
+        <table className="w-full text-sm">
+          <thead className="bg-neutral-100 dark:bg-neutral-900 text-left">
+            <tr>
+              <th rowSpan={2} className="px-3 py-2 font-medium align-bottom">
+                {ts.cols.domain}
+              </th>
+              {CRITERIA_ORDER.map((c) => (
+                <th
+                  key={c}
+                  colSpan={2}
+                  className="px-3 py-2 font-medium border-l dark:border-neutral-800 text-center"
+                >
+                  {ts.cols[c as keyof typeof ts.cols]}
+                </th>
+              ))}
+              <th
+                colSpan={2}
+                className="px-3 py-2 font-medium border-l dark:border-neutral-800 text-center"
+              >
+                {ts.cols.final}
+              </th>
+            </tr>
+            <tr className="text-xs text-neutral-500">
+              {CRITERIA_ORDER.flatMap((c) => [
+                <th
+                  key={`${c}-A`}
+                  className="px-2 py-1 font-normal border-l dark:border-neutral-800"
+                  title={aLabel}
+                >
+                  {aLabel}
+                </th>,
+                <th
+                  key={`${c}-B`}
+                  className="px-2 py-1 font-normal"
+                  title={bLabel}
+                >
+                  {bLabel}
+                </th>,
+              ])}
+              <th
+                className="px-2 py-1 font-normal border-l dark:border-neutral-800"
+                title={aLabel}
+              >
+                {aLabel}
+              </th>
+              <th className="px-2 py-1 font-normal" title={bLabel}>
+                {bLabel}
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {allDomains.map((domain) => {
+              const a = byDomainA.get(domain) || null;
+              const b = byDomainB.get(domain) || null;
+              return (
+                <CompareRow
+                  key={domain}
+                  domain={domain}
+                  a={a}
+                  b={b}
+                  jobId={jobId}
+                  runAId={runA.run_id}
+                  runBId={runB.run_id}
+                  aLabel={aLabel}
+                  bLabel={bLabel}
+                />
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function Legend({ aLabel, bLabel }: { aLabel: string; bLabel: string }) {
+  const { t } = useT();
+  const ts = t.pages.jobs.compare;
+  return (
+    <div className="flex flex-wrap gap-3 text-xs text-neutral-600 dark:text-neutral-400">
+      <span className="inline-flex items-center gap-1.5">
+        <span className="w-3 h-3 rounded bg-amber-200 dark:bg-amber-800/60" />
+        {ts.legendDiff}
+      </span>
+      <span className="inline-flex items-center gap-1.5">
+        <span className="w-3 h-3 rounded bg-neutral-200 dark:bg-neutral-700" />
+        {ts.legendSame}
+      </span>
+      <span className="inline-flex items-center gap-1.5 ml-2">
+        {ts.legendOnlyA}: <em>{aLabel}</em> only
+      </span>
+      <span className="inline-flex items-center gap-1.5">
+        {ts.legendOnlyB}: <em>{bLabel}</em> only
+      </span>
+    </div>
+  );
+}
+
+function CompareRow({
+  domain,
+  a,
+  b,
+  jobId,
+  runAId,
+  runBId,
+  aLabel,
+  bLabel,
+}: {
+  domain: string;
+  a: RunSummaryDomain | null;
+  b: RunSummaryDomain | null;
+  jobId: number;
+  runAId: number;
+  runBId: number;
+  aLabel: string;
+  bLabel: string;
+}) {
+  const aOnly = a && !b;
+  const bOnly = !a && b;
+  const both = a && b;
+  return (
+    <tr className="border-t dark:border-neutral-800 hover:bg-neutral-50 dark:hover:bg-neutral-900/60">
+      <td className="px-3 py-2">
+        <div className="font-mono text-xs">{domain}</div>
+        <div className="text-[10px] text-neutral-500 mt-0.5 flex gap-2">
+          {a && (
+            <Link
+              href={`/jobs/${jobId}/runs/${runAId}/domains/${a.id}`}
+              className="text-blue-600 dark:text-blue-400 hover:underline"
+              title={aLabel}
+            >
+              Open {aLabel}
+            </Link>
+          )}
+          {b && (
+            <Link
+              href={`/jobs/${jobId}/runs/${runBId}/domains/${b.id}`}
+              className="text-blue-600 dark:text-blue-400 hover:underline"
+              title={bLabel}
+            >
+              Open {bLabel}
+            </Link>
+          )}
+        </div>
+      </td>
+      {CRITERIA_ORDER.flatMap((c) => {
+        const aVal = a?.criteria[c]?.ai_assessment ?? null;
+        const bVal = b?.criteria[c]?.ai_assessment ?? null;
+        const diffShade = both && aVal !== bVal
+          ? "bg-amber-50 dark:bg-amber-900/10"
+          : "";
+        return [
+          <td
+            key={`${c}-A`}
+            className={`px-2 py-2 border-l dark:border-neutral-800 ${diffShade}`}
+          >
+            <VerdictPill value={aVal} />
+          </td>,
+          <td key={`${c}-B`} className={`px-2 py-2 ${diffShade}`}>
+            <VerdictPill value={bVal} />
+          </td>,
+        ];
+      })}
+      {(() => {
+        // Compare via the normalized bucket so a 78% (mixed) and a "mixed"
+        // text label don't get flagged as a difference.
+        const aBucket = a?.final_bucket || labelToBucket(a?.final_summary ?? null) || "";
+        const bBucket = b?.final_bucket || labelToBucket(b?.final_summary ?? null) || "";
+        const diffShade = both && aBucket !== bBucket
+          ? "bg-amber-50 dark:bg-amber-900/10"
+          : "";
+        return (
+          <>
+            <td
+              className={`px-2 py-2 border-l dark:border-neutral-800 ${diffShade}`}
+            >
+              <FinalCompareCell value={a} />
+            </td>
+            <td className={`px-2 py-2 ${diffShade}`}>
+              <FinalCompareCell value={b} />
+            </td>
+          </>
+        );
+      })()}
+      {(aOnly || bOnly) && (
+        <td className="px-2 py-2 text-xs text-neutral-500 italic">
+          {aOnly ? `only in ${aLabel}` : `only in ${bLabel}`}
+        </td>
+      )}
+    </tr>
+  );
+}

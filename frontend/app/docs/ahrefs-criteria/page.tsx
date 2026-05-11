@@ -1,0 +1,402 @@
+import Link from "next/link";
+
+export const metadata = { title: "Ahrefs-критерии — Drop Sherlock" };
+
+export default function AhrefsCriteriaDoc() {
+  return (
+    <div className="docs-content">
+      <h1>Ahrefs-критерии (B / D / A / K)</h1>
+      <p>
+        Drop Sherlock использует четыре эндпоинта Ahrefs Site Explorer для
+        оценки домена: <strong>backlinks</strong> (B), <strong>refdomains</strong>{" "}
+        (D), <strong>anchors</strong> (A), <strong>keywords</strong> (K). Каждый
+        — отдельный критерий со своим ИИ-судьёй и своим вкладом в итоговый
+        балл. Эта статья — про то, что именно смотрит каждый критерий,
+        какие поля приходят из Ahrefs и на какие сигналы ИИ обращает
+        внимание.
+      </p>
+
+      <h2>Общие принципы</h2>
+      <h3>Стоимость</h3>
+      <p>
+        Каждый Ahrefs-запрос стоит юниты, лимит хранится в подписке.
+        Drop Sherlock считает потраченные юниты по заголовкам ответа Ahrefs
+        и отображает их в строке стоимости запуска. Самый «жирный»
+        обычно — backlinks (тысячи строк по жирным доменам). Anchors и
+        keywords дешевле.
+      </p>
+      <p>
+        Если домен уже был проанализирован, повторный запрос можно
+        исключить через <Link href="/docs/cache">кэш</Link> — сырая выдача
+        копируется из прошлого RunDomain.
+      </p>
+
+      <h3>Пред-фильтрация</h3>
+      <p>
+        Drop Sherlock <em>не</em> отдаёт ИИ всю Ahrefs-выдачу — у больших
+        доменов её десятки тысяч строк, и токенов не хватит. На уровне
+        запроса включаются фильтры:
+      </p>
+      <ul>
+        <li>
+          <strong>backlinks</strong>: только <code>dofollow=true</code>,
+          без спамовых доменов, только in-content (article-body) ссылки.
+          Это значит, что ИИ-судья оценивает <em>уже очищенный</em>{" "}
+          ссылочный профиль — спам/футеры/сайтвайды исключены ещё до
+          входа в промпт.
+        </li>
+        <li>
+          <strong>refdomains</strong>: исключены явно спамовые домены.
+        </li>
+        <li>
+          <strong>anchors</strong>: без специальной пред-фильтрации;
+          приходит распределение анкоров как есть.
+        </li>
+        <li>
+          <strong>keywords</strong>: organic-keywords, без фильтра по
+          типу (брендовые/коммерческие смешаны).
+        </li>
+      </ul>
+      <p>
+        Точные параметры запроса можно увидеть на{" "}
+        <Link href="/docs/domain">странице домена</Link> в табах сырых
+        данных — там показан полный URL Ahrefs-запроса.
+      </p>
+
+      <h3>Усечение перед ИИ</h3>
+      <p>
+        Из получившейся очищенной выдачи в промпт идёт только
+        ограниченное число строк (обычно 100–300, зависит от критерия) и
+        ограниченный набор полей. Полный список полей видно в «AI input
+        preview» на странице домена. Это нужно, чтобы:
+      </p>
+      <ul>
+        <li>Не превысить контекст модели.</li>
+        <li>Не платить за бесполезные токены.</li>
+        <li>Сосредоточить внимание модели на сильных сигналах.</li>
+      </ul>
+
+      <h3>Сортировка</h3>
+      <p>
+        Какие именно строки попадут под лимит — определяет сортировка.
+        Например, для backlinks по умолчанию приоритет идёт по{" "}
+        <code>url_rating_source</code> (DESC), чтобы видеть самые
+        авторитетные ссылки сверху. Сортировку можно поменять в форме{" "}
+        <Link href="/docs/analyze">Анализа</Link> для каждого критерия.
+      </p>
+      <p>
+        Сортировка входит в <code>params_hash</code> — смена сортировки
+        инвалидирует кэш данных для этого критерия (см.{" "}
+        <Link href="/docs/cache">«Кэш»</Link>).
+      </p>
+
+      <hr />
+
+      <h2>B — Backlinks</h2>
+      <p>
+        <strong>Ahrefs endpoint:</strong>{" "}
+        <code>site-explorer/all-backlinks</code>. По одной строке на
+        входящую ссылку.
+      </p>
+
+      <h3>Ключевые поля</h3>
+      <ul>
+        <li>
+          <code>url_rating_source</code> (UR) — авторитет страницы-донора.
+          Сильнее DR на уровне страниц.
+        </li>
+        <li>
+          <code>traffic_domain</code>,{" "}
+          <code>traffic</code>, <code>positions</code> — реальный трафик
+          донора. Trafic &gt; vanity DR.
+        </li>
+        <li>
+          <code>anchor</code> — текст анкора. Распределение по строкам
+          показывает, шёл ли линкбилдинг «вручную» или «массово».
+        </li>
+        <li>
+          <code>snippet_left</code> + <code>snippet_right</code> — ~150
+          символов до и после ссылки. Самый сильный «человеческий»
+          сигнал: вписана ли ссылка в текст естественно или вставлена
+          шаблонно.
+        </li>
+        <li>
+          <code>url_to</code> — на какую страницу анализируемого домена
+          ведёт ссылка. Если все ссылки на одну «денежную»
+          страницу — манипулятивно.
+        </li>
+        <li>
+          <code>domain_rating_source</code> (DR) — авторитет домена-донора.
+          Вес <em>после</em> трафика.
+        </li>
+        <li>
+          <code>refdomains_source</code> — у самого донора сколько входящих
+          доменов. PBN-сетки обычно с низким значением (своих ссылок
+          мало, но они высокий DR раздают).
+        </li>
+        <li>
+          <code>first_seen_link</code>, <code>last_seen</code> — свежесть
+          и убыль. Хвост свежих first_seen без last_seen = активный рост;
+          резкий кластер lost = penalty или миграция.
+        </li>
+        <li>
+          <code>title</code>, <code>languages</code> — тематический и
+          языковой контекст страницы-донора.
+        </li>
+      </ul>
+
+      <h3>Что ИИ-судья ищет</h3>
+      <p>
+        <strong>High quality:</strong>
+      </p>
+      <ul>
+        <li>Реальный DR + реальный трафик у доноров.</li>
+        <li>
+          Естественный микс анкоров: бренд + URL + generic, без массового
+          exact-match по коммерческим ключам.
+        </li>
+        <li>
+          Snippets читаются как живые редакционные упоминания, а не
+          вставки.
+        </li>
+        <li>Доноры тематически релевантные.</li>
+      </ul>
+      <p>
+        <strong>Low quality:</strong>
+      </p>
+      <ul>
+        <li>
+          Шаблонные/офтопик snippets, одинаковые boilerplate-куски на
+          разных доменах = footprint линк-сетки.
+        </li>
+        <li>
+          Exact-match anchor stuffing на коммерческих терминах.
+        </li>
+        <li>
+          PBN-сигналы: похожие низкотрафные high-DR доноры с тонким
+          собственным профилем.
+        </li>
+      </ul>
+
+      <hr />
+
+      <h2>D — Refdomains</h2>
+      <p>
+        <strong>Ahrefs endpoint:</strong>{" "}
+        <code>site-explorer/refdomains</code>. По одной строке на
+        уникальный домен-донор (агрегация всех ссылок с этого домена).
+      </p>
+
+      <h3>Ключевые поля</h3>
+      <ul>
+        <li>
+          <code>domain_rating</code> — DR донора.
+        </li>
+        <li>
+          <code>traffic_domain</code>, <code>positions_source_domain</code>{" "}
+          — органическая видимость донора.
+        </li>
+        <li>
+          <code>dofollow_links</code>, <code>dofollow_refdomains</code>,{" "}
+          <code>dofollow_linked_domains</code> — какая доля dofollow.
+          Определяет, сколько equity реально передаётся.
+        </li>
+        <li>
+          <code>new_links</code> vs <code>lost_links</code> — чистая
+          скорость прироста.
+        </li>
+        <li>
+          <code>links_to_target</code> — сколько ссылок от этого донора на
+          вашу цель. Много → возможен сайтвайд (подозрительно).
+        </li>
+        <li>
+          <code>first_seen</code>, <code>last_seen</code> — свежесть пула.
+        </li>
+      </ul>
+
+      <h3>Что ИИ-судья ищет</h3>
+      <p>
+        <strong>High quality:</strong>
+      </p>
+      <ul>
+        <li>
+          Разнообразный микс DR (от низких до высоких) — здоровый
+          органический рост.
+        </li>
+        <li>Реальный трафик у доноров.</li>
+        <li>Высокая доля dofollow.</li>
+        <li>Стабильная или растущая link velocity.</li>
+      </ul>
+      <p>
+        <strong>Low quality:</strong>
+      </p>
+      <ul>
+        <li>Все доноры низкого DR.</li>
+        <li>Zero-traffic high-DR shells (мусорные хосты).</li>
+        <li>Резкое падение velocity (cliff of lost links).</li>
+      </ul>
+
+      <hr />
+
+      <h2>A — Anchors</h2>
+      <p>
+        <strong>Ahrefs endpoint:</strong>{" "}
+        <code>site-explorer/anchors</code>. По одной строке на уникальный
+        анкор.
+      </p>
+
+      <h3>Ключевые поля</h3>
+      <ul>
+        <li>
+          <code>anchor</code> — сам текст.
+        </li>
+        <li>
+          <code>refdomains</code>, <code>refpages</code> — сколько
+          доменов/страниц используют этот анкор.
+        </li>
+        <li>
+          <code>dofollow_links</code> — сколько equity несёт анкор.
+        </li>
+        <li>
+          <code>top_domain_rating</code> — DR самого жирного донора с этим
+          анкором.
+        </li>
+        <li>
+          <code>new_links</code> vs <code>lost_links</code> — anchor-level
+          velocity.
+        </li>
+      </ul>
+
+      <h3>Что ИИ-судья ищет</h3>
+      <p>
+        <strong>High quality:</strong>
+      </p>
+      <ul>
+        <li>
+          Доминируют бренд-анкоры и naked-URL.
+        </li>
+        <li>Generic анкоры в разумной доле.</li>
+      </ul>
+      <p>
+        <strong>Low quality:</strong>
+      </p>
+      <ul>
+        <li>
+          Чрезмерное использование exact-match commercial анкоров.
+        </li>
+        <li>
+          Резкий рост одного коммерческого анкора (sudden growth) =
+          линк-buying tell.
+        </li>
+        <li>
+          Один анкор почти полностью от одного донора (refdomains=1, но
+          dofollow_links=100) = сайтвайд.
+        </li>
+      </ul>
+
+      <hr />
+
+      <h2>K — Keywords</h2>
+      <p>
+        <strong>Ahrefs endpoint:</strong>{" "}
+        <code>site-explorer/organic-keywords</code>. По одной строке на
+        ключевую фразу, по которой домен ранжируется.
+      </p>
+
+      <h3>Ключевые поля</h3>
+      <ul>
+        <li>
+          <code>keyword</code> — сама фраза.
+        </li>
+        <li>
+          <code>volume</code> — частотность.
+        </li>
+        <li>
+          <code>best_position</code> — лучшая позиция домена по этой фразе.
+        </li>
+        <li>
+          <code>sum_traffic</code> — оценочный трафик с этого ключа.
+        </li>
+        <li>
+          <code>keyword_difficulty</code> (KD) — насколько сложно туда
+          пробиться.
+        </li>
+        <li>
+          <code>is_branded</code> — единственный intent-флаг от Ahrefs:
+          бренд или нет.
+        </li>
+      </ul>
+
+      <h3>Что ИИ-судья ищет</h3>
+      <p>
+        <strong>High quality:</strong>
+      </p>
+      <ul>
+        <li>
+          Реальный трафик на non-branded ключах (домен ранжируется не
+          только по своему названию).
+        </li>
+        <li>
+          Здоровое распределение позиций (топ-3 / топ-10), а не одна
+          фраза в топе и хвост на 50+.
+        </li>
+        <li>
+          Сложные ключи (KD высокий) в портфеле — сильный сигнал
+          авторитета.
+        </li>
+      </ul>
+      <p>
+        <strong>Low quality:</strong>
+      </p>
+      <ul>
+        <li>
+          Все ключи брендовые — single-domain intent, слабый сигнал.
+        </li>
+        <li>
+          Много ranking-ов с нулевым трафиком (vanity rankings).
+        </li>
+        <li>
+          Узкий пул из 3–5 ключей с малой суммарной частотностью.
+        </li>
+      </ul>
+
+      <hr />
+
+      <h2>Confidence и размер выборки</h2>
+      <p>
+        Каждый ИИ-судья снижает confidence, когда выборка маленькая:
+      </p>
+      <ul>
+        <li>backlinks: меньше 20 строк → confidence просаживается;</li>
+        <li>refdomains: меньше 15;</li>
+        <li>anchors: меньше 10 уникальных анкоров;</li>
+        <li>keywords: меньше 10 ключей.</li>
+      </ul>
+      <p>
+        Это видно в каждом боксе вердикта (% confidence) и в итоговом
+        баннере — низкая средняя confidence визуально серит финальный
+        балл.
+      </p>
+
+      <h2>Связанные статьи</h2>
+      <ul>
+        <li>
+          <Link href="/docs/brain">Brain</Link> — где редактируются эти
+          промпты и как считаются веса.
+        </li>
+        <li>
+          <Link href="/docs/cache">Кэш</Link> — как переиспользуются
+          собранные Ahrefs-данные.
+        </li>
+        <li>
+          <Link href="/docs/domain">Страница домена</Link> — где видны
+          сырые табы с этими данными.
+        </li>
+        <li>
+          <Link href="/docs/analyze">Анализ</Link> — выбор сортировок,
+          лимитов, провайдера для ИИ.
+        </li>
+      </ul>
+    </div>
+  );
+}

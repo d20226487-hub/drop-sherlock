@@ -1,0 +1,66 @@
+services:
+  api:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    expose:
+      - "8000"
+    # Healthcheck so Caddy / docker compose know when the API is
+    # actually ready. Hits /health (returns {"ok":true}) so we don't
+    # depend on any business endpoint.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE: /api
+    restart: unless-stopped
+    env_file: .env
+    # Force Next standalone to bind 0.0.0.0 so the healthcheck (which
+    # hits localhost) can reach it. Default standalone behaviour binds
+    # to the container's network IP only — localhost:3000 inside the
+    # container would `Connection refused`.
+    environment:
+      HOSTNAME: 0.0.0.0
+    expose:
+      - "3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # Next.js doesn't ship a built-in health route; the root page is
+      # cheap and returns 200 once the server is ready. node-native to
+      # avoid depending on wget/curl being in the slim base image.
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # 8081 / 8444 chosen because serp-monitor's caddy already owns 8080 / 8443.
+      - "${HTTP_PORT:-8081}:80"
+      - "${HTTPS_PORT:-8444}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - web
+
+volumes:
+  caddy_data:
+  caddy_config:

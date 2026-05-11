@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "drop-sherlock",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": ["compose", "logs", "-f", "--tail=20", "web", "api"],
+      "port": 8081
+    }
+  ]
+}

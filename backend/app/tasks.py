@@ -1,0 +1,2803 @@
+"""Background job execution.
+
+`process_run(run_id)` is the entry point: it loads the run + spec from DB,
+fetches every (domain × enabled-criterion) Ahrefs request via the rate
+limiter, persists results, and updates statuses as it goes. It's a single
+top-level coroutine — APScheduler is not involved (Drop Sherlock has no
+cron; one-shot async tasks are simpler).
+
+`mark_orphaned_runs_paused()` is called on lifespan startup: any Run still
+flagged `running` after a uvicorn restart is now stale (the asyncio task
+that owned it is gone). Mark such runs `paused` so the UI doesn't lie about
+their state — and crucially so the user can hit Resume to pick up where
+they left off via the existing pause/resume idempotency. (Pre-2026-05-07
+this was `mark_orphaned_runs_failed` and the run was unrecoverable.)"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from .ai_judge import AI_PROVIDERS, _resolve_model, judge
+from .ai_prompts import localize_prompt
+from .app_settings import get_ai_prompt
+from .cache import (
+    compute_params_hash,
+    compute_prompt_hash,
+    lookup_cached_data,
+    lookup_cached_verdict,
+)
+from .db import SessionLocal
+from .limits import limit
+from .models import CriterionResult, Run, RunDomain
+from .providers import get_provider
+from .providers.ahrefs_requests import build_preview
+from .providers.base import ProviderConfigError, ProviderError
+from .schemas import AnalyzeSpec
+from .scoring import compute_final
+
+log = logging.getLogger(__name__)
+
+
+# Per-criterion field-trim list passed to the AI. Order matters for
+# prompt readability. Each list is kept in lockstep with the matching
+# SELECT_FIELDS entry in providers/ahrefs_requests.py — fetching a
+# column we don't send to the AI just costs Ahrefs units for nothing,
+# and sending a field we didn't fetch produces empty values that the
+# model has to skip.
+AI_FIELD_TRIM: dict[str, list[str]] = {
+    # Backlinks (trimmed 2026-05-10): snippet_left + snippet_right + url_to
+    # are now sent to the AI so it can judge editorial-vs-boilerplate
+    # placement directly from the surrounding text (the per-row
+    # is_dofollow / is_content / link_type flags that used to drive that
+    # judgment were dropped from SELECT — see ahrefs_requests.py).
+    "backlinks": [
+        "url_from", "anchor", "snippet_left", "snippet_right", "url_to",
+        "domain_rating_source", "url_rating_source", "traffic_domain",
+        "traffic", "positions", "refdomains_source", "first_seen_link",
+        "last_seen", "title", "languages",
+    ],
+    # Refdomains: dropped is_spam (every returned row has is_spam=0 by
+    # default non_spammy filter; sending the field added noise without
+    # signal).
+    "refdomains": [
+        "domain", "domain_rating", "dofollow_refdomains",
+        "dofollow_linked_domains", "dofollow_links", "links_to_target",
+        "traffic_domain", "positions_source_domain", "new_links",
+        "lost_links", "first_seen", "last_seen",
+    ],
+    # Anchors: `is_spam` deliberately omitted (2026-05-07). Ahrefs's per-row
+    # spam flag on the anchors endpoint is unreliable enough to mislead the
+    # AI; spam detection lives on the backlinks criterion. (As of
+    # 2026-05-10 it's also dropped from SELECT_FIELDS so we no longer
+    # pay to fetch it.)
+    "anchors": [
+        "anchor", "refdomains", "refpages", "dofollow_links",
+        "links_to_target", "top_domain_rating", "new_links",
+        "lost_links", "first_seen", "last_seen",
+    ],
+    # Kept in sync with SELECT_FIELDS["keywords"] in ahrefs_requests.py.
+    # Trimmed 2026-05-10 to lower Ahrefs unit cost; see the comment on
+    # SELECT_FIELDS for the full rationale on each dropped column.
+    "keywords": [
+        "keyword", "sum_traffic", "volume", "best_position",
+        "keyword_difficulty", "is_branded",
+    ],
+    # Wayback CDX rows. The AI sees the timestamp + statuscode + path
+    # signal it needs to detect 301 patterns, theme drift via URL paths,
+    # and overall site-health-over-time. `digest` would just be hash noise
+    # so we drop it from the AI input even though it's in the table.
+    "wayback": [
+        "timestamp", "original", "statuscode", "mimetype", "length",
+    ],
+}
+
+
+def _trim_rows_for_ai(criterion: str, rows: list[dict]) -> list[dict]:
+    """Drop high-volume low-signal fields before sending to the AI."""
+    fields = AI_FIELD_TRIM.get(criterion)
+    if not fields:
+        return rows
+    return [{k: r.get(k) for k in fields if k in r} for r in rows]
+
+
+def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
+    """Return EXACTLY what would be sent to the AI for this criterion on
+    this domain. Same trim list, same system prompt, same user message
+    format the runner uses. Pure inspection — runs no AI, mutates nothing.
+
+    Used by the UI's "Preview AI input" link so users can see the data
+    behind a verdict (e.g. is_spam / first_seen / last_seen fields that
+    aren't in the default raw-data table)."""
+    if criterion not in ("backlinks", "refdomains", "anchors", "keywords", "wayback", "wayback_classify"):
+        raise ValueError(f"invalid criterion: {criterion}")
+
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None:
+            raise LookupError("run domain not found")
+        domain = rd.domain
+        cr = next(
+            (c for c in rd.results if c.criterion == criterion), None
+        )
+        rows: list[dict] = []
+        wayback_samples_raw: list[dict] = []
+        if cr is not None and cr.data_json:
+            try:
+                body = json.loads(cr.data_json)
+            except json.JSONDecodeError:
+                body = None
+            if isinstance(body, dict):
+                for v in body.values():
+                    if isinstance(v, list):
+                        rows = v
+                        break
+                # Wayback V2 samples sit alongside the CDX rows under
+                # "samples". Pull them out so the AI preview matches what
+                # the judge actually receives.
+                if criterion == "wayback":
+                    samples_val = body.get("samples")
+                    if isinstance(samples_val, list):
+                        wayback_samples_raw = samples_val
+        # wayback_classify reads samples from the SIBLING wayback CR
+        # (not its own — its own CR has no data_json). Look up the
+        # wayback CR on the same rd here.
+        if criterion == "wayback_classify":
+            wb_cr = next(
+                (c for c in rd.results if c.criterion == "wayback"), None
+            )
+            if wb_cr is not None and wb_cr.data_json:
+                try:
+                    wb_body = json.loads(wb_cr.data_json)
+                except json.JSONDecodeError:
+                    wb_body = None
+                if isinstance(wb_body, dict):
+                    samples_val = wb_body.get("samples")
+                    if isinstance(samples_val, list):
+                        wayback_samples_raw = samples_val
+        run = db.get(Run, rd.run_id)
+        spec_provider = ""
+        spec_model = ""
+        spec_language_mode = "ai"
+        spec_lang = "en"
+        if run is not None:
+            try:
+                sj = json.loads(run.spec_json or "{}")
+                ai = sj.get("ai") or {}
+                spec_provider = ai.get("provider") or ""
+                spec_model = ai.get("model") or ""
+                wbc_cfg = (sj.get("criteria") or {}).get("wayback_classify") or {}
+                spec_language_mode = wbc_cfg.get("language_mode") or "ai"
+                # Output-language directive carried on the run's spec; the
+                # preview should show the EXACT system prompt the runner
+                # would use (RU directive included on RU runs).
+                if sj.get("lang") == "ru":
+                    spec_lang = "ru"
+            except json.JSONDecodeError:
+                pass
+        # Verdict-level provenance: who ACTUALLY produced the current
+        # verdict on this CR (set by the runner / reanalyze; may differ
+        # from the run's original spec.ai after a reanalyze with an
+        # override). Preferred over spec.ai for the "next reanalyze
+        # default" pill since hitting Re-judge again without picking a
+        # provider keeps you on whatever produced the row you're looking
+        # at — matches the VerdictBox provenance chip's behavior.
+        cr_provider = (cr.ai_provider or "") if cr is not None else ""
+        cr_model = (cr.ai_model or "") if cr is not None else ""
+    finally:
+        db.close()
+
+    # wayback_classify uses its own prompt + user-message builder. The
+    # standard fields_sent / row-trimming logic doesn't apply (it doesn't
+    # consume row dicts; it consumes V2 samples). Render a multi-step
+    # preview so the user can see BOTH the language+theme prompt AND the
+    # chained category prompt that would run after.
+    if criterion == "wayback_classify":
+        from .wayback_classify import build_classify_user_message
+        from .app_settings import get_categories
+        # Pick the right prompt based on the run's stored language_mode.
+        prompt_key = (
+            "wayback_classify_theme_only"
+            if spec_language_mode == "library"
+            else "wayback_classify_combined"
+        )
+        system_prompt = localize_prompt(get_ai_prompt(prompt_key), spec_lang)
+        # The combined / theme-only prompts read full V2 samples — pass
+        # them through the same trim function the runner uses so the
+        # preview matches the wire payload exactly.
+        trimmed_samples = _trim_samples_for_ai(wayback_samples_raw)
+        user_message = build_classify_user_message(
+            domain=domain, samples=trimmed_samples, lingua_hint=None,
+        )
+        category_prompt = localize_prompt(
+            get_ai_prompt("wayback_category"), spec_lang
+        )
+        # If a verdict already landed, render the EXACT category user-msg
+        # the runner would have built. Otherwise render a placeholder so
+        # the user can see the prompt + categories at minimum.
+        category_user_message = ""
+        if cr is not None and cr.ai_verdict_json:
+            try:
+                from .wayback_classify import build_category_user_message
+                verdict = json.loads(cr.ai_verdict_json)
+                if isinstance(verdict, dict):
+                    category_user_message = build_category_user_message(
+                        theme_verdict=verdict, categories=get_categories(),
+                    )
+            except json.JSONDecodeError:
+                pass
+        # Provider/model: prefer what actually produced this CR's verdict
+        # (cr.ai_provider/cr.ai_model). If there's no verdict yet, fall
+        # back to the run's spec.ai resolved through Settings defaults.
+        effective_provider = cr_provider or spec_provider
+        effective_model = cr_model or spec_model
+        if not cr_model and effective_provider:
+            try:
+                effective_model = _resolve_model(effective_provider, spec_model)
+            except Exception:  # noqa: BLE001
+                effective_model = spec_model
+        return {
+            "domain": domain,
+            "criterion": criterion,
+            "provider": effective_provider,
+            "model": effective_model,
+            "fields_sent": [],
+            "row_count": len(trimmed_samples),
+            "system_prompt": system_prompt,
+            "user_message": user_message,
+            "rows": trimmed_samples,
+            # wayback_classify-specific fields surfaced for the UI to
+            # render a 2-step preview. `language_mode` tells the user
+            # which combined-vs-theme-only prompt was picked. The
+            # category step's user_message is empty when no verdict
+            # exists yet (since theme-detection's output feeds it).
+            "language_mode": spec_language_mode,
+            "category_system_prompt": category_prompt,
+            "category_user_message": category_user_message,
+        }
+
+    trimmed = _trim_rows_for_ai(criterion, rows)
+    fields_sent = AI_FIELD_TRIM.get(criterion, [])
+    system_prompt = localize_prompt(get_ai_prompt(criterion), spec_lang)
+    wayback_samples_for_ai: list[dict] | None = None
+    if criterion == "wayback" and wayback_samples_raw:
+        wayback_samples_for_ai = _trim_samples_for_ai(wayback_samples_raw)
+    user_message = _build_user_message_for_criterion(
+        criterion=criterion,
+        domain=domain,
+        rows=trimmed,
+        wayback_samples=wayback_samples_for_ai,
+    )
+    # Provider/model — same provenance preference as the wayback_classify
+    # branch above: actual verdict producer wins, falling back to the
+    # run's spec.ai resolved through Settings.
+    effective_provider = cr_provider or spec_provider
+    effective_model = cr_model or spec_model
+    if not cr_model and effective_provider:
+        try:
+            effective_model = _resolve_model(effective_provider, spec_model)
+        except Exception:  # noqa: BLE001
+            effective_model = spec_model
+
+    return {
+        "domain": domain,
+        "criterion": criterion,
+        "provider": effective_provider,
+        "model": effective_model,
+        "fields_sent": fields_sent,
+        "row_count": len(trimmed),
+        "system_prompt": system_prompt,
+        "user_message": user_message,
+        # Same trimmed rows the AI sees, exposed as structured data so the
+        # UI can render them as a table without re-parsing the JSON out of
+        # `user_message`. Identical content; redundant by design.
+        "rows": trimmed,
+    }
+
+
+# --- Public entry points ----------------------------------------------------
+
+def mark_orphaned_runs_paused(db: Session) -> int:
+    """Convert any `running` runs to `paused` so the user can resume them
+    via the existing Resume button. Called once at lifespan startup —
+    after a uvicorn restart there's no asyncio task left owning the run,
+    so leaving status=`running` would lie to the UI. Marking them
+    `paused` (rather than `failed`, the pre-2026-05-07 behavior) preserves
+    the user's option to pick up where they left off: `resume_run_now`
+    already handles cleanup of half-written CriterionResult rows + reset
+    of non-terminal domains. Returns the number of runs touched.
+
+    Domain/CriterionResult statuses are left alone here. `resume_run_now`
+    is the single place that decides what to keep vs reset, so there's no
+    point pre-mutating them on the way in."""
+    rows = db.query(Run).filter(Run.status == "running").all()
+    n = 0
+    for r in rows:
+        r.status = "paused"
+        r.error = (
+            "Process restarted while this run was in progress; auto-paused. "
+            "Resume to continue (already-fetched criteria + AI verdicts will "
+            "be reused)."
+        )
+        n += 1
+    if n:
+        db.commit()
+    return n
+
+
+def dispatch_run(run_id: int) -> asyncio.Task:
+    """Schedule `process_run` to run on the current event loop. Returns the
+    Task handle so callers can keep a reference (asyncio GC's task objects
+    that aren't referenced anywhere)."""
+    return asyncio.create_task(process_run(run_id))
+
+
+# Module-level set keeps task references alive across `dispatch_run` returns.
+# Without this, asyncio's GC can drop a task mid-flight if no one stores the
+# Task object.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _track(task: asyncio.Task) -> None:
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+# --- Cancellation -----------------------------------------------------------
+
+# Process-level set of run ids the user has asked to cancel. The worker
+# checks `is_canceled(run_id)` before each new fetch / AI call. In-flight
+# requests are NOT killed; they finish and persist normally. This is a
+# deliberate trade — interrupting httpx mid-request leaves the upstream
+# bill in place anyway, so just letting it complete keeps the data we
+# already paid for.
+_CANCELED_RUNS: set[int] = set()
+
+
+def is_canceled(run_id: int) -> bool:
+    return run_id in _CANCELED_RUNS
+
+
+def request_cancel(run_id: int) -> None:
+    _CANCELED_RUNS.add(run_id)
+
+
+def _clear_cancel(run_id: int) -> None:
+    _CANCELED_RUNS.discard(run_id)
+
+
+# --- Pause / resume ---------------------------------------------------------
+
+# Distinct from cancel: pause is reversible. The flag stops workers at the
+# same hook-points; resume restarts a fresh worker that picks up where the
+# old one stopped (skipping criteria that already finished). Resume preserves
+# completed Ahrefs fetches AND completed AI verdicts so the user doesn't pay
+# twice for the same work after a pause.
+_PAUSED_RUNS: set[int] = set()
+
+
+def is_paused(run_id: int) -> bool:
+    return run_id in _PAUSED_RUNS
+
+
+def _clear_pause(run_id: int) -> None:
+    _PAUSED_RUNS.discard(run_id)
+
+
+def pause_run_now(run_id: int) -> dict:
+    """Mark the run paused and signal workers to exit. Domains/criteria
+    keep their current state — they'll be reset to pending when resumed."""
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return {"id": run_id, "found": False}
+        if run.status in ("done", "failed", "canceled"):
+            return {
+                "id": run_id,
+                "found": True,
+                "already_terminal": True,
+                "status": run.status,
+            }
+        if run.status == "paused":
+            return {"id": run_id, "found": True, "status": "paused"}
+        _PAUSED_RUNS.add(run_id)
+        run.status = "paused"
+        db.commit()
+        return {"id": run_id, "found": True, "status": "paused"}
+    finally:
+        db.close()
+
+
+def resume_run_now(run_id: int) -> dict:
+    """Clear the pause flag, reset non-terminal rows to pending (deleting
+    half-written CriterionResult rows so the worker doesn't double-write),
+    flip run.status to pending, and dispatch a fresh worker.
+
+    Also clears any stale `_CANCELED_RUNS` entry. Without this, a Cancel
+    issued earlier in the same process (which sets the in-memory flag
+    but leaves it in place after the canceled worker exits) would short-
+    circuit every domain in the freshly-dispatched resume worker, marking
+    the run "done" in milliseconds with zero progress (real bug observed
+    on run 41, 2026-05-07: 96ms duration, 0 CriterionResults, 35 rds
+    stuck at pending). Defense-in-depth — process_run's `_clear_cancel`
+    in the finally clause SHOULD have caught it eventually, but the
+    sequencing made the flag still active when the resume worker checked."""
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return {"id": run_id, "found": False}
+        if run.status != "paused":
+            return {
+                "id": run_id,
+                "found": True,
+                "status": run.status,
+                "error": "not in paused state",
+            }
+        _clear_pause(run_id)
+        _clear_cancel(run_id)
+        # Reset domains that didn't reach a terminal state.
+        for d in run.domains:
+            if d.status in ("running", "pending"):
+                d.status = "pending"
+                d.started_at = None
+                d.finished_at = None
+                # Drop any partial CriterionResult rows (status != done) —
+                # they may have been mid-write when the pause hit. The
+                # worker will recreate them. Done rows are preserved.
+                still_done = [cr for cr in d.results if cr.status == "done"]
+                to_delete = [cr for cr in d.results if cr.status != "done"]
+                for cr in to_delete:
+                    db.delete(cr)
+                # SQLAlchemy needs a flush here to actually remove them
+                # before we add new rows in the same session.
+                d.results = still_done
+        run.status = "pending"
+        run.started_at = None
+        run.finished_at = None
+        run.error = ""
+        db.commit()
+    finally:
+        db.close()
+    # Dispatch a fresh worker outside the session.
+    dispatch_run(run_id)
+    return {"id": run_id, "found": True, "status": "pending"}
+
+
+# --- Reanalyze (re-run AI step over existing Ahrefs data) ------------------
+
+# Process-level dicts mapping id → in-flight asyncio.Task so the UI can
+# poll the `reanalyzing` flag and disable the Reanalyze button while a
+# reanalyze is in flight. Each task's `finally` clause discards its entry
+# from the appropriate dict, but the readers below also self-heal by
+# checking `task.done()` — if a finally clause somehow misses (e.g. task
+# was abruptly cancelled mid-await with no chance to release), the next
+# poll sweeps the stale entry out so the UI doesn't get permanently
+# stuck on `reanalyzing: True`.
+#
+# We keep the original `_REANALYZING_RUNS` / `_REANALYZING_RUN_DOMAINS`
+# names for `.discard()` API compatibility — only the value-type changed.
+class _TaskMap(dict):
+    """Dict-of-tasks with the same `discard` API as a plain set so the
+    existing `_REANALYZING_*.discard(id)` callsites in `finally` blocks
+    don't need to change. `add(id)` records the calling task so readers
+    can detect `done()` tasks and self-heal. `__contains__` also self-
+    heals — that's what powers the `is_reanalyzing_*` checks below."""
+    def add_task(self, key: int, task: "asyncio.Task") -> None:
+        self[key] = task
+
+    def discard(self, key: int) -> None:
+        self.pop(key, None)
+
+    def is_active(self, key: int) -> bool:
+        task = self.get(key)
+        if task is None:
+            return False
+        if task.done():
+            # Task finished without its `finally` clearing this entry —
+            # treat as not-running and clean up so the next caller doesn't
+            # see a phantom flag.
+            self.pop(key, None)
+            return False
+        return True
+
+
+_REANALYZING_RUNS: _TaskMap = _TaskMap()
+_REANALYZING_RUN_DOMAINS: _TaskMap = _TaskMap()
+
+
+def is_reanalyzing_run(run_id: int) -> bool:
+    return _REANALYZING_RUNS.is_active(run_id)
+
+
+def is_reanalyzing_run_domain(run_domain_id: int) -> bool:
+    return _REANALYZING_RUN_DOMAINS.is_active(run_domain_id)
+
+
+def reanalyze_run_now(
+    run_id: int, ai_override: dict | None = None
+) -> dict:
+    """Schedule an AI-only re-judge of every domain in a terminal run.
+    Bypasses the AI cache. Caller can pass `ai_override` (dict with
+    provider/model) to override the run's stored AI spec — useful when the
+    original run had `ai.provider=null`."""
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return {"id": run_id, "found": False}
+        if run.status in ("pending", "running", "paused"):
+            return {
+                "id": run_id, "found": True,
+                "error": f"run is {run.status} — wait for it to finish",
+            }
+        if _REANALYZING_RUNS.is_active(run_id):
+            return {
+                "id": run_id, "found": True,
+                "error": "reanalysis already in progress",
+            }
+        try:
+            spec = AnalyzeSpec.model_validate(json.loads(run.spec_json or "{}"))
+        except Exception as e:  # noqa: BLE001
+            return {"id": run_id, "found": True, "error": f"bad spec: {e}"}
+    finally:
+        db.close()
+
+    if ai_override:
+        spec.ai.provider = ai_override.get("provider") or spec.ai.provider
+        spec.ai.model = ai_override.get("model") or spec.ai.model
+    if not spec.ai or not spec.ai.provider:
+        return {
+            "id": run_id, "found": True,
+            "error": "no AI provider configured for this run",
+        }
+    # Critical: bypass the AI cache for this action.
+    spec.use_cache = False
+
+    task = asyncio.create_task(_reanalyze_run(run_id, spec))
+    _REANALYZING_RUNS.add_task(run_id, task)
+    _track(task)
+    return {"id": run_id, "found": True, "status": "started"}
+
+
+def reanalyze_run_domain_criterion_now(
+    run_domain_id: int,
+    criterion: str,
+    ai_override: dict | None = None,
+) -> dict:
+    """Schedule an AI-only re-judge of a SINGLE criterion on one domain.
+    Same guards as reanalyze_run_domain_now; uses the same in-flight set so
+    the existing per-domain `reanalyzing` polling state covers it without
+    UI plumbing changes. The other criteria's existing verdicts are kept;
+    the final assessment is recomputed because it aggregates all four."""
+    if criterion not in ("backlinks", "refdomains", "anchors", "keywords", "wayback", "wayback_classify"):
+        return {
+            "id": run_domain_id, "found": True,
+            "error": f"invalid criterion: {criterion}",
+        }
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None:
+            return {"id": run_domain_id, "found": False}
+        run = db.get(Run, rd.run_id)
+        if run is None:
+            return {"id": run_domain_id, "found": False}
+        if run.status in ("pending", "running", "paused"):
+            return {
+                "id": run_domain_id, "found": True,
+                "error": f"run is {run.status} — wait for it to finish",
+            }
+        if _REANALYZING_RUN_DOMAINS.is_active(run_domain_id):
+            return {
+                "id": run_domain_id, "found": True,
+                "error": "reanalysis already in progress",
+            }
+        try:
+            spec = AnalyzeSpec.model_validate(json.loads(run.spec_json or "{}"))
+        except Exception as e:  # noqa: BLE001
+            return {
+                "id": run_domain_id, "found": True, "error": f"bad spec: {e}",
+            }
+    finally:
+        db.close()
+
+    if ai_override:
+        spec.ai.provider = ai_override.get("provider") or spec.ai.provider
+        spec.ai.model = ai_override.get("model") or spec.ai.model
+    if not spec.ai or not spec.ai.provider:
+        return {
+            "id": run_domain_id, "found": True,
+            "error": "no AI provider configured for this run",
+        }
+    spec.use_cache = False
+
+    task = asyncio.create_task(
+        _reanalyze_run_domain_criterion(
+            run_domain_id, criterion, spec, track_set=True
+        )
+    )
+    _REANALYZING_RUN_DOMAINS.add_task(run_domain_id, task)
+    _track(task)
+    return {"id": run_domain_id, "found": True, "status": "started"}
+
+
+_ALL_CRITERIA = (
+    "backlinks", "refdomains", "anchors", "keywords",
+    "wayback", "wayback_classify",
+)
+
+
+def _collect_failed_criteria(
+    rd: RunDomain, spec: AnalyzeSpec
+) -> list[str]:
+    """Return enabled criteria on this RD that need a retry. A criterion
+    counts as failed when any of these holds:
+      • CR row missing entirely (e.g. run aborted before this criterion
+        started — `_reanalyze_run_domain_criterion` will create + fetch),
+      • CR.status == "failed" (fetch failed → refetch + re-judge),
+      • CR.ai_verdict_error != "" (fetch OK, AI judge failed → re-judge).
+    Disabled criteria in the spec are never retried."""
+    by_name = {cr.criterion: cr for cr in rd.results}
+    failed: list[str] = []
+    for c in _ALL_CRITERIA:
+        cfg = _cfg_for_criterion(spec, c)
+        if cfg is None or not getattr(cfg, "enabled", False):
+            continue
+        cr = by_name.get(c)
+        if cr is None:
+            failed.append(c)
+            continue
+        if cr.status == "failed":
+            failed.append(c)
+            continue
+        if cr.ai_verdict_error:
+            failed.append(c)
+    return failed
+
+
+def retry_failed_run_now(
+    run_id: int, ai_override: dict | None = None
+) -> dict:
+    """Retry every failed criterion across every domain in a terminal run.
+    A "failed criterion" means a fetch that errored, an AI verdict that
+    errored, or a never-created CR row for an enabled criterion. Each RD
+    runs its retries sequentially under one `_REANALYZING_RUN_DOMAINS`
+    lock so the existing per-domain `reanalyzing` polling state covers
+    progress without UI plumbing changes."""
+    if _REANALYZING_RUNS.is_active(run_id):
+        return {
+            "id": run_id, "found": True,
+            "error": "a run-level reanalysis is already in progress",
+        }
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return {"id": run_id, "found": False}
+        if run.status in ("pending", "running", "paused"):
+            return {
+                "id": run_id, "found": True,
+                "error": f"run is {run.status} — wait for it to finish",
+            }
+        try:
+            spec = AnalyzeSpec.model_validate(json.loads(run.spec_json or "{}"))
+        except Exception as e:  # noqa: BLE001
+            return {"id": run_id, "found": True, "error": f"bad spec: {e}"}
+
+        if ai_override:
+            spec.ai.provider = ai_override.get("provider") or spec.ai.provider
+            spec.ai.model = ai_override.get("model") or spec.ai.model
+        if not spec.ai or not spec.ai.provider:
+            return {
+                "id": run_id, "found": True,
+                "error": "no AI provider configured for this run",
+            }
+        spec.use_cache = False
+
+        # Snapshot the per-RD failed-criteria map BEFORE leaving the DB
+        # session — we'll close it before scheduling tasks so the workers
+        # get fresh sessions of their own.
+        failed_per_rd: dict[int, list[str]] = {}
+        for rd in run.domains:
+            failed = _collect_failed_criteria(rd, spec)
+            if failed:
+                failed_per_rd[rd.id] = failed
+    finally:
+        db.close()
+
+    if not failed_per_rd:
+        return {
+            "id": run_id, "found": True,
+            "error": "no failed criteria to retry",
+        }
+
+    # Refuse if any candidate RD is already in flight — partial dispatch
+    # would leave the user wondering which domains were skipped.
+    busy = [
+        rd_id for rd_id in failed_per_rd
+        if _REANALYZING_RUN_DOMAINS.is_active(rd_id)
+    ]
+    if busy:
+        return {
+            "id": run_id, "found": True,
+            "error": (
+                f"reanalysis already in progress on {len(busy)} domain(s) — "
+                "wait for it to finish"
+            ),
+        }
+
+    for rd_id, criteria in failed_per_rd.items():
+        task = asyncio.create_task(
+            _retry_failed_run_domain(rd_id, criteria, spec, track_set=True)
+        )
+        _REANALYZING_RUN_DOMAINS.add_task(rd_id, task)
+        _track(task)
+
+    total_criteria = sum(len(v) for v in failed_per_rd.values())
+    return {
+        "id": run_id, "found": True, "status": "started",
+        "domains": len(failed_per_rd), "criteria": total_criteria,
+    }
+
+
+async def _retry_failed_run_domain(
+    run_domain_id: int,
+    criteria: list[str],
+    spec: AnalyzeSpec,
+    *,
+    track_set: bool,
+) -> None:
+    """Run `_reanalyze_run_domain_criterion` sequentially for each failed
+    criterion on this RD, holding the rd-level reanalyzing lock for the
+    full duration. Sequential (not parallel) because these calls share
+    the same RD's CR rows and share the rd-level lock; parallelizing
+    would race the per-criterion writes and the final-assessment
+    recompute."""
+    try:
+        for c in criteria:
+            await _reanalyze_run_domain_criterion(
+                run_domain_id, c, spec, track_set=False
+            )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "retry-failed for run_domain %s failed", run_domain_id,
+        )
+    finally:
+        if track_set:
+            _REANALYZING_RUN_DOMAINS.discard(run_domain_id)
+
+
+def reanalyze_run_domain_now(
+    run_domain_id: int, ai_override: dict | None = None
+) -> dict:
+    """Schedule an AI-only re-judge of a single domain. Same semantics as
+    reanalyze_run_now but scoped to one RunDomain."""
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None:
+            return {"id": run_domain_id, "found": False}
+        run = db.get(Run, rd.run_id)
+        if run is None:
+            return {"id": run_domain_id, "found": False}
+        if run.status in ("pending", "running", "paused"):
+            return {
+                "id": run_domain_id, "found": True,
+                "error": f"run is {run.status} — wait for it to finish",
+            }
+        if _REANALYZING_RUN_DOMAINS.is_active(run_domain_id):
+            return {
+                "id": run_domain_id, "found": True,
+                "error": "reanalysis already in progress",
+            }
+        try:
+            spec = AnalyzeSpec.model_validate(json.loads(run.spec_json or "{}"))
+        except Exception as e:  # noqa: BLE001
+            return {
+                "id": run_domain_id, "found": True, "error": f"bad spec: {e}",
+            }
+    finally:
+        db.close()
+
+    if ai_override:
+        spec.ai.provider = ai_override.get("provider") or spec.ai.provider
+        spec.ai.model = ai_override.get("model") or spec.ai.model
+    if not spec.ai or not spec.ai.provider:
+        return {
+            "id": run_domain_id, "found": True,
+            "error": "no AI provider configured for this run",
+        }
+    spec.use_cache = False
+
+    task = asyncio.create_task(
+        _reanalyze_run_domain(run_domain_id, spec, track_set=True)
+    )
+    _REANALYZING_RUN_DOMAINS.add_task(run_domain_id, task)
+    _track(task)
+    return {"id": run_domain_id, "found": True, "status": "started"}
+
+
+async def _reanalyze_run(run_id: int, spec: AnalyzeSpec) -> None:
+    try:
+        db = SessionLocal()
+        try:
+            domain_ids = [
+                rd.id
+                for rd in db.query(RunDomain)
+                .filter(RunDomain.run_id == run_id)
+                .all()
+            ]
+        finally:
+            db.close()
+        await asyncio.gather(*(
+            _reanalyze_run_domain(rd_id, spec, track_set=False)
+            for rd_id in domain_ids
+        ))
+    except Exception:  # noqa: BLE001
+        log.exception("reanalyze run %s failed", run_id)
+    finally:
+        _REANALYZING_RUNS.discard(run_id)
+
+
+async def _reanalyze_run_domain_criterion(
+    run_domain_id: int,
+    criterion: str,
+    spec: AnalyzeSpec,
+    *,
+    track_set: bool,
+) -> None:
+    """Wipe a SINGLE criterion's AI verdict on this domain (and the final
+    assessment, which aggregates all criteria), then re-judge that one
+    criterion. Existing verdicts on the other criteria are reused by
+    `_run_ai_for_domain` via `_existing_ai_verdicts`, so the final gets
+    recomputed from new+reused sub-verdicts without paying for the others.
+
+    If the criterion has no usable data (fetch failed previously, or the
+    row was never created), this also REFETCHES from Ahrefs so the user can
+    recover from a broken where-clause / API change without rerunning the
+    whole job.
+
+    Special-cased criteria: `wayback_classify` doesn't fetch — it derives
+    its result from the wayback CR's V2 samples. We skip the refetch path
+    entirely and call `_run_wayback_classify_for_domain` after wiping the
+    targeted verdict; the function handles the rest (sample loading,
+    AI calls, status flipping)."""
+    try:
+        db = SessionLocal()
+        try:
+            rd = db.get(RunDomain, run_domain_id)
+            if rd is None:
+                return
+            domain = rd.domain
+            run_id = rd.run_id
+            for cr in rd.results:
+                if cr.criterion != criterion:
+                    continue
+                cr.ai_verdict_json = ""
+                cr.ai_verdict_error = ""
+                cr.ai_cached_from_run_id = None
+                cr.prompt_hash = ""
+            # Final aggregates all criteria — must be recomputed.
+            rd.final_assessment_json = ""
+            rd.final_summary = ""
+            db.commit()
+
+            fetched_rows: dict[str, list[dict]] = {}
+            for cr in rd.results:
+                if cr.status != "done" or not cr.data_json:
+                    continue
+                try:
+                    body = json.loads(cr.data_json)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(body, dict):
+                    for v in body.values():
+                        if isinstance(v, list):
+                            fetched_rows[cr.criterion] = v
+                            break
+        finally:
+            db.close()
+
+        # Special case: wayback_classify has no fetch step. Drive it
+        # directly via _run_wayback_classify_for_domain (which the main
+        # AI path also uses). Reuses the same provider/model + cache
+        # logic as the regular flow.
+        if criterion == "wayback_classify":
+            wbc_cfg = _cfg_for_criterion(spec, "wayback_classify")
+            if wbc_cfg is None or not getattr(wbc_cfg, "enabled", False):
+                return
+            if not spec.ai or not spec.ai.provider:
+                return
+            try:
+                resolved_model = _resolve_model(
+                    spec.ai.provider, spec.ai.model
+                )
+            except ProviderConfigError:
+                return
+            sub_verdicts: dict[str, dict] = {}
+            await _run_wayback_classify_for_domain(
+                run_domain_id=run_domain_id,
+                domain=domain,
+                spec=spec,
+                wbc_cfg=wbc_cfg,
+                provider=spec.ai.provider,
+                resolved_model=resolved_model,
+                cached_verdicts={},
+                sub_verdicts=sub_verdicts,
+                run_id=run_id,
+            )
+            _reevaluate_domain_and_run_status(run_domain_id)
+            return
+
+        # Refetch path: criterion had no usable data (fetch had failed, or
+        # row never existed). Build the URL using the criterion's current
+        # spec config and run a fresh Ahrefs request. The existing failed
+        # CriterionResult row is reset in place; if there isn't one we
+        # create a fresh row.
+        if criterion not in fetched_rows:
+            cfg = _cfg_for_criterion(spec, criterion)
+            if cfg is None or not getattr(cfg, "enabled", False):
+                return  # criterion not enabled in spec — nothing to fetch
+            single_spec = AnalyzeSpec(
+                domains=[domain], criteria=spec.criteria, ai=spec.ai
+            )
+            _, requests = build_preview(single_spec)
+            target_req = next(
+                (r for r in requests if r.criterion == criterion and r.enabled),
+                None,
+            )
+            if target_req is None:
+                return
+            params_hash = compute_params_hash(criterion, cfg)
+            cr_id = _reset_or_create_criterion_row(
+                run_domain_id=run_domain_id,
+                criterion=criterion,
+                url=target_req.url,
+                params_hash=params_hash,
+            )
+            ok, http_status, body, err, units = await _fetch_criterion(
+                target_req.url, criterion=criterion,
+            )
+            _finish_criterion_row(cr_id, ok, http_status, body, err, units)
+            if ok and isinstance(body, dict):
+                for v in body.values():
+                    if isinstance(v, list):
+                        fetched_rows[criterion] = v
+                        break
+            if criterion not in fetched_rows:
+                return  # fetch still failed; finish_criterion_row stored err
+
+        await _run_ai_for_domain(
+            run_domain_id=run_domain_id,
+            domain=domain,
+            spec=spec,
+            fetched_rows=fetched_rows,
+            run_id=run_id,
+        )
+        # Refresh rd.status / run.status — refetch may have flipped a
+        # previously-failed criterion to done, so the stale "failed" pill
+        # would otherwise stick around until the next full rerun.
+        _reevaluate_domain_and_run_status(run_domain_id)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "reanalyze criterion %s for run_domain %s failed",
+            criterion, run_domain_id,
+        )
+    finally:
+        if track_set:
+            _REANALYZING_RUN_DOMAINS.discard(run_domain_id)
+
+
+async def _reanalyze_run_domain(
+    run_domain_id: int, spec: AnalyzeSpec, *, track_set: bool
+) -> None:
+    """Wipe a domain's existing AI verdicts + final assessment, then re-judge
+    each criterion using the (cache-disabled) spec. Loads the Ahrefs rows
+    from the existing CriterionResult.data_json — no new fetches."""
+    try:
+        db = SessionLocal()
+        try:
+            rd = db.get(RunDomain, run_domain_id)
+            if rd is None:
+                return
+            domain = rd.domain
+            run_id = rd.run_id
+            for cr in rd.results:
+                cr.ai_verdict_json = ""
+                cr.ai_verdict_error = ""
+                cr.ai_cached_from_run_id = None
+                # Clear prompt_hash so subsequent cache lookups won't false-
+                # match against this row's stale (now-empty) verdict.
+                cr.prompt_hash = ""
+            rd.final_assessment_json = ""
+            rd.final_summary = ""
+            db.commit()
+
+            # Reload Ahrefs rows from existing data_json — no refetch.
+            fetched_rows: dict[str, list[dict]] = {}
+            for cr in rd.results:
+                if cr.status != "done" or not cr.data_json:
+                    continue
+                try:
+                    body = json.loads(cr.data_json)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(body, dict):
+                    for v in body.values():
+                        if isinstance(v, list):
+                            fetched_rows[cr.criterion] = v
+                            break
+        finally:
+            db.close()
+
+        if not fetched_rows:
+            return  # nothing to judge
+
+        await _run_ai_for_domain(
+            run_domain_id=run_domain_id,
+            domain=domain,
+            spec=spec,
+            fetched_rows=fetched_rows,
+            run_id=run_id,
+        )
+        # Same status-refresh as the per-criterion path. Reanalyze itself
+        # doesn't refetch, but other reanalyze invocations on the same
+        # domain may have raced — keep the pill consistent regardless.
+        _reevaluate_domain_and_run_status(run_domain_id)
+    except Exception:  # noqa: BLE001
+        log.exception("reanalyze run_domain %s failed", run_domain_id)
+    finally:
+        if track_set:
+            _REANALYZING_RUN_DOMAINS.discard(run_domain_id)
+
+
+def cancel_run_now(run_id: int) -> dict:
+    """Mark the run + all its pending domains/criteria as canceled in DB,
+    and set the process-level flag so any in-progress worker exits early.
+
+    Also clears any stale `_PAUSED_RUNS` entry for this run id — if the
+    user paused then immediately canceled, the pause flag would otherwise
+    persist and could short-circuit a future fresh dispatch (e.g. a
+    rerun that happens to reuse the run id behavior). Defense-in-depth;
+    cheap to clear.
+
+    Critical ordering: only call `request_cancel` AFTER confirming the run
+    is non-terminal. Otherwise canceling an already-terminal run leaves a
+    stale flag in `_CANCELED_RUNS` (no worker will ever clear it via the
+    `finally` block — the worker exited long ago). SQLite reuses deleted
+    primary keys, so a stale flag for an old run id can short-circuit a
+    fresh future run that gets assigned the same id (real bug observed
+    2026-05-07: run 46 inherited a flag from a previous canceled-then-
+    deleted run with the same id, all 35 domains short-circuited)."""
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return {"id": run_id, "found": False}
+        if run.status in ("done", "failed", "canceled"):
+            return {
+                "id": run_id,
+                "found": True,
+                "already_terminal": True,
+                "status": run.status,
+            }
+        request_cancel(run_id)
+        _clear_pause(run_id)
+        run.status = "canceled"
+        run.finished_at = datetime.utcnow()
+        if not run.error:
+            run.error = "Canceled by user."
+        for d in run.domains:
+            if d.status in ("pending", "running"):
+                d.status = "canceled"
+                d.finished_at = datetime.utcnow()
+                if not d.error:
+                    d.error = "Canceled by user."
+            for cr in d.results:
+                if cr.status in ("pending", "running"):
+                    cr.status = "canceled"
+                    if not cr.error:
+                        cr.error = "Canceled by user."
+        db.commit()
+        return {"id": run_id, "found": True, "status": "canceled"}
+    finally:
+        db.close()
+
+
+# --- The worker -------------------------------------------------------------
+
+async def process_run(run_id: int) -> None:
+    """Top-level coroutine for a Run. Each step in its own DB session — no
+    long-held transactions across awaits."""
+    _track(asyncio.current_task())  # type: ignore[arg-type]
+
+    # 1. Mark the run as running, load the spec.
+    spec = _begin_run(run_id)
+    if spec is None:
+        return  # Already terminal, or row gone.
+
+    # 2. Fan out per-domain workers. The semaphore inside `limit("ahrefs")`
+    #    bounds actual concurrency; we can `gather` everything at once.
+    domain_ids = _get_domain_ids(run_id)
+    try:
+        await asyncio.gather(
+            *(_process_domain(rd_id, spec, run_id) for rd_id in domain_ids),
+            return_exceptions=False,
+        )
+        # Re-read status from DB rather than trusting the in-memory pause/cancel
+        # flag. Race: user pauses → worker exits its gather slot → user resumes
+        # (clears pause flag, dispatches a NEW worker) → THIS old worker reaches
+        # this check with the flag already cleared. If we trusted the flag we'd
+        # call _finish_run and clobber the new worker's run. Instead: only
+        # finalize if status is still "running" (i.e. WE own the run).
+        current_status = _read_run_status(run_id)
+        if current_status != "running":
+            return
+        # Sanity: did any domain actually start? If every `_process_domain`
+        # short-circuited at the cancel/pause guard (real bug observed
+        # 2026-05-07: stale cancel flag → 96ms run with 0 CriterionResults
+        # incorrectly marked "done"), don't lie about success. Mark the
+        # run failed with a clear, actionable error so the user knows to
+        # submit a rerun rather than think this run completed normally.
+        if not _any_domain_made_progress(run_id):
+            _finish_run(
+                run_id,
+                success=False,
+                error=(
+                    "Run produced no work — every domain short-circuited "
+                    "before starting. Most common cause is a stale Cancel "
+                    "or Pause flag from an earlier run-action that wasn't "
+                    "cleared. Submit a fresh rerun; if this repeats, "
+                    "restart the API process to clear all in-memory flags."
+                ),
+            )
+            return
+        _finish_run(run_id, success=True, error="")
+    except Exception as e:  # noqa: BLE001
+        log.exception("run %s failed", run_id)
+        # Same race protection — only flip to failed if we still own the run.
+        if _read_run_status(run_id) == "running":
+            _finish_run(run_id, success=False, error=f"{type(e).__name__}: {e}")
+    finally:
+        _clear_cancel(run_id)
+
+
+# --- Step helpers, each self-contained around a session --------------------
+
+def _begin_run(run_id: int) -> AnalyzeSpec | None:
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None or run.status not in ("pending",):
+            return None
+        run.status = "running"
+        run.started_at = datetime.utcnow()
+        run.error = ""
+        db.commit()
+        return AnalyzeSpec.model_validate(json.loads(run.spec_json or "{}"))
+    finally:
+        db.close()
+
+
+def _get_domain_ids(run_id: int) -> list[int]:
+    db = SessionLocal()
+    try:
+        return [
+            r.id
+            for r in db.query(RunDomain).filter(RunDomain.run_id == run_id).all()
+        ]
+    finally:
+        db.close()
+
+
+def _any_domain_made_progress(run_id: int) -> bool:
+    """Sanity check at end of `process_run`. Returns True if at least one
+    RunDomain has `started_at` set OR has any CriterionResult rows. Used
+    to refuse marking a run "done" when every per-domain coroutine
+    short-circuited at the cancel/pause guard — that's not success, it's
+    a stuck flag, and the run should be marked failed so the user can
+    submit a clean rerun."""
+    db = SessionLocal()
+    try:
+        rds = (
+            db.query(RunDomain).filter(RunDomain.run_id == run_id).all()
+        )
+        for rd in rds:
+            if rd.started_at is not None:
+                return True
+            if rd.results:
+                return True
+        return False
+    finally:
+        db.close()
+
+
+def _finish_run(run_id: int, success: bool, error: str) -> None:
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return
+        run.status = "done" if success else "failed"
+        run.finished_at = datetime.utcnow()
+        if error:
+            run.error = error
+        db.commit()
+    finally:
+        db.close()
+
+
+# --- Per-domain worker ------------------------------------------------------
+
+def _cfg_for_criterion(spec: AnalyzeSpec, criterion: str):
+    """Return the per-criterion config object out of `spec.criteria` so we
+    can hash it for the cache."""
+    return getattr(spec.criteria, criterion, None)
+
+
+def _resolve_job_id(run_id: int) -> int | None:
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        return run.job_id if run else None
+    finally:
+        db.close()
+
+
+def _try_serve_data_from_cache(
+    *,
+    run_domain_id: int,
+    domain: str,
+    criterion: str,
+    params_hash: str,
+    job_id: int | None,
+    run_id: int,
+) -> tuple[int, int | None, list[dict]] | None:
+    """Hand back data from a prior matching run if the params hash matches.
+    Returns (cr_id, source_run_id, rows) on hit, None on miss.
+
+    `job_id`: int → only this job; None → cross-job (any prior run)."""
+    db = SessionLocal()
+    try:
+        src = lookup_cached_data(
+            db,
+            job_id=job_id,
+            domain=domain,
+            criterion=criterion,
+            params_hash=params_hash,
+            exclude_run_id=run_id,
+        )
+        if src is None:
+            return None
+        src_id = src.id
+    finally:
+        db.close()
+    return _create_cached_criterion_row(
+        run_domain_id=run_domain_id,
+        criterion=criterion,
+        params_hash=params_hash,
+        source_cr_id=src_id,
+    )
+
+
+def _create_cached_criterion_row(
+    *,
+    run_domain_id: int,
+    criterion: str,
+    params_hash: str,
+    source_cr_id: int,
+) -> tuple[int, int | None, list[dict]] | None:
+    """Copy a prior `done` CriterionResult into a fresh row on the new run.
+    Returns (cr_id, source_run_id, rows_for_ai). The new row is marked as
+    served from cache via `cached_from_run_id`. Caller has already verified
+    `spec.use_cache` is on. Returns None if the source row vanished between
+    lookup and copy (race-safe)."""
+    db = SessionLocal()
+    try:
+        src = db.get(CriterionResult, source_cr_id)
+        if src is None:
+            return None
+        src_rd = db.get(RunDomain, src.run_domain_id)
+        source_run_id = src_rd.run_id if src_rd else None
+        cr = CriterionResult(
+            run_domain_id=run_domain_id,
+            criterion=criterion,
+            request_url=src.request_url,
+            status="done",
+            http_status=src.http_status,
+            fetched_at=src.fetched_at,
+            data_json=src.data_json,
+            params_hash=params_hash,
+            cached_from_run_id=source_run_id,
+        )
+        db.add(cr)
+        db.commit()
+        rows: list[dict] = []
+        if cr.data_json:
+            try:
+                body = json.loads(cr.data_json)
+            except json.JSONDecodeError:
+                body = None
+            if isinstance(body, dict):
+                for v in body.values():
+                    if isinstance(v, list):
+                        rows = v
+                        break
+        return cr.id, source_run_id, rows
+    finally:
+        db.close()
+
+
+async def _process_domain(
+    run_domain_id: int, spec: AnalyzeSpec, run_id: int
+) -> None:
+    """Mark domain running, build per-criterion request URLs, fetch each,
+    persist results, then (if AI is enabled) judge each criterion + a final
+    assessment. A failure in one criterion does not abort the others.
+
+    Cancellation: checked between each fetch and before the AI step. If the
+    run was canceled mid-flight, the worker stops cleanly and `cancel_run_now`
+    will have already marked the remaining domains/criteria as canceled.
+
+    AI failures are recorded in `ai_verdict_error` but do NOT fail the run —
+    the user still has the raw Ahrefs data, and they can rerun later with
+    fixed credentials. This matters because AI provider outages shouldn't
+    invalidate a costly Ahrefs fetch."""
+    if is_canceled(run_id) or is_paused(run_id):
+        return
+    # Already finished in a previous worker iteration (e.g. pause+resume) —
+    # nothing to redo.
+    domain_status = _get_domain_status(run_domain_id)
+    if domain_status in ("done", "failed", "canceled"):
+        return
+    domain = _begin_domain(run_domain_id)
+    if domain is None:
+        return
+    # Map of already-completed criteria for this domain — used to skip
+    # refetching after a resume. Key = criterion name, value = (cr_id, rows).
+    already_done = _completed_criteria(run_domain_id)
+
+    # Build the URLs for THIS specific domain (build_preview only emits the
+    # first one; reuse the same builder by calling it with a one-element list).
+    single_spec = AnalyzeSpec(
+        domains=[domain], criteria=spec.criteria, ai=spec.ai
+    )
+    _, requests = build_preview(single_spec)
+
+    any_failed = False
+    # Track the rows per criterion in memory so the AI step doesn't need a
+    # round-trip back to the DB.
+    fetched_rows: dict[str, list[dict]] = {}
+
+    # Cache scope:
+    #   • `cache_enabled` gates whether we look up at all (`use_cache` flag).
+    #   • `cache_job_scope` controls what we look up:
+    #       - int  → only this job (default, per-job cache locked 2026-05-06)
+    #       - None → cross-job cache, ANY prior run with matching params
+    #         (opt-in via `cross_job_cache` — Database-page entry point).
+    cache_enabled = spec.use_cache
+    if spec.cross_job_cache:
+        cache_job_scope: int | None = None
+    else:
+        cache_job_scope = _resolve_job_id(run_id) if cache_enabled else None
+
+    for req in requests:
+        if not req.enabled:
+            continue
+        if is_canceled(run_id) or is_paused(run_id):
+            return
+        # Resume idempotency: if this criterion already completed in a
+        # previous (paused) worker, reuse those rows for the AI step and
+        # skip the Ahrefs fetch entirely.
+        if req.criterion in already_done:
+            cached_rows = already_done[req.criterion]
+            fetched_rows[req.criterion] = cached_rows
+            # V2 sample-resume: if the user paused/canceled in the narrow
+            # window between CDX-done and sampling-done, the existing
+            # CriterionResult row has rows but no `samples` key. Re-run the
+            # snapshot picker on resume so the run actually finishes with
+            # the configured sampling. Cheap to detect; sampling itself
+            # has its own pause/cancel checks.
+            if req.criterion == "wayback":
+                wb_cfg = getattr(spec.criteria, "wayback", None)
+                if (
+                    wb_cfg is not None
+                    and getattr(wb_cfg, "sample_pages", False)
+                    and not is_canceled(run_id)
+                    and not is_paused(run_id)
+                ):
+                    cr_id_existing = _criterion_row_ids(
+                        run_domain_id
+                    ).get("wayback")
+                    if cr_id_existing is not None and not _load_wayback_samples(
+                        cr_id_existing
+                    ):
+                        picks = _pick_wayback_samples(
+                            cached_rows,
+                            count=wb_cfg.sample_count,
+                            strategy=wb_cfg.sample_strategy,
+                            path_mode=wb_cfg.sample_path_mode,
+                            domain=domain,
+                        )
+                        if picks:
+                            samples = await _fetch_wayback_samples(
+                                samples=picks
+                            )
+                            _attach_wayback_samples(cr_id_existing, samples)
+            continue
+        # Per-job cache: when the spec hash matches a prior run's row, copy
+        # data forward without hitting Ahrefs. The user opted into this via
+        # `spec.use_cache` (default on) — they can disable it from the
+        # rerun banner to force a fresh fetch.
+        cfg = _cfg_for_criterion(spec, req.criterion)
+        params_hash = (
+            compute_params_hash(req.criterion, cfg) if cfg is not None else ""
+        )
+        if cache_enabled and params_hash and (
+            cache_job_scope is not None or spec.cross_job_cache
+        ):
+            cached = _try_serve_data_from_cache(
+                run_domain_id=run_domain_id,
+                domain=domain,
+                criterion=req.criterion,
+                params_hash=params_hash,
+                job_id=cache_job_scope,
+                run_id=run_id,
+            )
+            if cached is not None:
+                _, _, rows = cached
+                fetched_rows[req.criterion] = rows
+                continue
+        cr_id = _create_criterion_row(
+            run_domain_id, req.criterion, req.url, params_hash
+        )
+        ok, http_status, body, err, units = await _fetch_criterion(
+            req.url, criterion=req.criterion,
+        )
+        _finish_criterion_row(cr_id, ok, http_status, body, err, units)
+        if ok and isinstance(body, dict):
+            for v in body.values():
+                if isinstance(v, list):
+                    fetched_rows[req.criterion] = v
+                    break
+        if not ok:
+            any_failed = True
+            continue
+        # Wayback V2: page-content sampling. Runs only on a fresh CDX fetch
+        # (cache hits already carry samples from the source row's data_json,
+        # since `_create_cached_criterion_row` copies data_json wholesale).
+        # Slow — adds 1–3s per pick under the `wayback` rate limit — so we
+        # check cancel/pause before and during. Sampling failures don't fail
+        # the criterion: the CDX rows are already persisted and the AI step
+        # gets whatever samples we did manage to pull.
+        if req.criterion == "wayback":
+            wb_cfg = getattr(spec.criteria, "wayback", None)
+            if (
+                wb_cfg is not None
+                and getattr(wb_cfg, "sample_pages", False)
+                and not is_canceled(run_id)
+                and not is_paused(run_id)
+            ):
+                cdx_rows = fetched_rows.get("wayback", [])
+                picks = _pick_wayback_samples(
+                    cdx_rows,
+                    count=wb_cfg.sample_count,
+                    strategy=wb_cfg.sample_strategy,
+                    path_mode=wb_cfg.sample_path_mode,
+                    domain=domain,
+                )
+                if picks:
+                    samples = await _fetch_wayback_samples(samples=picks)
+                    _attach_wayback_samples(cr_id, samples)
+
+    # wayback_classify is enabled — make sure its CR row exists before the
+    # AI step. The row is non-fetching (no URL); it just acts as a slot to
+    # persist the classify verdict + propagate status to the criteria pill.
+    # Status starts "pending" — the AI step flips it to done/failed.
+    wbc_cfg = getattr(spec.criteria, "wayback_classify", None)
+    if wbc_cfg is not None and wbc_cfg.enabled:
+        existing_ids = _criterion_row_ids(run_domain_id)
+        if "wayback_classify" not in existing_ids:
+            cr_id_wbc = _create_criterion_row(
+                run_domain_id, "wayback_classify", "", ""
+            )
+            # _create_criterion_row defaults status to "running" — flip
+            # back to pending until the AI step actually starts on it.
+            _set_criterion_status(cr_id_wbc, "pending")
+
+    # AI step — skip if no provider selected or if Ahrefs failed for everything.
+    ai_provider = (spec.ai.provider if spec.ai else None) if spec.ai else None
+    if (
+        ai_provider
+        and ai_provider in AI_PROVIDERS
+        and (fetched_rows or (wbc_cfg is not None and wbc_cfg.enabled))
+        and not is_canceled(run_id)
+        and not is_paused(run_id)
+    ):
+        await _run_ai_for_domain(
+            run_domain_id=run_domain_id,
+            domain=domain,
+            spec=spec,
+            fetched_rows=fetched_rows,
+            run_id=run_id,
+        )
+
+    if is_canceled(run_id) or is_paused(run_id):
+        return
+    _finish_domain(run_domain_id, success=not any_failed)
+
+
+async def _run_ai_for_domain(
+    *,
+    run_domain_id: int,
+    domain: str,
+    spec: AnalyzeSpec,
+    fetched_rows: dict[str, list[dict]],
+    run_id: int,
+) -> None:
+    """For each successfully-fetched criterion, judge it; then combine the
+    sub-verdicts into a final assessment and persist on the RunDomain."""
+    assert spec.ai and spec.ai.provider
+    provider = spec.ai.provider
+    model_override = spec.ai.model
+    # CRITICAL: hash the RESOLVED model, not the raw override. When the
+    # user leaves the model field blank, spec.ai.model is None and the
+    # runner resolves it to the provider's Settings default at call time.
+    # If we hash with the raw None we get false cache hits across runs
+    # whose actual API call used different models because Settings changed
+    # in between (real bug observed 2026-05-06: runs 26 and 27 of job 18
+    # had spec.ai.model=None on both, but the actual judge calls used
+    # gemini-2.5-flash and gemma-4-26b-a4b-it respectively — and the
+    # per-criterion cache wrongly hit).
+    resolved_model_for_hash = _resolve_model(provider, model_override)
+    sub_verdicts: dict[str, dict] = {}
+
+    # Per-criterion judges. CriterionResult rows already exist (created in
+    # the fetch loop); we look them up by run_domain_id + criterion so we
+    # can write the verdict into the same row.
+    cr_id_by_criterion = _criterion_row_ids(run_domain_id)
+    # Resume idempotency: reuse any AI verdicts that were saved in a prior
+    # (paused) worker. Saves tokens + time.
+    cached_verdicts = _existing_ai_verdicts(run_domain_id)
+
+    # Same scope semantics as the data cache (see `_process_domain` for
+    # the full comment). cross_job_cache=True → look anywhere; default →
+    # this job only.
+    cache_enabled = spec.use_cache
+    if spec.cross_job_cache:
+        cache_job_scope: int | None = None
+    else:
+        cache_job_scope = _resolve_job_id(run_id) if cache_enabled else None
+
+    for criterion, rows in fetched_rows.items():
+        if is_canceled(run_id) or is_paused(run_id):
+            return
+        cr_id = cr_id_by_criterion.get(criterion)
+        if cr_id is None:
+            continue
+        # Defensive: skip AI judge when the criterion's CR row is in a
+        # failed state. The fetch loop above already excludes failed
+        # criteria from `fetched_rows` (they're never added when ok=False),
+        # so this is normally unreachable — it's a guard for future
+        # restructures (e.g. someone changes the resume/refetch path to
+        # populate fetched_rows pre-validation). If a wayback fetch
+        # errored we explicitly do NOT want to send the wayback judge
+        # prompt to the AI; same goes for any criterion.
+        if _criterion_status(cr_id) == "failed":
+            continue
+        # Already judged in a prior worker — reuse and skip the API call.
+        if criterion in cached_verdicts:
+            sub_verdicts[criterion] = cached_verdicts[criterion]
+            continue
+        system_prompt = localize_prompt(get_ai_prompt(criterion), spec.lang)
+        prompt_hash = compute_prompt_hash(
+            system_prompt,
+            provider,
+            resolved_model_for_hash,
+            fields_sent=AI_FIELD_TRIM.get(criterion, []),
+        )
+        # Per-job AI cache: identical Ahrefs params + identical prompt +
+        # identical provider/model → reuse the prior verdict. Editing the
+        # prompt in Settings or switching provider/model busts this cache.
+        if cache_enabled and (
+            cache_job_scope is not None or spec.cross_job_cache
+        ):
+            params_hash = _get_criterion_params_hash(cr_id)
+            verdict = _try_serve_verdict_from_cache(
+                cr_id=cr_id,
+                domain=domain,
+                criterion=criterion,
+                params_hash=params_hash,
+                prompt_hash=prompt_hash,
+                job_id=cache_job_scope,
+                run_id=run_id,
+            )
+            if verdict is not None:
+                sub_verdicts[criterion] = verdict
+                continue
+        trimmed = _trim_rows_for_ai(criterion, rows)
+        # Wayback V2: fold in any page-content samples that the fetch step
+        # (or a cache copy from a prior run) attached to data_json. The AI
+        # judge sees them alongside the CDX rows and can reason about
+        # title-over-time drift. Non-wayback criteria pass None and the
+        # builder skips the samples block entirely.
+        wayback_samples_for_ai: list[dict] | None = None
+        if criterion == "wayback":
+            raw_samples = _load_wayback_samples(cr_id)
+            if raw_samples:
+                wayback_samples_for_ai = _trim_samples_for_ai(raw_samples)
+        user_msg = _build_user_message_for_criterion(
+            criterion=criterion,
+            domain=domain,
+            rows=trimmed,
+            wayback_samples=wayback_samples_for_ai,
+        )
+        # Resolve the model up-front so we can persist it on the row no
+        # matter which branch wins below. If the provider has no usable
+        # model, judge() would raise ProviderConfigError anyway — we do
+        # the same here, just earlier, and record the empty model on the
+        # failure row.
+        try:
+            resolved_model = _resolve_model(provider, model_override)
+        except ProviderConfigError as e:
+            log.warning("AI verdict failed for run_domain=%s criterion=%s: %s",
+                        run_domain_id, criterion, e)
+            _store_ai_verdict(
+                cr_id, None, error=f"{type(e).__name__}: {e}",
+                prompt_hash=prompt_hash,
+                provider=provider, model=model_override or "",
+            )
+            continue
+        try:
+            async with limit(provider):
+                parsed, _raw, usage = await judge(
+                    provider=provider,
+                    system_prompt=system_prompt,
+                    user_message=user_msg,
+                    model_override=resolved_model,
+                )
+            sub_verdicts[criterion] = parsed
+            _store_ai_verdict(
+                cr_id, parsed, error="",
+                prompt_hash=prompt_hash,
+                provider=provider, model=resolved_model,
+                usage=usage,
+            )
+        except (ProviderConfigError, ProviderError, ValueError) as e:
+            log.warning("AI verdict failed for run_domain=%s criterion=%s: %s",
+                        run_domain_id, criterion, e)
+            _store_ai_verdict(
+                cr_id, None, error=f"{type(e).__name__}: {e}",
+                prompt_hash=prompt_hash,
+                provider=provider, model=resolved_model,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("AI verdict crashed for run_domain=%s criterion=%s",
+                          run_domain_id, criterion)
+            _store_ai_verdict(
+                cr_id, None, error=f"unexpected: {e!r}",
+                prompt_hash=prompt_hash,
+                provider=provider, model=resolved_model,
+            )
+
+    # Cancellation/pause check first — same semantics as before.
+    if is_canceled(run_id) or is_paused(run_id):
+        if cr_id_by_criterion:
+            _stamp_last_analyzed(run_domain_id)
+        return
+
+    # wayback_classify post-step (added 2026-05-09): runs AFTER the regular
+    # per-criterion judges because it depends on the wayback CR row's V2
+    # samples being available. Reuses the same provider/model/cache logic.
+    # Result is stored in wayback_classify's own CR.ai_verdict_json + added
+    # to sub_verdicts so partial detection treats it like any other
+    # criterion (i.e. "any enabled criterion that didn't produce a verdict
+    # makes the run partial").
+    wbc_cfg = getattr(spec.criteria, "wayback_classify", None)
+    if (
+        wbc_cfg is not None
+        and wbc_cfg.enabled
+        and not is_canceled(run_id)
+        and not is_paused(run_id)
+    ):
+        await _run_wayback_classify_for_domain(
+            run_domain_id=run_domain_id,
+            domain=domain,
+            spec=spec,
+            wbc_cfg=wbc_cfg,
+            provider=provider,
+            resolved_model=resolved_model_for_hash,
+            cached_verdicts=cached_verdicts,
+            sub_verdicts=sub_verdicts,
+            run_id=run_id,
+        )
+
+    # Partial-result detection (added 2026-05-06): if ANY enabled criterion
+    # didn't produce an AI verdict (judge failed, JSON parse failed, data
+    # fetch failed earlier), do NOT compute the final score and do NOT call
+    # the synth AI — both would be based on incomplete data and silently
+    # mislead the user (compute_final renormalizes weights over only the
+    # criteria that succeeded). Instead persist a stub the UI can render
+    # as a clear "Partial — N of M succeeded · Reanalyze to retry."
+    enabled_criteria = [
+        c
+        for c in (
+            "backlinks", "refdomains", "anchors", "keywords",
+            "wayback", "wayback_classify",
+        )
+        if getattr(getattr(spec.criteria, c, None), "enabled", False)
+    ]
+    failed_in_ai = [c for c in enabled_criteria if c not in sub_verdicts]
+    succeeded_in_ai = [c for c in enabled_criteria if c in sub_verdicts]
+    if failed_in_ai:
+        if not _existing_final_assessment(run_domain_id):
+            partial_stub = {
+                "partial": True,
+                "succeeded": succeeded_in_ai,
+                "failed": failed_in_ai,
+                "provider": provider,
+                # No model recorded — synth never ran. Reanalyze writes a
+                # fresh model/provider when it succeeds.
+                "model": "",
+                "summary": "",
+                "recommendation": "",
+            }
+            _store_final_assessment(run_domain_id, partial_stub, "")
+        if cr_id_by_criterion:
+            _stamp_last_analyzed(run_domain_id)
+        return
+
+    if not sub_verdicts:
+        # Defensive: no enabled criteria at all (shouldn't happen — the
+        # submit endpoint rejects this — but don't crash if it does).
+        if cr_id_by_criterion:
+            _stamp_last_analyzed(run_domain_id)
+        return
+    # Resume idempotency: if a final was already produced, don't redo it.
+    if _existing_final_assessment(run_domain_id):
+        return
+    final_prompt = localize_prompt(get_ai_prompt("final"), spec.lang)
+    user_msg = _build_user_message_for_final(
+        domain=domain, sub_verdicts=sub_verdicts
+    )
+    # Defaults for the early-error / judge-raised paths so the args we pass
+    # to _store_final_assessment are always defined.
+    final_usage: dict[str, int] | None = None
+    try:
+        final_resolved_model = _resolve_model(provider, model_override)
+    except ProviderConfigError as e:
+        log.warning("Final AI assessment failed for run_domain=%s: %s",
+                    run_domain_id, e)
+        final_resolved_model = ""
+        parsed = {}
+    else:
+        try:
+            async with limit(provider):
+                parsed, _raw, final_usage = await judge(
+                    provider=provider,
+                    system_prompt=final_prompt,
+                    user_message=user_msg,
+                    model_override=final_resolved_model,
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("Final AI assessment failed for run_domain=%s: %s",
+                        run_domain_id, e)
+            parsed = {}
+    # Override the AI's `final` field with our deterministic computation
+    # (LLMs are bad at arithmetic — the user's prompt explicitly asks them
+    # to compute a weighted average and they routinely get it wrong). Keep
+    # the AI's `summary` and `recommendation` prose; replace the math.
+    if not isinstance(parsed, dict):
+        parsed = {}
+    from .app_settings import get_scoring_config
+    score, mean_conf = compute_final(
+        sub_verdicts, weights=get_scoring_config()["weights"]
+    )
+    if score is not None:
+        parsed["final"] = round(score, 1)
+    if mean_conf is not None:
+        parsed["confidence"] = round(mean_conf, 3)
+    # Stamp provenance inline so the per-domain page + Database can show
+    # "judged by github_models / gpt-4o-mini" without joining tables.
+    if provider:
+        parsed["provider"] = provider
+    if final_resolved_model:
+        parsed["model"] = final_resolved_model
+    final_label = str(parsed.get("final") or "").strip()
+    if score is not None or parsed:
+        _store_final_assessment(
+            run_domain_id, parsed, final_label,
+            usage=final_usage,
+            provider=provider,
+            model=final_resolved_model,
+        )
+
+
+def _build_user_message_for_criterion(
+    *,
+    criterion: str,
+    domain: str,
+    rows: list[dict],
+    wayback_samples: list[dict] | None = None,
+) -> str:
+    """Compact JSON payload sent to the model. The system prompt does the
+    heavy explanation; the user message stays short to save tokens.
+
+    `wayback_samples` is V2 page-content data (title + headings + body
+    excerpt per archived snapshot). When present + non-empty + criterion
+    is wayback, an extra "Page samples (JSON)" section is appended so
+    the AI can reason about year-over-year theme drift on top of the
+    CDX activity rows. Other criteria ignore the parameter."""
+    parts = [
+        f"Domain: {domain}",
+        f"Criterion: {criterion}",
+        f"Row count: {len(rows)}",
+        f"Rows (JSON):\n{json.dumps(rows, ensure_ascii=False)}",
+    ]
+    if criterion == "wayback" and wayback_samples:
+        parts.append(
+            f"Page samples (JSON, chronological):"
+            f"\n{json.dumps(wayback_samples, ensure_ascii=False)}"
+        )
+    return "\n".join(parts) + "\n"
+
+
+def _build_user_message_for_final(
+    *, domain: str, sub_verdicts: dict[str, dict]
+) -> str:
+    return (
+        f"Domain: {domain}\n"
+        f"Sub-verdicts (JSON):\n{json.dumps(sub_verdicts, ensure_ascii=False)}\n"
+    )
+
+
+async def _run_wayback_classify_for_domain(
+    *,
+    run_domain_id: int,
+    domain: str,
+    spec: AnalyzeSpec,
+    wbc_cfg,
+    provider: str,
+    resolved_model: str,
+    cached_verdicts: dict[str, dict],
+    sub_verdicts: dict[str, dict],
+    run_id: int,
+) -> None:
+    """Drive the wayback_classify pipeline for one domain.
+
+    Reads V2 page samples from the wayback CR row, calls the classify
+    helpers in `wayback_classify.py`, persists the merged verdict on the
+    wayback_classify CR row, and pushes the result into `sub_verdicts`
+    so the partial-result detection (and any future final-synth caller)
+    sees it like every other criterion.
+
+    Resume idempotency: if `cached_verdicts` already has a
+    `wayback_classify` entry (the runner reuses verdicts saved in a prior
+    paused worker), we skip the AI calls and just propagate the cached
+    verdict into `sub_verdicts`.
+
+    Cache pathway: wayback_classify uses the standard per-job AI cache
+    (prompt_hash + params_hash). However its `params_hash` is derived
+    from `language_mode` only — there are no fetch-side params to hash.
+    """
+    # Find / create the CR row for wayback_classify on this rd.
+    rd_crs = _criterion_row_ids(run_domain_id)
+    cr_id = rd_crs.get("wayback_classify")
+    if cr_id is None:
+        cr_id = _create_criterion_row(
+            run_domain_id, "wayback_classify", "", ""
+        )
+
+    # Resume: reuse a verdict saved in a prior paused worker.
+    if "wayback_classify" in cached_verdicts:
+        sub_verdicts["wayback_classify"] = cached_verdicts["wayback_classify"]
+        _set_criterion_status(cr_id, "done")
+        return
+
+    # Find the wayback CR row + its samples. Failing here surfaces a
+    # readable error so the user knows to enable Wayback or wait for it
+    # to finish (auto-enable should have handled this at submit, but we
+    # check defensively).
+    wb_cr_id = rd_crs.get("wayback")
+    if wb_cr_id is None:
+        _store_ai_verdict(
+            cr_id, None,
+            error=(
+                "wayback_classify needs the wayback criterion enabled — "
+                "no wayback CR row exists for this domain"
+            ),
+            provider=provider, model=resolved_model,
+        )
+        _set_criterion_status(cr_id, "failed")
+        return
+    samples = _load_wayback_samples(wb_cr_id)
+    if not samples:
+        _store_ai_verdict(
+            cr_id, None,
+            error=(
+                "wayback_classify needs Wayback V2 page samples — none on "
+                "the wayback CR row. Enable Wayback page sampling and "
+                "rerun (Settings → Wayback config), or wait for an "
+                "in-flight wayback fetch to finish."
+            ),
+            provider=provider, model=resolved_model,
+        )
+        _set_criterion_status(cr_id, "failed")
+        return
+
+    _set_criterion_status(cr_id, "running")
+    from .wayback_classify import classify_wayback_for_domain
+    try:
+        verdict, usages = await classify_wayback_for_domain(
+            domain=domain,
+            samples=samples,
+            language_mode=getattr(wbc_cfg, "language_mode", "ai"),
+            provider=provider,
+            resolved_model=resolved_model,
+            judge_limit_ctx=limit,
+            lang=spec.lang,
+        )
+    except (ProviderConfigError, ProviderError, ValueError) as e:
+        log.warning(
+            "wayback_classify failed for run_domain=%s: %s",
+            run_domain_id, e,
+        )
+        _store_ai_verdict(
+            cr_id, None, error=f"{type(e).__name__}: {e}",
+            provider=provider, model=resolved_model,
+        )
+        _set_criterion_status(cr_id, "failed")
+        return
+    except Exception as e:  # noqa: BLE001
+        log.exception(
+            "wayback_classify crashed for run_domain=%s", run_domain_id,
+        )
+        _store_ai_verdict(
+            cr_id, None, error=f"unexpected: {e!r}",
+            provider=provider, model=resolved_model,
+        )
+        _set_criterion_status(cr_id, "failed")
+        return
+
+    # Aggregate token usage from the chained calls (combined/theme +
+    # category) into one usage dict so the cost columns reflect the
+    # whole pipeline.
+    total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+    for u in usages:
+        total_usage["input_tokens"] += int(u.get("input_tokens") or 0)
+        total_usage["output_tokens"] += int(u.get("output_tokens") or 0)
+
+    _store_ai_verdict(
+        cr_id, verdict, error="",
+        provider=provider, model=resolved_model,
+        usage=total_usage,
+    )
+    _set_criterion_status(cr_id, "done")
+    sub_verdicts["wayback_classify"] = verdict
+
+
+def _criterion_row_ids(run_domain_id: int) -> dict[str, int]:
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(CriterionResult)
+            .filter(CriterionResult.run_domain_id == run_domain_id)
+            .all()
+        )
+        return {r.criterion: r.id for r in rows}
+    finally:
+        db.close()
+
+
+def _get_domain_status(run_domain_id: int) -> str:
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        return rd.status if rd else "missing"
+    finally:
+        db.close()
+
+
+def _read_run_status(run_id: int) -> str:
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        return run.status if run else "missing"
+    finally:
+        db.close()
+
+
+def _completed_criteria(run_domain_id: int) -> dict[str, list[dict]]:
+    """For resume: returns {criterion: rows} for criteria already fetched
+    successfully in a prior (paused) run. Empty for first-time runs."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(CriterionResult)
+            .filter(
+                CriterionResult.run_domain_id == run_domain_id,
+                CriterionResult.status == "done",
+            )
+            .all()
+        )
+        out: dict[str, list[dict]] = {}
+        for r in rows:
+            if not r.data_json:
+                continue
+            try:
+                body = json.loads(r.data_json)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(body, dict):
+                for v in body.values():
+                    if isinstance(v, list):
+                        out[r.criterion] = v
+                        break
+        return out
+    finally:
+        db.close()
+
+
+def _existing_ai_verdicts(run_domain_id: int) -> dict[str, dict]:
+    """For resume: returns {criterion: parsed_verdict} for criteria that
+    already have a saved AI verdict. Empty for first-time runs."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(CriterionResult)
+            .filter(CriterionResult.run_domain_id == run_domain_id)
+            .all()
+        )
+        out: dict[str, dict] = {}
+        for r in rows:
+            if not r.ai_verdict_json:
+                continue
+            try:
+                out[r.criterion] = json.loads(r.ai_verdict_json)
+            except json.JSONDecodeError:
+                pass
+        return out
+    finally:
+        db.close()
+
+
+def _existing_final_assessment(run_domain_id: int) -> dict | None:
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None or not rd.final_assessment_json:
+            return None
+        try:
+            return json.loads(rd.final_assessment_json)
+        except json.JSONDecodeError:
+            return None
+    finally:
+        db.close()
+
+
+def _reevaluate_domain_and_run_status(run_domain_id: int) -> None:
+    """After a reanalyze (per-criterion or full-domain), re-derive rd.status
+    from its CriterionResult rows so the UI's status pill reflects reality.
+    Same logic as the original `_finish_domain`: any failed criterion → rd
+    failed; otherwise → rd done. If flipping rd to "done" makes EVERY rd in
+    the run also "done", flip run.status too (only ever forward, never
+    backward — we don't reopen a "done" run as "failed" here)."""
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None:
+            return
+        # Don't touch domains in non-terminal states — the runner owns them.
+        if rd.status not in ("done", "failed"):
+            return
+        any_failed = any(cr.status == "failed" for cr in rd.results)
+        new_status = "failed" if any_failed else "done"
+        if new_status != rd.status:
+            rd.status = new_status
+            if new_status == "done":
+                rd.error = ""
+            db.commit()
+
+        run = db.get(Run, rd.run_id)
+        if run is None:
+            return
+        if run.status != "failed":
+            return  # only ever flip failed → done
+        all_done = all(d.status == "done" for d in run.domains)
+        if all_done:
+            run.status = "done"
+            run.error = ""
+            db.commit()
+    finally:
+        db.close()
+
+
+def _stamp_last_analyzed(run_domain_id: int) -> None:
+    """Update RunDomain.last_analyzed_at to now. Called after any AI write
+    (fresh judge, reanalyze, or cache-hit copy). Distinct from finished_at,
+    which represents the original run completion."""
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None:
+            return
+        rd.last_analyzed_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _compute_ai_cost_usd(
+    provider: str, model: str, input_tokens: int, output_tokens: int
+) -> float:
+    """Look up the (provider, model) pricing row and return $ cost for one
+    call. Returns 0.0 when no row exists — the run's `missing_pricing`
+    list will surface the gap so the user knows their total is incomplete.
+
+    Locked-in semantics: caller stores the returned value on the row
+    immediately; later edits to the price table do NOT recompute it."""
+    if not provider or not model or (input_tokens <= 0 and output_tokens <= 0):
+        return 0.0
+    from .app_settings import get_model_price
+    price = get_model_price(provider, model)
+    if price is None:
+        return 0.0
+    in_rate, out_rate = price
+    return (input_tokens * in_rate + output_tokens * out_rate) / 1_000_000.0
+
+
+def _store_ai_verdict(
+    cr_id: int,
+    parsed: dict | None,
+    error: str,
+    *,
+    prompt_hash: str = "",
+    provider: str = "",
+    model: str = "",
+    usage: dict[str, int] | None = None,
+) -> None:
+    """Write AI verdict + token/cost accounting in one transaction. `usage`
+    is the dict returned by `ai_judge.judge()` (`{input_tokens,
+    output_tokens}`); caller already swallowed exceptions so this just
+    persists what's known. `usage=None` (judge failed before returning,
+    or pre-feature callsite) leaves the token columns at their existing
+    values — fail-soft, no zeroing."""
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        if cr is None:
+            return
+        if parsed is not None:
+            cr.ai_verdict_json = json.dumps(parsed, ensure_ascii=False)
+            cr.ai_verdict_error = ""
+        else:
+            cr.ai_verdict_json = ""
+            cr.ai_verdict_error = error
+        if prompt_hash:
+            cr.prompt_hash = prompt_hash
+        # Always overwrite — even on failure we want to know which provider
+        # we tried; clearing only happens when caller passes empty strings.
+        cr.ai_provider = provider or ""
+        cr.ai_model = model or ""
+        if usage is not None:
+            in_tok = int(usage.get("input_tokens") or 0)
+            out_tok = int(usage.get("output_tokens") or 0)
+            cr.ai_input_tokens = in_tok
+            cr.ai_output_tokens = out_tok
+            cr.ai_cost_usd = _compute_ai_cost_usd(
+                provider or "", model or "", in_tok, out_tok
+            )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _get_criterion_params_hash(cr_id: int) -> str:
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        return (cr.params_hash or "") if cr else ""
+    finally:
+        db.close()
+
+
+def _set_criterion_status(cr_id: int, status: str) -> None:
+    """Mutate CriterionResult.status — used by wayback_classify which has
+    no fetch step, so we manage status transitions explicitly."""
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        if cr is None:
+            return
+        cr.status = status
+        if status == "done" and cr.fetched_at is None:
+            cr.fetched_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _criterion_status(cr_id: int) -> str:
+    """Read CriterionResult.status by id. Used by the AI judge loop to
+    skip rows whose fetch errored (defensive — `fetched_rows` already
+    excludes failed criteria upstream)."""
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        return (cr.status or "") if cr else ""
+    finally:
+        db.close()
+
+
+def _try_serve_verdict_from_cache(
+    *,
+    cr_id: int,
+    domain: str,
+    criterion: str,
+    params_hash: str,
+    prompt_hash: str,
+    job_id: int | None,
+    run_id: int,
+) -> dict | None:
+    """Copy a prior matching AI verdict into the current CriterionResult row.
+    Returns the parsed verdict on hit, None on miss.
+
+    `job_id`: int → only this job; None → cross-job lookup."""
+    if not params_hash or not prompt_hash:
+        return None
+    db = SessionLocal()
+    try:
+        src = lookup_cached_verdict(
+            db,
+            job_id=job_id,
+            domain=domain,
+            criterion=criterion,
+            params_hash=params_hash,
+            prompt_hash=prompt_hash,
+            exclude_run_id=run_id,
+        )
+        if src is None:
+            return None
+        try:
+            parsed = json.loads(src.ai_verdict_json)
+        except json.JSONDecodeError:
+            return None
+        src_rd = db.get(RunDomain, src.run_domain_id)
+        source_run_id = src_rd.run_id if src_rd else None
+        cur = db.get(CriterionResult, cr_id)
+        if cur is None:
+            return None
+        cur.ai_verdict_json = src.ai_verdict_json
+        cur.ai_verdict_error = ""
+        cur.prompt_hash = prompt_hash
+        cur.ai_cached_from_run_id = source_run_id
+        # Carry over provenance from the source row so the UI shows which
+        # provider/model originally produced this verdict, not the one
+        # that just looked it up.
+        cur.ai_provider = src.ai_provider or ""
+        # Carry over token counts (visibility into "tokens reused") but
+        # set $ cost to 0 — we didn't actually pay for this verdict on
+        # this run. Run-level cost totals reflect only fresh-call spend.
+        cur.ai_input_tokens = src.ai_input_tokens
+        cur.ai_output_tokens = src.ai_output_tokens
+        cur.ai_cost_usd = 0.0
+        cur.ai_model = src.ai_model or ""
+        # Mark the host run-domain as analyzed-now: from the user's POV
+        # this row just got an AI verdict. The original timestamp is still
+        # recoverable via ai_cached_from_run_id → source row.
+        rd_for_cur = db.get(RunDomain, cur.run_domain_id)
+        if rd_for_cur is not None:
+            rd_for_cur.last_analyzed_at = datetime.utcnow()
+        db.commit()
+        return parsed
+    finally:
+        db.close()
+
+
+def _store_final_assessment(
+    run_domain_id: int, parsed: dict, final_label: str,
+    *,
+    usage: dict[str, int] | None = None,
+    provider: str = "",
+    model: str = "",
+) -> None:
+    """Persist the final synth output + (optionally) its token/cost. Pass
+    `usage` as the dict from `ai_judge.judge()`; pass `provider`/`model`
+    so we can resolve pricing. Skip those args (or `usage=None`) for
+    partial-run stubs and resume idempotency paths — the row's existing
+    final_*_tokens / final_cost_usd values are left alone."""
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None:
+            return
+        rd.final_assessment_json = json.dumps(parsed, ensure_ascii=False)
+        # `final_summary` is a denormalized short label so the summary table
+        # query can read it directly without parsing JSON per row.
+        if final_label in ("quality", "mixed", "low_quality"):
+            rd.final_summary = final_label
+        else:
+            rd.final_summary = ""
+        if usage is not None:
+            in_tok = int(usage.get("input_tokens") or 0)
+            out_tok = int(usage.get("output_tokens") or 0)
+            rd.final_input_tokens = in_tok
+            rd.final_output_tokens = out_tok
+            rd.final_cost_usd = _compute_ai_cost_usd(
+                provider, model, in_tok, out_tok
+            )
+        # Stamp the AI-completion time. `finished_at` stays put (it's the
+        # original run-completion); `last_analyzed_at` is the answer to
+        # "when did AI most recently touch this domain?".
+        rd.last_analyzed_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _begin_domain(run_domain_id: int) -> str | None:
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None:
+            return None
+        rd.status = "running"
+        rd.started_at = datetime.utcnow()
+        rd.error = ""
+        db.commit()
+        return rd.domain
+    finally:
+        db.close()
+
+
+def _create_criterion_row(
+    run_domain_id: int, criterion: str, url: str, params_hash: str = ""
+) -> int:
+    db = SessionLocal()
+    try:
+        cr = CriterionResult(
+            run_domain_id=run_domain_id,
+            criterion=criterion,
+            request_url=url,
+            status="running",
+            params_hash=params_hash,
+        )
+        db.add(cr)
+        db.commit()
+        return cr.id
+    finally:
+        db.close()
+
+
+def _reset_or_create_criterion_row(
+    *,
+    run_domain_id: int,
+    criterion: str,
+    url: str,
+    params_hash: str,
+) -> int:
+    """For per-criterion refetch: if a CriterionResult already exists for
+    this (rd, criterion), reset its fetch-side fields (status, data, error,
+    units, cache pointers, request URL) so the new fetch overwrites cleanly.
+    Otherwise create a fresh row. Returns the row id either way."""
+    db = SessionLocal()
+    try:
+        existing = (
+            db.query(CriterionResult)
+            .filter(
+                CriterionResult.run_domain_id == run_domain_id,
+                CriterionResult.criterion == criterion,
+            )
+            .first()
+        )
+        if existing is not None:
+            existing.request_url = url
+            existing.status = "running"
+            existing.http_status = None
+            existing.fetched_at = None
+            existing.data_json = ""
+            existing.error = ""
+            existing.units_cost_row = None
+            existing.units_cost_total = None
+            existing.units_cost_actual = None
+            existing.params_hash = params_hash
+            existing.cached_from_run_id = None
+            db.commit()
+            return existing.id
+        cr = CriterionResult(
+            run_domain_id=run_domain_id,
+            criterion=criterion,
+            request_url=url,
+            status="running",
+            params_hash=params_hash,
+        )
+        db.add(cr)
+        db.commit()
+        return cr.id
+    finally:
+        db.close()
+
+
+def _finish_criterion_row(
+    cr_id: int,
+    ok: bool,
+    http_status: int | None,
+    body: dict | None,
+    err: str,
+    units: dict | None = None,
+) -> None:
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        if cr is None:
+            return
+        cr.status = "done" if ok else "failed"
+        cr.http_status = http_status
+        cr.fetched_at = datetime.utcnow()
+        if body is not None:
+            cr.data_json = json.dumps(body, ensure_ascii=False)
+        if err:
+            cr.error = err
+        if units:
+            cr.units_cost_row = units.get("cost_row")
+            cr.units_cost_total = units.get("cost_total")
+            cr.units_cost_actual = units.get("cost_actual")
+        db.commit()
+    finally:
+        db.close()
+
+
+def _load_wayback_samples(cr_id: int) -> list[dict]:
+    """Read the V2 page-content samples persisted under data_json["samples"]
+    on a wayback CriterionResult row. Returns [] if the row is missing,
+    has no data_json yet, or the row was fetched before V2 sampling
+    existed (older shape: data_json = {"wayback": [...]} with no
+    "samples" key — that's how cache rows from before this feature look)."""
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        if cr is None or not cr.data_json:
+            return []
+        try:
+            body = json.loads(cr.data_json)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(body, dict):
+            samples = body.get("samples")
+            if isinstance(samples, list):
+                return samples
+        return []
+    finally:
+        db.close()
+
+
+def _trim_samples_for_ai(samples: list[dict]) -> list[dict]:
+    """Compact a sample list before sending to the AI: drops the long
+    `snapshot_url`, normalizes empty fields, and only includes
+    `http_status` when non-2xx (else it's noise). Keeps the timeline +
+    title/headings/body which is what the model actually uses.
+
+    Redirect snapshots (3xx) carry their `Location` header in
+    `redirect_to` instead of useless Apache-stub body text, so the AI
+    sees a clean structured signal like
+    `redirect_to: "https://www.petsmart.com"`."""
+    out: list[dict] = []
+    for s in samples:
+        trimmed: dict = {
+            "timestamp": s.get("timestamp"),
+            "url": s.get("url"),
+            "title": s.get("title", ""),
+            "h1s": s.get("h1s", []),
+            "h2s": s.get("h2s", []),
+            "h3s": s.get("h3s", []),
+            "body_excerpt": s.get("body_excerpt", ""),
+        }
+        err = s.get("error")
+        if err:
+            trimmed["error"] = err
+        http_status = s.get("http_status")
+        if http_status and http_status != 200:
+            trimmed["http_status"] = http_status
+        redirect_to = s.get("redirect_to")
+        if redirect_to:
+            trimmed["redirect_to"] = redirect_to
+        # `lang_attr` is the <html lang="..."> value extracted by the V2
+        # parser. Only emit when present — saves tokens for samples that
+        # didn't have the attribute. wayback_classify (added 2026-05-09)
+        # uses it as a hint in AI-mode language detection.
+        lang_attr = s.get("lang_attr")
+        if lang_attr:
+            trimmed["lang_attr"] = lang_attr
+        out.append(trimmed)
+    return out
+
+
+def _attach_wayback_samples(cr_id: int, samples: list[dict]) -> None:
+    """Append `samples` to a wayback CriterionResult's `data_json` shape.
+
+    Result shape becomes `{"wayback": [...cdx rows], "samples": [...]}`.
+    The "wayback" key stays first so existing helpers that grab the first
+    list value (e.g. _completed_criteria, build_ai_preview, cache copy)
+    continue to read the CDX rows — samples are read separately by the
+    AI judge + UI via the explicit "samples" key.
+
+    No-op if `samples` is empty so we don't re-write data_json on a domain
+    that returned no usable snapshot picks."""
+    if not samples:
+        return
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        if cr is None or not cr.data_json:
+            return
+        try:
+            body = json.loads(cr.data_json)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(body, dict):
+            return
+        body["samples"] = samples
+        cr.data_json = json.dumps(body, ensure_ascii=False)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _ts_to_year(ts: str) -> int | None:
+    """Wayback timestamps are `YYYYMMDDHHMMSS`. Return year as int."""
+    if not isinstance(ts, str) or len(ts) < 4 or not ts[:4].isdigit():
+        return None
+    return int(ts[:4])
+
+
+def _pick_even_wayback_rows(
+    rows: list[dict], *, count: int
+) -> list[dict]:
+    """Quantile-spaced picks across the CDX timeline. Prefers status=200
+    + html mimetype rows because non-200/non-html samples carry weak title
+    signal. Falls back to the full row set if the filtered candidate pool
+    is too small (e.g. domain that 301'd for most of its history)."""
+    if not rows or count <= 0:
+        return []
+    candidates = [
+        r for r in rows
+        if str(r.get("statuscode") or "") == "200"
+        and "html" in str(r.get("mimetype") or "").lower()
+    ]
+    # If the filtered pool is meaningfully smaller than the budget, the
+    # filter is hurting more than helping — fall back to all rows. This
+    # surfaces parking-page domains too (where the AI's job is to spot a
+    # consistent 301/parking pattern, not theme drift).
+    if len(candidates) < max(2, count):
+        candidates = rows
+    if len(candidates) <= count:
+        return list(candidates)
+    n = len(candidates)
+    # Quantile-spaced indices: 0, ..., n-1 split into `count` points.
+    raw_indices = [
+        int(round(i * (n - 1) / (count - 1))) for i in range(count)
+    ]
+    # Dedupe while preserving order (ties at sparse populations).
+    seen: dict[int, None] = {}
+    for idx in raw_indices:
+        if 0 <= idx < n:
+            seen.setdefault(idx, None)
+    return [candidates[i] for i in seen]
+
+
+def _pick_anchor_wayback_rows(
+    rows: list[dict], *, count: int
+) -> list[dict]:
+    """Pick rows around CDX anomaly events: status flips, mimetype flips,
+    big content-length jumps, multi-year crawl gaps. Always includes the
+    chronological first + last rows so the AI sees the bookends. Fills
+    remaining budget with even-spaced rows from the unsampled set so we
+    use the full count even on uniform domains with no anomalies.
+
+    Priority order when more anchors than budget exist (lower wins):
+      0 = first/last bookend
+      1 = status code change
+      2 = mimetype change
+      3 = length jump (>5x)
+      4 = time gap (>365 days)
+    """
+    if not rows or count <= 0:
+        return []
+    sorted_rows = sorted(
+        rows, key=lambda r: str(r.get("timestamp") or "")
+    )
+    n = len(sorted_rows)
+    if n <= count:
+        return sorted_rows
+
+    # (priority, index) candidates — duplicates allowed; resolved below.
+    candidates: list[tuple[int, int]] = [(0, 0), (0, n - 1)]
+    for i in range(1, n):
+        prev_row = sorted_rows[i - 1]
+        curr_row = sorted_rows[i]
+        if (
+            str(prev_row.get("statuscode") or "")
+            != str(curr_row.get("statuscode") or "")
+        ):
+            candidates.append((1, i - 1))
+            candidates.append((1, i))
+        if (
+            str(prev_row.get("mimetype") or "").lower()
+            != str(curr_row.get("mimetype") or "").lower()
+        ):
+            candidates.append((2, i - 1))
+            candidates.append((2, i))
+        try:
+            lp = int(prev_row.get("length") or 0)
+            lc = int(curr_row.get("length") or 0)
+            if lp > 0 and lc > 0 and (lc / lp > 5 or lp / lc > 5):
+                candidates.append((3, i - 1))
+                candidates.append((3, i))
+        except (TypeError, ValueError):
+            pass
+        yp = _ts_to_year(str(prev_row.get("timestamp") or ""))
+        yc = _ts_to_year(str(curr_row.get("timestamp") or ""))
+        if yp is not None and yc is not None and (yc - yp) >= 2:
+            candidates.append((4, i - 1))
+            candidates.append((4, i))
+
+    # Best (lowest) priority wins per index.
+    best_priority: dict[int, int] = {}
+    for prio, idx in candidates:
+        if idx not in best_priority or prio < best_priority[idx]:
+            best_priority[idx] = prio
+
+    # Sort by priority asc, then by index asc, then take top `count`.
+    ranked = sorted(best_priority.items(), key=lambda x: (x[1], x[0]))
+    if len(ranked) >= count:
+        picked = sorted({idx for idx, _ in ranked[:count]})
+    else:
+        picked_set = {idx for idx, _ in ranked}
+        deficit = count - len(picked_set)
+        # Fill from unsampled rows with quantile spacing.
+        unsampled = [i for i in range(n) if i not in picked_set]
+        if unsampled and deficit > 0:
+            m = len(unsampled)
+            for k in range(deficit):
+                if deficit == 1:
+                    pos = m // 2
+                else:
+                    pos = int(round(k * (m - 1) / (deficit - 1)))
+                if 0 <= pos < m:
+                    picked_set.add(unsampled[pos])
+        picked = sorted(picked_set)[:count]
+    return [sorted_rows[i] for i in picked]
+
+
+def _pick_wayback_samples(
+    rows: list[dict],
+    *,
+    count: int,
+    strategy: str,
+    path_mode: str,
+    domain: str,
+) -> list[tuple[str, str]]:
+    """Returns a list of (timestamp, url) pairs to fetch via
+    `WaybackClient.fetch_snapshot_page`. Empty list = nothing to sample
+    (no rows, count=0, or no usable timestamps).
+
+    `path_mode="root"` always samples `https://{domain}/`. `mixed` uses
+    the `original` URL recorded in each chosen CDX row (falling back to
+    the root if `original` is missing — old CDX rows have spotty data)."""
+    if not rows or count <= 0:
+        return []
+    picker = (
+        _pick_anchor_wayback_rows
+        if strategy == "anchor"
+        else _pick_even_wayback_rows
+    )
+    picked_rows = picker(rows, count=count)
+    root_url = f"https://{domain}/"
+    out: list[tuple[str, str]] = []
+    for row in picked_rows:
+        ts = str(row.get("timestamp") or "").strip()
+        if not ts:
+            continue
+        if path_mode == "root":
+            url = root_url
+        else:
+            url = str(row.get("original") or "").strip() or root_url
+        out.append((ts, url))
+    return out
+
+
+async def _fetch_wayback_samples(
+    *, samples: list[tuple[str, str]]
+) -> list[dict]:
+    """Fetch each `(ts, url)` snapshot page through the `wayback` rate
+    limit, in parallel up to whatever max_concurrent is set on the
+    wayback rate-limit row. Returns the list of sample dicts (one per
+    pick) in the SAME ORDER as the input — failed fetches are still
+    returned so the AI can see "we tried, archive.org didn't have a
+    usable snapshot here".
+
+    Was sequential prior to 2026-05-10 (a single 6-sample fetch took
+    6-18 seconds wall-clock). The `limit("wayback")` async context
+    already gates concurrency at the user-configured ceiling, so
+    `asyncio.gather` cannot exceed that ceiling — at max_concurrent=1
+    behavior is byte-identical to the old sequential loop; at higher
+    concurrency settings the wall-clock drops proportionally."""
+    async def fetch_one(ts: str, url: str) -> dict:
+        try:
+            async with limit("wayback"):
+                async with get_provider("wayback") as wb:
+                    return await wb.fetch_snapshot_page(
+                        timestamp=ts, url=url
+                    )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "wayback snapshot fetch crashed ts=%s url=%s: %s",
+                ts, url, e,
+            )
+            return {
+                "timestamp": ts,
+                "url": url,
+                "snapshot_url": "",
+                "http_status": 0,
+                "title": "",
+                "h1s": [],
+                "h2s": [],
+                "h3s": [],
+                "body_excerpt": "",
+                "error": f"crashed: {type(e).__name__}: {e}",
+            }
+
+    if not samples:
+        return []
+    return list(await asyncio.gather(*(fetch_one(ts, url) for ts, url in samples)))
+
+
+def _finish_domain(run_domain_id: int, success: bool) -> None:
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None:
+            return
+        rd.status = "done" if success else "failed"
+        rd.finished_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+# Map criterion → provider name. Wayback is its own service; the four
+# Ahrefs criteria all go through the same client.
+_CRITERION_PROVIDER = {
+    "backlinks": "ahrefs",
+    "refdomains": "ahrefs",
+    "anchors": "ahrefs",
+    "keywords": "ahrefs",
+    "wayback": "wayback",
+}
+
+
+async def _fetch_criterion(
+    url: str,
+    criterion: str = "backlinks",
+) -> tuple[bool, int | None, dict | None, str, dict]:
+    """Single fetch with rate limiter + retry. Routes to the provider
+    that owns the criterion (ahrefs vs wayback). Returns
+    (ok, http_status, body, err_msg, units). `units` is empty for
+    Wayback (no metered quota); Ahrefs populates it from response headers.
+    Never raises — failures are reported to the caller so one criterion's
+    failure doesn't kill the whole domain."""
+    provider = _CRITERION_PROVIDER.get(criterion, "ahrefs")
+    try:
+        async with limit(provider):
+            async with get_provider(provider) as p:
+                http_status, body, units = await p.fetch_url(url)
+        return True, http_status, body, "", units
+    except Exception as e:  # noqa: BLE001
+        return False, None, None, f"{type(e).__name__}: {e}", {}

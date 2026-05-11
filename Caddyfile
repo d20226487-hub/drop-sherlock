@@ -1,0 +1,39 @@
+{$SITE_HOST} {
+	encode zstd gzip
+
+	# HTTP basic auth — single shared credential for the LAN crew. Caddy
+	# enforces it on every request (HTML pages + the /api proxy below);
+	# the browser caches the credential after the first prompt so the
+	# frontend's fetch() calls reach the API transparently. The bcrypt
+	# hash is generated with `caddy hash-password`; see .env.example.
+	basicauth {
+		{$BASIC_AUTH_USERNAME} {$BASIC_AUTH_PASSWORD_HASH}
+	}
+
+	# Defense-in-depth headers. LAN deploy with no public exposure means
+	# the threat surface is small, but these are essentially free and
+	# protect against accidental future-you mistakes (e.g. embedding the
+	# app in an iframe on an internal wiki).
+	header {
+		# Block clickjacking — the app isn't designed to be iframed.
+		X-Frame-Options "DENY"
+		# Stop browsers from MIME-sniffing JS/CSS responses.
+		X-Content-Type-Options "nosniff"
+		# Don't send the full URL (which could include filter params,
+		# search terms, etc.) to off-site followed links.
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Conservative CSP. `unsafe-inline` for script/style is required
+		# by Next.js's runtime + Tailwind's preflight; tighten further
+		# if Next ever ships a nonce-based mode that works for our
+		# setup.
+		Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'"
+		# HSTS only matters on HTTPS; harmless on plain HTTP listeners.
+		Strict-Transport-Security "max-age=31536000"
+	}
+
+	handle_path /api/* {
+		reverse_proxy api:8000
+	}
+
+	reverse_proxy web:3000
+}

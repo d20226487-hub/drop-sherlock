@@ -1,0 +1,28 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+sqlalchemy==2.0.36
+pydantic==2.10.3
+pydantic-settings==2.6.1
+httpx==0.28.1
+apscheduler==3.10.4
+python-multipart==0.0.20
+# Deterministic language detector — used by the wayback_classify
+# criterion when language_mode=library. Picked over `langdetect` for
+# better short-text accuracy and ISO 639-1 normalization out of the box.
+lingua-language-detector==2.0.2
+# Test runner — included in the prod image so `docker exec api-1 pytest`
+# Just Works for ad-hoc verification. Cost is ~3 MB; not worth a
+# separate requirements-dev.txt for a single-user tool.
+pytest==8.3.4
+# S3-compatible client for off-box backup uploads. boto3 talks to AWS
+# S3, Backblaze B2 (S3 API), Cloudflare R2, Wasabi, MinIO, and any
+# other S3-compatible endpoint via the `endpoint_url` knob — one
+# dependency covers every storage provider a single user might pick.
+# ~10 MB on disk; only loaded when the user uploads.
+boto3==1.35.86
+# At-rest encryption of provider API keys and S3 backup credentials in
+# the `app_settings` table. Fernet (AES-128-CBC + HMAC) via MultiFernet
+# so the key can be rotated by listing a new primary plus the old key
+# in FERNET_KEYS — decrypts continue working until the old data has been
+# re-encrypted, then the old key can be dropped from the list.
+cryptography==44.0.0

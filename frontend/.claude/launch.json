@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "drop-sherlock",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "cwd": "drop-sherlock/frontend",
+      "autoPort": true,
+      "env": {
+        "NEXT_PUBLIC_API_BASE": "http://localhost:8081/api"
+      }
+    }
+  ]
+}
