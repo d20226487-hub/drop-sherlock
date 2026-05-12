@@ -1,0 +1,51 @@
+# Caddy config when this stack is fronted by Traefik (or any other outer
+# reverse proxy). Differences from the standalone Caddyfile:
+#
+#   - No `{$SITE_HOST}` host matching — we listen on a fixed internal
+#     port (443) for any Host header, because Traefik already routed
+#     to us by Host(`drop-sherlock.<your-domain>`).
+#   - `auto_https off` — Caddy is no longer the outermost server, so it
+#     must not try to issue or redirect for ACME. Traefik handles the
+#     public TLS; this cert is only for the Caddy↔Traefik internal hop.
+#   - A self-signed cert pair from /certs/ is used so Traefik can talk
+#     HTTPS to us with `insecureSkipVerify: true` — matches your
+#     existing `nginx-tool-1` backend pattern.
+#
+# Basicauth + security headers are KEPT — defense in depth on top of
+# Traefik's IP-whitelist middleware. Anyone who somehow reaches Caddy
+# from inside the VPN still needs the basicauth credential.
+
+{
+  auto_https off
+}
+
+:443 {
+  tls /certs/selfsigned.crt /certs/selfsigned.key
+
+  encode zstd gzip
+
+  # HTTP basic auth — shared credential for the LAN crew. The browser
+  # caches it after the first prompt; subsequent fetch() calls from the
+  # frontend reach the API transparently. Hash is bcrypt; generated with
+  # `caddy hash-password`; see .env.example.
+  basicauth {
+    {$BASIC_AUTH_USERNAME} {$BASIC_AUTH_PASSWORD_HASH}
+  }
+
+  # Defense-in-depth headers — same set as the standalone Caddyfile.
+  # HSTS only meaningful on the public-facing TLS (which Traefik owns),
+  # but harmless here.
+  header {
+    X-Frame-Options "DENY"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'"
+    Strict-Transport-Security "max-age=31536000"
+  }
+
+  handle_path /api/* {
+    reverse_proxy api:8000
+  }
+
+  reverse_proxy web:3000
+}

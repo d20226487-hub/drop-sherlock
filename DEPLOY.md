@@ -9,6 +9,11 @@ updates, restores, and migrations.
 > This file is the **ops** runbook — it stays in the repo and is for whoever
 > deploys / maintains the box. English by convention.
 
+> **Deploying behind a shared Traefik proxy?** Skip the host-port + TLS
+> setup in §2 and follow [`deploy/traefik/README.md`](deploy/traefik/README.md)
+> instead. Caddy still sits in front of api/web for basicauth + headers,
+> but no host ports are exposed and Traefik handles public TLS.
+
 ---
 
 ## 1. Prerequisites

@@ -1,0 +1,31 @@
+# Snippet to add to your existing Traefik dynamic config file (the one
+# that already defines tool-1, allow-vpn-only, insecure-backend).
+#
+# Reuses the existing `allow-vpn-only` middleware (IP whitelist) and
+# `insecure-backend` transport (skip TLS verification for self-signed
+# backends). Only the router + service entries are new.
+#
+# Subdomain placeholder: drop-sherlock.mrba-stage1.xyz — swap for the
+# real hostname before applying. Make sure DNS points it at the VPS.
+
+http:
+  routers:
+    drop-sherlock:
+      rule: Host(`drop-sherlock.mrba-stage1.xyz`)
+      entryPoints:
+        - websecure
+      tls: {}
+      middlewares:
+        - allow-vpn-only
+      service: drop-sherlock
+
+  services:
+    drop-sherlock:
+      loadBalancer:
+        servers:
+          # `drop-sherlock-caddy` is the container_name set by the base
+          # docker-compose.yml. Container must be on the `traefik_proxy`
+          # external network (the docker-compose.traefik.yml override
+          # adds it). Traefik resolves the name via Docker DNS.
+          - url: "https://drop-sherlock-caddy:443"
+        serversTransport: insecure-backend

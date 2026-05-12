@@ -8,3 +8,12 @@ frontend/.next/
 frontend/.turbo/
 frontend/build-web.log
 *.log
+
+# Self-signed cert pair for the Caddy ↔ Traefik internal hop, generated
+# per-deployment on the host (see deploy/traefik/README.md). Certs are
+# specific to a deployment and not interesting to share — keep them out
+# of the repo.
+caddy-certs/
+*.crt
+*.key
+!deploy/traefik/.gitkeep

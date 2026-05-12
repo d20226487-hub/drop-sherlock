@@ -1,0 +1,48 @@
+# Traefik-fronted deploy overrides.
+#
+# Use alongside the base docker-compose.yml when this stack lives behind
+# the shared Traefik proxy on the host. Traefik terminates TLS for
+# clients and routes traffic to Caddy on the `traefik_proxy` Docker
+# network; Caddy still enforces basicauth + security headers + the
+# /api → api, / → web routing. Net effect: no host ports exposed by
+# this stack; only Traefik is reachable from the outside.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
+#
+# Before first up: generate the self-signed cert pair into ./caddy-certs/
+# (see deploy/traefik/README.md for the openssl command).
+
+services:
+  caddy:
+    # Fix the container name so Traefik's loadBalancer can target a
+    # stable hostname. Without this, Compose would use
+    # `drop-sherlock-caddy-1` (with the trailing `-1` for the replica
+    # index) — works, but uglier in the Traefik config.
+    container_name: drop-sherlock-caddy
+    # Drop the host port mappings — Traefik reaches us by container
+    # name on the shared external network. Keeping port 443 exposed
+    # inside the Docker network so Traefik's loadBalancer can target it.
+    ports: !reset []
+    expose:
+      - "443"
+    volumes:
+      # Override the base mount so we use the Traefik-flavoured Caddyfile
+      # (TLS internally, no auto-https). The other volumes carry over from
+      # the base docker-compose.yml since Compose merges them.
+      - ./Caddyfile.traefik:/etc/caddy/Caddyfile:ro
+      - ./caddy-certs:/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      # `default` is the implicit network the base stack uses for the
+      # api ↔ web ↔ caddy hop; keep it so Caddy can still reach the
+      # internal services by hostname. `traefik_proxy` is the shared
+      # external network Traefik discovers backends on.
+      - default
+      - traefik_proxy
+
+networks:
+  default:
+  traefik_proxy:
+    external: true
