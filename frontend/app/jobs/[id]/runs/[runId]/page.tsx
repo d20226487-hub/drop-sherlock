@@ -139,10 +139,10 @@ function ScoreWeightsPanel({
   const [busy, setBusy] = useState<"" | "preview" | "apply" | "reset">("");
   const [opError, setOpError] = useState<string | null>(null);
   // Collapsed by default — the panel is a power-user tool. The header
-  // stays visible so the override-active badge is always discoverable,
-  // and we auto-expand when a custom override is in effect so the user
-  // sees the current weights without an extra click on reopen.
-  const [open, setOpen] = useState<boolean>(!!currentOverride);
+  // (heading + override-active badge + chevron) stays visible so an
+  // active override remains discoverable at a glance; opening the
+  // panel is always an explicit click, even when an override is set.
+  const [open, setOpen] = useState<boolean>(false);
 
   // Populate initial weights from either the active override or the
   // global Settings defaults. We only run this once on mount and once
@@ -670,6 +670,10 @@ export default function RunDetailPage({
   // unpin call.
   const [critPins, setCritPins] = useState<Record<string, number>>({});
   const [critPinBusy, setCritPinBusy] = useState<string | null>(null);
+  // Collapsed by default — match the Score Weights panel pattern. The
+  // pinned-here count stays visible in the header so the user can see
+  // at a glance whether anything's pinned without expanding.
+  const [critPinPanelOpen, setCritPinPanelOpen] = useState<boolean>(false);
   const [critPinAllResult, setCritPinAllResult] = useState<{
     pinned: number;
     replaced: number;
@@ -1203,15 +1207,49 @@ export default function RunDetailPage({
         )}
         {run.status === "done" && criteriaInRun.length > 0 && (
           <div className="rounded-md border border-neutral-200 dark:border-neutral-800 p-3 space-y-2 bg-neutral-50/50 dark:bg-neutral-900/30">
-            <div className="flex flex-wrap items-center gap-2 justify-between">
-              <div>
-                <div className="text-sm font-medium">
-                  {ts.pinPerCriterionHeading}
-                </div>
-                <div className="text-xs text-neutral-600 dark:text-neutral-400 max-w-2xl">
-                  {ts.pinPerCriterionHint}
+            <button
+              type="button"
+              onClick={() => setCritPinPanelOpen((v) => !v)}
+              aria-expanded={critPinPanelOpen}
+              className="w-full flex flex-wrap items-center gap-2 justify-between text-left cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 rounded-md"
+            >
+              <div className="flex items-start gap-2">
+                <span
+                  className="text-xs text-neutral-500 dark:text-neutral-400 mt-0.5 select-none"
+                  aria-hidden
+                >
+                  {critPinPanelOpen ? "▾" : "▸"}
+                </span>
+                <div>
+                  <div className="text-sm font-medium">
+                    {ts.pinPerCriterionHeading}
+                  </div>
+                  {critPinPanelOpen && (
+                    <div className="text-xs text-neutral-600 dark:text-neutral-400 max-w-2xl">
+                      {ts.pinPerCriterionHint}
+                    </div>
+                  )}
                 </div>
               </div>
+              {(() => {
+                const pinnedHereCount = criteriaInRun.filter(
+                  (c) => critPins[c] === runId,
+                ).length;
+                const tone = pinnedHereCount > 0
+                  ? "border-emerald-400 bg-emerald-50 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200"
+                  : "border-neutral-300 bg-white text-neutral-600 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300";
+                return (
+                  <span
+                    className={`text-xs px-2 py-0.5 rounded-md border ${tone}`}
+                  >
+                    {pinnedHereCount}/{criteriaInRun.length} pinned here
+                  </span>
+                );
+              })()}
+            </button>
+            {critPinPanelOpen && (
+              <>
+            <div className="flex flex-wrap items-center justify-end">
               <button
                 type="button"
                 onClick={handlePinAllCriteria}
@@ -1275,6 +1313,8 @@ export default function RunDetailPage({
                   critPinAllResult.replaced,
                 )}
               </p>
+            )}
+              </>
             )}
           </div>
         )}
