@@ -1958,6 +1958,176 @@ async def _process_domain(
     _finish_domain(run_domain_id, success=not any_failed)
 
 
+async def _judge_one_criterion(
+    *,
+    criterion: str,
+    rows: list[dict],
+    run_domain_id: int,
+    domain: str,
+    spec: AnalyzeSpec,
+    provider: str,
+    model_override: str | None,
+    resolved_model_for_hash: str,
+    cr_id_by_criterion: dict[str, int],
+    cached_verdicts: dict[str, dict],
+    sub_verdicts: dict[str, dict],
+    cache_enabled: bool,
+    cache_job_scope: int | None,
+    classify_ctx_config: dict,
+    run_id: int,
+) -> None:
+    """Judge a single criterion (wayback or one of B/D/A/K) and write
+    the verdict into both `sub_verdicts` (in-memory, for downstream
+    phases) and the CR row (persistent).
+
+    Idempotent: returns early when the CR row is missing, in a `failed`
+    state from the fetch step, already has a verdict in `cached_verdicts`
+    (resume idempotency), or is served by the cross-job AI verdict cache.
+    Each early-return path still populates `sub_verdicts[criterion]` from
+    the cached source so downstream phases see the verdict regardless.
+
+    Reads classify_context from `sub_verdicts.get("wayback_classify")`
+    when `criterion` is in `_CLASSIFY_CONTEXT_ELIGIBLE_CRITERIA` AND the
+    user's classify-context Settings include this criterion. Caller is
+    responsible for ensuring Phase 2 has run before invoking this for
+    a context-eligible criterion."""
+    cr_id = cr_id_by_criterion.get(criterion)
+    if cr_id is None:
+        return
+    # Defensive: skip AI judge when the criterion's CR row is in a failed
+    # state. The fetch loop excludes failed criteria from `fetched_rows`
+    # (they're never added when ok=False), so this is normally unreachable
+    # — it's a guard for future restructures (e.g. someone changes the
+    # resume/refetch path to populate fetched_rows pre-validation). If a
+    # wayback fetch errored we explicitly do NOT want to send the wayback
+    # judge prompt to the AI; same goes for any criterion.
+    if _criterion_status(cr_id) == "failed":
+        return
+
+    # Build classify_context BEFORE the cache-key check so the
+    # fields_sent sentinel correctly diverges from no-context hashes.
+    # See drop_sherlock_ai_pipeline.md (memory) for why: prompt_hash
+    # doesn't include the user_message, so we MUST also mutate the
+    # fields_sent list when the user_message gains a new block —
+    # otherwise the cache will serve stale verdicts judged without
+    # the context. Wayback + classify-itself never receive context;
+    # only the configured Ahrefs criteria do.
+    classify_context_for_ai: dict | None = None
+    if criterion in _CLASSIFY_CONTEXT_ELIGIBLE_CRITERIA:
+        classify_context_for_ai = _load_classify_context(
+            run_domain_id, criterion, sub_verdicts, classify_ctx_config,
+        )
+    fields_sent = AI_FIELD_TRIM.get(criterion, [])
+    if classify_context_for_ai is not None:
+        # Sentinel encodes the sorted set of context field NAMES so
+        # changing the Settings field-set in any way invalidates the
+        # cache. Field VALUES don't go into the sentinel — that would
+        # bust the cache per-domain (the whole point is per-criterion
+        # cache namespaces, not per-domain).
+        sentinel = "classify_context:" + ",".join(
+            sorted(classify_context_for_ai.keys())
+        )
+        fields_sent = list(fields_sent) + [sentinel]
+
+    # Already judged in a prior worker — reuse and skip the API call.
+    if criterion in cached_verdicts:
+        sub_verdicts[criterion] = cached_verdicts[criterion]
+        return
+
+    system_prompt = localize_prompt(get_ai_prompt(criterion), spec.lang)
+    prompt_hash = compute_prompt_hash(
+        system_prompt,
+        provider,
+        resolved_model_for_hash,
+        fields_sent=fields_sent,
+    )
+    # Per-job AI cache: identical Ahrefs params + identical prompt +
+    # identical provider/model → reuse the prior verdict. Editing the
+    # prompt in Settings or switching provider/model busts this cache.
+    if cache_enabled and (
+        cache_job_scope is not None or spec.cross_job_cache
+    ):
+        params_hash = _get_criterion_params_hash(cr_id)
+        verdict = _try_serve_verdict_from_cache(
+            cr_id=cr_id,
+            domain=domain,
+            criterion=criterion,
+            params_hash=params_hash,
+            prompt_hash=prompt_hash,
+            job_id=cache_job_scope,
+            run_id=run_id,
+        )
+        if verdict is not None:
+            sub_verdicts[criterion] = verdict
+            return
+
+    trimmed = _trim_rows_for_ai(criterion, rows)
+    # Wayback V2: fold in any page-content samples that the fetch step
+    # (or a cache copy from a prior run) attached to data_json. The AI
+    # judge sees them alongside the CDX rows and can reason about
+    # title-over-time drift. Non-wayback criteria pass None and the
+    # builder skips the samples block entirely.
+    wayback_samples_for_ai: list[dict] | None = None
+    if criterion == "wayback":
+        raw_samples = _load_wayback_samples(cr_id)
+        if raw_samples:
+            wayback_samples_for_ai = _trim_samples_for_ai(raw_samples)
+    user_msg = _build_user_message_for_criterion(
+        criterion=criterion,
+        domain=domain,
+        rows=trimmed,
+        wayback_samples=wayback_samples_for_ai,
+        classify_context=classify_context_for_ai,
+    )
+    # Resolve the model up-front so we can persist it on the row no
+    # matter which branch wins below. If the provider has no usable
+    # model, judge() would raise ProviderConfigError anyway — we do
+    # the same here, just earlier, and record the empty model on the
+    # failure row.
+    try:
+        resolved_model = _resolve_model(provider, model_override)
+    except ProviderConfigError as e:
+        log.warning("AI verdict failed for run_domain=%s criterion=%s: %s",
+                    run_domain_id, criterion, e)
+        _store_ai_verdict(
+            cr_id, None, error=f"{type(e).__name__}: {e}",
+            prompt_hash=prompt_hash,
+            provider=provider, model=model_override or "",
+        )
+        return
+    try:
+        async with limit(provider):
+            parsed, _raw, usage = await judge(
+                provider=provider,
+                system_prompt=system_prompt,
+                user_message=user_msg,
+                model_override=resolved_model,
+            )
+        sub_verdicts[criterion] = parsed
+        _store_ai_verdict(
+            cr_id, parsed, error="",
+            prompt_hash=prompt_hash,
+            provider=provider, model=resolved_model,
+            usage=usage,
+        )
+    except (ProviderConfigError, ProviderError, ValueError) as e:
+        log.warning("AI verdict failed for run_domain=%s criterion=%s: %s",
+                    run_domain_id, criterion, e)
+        _store_ai_verdict(
+            cr_id, None, error=f"{type(e).__name__}: {e}",
+            prompt_hash=prompt_hash,
+            provider=provider, model=resolved_model,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("AI verdict crashed for run_domain=%s criterion=%s",
+                      run_domain_id, criterion)
+        _store_ai_verdict(
+            cr_id, None, error=f"unexpected: {e!r}",
+            prompt_hash=prompt_hash,
+            provider=provider, model=resolved_model,
+        )
+
+
 async def _run_ai_for_domain(
     *,
     run_domain_id: int,
@@ -1967,7 +2137,24 @@ async def _run_ai_for_domain(
     run_id: int,
 ) -> None:
     """For each successfully-fetched criterion, judge it; then combine the
-    sub-verdicts into a final assessment and persist on the RunDomain."""
+    sub-verdicts into a final assessment and persist on the RunDomain.
+
+    Ordering (v2, 2026-05-13): three explicit phases, no flags, no
+    duplicate call sites.
+
+      Phase 1 — wayback judge (if wayback was fetched).
+      Phase 2 — wayback_classify (if enabled in spec).
+      Phase 3 — Ahrefs B/D/A/K judges, each reading classify_context
+                from sub_verdicts (populated by Phase 2).
+
+    The earlier v1 design tried to do the same with a single for-loop
+    over (wayback, B, D, A, K) plus an inline classify call at the
+    bottom of the wayback iteration + a fallback after the loop. That
+    broke whenever wayback's AI verdict was cache-hit: the iteration
+    `continue`d past the inline classify call, B/A/K then judged
+    without context, and the fallback block fired classify too late.
+    Splitting into phases makes each phase's cache short-circuit only
+    affect that phase's judge call — it cannot skip the next phase."""
     assert spec.ai and spec.ai.provider
     provider = spec.ai.provider
     model_override = spec.ai.model
@@ -2007,208 +2194,42 @@ async def _run_ai_for_domain(
     from .app_settings import get_classify_context_config
     classify_ctx_config = get_classify_context_config()
 
-    # New v1 ordering (2026-05-13): wayback judge → wayback_classify
-    # post-step → B/D/A/K judges (with classify_context piped in). The
-    # per-criterion judge body is otherwise unchanged. The previous order
-    # was fetch-order = B → D → A → K → wayback, then classify, then
-    # final. Reordering is required so B/A/K can see classify's verdict
-    # at judge time. Per-domain wall-clock is unchanged (still sequential);
-    # only the per-pill flip order on the Run page differs.
-    judge_order: list[str] = []
-    if "wayback" in fetched_rows:
-        judge_order.append("wayback")
-    for c in ("backlinks", "refdomains", "anchors", "keywords"):
-        if c in fetched_rows:
-            judge_order.append(c)
-    classify_post_step_done = False
+    judge_kwargs = dict(
+        run_domain_id=run_domain_id,
+        domain=domain,
+        spec=spec,
+        provider=provider,
+        model_override=model_override,
+        resolved_model_for_hash=resolved_model_for_hash,
+        cr_id_by_criterion=cr_id_by_criterion,
+        cached_verdicts=cached_verdicts,
+        sub_verdicts=sub_verdicts,
+        cache_enabled=cache_enabled,
+        cache_job_scope=cache_job_scope,
+        classify_ctx_config=classify_ctx_config,
+        run_id=run_id,
+    )
 
-    for criterion in judge_order:
-        rows = fetched_rows[criterion]
-        if is_canceled(run_id) or is_paused(run_id):
-            return
-        cr_id = cr_id_by_criterion.get(criterion)
-        if cr_id is None:
-            continue
-        # Defensive: skip AI judge when the criterion's CR row is in a
-        # failed state. The fetch loop above already excludes failed
-        # criteria from `fetched_rows` (they're never added when ok=False),
-        # so this is normally unreachable — it's a guard for future
-        # restructures (e.g. someone changes the resume/refetch path to
-        # populate fetched_rows pre-validation). If a wayback fetch
-        # errored we explicitly do NOT want to send the wayback judge
-        # prompt to the AI; same goes for any criterion.
-        if _criterion_status(cr_id) == "failed":
-            continue
-        # Build classify_context BEFORE the cache-key check so the
-        # fields_sent sentinel correctly diverges from no-context hashes.
-        # See drop_sherlock_ai_pipeline.md (memory) for why: prompt_hash
-        # doesn't include the user_message, so we MUST also mutate the
-        # fields_sent list when the user_message gains a new block —
-        # otherwise the cache will serve stale verdicts judged without
-        # the context. Wayback + classify-itself never receive context;
-        # only the configured Ahrefs criteria do.
-        classify_context_for_ai: dict | None = None
-        if criterion in _CLASSIFY_CONTEXT_ELIGIBLE_CRITERIA:
-            classify_context_for_ai = _load_classify_context(
-                run_domain_id, criterion, sub_verdicts, classify_ctx_config,
-            )
-        fields_sent = AI_FIELD_TRIM.get(criterion, [])
-        if classify_context_for_ai is not None:
-            # Sentinel encodes the sorted set of context field NAMES so
-            # changing the Settings field-set in any way invalidates the
-            # cache. Field VALUES don't go into the sentinel — that would
-            # bust the cache per-domain (the whole point is per-criterion
-            # cache namespaces, not per-domain).
-            sentinel = "classify_context:" + ",".join(
-                sorted(classify_context_for_ai.keys())
-            )
-            fields_sent = list(fields_sent) + [sentinel]
-        # Already judged in a prior worker — reuse and skip the API call.
-        if criterion in cached_verdicts:
-            sub_verdicts[criterion] = cached_verdicts[criterion]
-            continue
-        system_prompt = localize_prompt(get_ai_prompt(criterion), spec.lang)
-        prompt_hash = compute_prompt_hash(
-            system_prompt,
-            provider,
-            resolved_model_for_hash,
-            fields_sent=fields_sent,
+    # Phase 1 — wayback judge. Self-contained: any cache hit only
+    # short-circuits this judge, never Phase 2 or 3.
+    if "wayback" in fetched_rows and not is_canceled(run_id) and not is_paused(run_id):
+        await _judge_one_criterion(
+            criterion="wayback", rows=fetched_rows["wayback"], **judge_kwargs,
         )
-        # Per-job AI cache: identical Ahrefs params + identical prompt +
-        # identical provider/model → reuse the prior verdict. Editing the
-        # prompt in Settings or switching provider/model busts this cache.
-        if cache_enabled and (
-            cache_job_scope is not None or spec.cross_job_cache
-        ):
-            params_hash = _get_criterion_params_hash(cr_id)
-            verdict = _try_serve_verdict_from_cache(
-                cr_id=cr_id,
-                domain=domain,
-                criterion=criterion,
-                params_hash=params_hash,
-                prompt_hash=prompt_hash,
-                job_id=cache_job_scope,
-                run_id=run_id,
-            )
-            if verdict is not None:
-                sub_verdicts[criterion] = verdict
-                continue
-        trimmed = _trim_rows_for_ai(criterion, rows)
-        # Wayback V2: fold in any page-content samples that the fetch step
-        # (or a cache copy from a prior run) attached to data_json. The AI
-        # judge sees them alongside the CDX rows and can reason about
-        # title-over-time drift. Non-wayback criteria pass None and the
-        # builder skips the samples block entirely.
-        wayback_samples_for_ai: list[dict] | None = None
-        if criterion == "wayback":
-            raw_samples = _load_wayback_samples(cr_id)
-            if raw_samples:
-                wayback_samples_for_ai = _trim_samples_for_ai(raw_samples)
-        user_msg = _build_user_message_for_criterion(
-            criterion=criterion,
-            domain=domain,
-            rows=trimmed,
-            wayback_samples=wayback_samples_for_ai,
-            classify_context=classify_context_for_ai,
-        )
-        # Resolve the model up-front so we can persist it on the row no
-        # matter which branch wins below. If the provider has no usable
-        # model, judge() would raise ProviderConfigError anyway — we do
-        # the same here, just earlier, and record the empty model on the
-        # failure row.
-        try:
-            resolved_model = _resolve_model(provider, model_override)
-        except ProviderConfigError as e:
-            log.warning("AI verdict failed for run_domain=%s criterion=%s: %s",
-                        run_domain_id, criterion, e)
-            _store_ai_verdict(
-                cr_id, None, error=f"{type(e).__name__}: {e}",
-                prompt_hash=prompt_hash,
-                provider=provider, model=model_override or "",
-            )
-            continue
-        try:
-            async with limit(provider):
-                parsed, _raw, usage = await judge(
-                    provider=provider,
-                    system_prompt=system_prompt,
-                    user_message=user_msg,
-                    model_override=resolved_model,
-                )
-            sub_verdicts[criterion] = parsed
-            _store_ai_verdict(
-                cr_id, parsed, error="",
-                prompt_hash=prompt_hash,
-                provider=provider, model=resolved_model,
-                usage=usage,
-            )
-        except (ProviderConfigError, ProviderError, ValueError) as e:
-            log.warning("AI verdict failed for run_domain=%s criterion=%s: %s",
-                        run_domain_id, criterion, e)
-            _store_ai_verdict(
-                cr_id, None, error=f"{type(e).__name__}: {e}",
-                prompt_hash=prompt_hash,
-                provider=provider, model=resolved_model,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.exception("AI verdict crashed for run_domain=%s criterion=%s",
-                          run_domain_id, criterion)
-            _store_ai_verdict(
-                cr_id, None, error=f"unexpected: {e!r}",
-                prompt_hash=prompt_hash,
-                provider=provider, model=resolved_model,
-            )
 
-        # v1 sequencing (2026-05-13): right after wayback judges, run the
-        # classify post-step. This lets B/D/A/K iterations (which come
-        # later in judge_order) see classify's verdict in `sub_verdicts`
-        # when they build their user messages. The "second" classify
-        # post-step block below is a no-op when classify_post_step_done
-        # is True, but still fires when wayback wasn't in the run at all
-        # (so classify still reports its "no samples" failure).
-        if criterion == "wayback" and not classify_post_step_done:
-            wbc_cfg = getattr(spec.criteria, "wayback_classify", None)
-            if (
-                wbc_cfg is not None
-                and wbc_cfg.enabled
-                and not is_canceled(run_id)
-                and not is_paused(run_id)
-            ):
-                await _run_wayback_classify_for_domain(
-                    run_domain_id=run_domain_id,
-                    domain=domain,
-                    spec=spec,
-                    wbc_cfg=wbc_cfg,
-                    provider=provider,
-                    resolved_model=resolved_model_for_hash,
-                    cached_verdicts=cached_verdicts,
-                    sub_verdicts=sub_verdicts,
-                    run_id=run_id,
-                )
-            classify_post_step_done = True
-
-    # Cancellation/pause check first — same semantics as before.
     if is_canceled(run_id) or is_paused(run_id):
         if cr_id_by_criterion:
             _stamp_last_analyzed(run_domain_id)
         return
 
-    # wayback_classify post-step (added 2026-05-09, made conditional
-    # 2026-05-13): in v1 sequencing this normally runs INLINE right
-    # after the wayback judge (see classify_post_step_done above) so
-    # B/A/K can see classify in sub_verdicts. This out-of-loop block
-    # remains as a fallback for the case where wayback isn't in
-    # judge_order at all (e.g. wayback criterion disabled in spec but
-    # classify enabled — classify still needs to fire so it reports
-    # its "no samples" failure rather than silently being skipped).
+    # Phase 2 — wayback_classify. Fires unconditionally when configured
+    # in the spec, regardless of how Phase 1 resolved (fresh judge,
+    # cache-hit, resume-cached, or skipped because wayback wasn't
+    # fetched). When wayback wasn't fetched / produced no samples,
+    # classify still runs and reports its "no samples" failure rather
+    # than silently being skipped — preserves the v1 fallback behavior.
     wbc_cfg = getattr(spec.criteria, "wayback_classify", None)
-    if (
-        not classify_post_step_done
-        and wbc_cfg is not None
-        and wbc_cfg.enabled
-        and not is_canceled(run_id)
-        and not is_paused(run_id)
-    ):
+    if wbc_cfg is not None and wbc_cfg.enabled:
         await _run_wayback_classify_for_domain(
             run_domain_id=run_domain_id,
             domain=domain,
@@ -2219,6 +2240,26 @@ async def _run_ai_for_domain(
             cached_verdicts=cached_verdicts,
             sub_verdicts=sub_verdicts,
             run_id=run_id,
+        )
+
+    if is_canceled(run_id) or is_paused(run_id):
+        if cr_id_by_criterion:
+            _stamp_last_analyzed(run_domain_id)
+        return
+
+    # Phase 3 — Ahrefs B/D/A/K judges. Each reads classify_context from
+    # sub_verdicts (populated by Phase 2). Cache hits inside this loop
+    # are safe — there's nothing left that depends on inter-phase
+    # ordering.
+    for criterion in ("backlinks", "refdomains", "anchors", "keywords"):
+        if criterion not in fetched_rows:
+            continue
+        if is_canceled(run_id) or is_paused(run_id):
+            if cr_id_by_criterion:
+                _stamp_last_analyzed(run_domain_id)
+            return
+        await _judge_one_criterion(
+            criterion=criterion, rows=fetched_rows[criterion], **judge_kwargs,
         )
 
     # Partial-result detection (added 2026-05-06): if ANY enabled criterion
