@@ -588,10 +588,40 @@ def list_domains(
             )
         else:
             # Case B — synthesize from per-criterion AI verdicts.
+            #
+            # When the primary contributing run has a per-run scoring
+            # override (2026-05-13 wave J), use those weights for the
+            # synth instead of the global Settings ones. Otherwise
+            # Case A (single-source) and Case B (Frankenstein) would
+            # silently diverge: applying an override on Run X would
+            # reflect on the Database page for domains where X is the
+            # sole source, but not for domains where X's B/D/A/K are
+            # stitched with wayback from a different run. The primary
+            # contributing run (`primary_run`) is the most-recent of
+            # the contributing set, which matches the user's mental
+            # model of "the run I just tuned".
+            synth_weights = weights
+            if primary_run.scoring_override_json:
+                try:
+                    _po = json.loads(primary_run.scoring_override_json)
+                    if isinstance(_po, dict):
+                        _w = _po.get("weights")
+                        if isinstance(_w, dict):
+                            # Coerce only — the recompute endpoint
+                            # always persists a complete 6-criterion
+                            # dict, but be defensive against partials.
+                            synth_weights = {
+                                str(k): float(v)
+                                for k, v in _w.items()
+                                if isinstance(v, (int, float))
+                                and not isinstance(v, bool)
+                            }
+                except json.JSONDecodeError:
+                    pass
             from ..scoring import compute_final
             synth_score, synth_conf = compute_final(
                 per_crit_ai_verdicts,
-                weights=weights or None,
+                weights=synth_weights or None,
             )
             score = synth_score
             confidence = synth_conf

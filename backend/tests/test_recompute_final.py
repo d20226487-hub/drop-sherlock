@@ -312,6 +312,151 @@ def test_excluding_a_criterion_via_weight_zero_renormalizes(fresh_db):
     assert result["rows"][0]["score_new"] == 85.0
 
 
+def test_database_synth_honors_primary_run_override(fresh_db):
+    """Frankenstein Database row regression (2026-05-13 wave J fix #2):
+    when criteria are pinned from MULTIPLE runs for a single domain,
+    `routers/database.list_domains` falls into the multi-source synth
+    branch. That branch must use the primary contributing run's
+    scoring override when set — otherwise the user-visible Database
+    score silently ignores the override on the run they just tuned.
+
+    Setup: two jobs containing the same domain. Job A pins B/D/A/K
+    from run A; Job B pins wayback from run B. Apply an override on
+    run A (B-weighted heavy). Assert the Database row's final_score
+    matches the override-weighted compute, not the global one."""
+    from datetime import datetime, timedelta
+    from app.models import (
+        CriterionResult, Job, JobCriterionPin, Run, RunDomain,
+    )
+
+    spec_dict = {
+        "criteria": {
+            "backlinks":  {"enabled": True, "limit": 50, "mode": "live"},
+            "refdomains": {"enabled": True, "limit": 50, "mode": "live"},
+            "anchors":    {"enabled": True, "limit": 50, "mode": "live"},
+            "keywords":   {"enabled": True, "limit": 50, "country": "us"},
+            "wayback":    {"enabled": True, "limit": 100},
+            "wayback_classify": {"enabled": False},
+        },
+        "ai": {"provider": "gemini", "model": "test"},
+    }
+    # Job A — newer run that supplies B/D/A/K and gets the override.
+    jobA = Job(name="A", spec_json=json.dumps(spec_dict))
+    fresh_db.add(jobA); fresh_db.flush()
+    runA = Run(
+        job_id=jobA.id, status="done", spec_json=json.dumps(spec_dict),
+        finished_at=datetime.utcnow(),
+    )
+    fresh_db.add(runA); fresh_db.flush()
+    rdA = RunDomain(
+        run_id=runA.id, domain="ex.com", status="done",
+        finished_at=datetime.utcnow(),
+    )
+    fresh_db.add(rdA); fresh_db.flush()
+    sub_verdicts_A = {
+        "backlinks":  _verdict("high_quality", 0.9),  # 85
+        "refdomains": _verdict("mixed",        0.7),  # 50
+        "anchors":    _verdict("high_quality", 0.9),  # 85
+        "keywords":   _verdict("low_quality",  0.5),  # 15
+    }
+    for crit, verdict in sub_verdicts_A.items():
+        fresh_db.add(CriterionResult(
+            run_domain_id=rdA.id, criterion=crit, status="done",
+            ai_verdict_json=json.dumps(verdict, ensure_ascii=False),
+        ))
+    # Original synth at global weights B=0.4 D=0.2 A=0.3 K=0.1:
+    # = 85*0.4 + 50*0.2 + 85*0.3 + 15*0.1 = 34+10+25.5+1.5 = 71
+    fresh_db.flush()
+    rdA.final_assessment_json = json.dumps({
+        "final": 71.0, "confidence": 0.78,
+        "summary": "ok", "recommendation": "ok",
+        "provider": "gemini", "model": "test",
+    })
+    rdA.final_summary = "quality"
+
+    # Job B — older run that supplies wayback for the same domain.
+    jobB = Job(name="B", spec_json=json.dumps(spec_dict))
+    fresh_db.add(jobB); fresh_db.flush()
+    runB = Run(
+        job_id=jobB.id, status="done", spec_json=json.dumps(spec_dict),
+        # Older finish time so runA is the primary (most-recent) source.
+        finished_at=datetime.utcnow() - timedelta(days=1),
+    )
+    fresh_db.add(runB); fresh_db.flush()
+    rdB = RunDomain(
+        run_id=runB.id, domain="ex.com", status="done",
+        finished_at=datetime.utcnow() - timedelta(days=1),
+    )
+    fresh_db.add(rdB); fresh_db.flush()
+    fresh_db.add(CriterionResult(
+        run_domain_id=rdB.id, criterion="wayback", status="done",
+        ai_verdict_json=json.dumps(
+            _verdict("low_quality", 0.6),  # 15
+            ensure_ascii=False,
+        ),
+    ))
+
+    # Pin B/D/A/K from runA at jobA; pin wayback from runB at jobB.
+    for c in ("backlinks", "refdomains", "anchors", "keywords"):
+        fresh_db.add(JobCriterionPin(
+            job_id=jobA.id, criterion=c, run_id=runA.id,
+        ))
+    fresh_db.add(JobCriterionPin(
+        job_id=jobB.id, criterion="wayback", run_id=runB.id,
+    ))
+    fresh_db.commit()
+
+    # Apply a heavy-backlinks override on runA.
+    from app.tasks import recompute_run_finals
+    new_weights = {
+        "backlinks": 0.6, "refdomains": 0.1,
+        "anchors": 0.1, "keywords": 0.1,
+        "wayback": 0.1, "wayback_classify": 0.0,
+    }
+    recompute_run_finals(runA.id, new_weights, preview=False)
+
+    # Hit the Database /domains endpoint and look up ex.com.
+    from app.main import app
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+    resp = client.get(
+        "/database/domains",
+        auth=("admin", "changeme"),
+    )
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    row = next(
+        (r for r in payload["rows"] if r["domain"] == "ex.com"), None,
+    )
+    assert row is not None, payload
+
+    # Expected synth under the override:
+    # B=high(85)*0.6 + D=mixed(50)*0.1 + A=high(85)*0.1 +
+    # K=low(15)*0.1 + W=low(15)*0.1
+    # = 51 + 5 + 8.5 + 1.5 + 1.5 = 67.5
+    assert abs(row["final_score"] - 67.5) < 0.5, row
+
+    # Sanity: without the override (global weights), the synth would
+    # produce a different number — make sure we're actually testing the
+    # override path, not coincidentally matching global.
+    from app.app_settings import get_scoring_config
+    from app.scoring import compute_final
+    global_score, _ = compute_final(
+        {
+            "backlinks":  sub_verdicts_A["backlinks"],
+            "refdomains": sub_verdicts_A["refdomains"],
+            "anchors":    sub_verdicts_A["anchors"],
+            "keywords":   sub_verdicts_A["keywords"],
+            "wayback":    _verdict("low_quality", 0.6),
+        },
+        weights=get_scoring_config()["weights"],
+    )
+    assert abs(global_score - 67.5) > 0.5, (
+        f"global score {global_score} too close to override score 67.5; "
+        f"pick different sub-verdicts to widen the gap"
+    )
+
+
 def test_get_run_scoring_override_roundtrip(fresh_db):
     """`get_run_scoring_override` returns the parsed weights dict when
     the override is set, None when cleared."""
