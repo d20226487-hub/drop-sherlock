@@ -138,6 +138,11 @@ function ScoreWeightsPanel({
   const [preview, setPreview] = useState<RecomputeFinalResult | null>(null);
   const [busy, setBusy] = useState<"" | "preview" | "apply" | "reset">("");
   const [opError, setOpError] = useState<string | null>(null);
+  // Collapsed by default — the panel is a power-user tool. The header
+  // stays visible so the override-active badge is always discoverable,
+  // and we auto-expand when a custom override is in effect so the user
+  // sees the current weights without an extra click on reopen.
+  const [open, setOpen] = useState<boolean>(!!currentOverride);
 
   // Populate initial weights from either the active override or the
   // global Settings defaults. We only run this once on mount and once
@@ -282,11 +287,28 @@ function ScoreWeightsPanel({
 
   return (
     <div className="rounded-md border border-neutral-200 dark:border-neutral-800 p-3 space-y-3 bg-neutral-50/50 dark:bg-neutral-900/30">
-      <div className="flex flex-wrap items-center gap-2 justify-between">
-        <div>
-          <div className="text-sm font-medium">{ts.scoreWeightsHeading}</div>
-          <div className="text-xs text-neutral-600 dark:text-neutral-400 max-w-2xl">
-            {ts.scoreWeightsHint}
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="w-full flex flex-wrap items-center gap-2 justify-between text-left cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 rounded-md"
+      >
+        <div className="flex items-start gap-2">
+          <span
+            className="text-xs text-neutral-500 dark:text-neutral-400 mt-0.5 select-none"
+            aria-hidden
+          >
+            {open ? "▾" : "▸"}
+          </span>
+          <div>
+            <div className="text-sm font-medium">
+              {ts.scoreWeightsHeading}
+            </div>
+            {open && (
+              <div className="text-xs text-neutral-600 dark:text-neutral-400 max-w-2xl">
+                {ts.scoreWeightsHint}
+              </div>
+            )}
           </div>
         </div>
         <span
@@ -300,9 +322,9 @@ function ScoreWeightsPanel({
             ? ts.scoreWeightsOverrideActive
             : ts.scoreWeightsOverrideGlobal}
         </span>
-      </div>
+      </button>
 
-      {loadingDefaults ? (
+      {open && (loadingDefaults ? (
         <div className="text-xs text-neutral-500">…</div>
       ) : loadError ? (
         <p className="text-xs text-red-600 dark:text-red-400">{loadError}</p>
@@ -504,7 +526,7 @@ function ScoreWeightsPanel({
             </div>
           )}
         </>
-      )}
+      ))}
     </div>
   );
 }
