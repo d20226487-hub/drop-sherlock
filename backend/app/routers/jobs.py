@@ -10,10 +10,17 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from ..db import get_db
-from ..models import CriterionResult, DomainNote, Job, Run, RunDomain
+from ..models import (
+    CriterionResult,
+    DomainNote,
+    Job,
+    JobCriterionPin,
+    Run,
+    RunDomain,
+)
 from ..schemas import AnalyzeSpec
 from ..tasks import cancel_run_now, dispatch_run, pause_run_now, resume_run_now
 
@@ -119,6 +126,13 @@ class RunDomainProgress(BaseModel):
     category: str = ""
     category_confidence: float | None = None
     category_was: str = ""
+    # Wayback CDX row count for THIS rd. `None` when the wayback criterion
+    # isn't on this rd at all (older runs, or wayback disabled in spec) OR
+    # when the fetch hasn't reached status=done yet (pending/running/failed).
+    # `0` means wayback ran cleanly and archive.org returned no snapshots —
+    # the signal the Run-page filter targets, since 0 CDX rows guarantees
+    # V2 sampling + wayback_classify will also have nothing to work with.
+    wayback_rows: int | None = None
 
 
 class RunDetail(BaseModel):
@@ -449,7 +463,19 @@ async def rerun_job(
 
 @runs_router.get("/{run_id}", response_model=RunDetail)
 def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
-    run = db.get(Run, run_id)
+    # Eager-load Run → RunDomains → CriterionResults in one IN-list
+    # query each instead of lazy-loading per-domain (regression observed
+    # 2026-05-12 with a 352-domain run — N+1 became 700+ SQLite
+    # roundtrips and the endpoint timed out at 15s, freezing the Run
+    # page). `selectinload` issues 3 queries total: Run, RunDomains,
+    # CriterionResults. The per-domain loop below accesses .results
+    # purely from the populated collection.
+    run = (
+        db.query(Run)
+        .options(selectinload(Run.domains).selectinload(RunDomain.results))
+        .filter(Run.id == run_id)
+        .one_or_none()
+    )
     if run is None:
         raise HTTPException(404, "run not found")
 
@@ -479,6 +505,11 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
             isinstance(parsed_final, dict) and parsed_final.get("partial")
         )
         ai_status: dict[str, str] = {}
+        # `wayback_rows`: surfaced for the Run-page "Wayback CDX" filter so
+        # the user can isolate done-but-empty-CDX rows for retry. Only
+        # populated when the wayback CR reached status=done; failed/pending
+        # rows stay None so they don't get lumped with genuine 0-row hits.
+        wayback_rows: int | None = None
         for cr in d.results:
             if cr.ai_verdict_error:
                 ai_status[cr.criterion] = "failed"
@@ -486,6 +517,19 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
                 ai_status[cr.criterion] = "done"
             else:
                 ai_status[cr.criterion] = "pending"
+            if (
+                cr.criterion == "wayback"
+                and cr.status == "done"
+                and cr.data_json
+            ):
+                try:
+                    wb_body = json.loads(cr.data_json)
+                except json.JSONDecodeError:
+                    wb_body = None
+                if isinstance(wb_body, dict):
+                    rows_val = wb_body.get("wayback")
+                    if isinstance(rows_val, list):
+                        wayback_rows = len(rows_val)
         # wayback_classify columns — pull straight from THIS rd's
         # classify CR ai_verdict_json. No cross-run stitching here:
         # the run page is run-isolated by design (per 2026-05-08 fix),
@@ -577,6 +621,7 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
                 category=wbc_category,
                 category_confidence=wbc_category_confidence,
                 category_was=wbc_category_was,
+                wayback_rows=wayback_rows,
             )
         )
     return RunDetail(
@@ -1314,6 +1359,62 @@ async def retry_failed_run_route(
     return result
 
 
+class RetryBatchIn(BaseModel):
+    """Scoped retry — pick exact RunDomain ids + (optional) criterion
+    allow-list. Added 2026-05-12 to support the Run-page filter + multi-
+    select + bulk-retry flow. `criteria=None` means "every enabled
+    criterion on the run" (equivalent to the unscoped Retry failed).
+
+    AI override fields mirror ReanalyzeIn — let the user retry under a
+    different model than the spec's default.
+
+    `wayback_resample_only` (added 2026-05-13) flips the selection
+    semantics for wayback: instead of "retry failed wayback CRs",
+    targets wayback CRs with ≥1 V1 row and re-collects V2 samples
+    against them. CDX call is skipped — V1 is reused as-is. Caller
+    must include "wayback" in `criteria` (or pass None)."""
+    run_domain_ids: list[int]
+    criteria: list[str] | None = None
+    provider: str | None = None
+    model: str | None = None
+    wayback_resample_only: bool = False
+
+
+@runs_router.post("/{run_id}/retry-batch")
+async def retry_batch_route(run_id: int, body: RetryBatchIn) -> dict:
+    """Retry failed criteria on a *subset* of this run's RunDomains,
+    optionally narrowed to a subset of criteria.
+
+    Semantics:
+      - Only failed criteria are dispatched. A criterion already in
+        good shape on a selected RD is skipped (no wasted refetch /
+        AI call).
+      - When `criteria` is provided, only those in the allow-list are
+        considered; the rest are left alone even if they failed.
+      - Same terminal-status + busy-RD guards as `/retry-failed`.
+    """
+    from ..tasks import retry_run_batch_now
+    if not body.run_domain_ids:
+        raise HTTPException(400, "no run_domain_ids provided")
+    override = (
+        {"provider": body.provider, "model": body.model}
+        if body.provider or body.model
+        else None
+    )
+    result = retry_run_batch_now(
+        run_id=run_id,
+        run_domain_ids=body.run_domain_ids,
+        criteria=body.criteria,
+        ai_override=override,
+        wayback_resample_only=body.wayback_resample_only,
+    )
+    if result.get("found") is False:
+        raise HTTPException(404, "run not found")
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
 @run_domains_router.post("/{run_domain_id}/reanalyze")
 async def reanalyze_run_domain_route(
     run_domain_id: int, body: ReanalyzeIn | None = None
@@ -1377,13 +1478,68 @@ class PinRunDomainOut(BaseModel):
     is_pinned: bool
 
 
+def _upsert_criterion_pins_for_run(
+    db: Session, run: Run, criteria: set[str]
+) -> int:
+    """Helper: upsert (job_id=run.job_id, criterion=C, run_id=run.id) for
+    every C in `criteria`. Returns the count of pins overwritten (rows
+    that previously pointed at a different run in the same job)."""
+    if not criteria:
+        return 0
+    existing = (
+        db.query(JobCriterionPin)
+        .filter(JobCriterionPin.job_id == run.job_id)
+        .filter(JobCriterionPin.criterion.in_(criteria))
+        .all()
+    )
+    by_crit = {p.criterion: p for p in existing}
+    now = datetime.utcnow()
+    replaced = 0
+    for c in criteria:
+        ex = by_crit.get(c)
+        if ex is None:
+            db.add(JobCriterionPin(
+                job_id=run.job_id, criterion=c, run_id=run.id,
+            ))
+        elif ex.run_id != run.id:
+            ex.run_id = run.id
+            ex.updated_at = now
+            replaced += 1
+    return replaced
+
+
+def _criteria_with_data_for_run(db: Session, run_id: int) -> set[str]:
+    """Criteria this run has produced data for (status=='done' or
+    non-empty data_json). Drives auto-expansion when a legacy pin
+    endpoint fires."""
+    rows = (
+        db.query(CriterionResult.criterion)
+        .join(RunDomain, RunDomain.id == CriterionResult.run_domain_id)
+        .filter(RunDomain.run_id == run_id)
+        .filter(
+            (CriterionResult.status == "done")
+            | (CriterionResult.data_json != "")
+        )
+        .distinct()
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
 @run_domains_router.post("/{run_domain_id}/pin", response_model=PinRunDomainOut)
 def pin_run_domain_route(
     run_domain_id: int, db: Session = Depends(get_db)
 ) -> PinRunDomainOut:
     """Mark this RunDomain as the definitive source for its `domain` on
     the Database page. Clears any other pin for the same domain so the
-    "at most one pinned per domain" invariant holds."""
+    "at most one pinned per domain" invariant holds.
+
+    Also expands into per-(job, criterion) pins (added 2026-05-12): for
+    every criterion this rd has CR data for, sets (job_id=rd.run.job_id,
+    criterion=C, run_id=rd.run_id). Keeps the legacy per-domain pin
+    button functional after the Database rollup rewrite — the user can
+    keep clicking the same "Pin" affordance and the new Database page
+    aggregation will source criteria from this rd's run."""
     rd = db.get(RunDomain, run_domain_id)
     if rd is None:
         raise HTTPException(404, "run domain not found")
@@ -1397,6 +1553,16 @@ def pin_run_domain_route(
     for o in others:
         o.is_pinned = False
     rd.is_pinned = True
+    # Per-criterion expansion. Only criteria this rd has CR data for —
+    # avoids overwriting another run's pin with one that wouldn't
+    # actually provide data for the criterion.
+    run = db.get(Run, rd.run_id)
+    if run is not None:
+        rd_crits = {
+            cr.criterion for cr in rd.results
+            if cr.status == "done" or cr.data_json
+        }
+        _upsert_criterion_pins_for_run(db, run, rd_crits)
     db.commit()
     return PinRunDomainOut(
         run_domain_id=rd.id, domain=rd.domain, is_pinned=True,
@@ -1416,70 +1582,6 @@ def unpin_run_domain_route(
     return PinRunDomainOut(
         run_domain_id=rd.id, domain=rd.domain, is_pinned=False,
     )
-
-
-class PinRunAllOut(BaseModel):
-    run_id: int
-    pinned: int  # count of RunDomains in this run flipped to is_pinned=True
-    replaced: int  # count of OTHER RunDomains (in other runs) cleared by this op
-
-
-@runs_router.post("/{run_id}/pin-all", response_model=PinRunAllOut)
-def pin_run_all_route(
-    run_id: int, db: Session = Depends(get_db)
-) -> PinRunAllOut:
-    """Pin every RunDomain in this run as the definitive source for its
-    domain. Domains previously pinned to a different run are replaced.
-    Idempotent — pinning a run that's already fully pinned is a no-op.
-
-    Also sets `Run.is_pinned=True` (the Job-page rollup pin) when the
-    run is `done` — the user's mental model of "pin this run" covers
-    both: per-domain canonicality AND the Job-page rollup source. The
-    finer-grained Job-page Pin button (sets only Run.is_pinned) is
-    still available when the user wants to lock the rollup without
-    touching individual rds."""
-    run = db.get(Run, run_id)
-    if run is None:
-        raise HTTPException(404, "run not found")
-    target_rds = list(run.domains)
-    if not target_rds:
-        return PinRunAllOut(run_id=run_id, pinned=0, replaced=0)
-    domains = {rd.domain for rd in target_rds}
-    target_ids = {rd.id for rd in target_rds}
-    # Clear any other pinned rds for the same domains.
-    others = (
-        db.query(RunDomain)
-        .filter(RunDomain.domain.in_(domains))
-        .filter(RunDomain.is_pinned == True)  # noqa: E712
-        .filter(~RunDomain.id.in_(target_ids))
-        .all()
-    )
-    replaced = len(others)
-    for o in others:
-        o.is_pinned = False
-    pinned_count = 0
-    for rd in target_rds:
-        if not rd.is_pinned:
-            pinned_count += 1
-        rd.is_pinned = True
-    # Also flip the Job-page rollup pin when this run is `done`. Skip
-    # for non-done runs: their counts are unstable and the rollup
-    # would shift under the user. Pin-all on a non-done run is still
-    # allowed (per-domain canonicality is independent) — it just
-    # doesn't take over the rollup until the run completes.
-    if run.status == "done":
-        job_others = (
-            db.query(Run)
-            .filter(Run.job_id == run.job_id)
-            .filter(Run.is_pinned == True)  # noqa: E712
-            .filter(Run.id != run.id)
-            .all()
-        )
-        for o in job_others:
-            o.is_pinned = False
-        run.is_pinned = True
-    db.commit()
-    return PinRunAllOut(run_id=run_id, pinned=pinned_count, replaced=replaced)
 
 
 class PinRunOut(BaseModel):
@@ -1526,6 +1628,10 @@ def pin_run_route(
     for o in others:
         o.is_pinned = False
     run.is_pinned = True
+    # Per-criterion expansion: pin every criterion this run produced.
+    _upsert_criterion_pins_for_run(
+        db, run, _criteria_with_data_for_run(db, run.id),
+    )
     db.commit()
     return PinRunOut(
         run_id=run.id,
@@ -1551,6 +1657,229 @@ def unpin_run_route(
         run_id=run.id,
         job_id=run.job_id,
         is_pinned=False,
+    )
+
+
+# --- Per-(job, criterion) pins (added 2026-05-12) ---------------------------
+# Replaces the older Run.is_pinned / RunDomain.is_pinned model for the
+# Database-page rollup. Each pin says "for this Job, criterion C is sourced
+# from Run R." Multiple criteria within one job can point at different runs
+# — supports iterative cascade (Wayback first, Ahrefs later, etc.).
+
+CRITERIA_NAMES = (
+    "backlinks",
+    "refdomains",
+    "anchors",
+    "keywords",
+    "wayback",
+    "wayback_classify",
+)
+
+
+class CriterionPinIn(BaseModel):
+    criterion: str
+    run_id: int
+
+
+class CriterionPinOut(BaseModel):
+    job_id: int
+    criterion: str
+    run_id: int
+    pinned: bool
+
+
+class CriterionPinsListItem(BaseModel):
+    criterion: str
+    run_id: int
+    run_name: str = ""
+    run_finished_at: datetime | None = None
+
+
+class CriterionPinsListOut(BaseModel):
+    job_id: int
+    pins: list[CriterionPinsListItem]
+
+
+@router.get(
+    "/{job_id}/criterion-pins", response_model=CriterionPinsListOut
+)
+def list_criterion_pins(
+    job_id: int, db: Session = Depends(get_db),
+) -> CriterionPinsListOut:
+    """Return every (criterion, run) currently pinned for this Job."""
+    job = db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    rows = (
+        db.query(JobCriterionPin)
+        .filter(JobCriterionPin.job_id == job_id)
+        .all()
+    )
+    run_ids = {r.run_id for r in rows}
+    runs = {
+        r.id: r
+        for r in (
+            db.query(Run).filter(Run.id.in_(run_ids)).all() if run_ids else []
+        )
+    }
+    items: list[CriterionPinsListItem] = []
+    for p in rows:
+        r = runs.get(p.run_id)
+        items.append(CriterionPinsListItem(
+            criterion=p.criterion,
+            run_id=p.run_id,
+            run_name=(r.name or "") if r else "",
+            run_finished_at=(r.finished_at if r else None),
+        ))
+    items.sort(key=lambda i: i.criterion)
+    return CriterionPinsListOut(job_id=job_id, pins=items)
+
+
+@router.post(
+    "/{job_id}/criterion-pins", response_model=CriterionPinOut
+)
+def set_criterion_pin(
+    job_id: int, payload: CriterionPinIn, db: Session = Depends(get_db),
+) -> CriterionPinOut:
+    """Upsert pin for (job, criterion) → run.
+
+    Validates: criterion ∈ CRITERIA_NAMES; run belongs to this job; run is
+    in 'done' status (pinning an unfinished run yields shifting data).
+    """
+    if payload.criterion not in CRITERIA_NAMES:
+        raise HTTPException(400, f"unknown criterion: {payload.criterion}")
+    job = db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    run = db.get(Run, payload.run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+    if run.job_id != job_id:
+        raise HTTPException(
+            400, f"run {run.id} does not belong to job {job_id}",
+        )
+    if run.status != "done":
+        raise HTTPException(
+            400, f"only 'done' runs can be pinned (this run is '{run.status}')",
+        )
+    existing = (
+        db.query(JobCriterionPin)
+        .filter(JobCriterionPin.job_id == job_id)
+        .filter(JobCriterionPin.criterion == payload.criterion)
+        .one_or_none()
+    )
+    if existing is None:
+        db.add(JobCriterionPin(
+            job_id=job_id,
+            criterion=payload.criterion,
+            run_id=payload.run_id,
+        ))
+    else:
+        existing.run_id = payload.run_id
+        existing.updated_at = datetime.utcnow()
+    db.commit()
+    return CriterionPinOut(
+        job_id=job_id,
+        criterion=payload.criterion,
+        run_id=payload.run_id,
+        pinned=True,
+    )
+
+
+@router.delete(
+    "/{job_id}/criterion-pins/{criterion}", response_model=CriterionPinOut
+)
+def clear_criterion_pin(
+    job_id: int, criterion: str, db: Session = Depends(get_db),
+) -> CriterionPinOut:
+    """Clear pin for (job, criterion). Idempotent."""
+    if criterion not in CRITERIA_NAMES:
+        raise HTTPException(400, f"unknown criterion: {criterion}")
+    existing = (
+        db.query(JobCriterionPin)
+        .filter(JobCriterionPin.job_id == job_id)
+        .filter(JobCriterionPin.criterion == criterion)
+        .one_or_none()
+    )
+    prev_run_id = existing.run_id if existing else 0
+    if existing is not None:
+        db.delete(existing)
+        db.commit()
+    return CriterionPinOut(
+        job_id=job_id, criterion=criterion, run_id=prev_run_id, pinned=False,
+    )
+
+
+class PinRunCriteriaOut(BaseModel):
+    """Response for the bulk per-run pin-all-populated endpoint."""
+    run_id: int
+    job_id: int
+    pinned_criteria: list[str]  # criteria now pointing at this run
+    replaced: int  # criterion-pins on other runs in this job that were overwritten
+
+
+@runs_router.post(
+    "/{run_id}/pin-all-criteria", response_model=PinRunCriteriaOut
+)
+def pin_run_all_criteria(
+    run_id: int, db: Session = Depends(get_db),
+) -> PinRunCriteriaOut:
+    """Pin every criterion this run produced data for, in its Job context.
+
+    For each criterion C this run has a populated CriterionResult for
+    (`status=='done'` OR non-empty data_json), upsert (job_id=run.job_id,
+    criterion=C, run_id=run_id). Pre-existing pins for the same (job, C)
+    pointing at a different run are replaced.
+
+    Only `done` runs are pinnable — the same invariant as the older
+    Run.is_pinned pin endpoint.
+    """
+    run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+    if run.status != "done":
+        raise HTTPException(
+            400, f"only 'done' runs can be pinned (this run is '{run.status}')",
+        )
+    crits = (
+        db.query(CriterionResult.criterion)
+        .join(RunDomain, RunDomain.id == CriterionResult.run_domain_id)
+        .filter(RunDomain.run_id == run_id)
+        .filter(
+            (CriterionResult.status == "done")
+            | (CriterionResult.data_json != "")
+        )
+        .distinct()
+        .all()
+    )
+    crit_set = {r[0] for r in crits if r[0] in CRITERIA_NAMES}
+    if not crit_set:
+        return PinRunCriteriaOut(
+            run_id=run_id, job_id=run.job_id, pinned_criteria=[], replaced=0,
+        )
+    existing = (
+        db.query(JobCriterionPin)
+        .filter(JobCriterionPin.job_id == run.job_id)
+        .filter(JobCriterionPin.criterion.in_(crit_set))
+        .all()
+    )
+    existing_by_crit: dict[str, JobCriterionPin] = {p.criterion: p for p in existing}
+    replaced = 0
+    now = datetime.utcnow()
+    for c in crit_set:
+        ex = existing_by_crit.get(c)
+        if ex is None:
+            db.add(JobCriterionPin(job_id=run.job_id, criterion=c, run_id=run_id))
+        elif ex.run_id != run_id:
+            ex.run_id = run_id
+            ex.updated_at = now
+            replaced += 1
+    db.commit()
+    return PinRunCriteriaOut(
+        run_id=run_id,
+        job_id=run.job_id,
+        pinned_criteria=sorted(crit_set),
+        replaced=replaced,
     )
 
 

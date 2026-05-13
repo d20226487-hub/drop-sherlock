@@ -885,6 +885,226 @@ def set_import_max_rows(value: int) -> int:
     return value
 
 
+# --- Availability cascade settings (added 2026-05-12) ---------------------
+# Flat key→value rows; all single-tab-managed in Settings → Domain
+# availability. Defaults match what an honest first user should expect:
+# RDAP enabled, others off; conservative rate limits; 24h cache.
+
+AVAILABILITY_DEFAULTS: dict[str, str] = {
+    "availability__dns__enabled":         "true",
+    "availability__rdap__enabled":        "true",
+    "availability__domainr__enabled":     "false",
+    "availability__whois__enabled":       "false",
+    # User-orderable cascade. Comma-separated list of providers to try
+    # in order. Providers not enabled are silently skipped at runtime.
+    "availability__cascade_order":        "dns,rdap,domainr,whois",
+    # Per-provider rate limits (req/s + max concurrent).
+    "availability__dns__rps":             "20",
+    "availability__dns__max_concurrent":  "10",
+    "availability__rdap__rps":            "3",
+    "availability__rdap__max_concurrent": "4",
+    "availability__domainr__rps":         "5",
+    "availability__domainr__max_concurrent": "4",
+    "availability__whois__rps":           "1",
+    "availability__whois__max_concurrent": "2",
+    # Domainr (via RapidAPI) API key — Fernet-encrypted at rest via the
+    # __api_key suffix detection in `_set`.
+    "availability__domainr__api_key":     "",
+    # Cache TTL hours — cascade returns the prior result if its
+    # checked_at is within this window. 24h is a reasonable default;
+    # drop-hunters near close-to-drop dates may want 1h.
+    "availability__cache_ttl_hours":      "24",
+    # Skip-registered policy. When both `skip_registered` is on AND a
+    # domain is `registered` AND `expires_on > now + skip_horizon_days`,
+    # the runner skips Ahrefs/Wayback/AI for this domain (saves units).
+    # Registered-but-soon-expiring domains still flow through analysis.
+    "availability__skip_registered":      "false",
+    "availability__skip_horizon_days":    "90",
+}
+
+# Hardcoded ceiling so a runaway Settings edit can't accidentally hammer
+# the registry. Settings UI accepts higher values, this clamps at write
+# time.
+AVAILABILITY_RPS_CEILING = 10
+
+
+def _availability_int(key: str, default: int) -> int:
+    db = SessionLocal()
+    try:
+        raw = _get(db, key)
+    finally:
+        db.close()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _availability_bool(key: str, default: bool) -> bool:
+    db = SessionLocal()
+    try:
+        raw = (_get(db, key) or "").strip().lower()
+    finally:
+        db.close()
+    if raw in ("true", "1", "yes", "on"):
+        return True
+    if raw in ("false", "0", "no", "off"):
+        return False
+    return default
+
+
+def _availability_str(key: str, default: str) -> str:
+    db = SessionLocal()
+    try:
+        raw = _get(db, key)
+    finally:
+        db.close()
+    if raw is None:
+        return default
+    return raw
+
+
+def get_availability_config() -> dict:
+    """Return the full availability config snapshot for the Settings UI
+    and the cascade. Single roundtrip — useful for the
+    per-run-overhead-sensitive runner path."""
+    out: dict = {}
+    db = SessionLocal()
+    try:
+        for k, default in AVAILABILITY_DEFAULTS.items():
+            v = _get(db, k)
+            out[k] = v if v is not None else default
+    finally:
+        db.close()
+    # Mask the API key for safe display — callers that need the raw key
+    # call `get_domainr_api_key()` directly.
+    if out.get("availability__domainr__api_key"):
+        out["availability__domainr__api_key__set"] = True
+        out["availability__domainr__api_key"] = ""
+    else:
+        out["availability__domainr__api_key__set"] = False
+    return out
+
+
+def get_domainr_api_key() -> str:
+    """Raw key for the Domainr HTTP call. Auto-decrypts via _get."""
+    return _availability_str("availability__domainr__api_key", "")
+
+
+def get_availability_cascade_order() -> list[str]:
+    raw = _availability_str(
+        "availability__cascade_order",
+        AVAILABILITY_DEFAULTS["availability__cascade_order"],
+    )
+    seen: set[str] = set()
+    order: list[str] = []
+    for p in raw.split(","):
+        p = p.strip().lower()
+        if p in ("dns", "rdap", "domainr", "whois") and p not in seen:
+            order.append(p)
+            seen.add(p)
+    # Append any missing providers at the end so a malformed config
+    # still reaches them. Order in defaults wins.
+    for p in ("dns", "rdap", "domainr", "whois"):
+        if p not in seen:
+            order.append(p)
+    return order
+
+
+def is_provider_enabled(provider: str) -> bool:
+    if provider not in ("dns", "rdap", "domainr", "whois"):
+        return False
+    return _availability_bool(
+        f"availability__{provider}__enabled",
+        AVAILABILITY_DEFAULTS[f"availability__{provider}__enabled"] == "true",
+    )
+
+
+def get_provider_rate_limits(provider: str) -> dict[str, int]:
+    """Returns {rps, max_concurrent} for the named provider, clamped to
+    the AVAILABILITY_RPS_CEILING regardless of stored value."""
+    if provider not in ("dns", "rdap", "domainr", "whois"):
+        return {"rps": 1, "max_concurrent": 1}
+    rps = _availability_int(
+        f"availability__{provider}__rps",
+        int(AVAILABILITY_DEFAULTS[f"availability__{provider}__rps"]),
+    )
+    mc = _availability_int(
+        f"availability__{provider}__max_concurrent",
+        int(AVAILABILITY_DEFAULTS[f"availability__{provider}__max_concurrent"]),
+    )
+    return {
+        "rps": min(max(rps, 1), AVAILABILITY_RPS_CEILING),
+        "max_concurrent": max(mc, 1),
+    }
+
+
+def get_cache_ttl_hours() -> int:
+    return max(_availability_int(
+        "availability__cache_ttl_hours",
+        int(AVAILABILITY_DEFAULTS["availability__cache_ttl_hours"]),
+    ), 0)
+
+
+def get_skip_registered_policy() -> dict:
+    return {
+        "enabled": _availability_bool(
+            "availability__skip_registered",
+            AVAILABILITY_DEFAULTS["availability__skip_registered"] == "true",
+        ),
+        "horizon_days": max(_availability_int(
+            "availability__skip_horizon_days",
+            int(AVAILABILITY_DEFAULTS["availability__skip_horizon_days"]),
+        ), 0),
+    }
+
+
+def set_availability_setting(key: str, value: str) -> None:
+    """Validated setter. Raises ValueError on unknown keys or invalid
+    values; the route handler turns that into HTTP 400."""
+    if key not in AVAILABILITY_DEFAULTS:
+        raise ValueError(f"unknown availability key: {key}")
+    if key.endswith("__rps"):
+        try:
+            n = int(value)
+        except ValueError as e:
+            raise ValueError(f"{key} must be an integer") from e
+        if n < 1:
+            raise ValueError(f"{key} must be ≥ 1")
+        if n > AVAILABILITY_RPS_CEILING:
+            n = AVAILABILITY_RPS_CEILING
+        value = str(n)
+    elif key.endswith("__max_concurrent") or key.endswith("__hours") or key.endswith("__days"):
+        try:
+            n = int(value)
+        except ValueError as e:
+            raise ValueError(f"{key} must be an integer") from e
+        if n < 0:
+            raise ValueError(f"{key} must be ≥ 0")
+        value = str(n)
+    elif key.endswith("__enabled") or key == "availability__skip_registered":
+        v = value.strip().lower()
+        if v not in ("true", "false"):
+            raise ValueError(f"{key} must be true|false")
+        value = v
+    elif key == "availability__cascade_order":
+        cleaned = []
+        for p in value.split(","):
+            p = p.strip().lower()
+            if p in ("dns", "rdap", "domainr", "whois") and p not in cleaned:
+                cleaned.append(p)
+        if not cleaned:
+            raise ValueError("cascade order needs at least one provider")
+        value = ",".join(cleaned)
+    db = SessionLocal()
+    try:
+        _set(db, key, value)
+    finally:
+        db.close()
+
+
 def all_ai_prompts() -> list[dict]:
     """For the Settings page — current effective prompt + whether it's
     customized + the default for "Reset" UX."""
@@ -907,3 +1127,132 @@ def all_ai_prompts() -> list[dict]:
         return out
     finally:
         db.close()
+
+
+# --- Wayback classify → Ahrefs context (added 2026-05-13) -------------------
+# When enabled, the Ahrefs B/A/K judges receive a "Site context" block built
+# from the rd's wayback_classify CR verdict (theme, category, language, ...).
+# Helps the judges flag PBN-style theme mismatches (e.g. "pet care site with
+# backlinks from gambling/loan domains").
+#
+# Stored as one JSON blob under `classify_context_config`. Missing/empty row
+# falls back to DEFAULT_CLASSIFY_CONTEXT_CONFIG (feature ON, criteria =
+# B/A/K, fields = all 9 classify outputs). refdomains defaults OFF because
+# refdomain rows lack anchors/snippets — the judge would hallucinate theme
+# inferences. The user can opt refdomains in from Settings.
+CLASSIFY_CONTEXT_CONFIG_KEY = "classify_context_config"
+
+_CLASSIFY_CONTEXT_ALLOWED_CRITERIA: tuple[str, ...] = (
+    "backlinks", "refdomains", "anchors", "keywords",
+)
+_CLASSIFY_CONTEXT_ALLOWED_FIELDS: tuple[str, ...] = (
+    "primary_theme",
+    "category",
+    "theme_confidence",
+    "category_confidence",
+    "primary_language",
+    "secondary_themes",
+    "secondary_languages",
+    "drift_detected",
+    "category_was",
+)
+
+DEFAULT_CLASSIFY_CONTEXT_CONFIG: dict = {
+    "enabled": True,
+    # refdomains deliberately omitted from defaults — see module docstring.
+    "criteria": ["backlinks", "anchors", "keywords"],
+    "fields": list(_CLASSIFY_CONTEXT_ALLOWED_FIELDS),
+}
+
+
+def get_classify_context_config() -> dict:
+    """Effective classify-context config. Always returns the full shape
+    (every key present); partial DB overrides merge on top of defaults."""
+    db = SessionLocal()
+    try:
+        raw = _get(db, CLASSIFY_CONTEXT_CONFIG_KEY) or ""
+    finally:
+        db.close()
+    out = {
+        "enabled": bool(DEFAULT_CLASSIFY_CONTEXT_CONFIG["enabled"]),
+        "criteria": list(DEFAULT_CLASSIFY_CONTEXT_CONFIG["criteria"]),
+        "fields": list(DEFAULT_CLASSIFY_CONTEXT_CONFIG["fields"]),
+    }
+    if not raw:
+        return out
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return out
+    if not isinstance(parsed, dict):
+        return out
+    if "enabled" in parsed:
+        out["enabled"] = bool(parsed["enabled"])
+    crits = parsed.get("criteria")
+    if isinstance(crits, list):
+        # Preserve allowed-list order so two installs with the same
+        # underlying set produce identical fields_sent sentinels (and thus
+        # identical cache keys). User toggle order in the UI doesn't
+        # affect hashing.
+        seen = {c for c in crits if isinstance(c, str)}
+        out["criteria"] = [
+            c for c in _CLASSIFY_CONTEXT_ALLOWED_CRITERIA if c in seen
+        ]
+    flds = parsed.get("fields")
+    if isinstance(flds, list):
+        seen_f = {f for f in flds if isinstance(f, str)}
+        out["fields"] = [
+            f for f in _CLASSIFY_CONTEXT_ALLOWED_FIELDS if f in seen_f
+        ]
+    return out
+
+
+def set_classify_context_config(cfg: dict) -> dict:
+    """Validate + persist. Caller may pass a partial dict — only provided
+    keys update; the rest stay at current effective values. Unknown
+    criteria / fields are silently dropped (forward-compat).
+    Returns the new effective config."""
+    if not isinstance(cfg, dict):
+        raise ValueError("config must be an object")
+    current = get_classify_context_config()
+    new_enabled = current["enabled"]
+    new_criteria = list(current["criteria"])
+    new_fields = list(current["fields"])
+    if "enabled" in cfg:
+        new_enabled = bool(cfg["enabled"])
+    if "criteria" in cfg:
+        crits = cfg["criteria"]
+        if not isinstance(crits, list):
+            raise ValueError("criteria must be a list")
+        seen = {c for c in crits if isinstance(c, str)}
+        new_criteria = [
+            c for c in _CLASSIFY_CONTEXT_ALLOWED_CRITERIA if c in seen
+        ]
+    if "fields" in cfg:
+        flds = cfg["fields"]
+        if not isinstance(flds, list):
+            raise ValueError("fields must be a list")
+        seen_f = {f for f in flds if isinstance(f, str)}
+        new_fields = [
+            f for f in _CLASSIFY_CONTEXT_ALLOWED_FIELDS if f in seen_f
+        ]
+    out = {
+        "enabled": new_enabled,
+        "criteria": new_criteria,
+        "fields": new_fields,
+    }
+    db = SessionLocal()
+    try:
+        _set(db, CLASSIFY_CONTEXT_CONFIG_KEY, json.dumps(out))
+    finally:
+        db.close()
+    return out
+
+
+def reset_classify_context_config() -> dict:
+    db = SessionLocal()
+    try:
+        _set(db, CLASSIFY_CONTEXT_CONFIG_KEY, "")
+    finally:
+        db.close()
+    return get_classify_context_config()

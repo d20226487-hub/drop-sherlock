@@ -297,6 +297,7 @@ export default function ErrorsPage() {
 
   return (
     <div className="space-y-6">
+      <AvailabilityErrorsPanel />
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl font-semibold">{ts.title}</h1>
@@ -553,5 +554,136 @@ export default function ErrorsPage() {
         </>
       )}
     </div>
+  );
+}
+
+// Availability check failures panel (added 2026-05-12). Pulls the
+// latest 100 availability_checks rows, filters to status='error' so
+// the user sees current failures grouped by category (DNS / RDAP /
+// Domainr / WHOIS / Quota / Network / Parse). Collapsed by default;
+// the count chip is the affordance.
+function AvailabilityErrorsPanel() {
+  const { t } = useT();
+  const a = t.pages.availability;
+  const [open, setOpen] = useState(false);
+  const [filter, setFilter] = useState<string>(""); // empty = all categories
+  const [rows, setRows] = useState<
+    {
+      id: number;
+      domain: string;
+      provider: string;
+      status: string;
+      checked_at: string;
+      error_message: string;
+      error_category: string;
+    }[]
+  >([]);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    api
+      .availabilityRecent(100)
+      .then((all) => {
+        setRows(
+          all
+            .filter((r) => r.status === "error")
+            .map((r) => ({
+              id: r.id,
+              domain: r.domain,
+              provider: r.provider,
+              status: r.status,
+              checked_at: r.checked_at,
+              error_message: r.error_message,
+              error_category: r.error_category,
+            })),
+        );
+        setLoaded(true);
+      })
+      .catch(() => setLoaded(true));
+  }, []);
+
+  if (!loaded || rows.length === 0) return null;
+  const filtered = filter
+    ? rows.filter((r) => r.error_category === filter)
+    : rows;
+  const byCat = rows.reduce<Record<string, number>>((acc, r) => {
+    acc[r.error_category] = (acc[r.error_category] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  const catLabel = (c: string): string => {
+    switch (c) {
+      case "dns": return a.errorCatDns;
+      case "rdap": return a.errorCatRdap;
+      case "domainr": return a.errorCatDomainr;
+      case "whois": return a.errorCatWhois;
+      case "quota": return a.errorCatQuota;
+      case "network": return a.errorCatNetwork;
+      case "parse": return a.errorCatParse;
+      default: return c || "—";
+    }
+  };
+
+  return (
+    <details
+      open={open}
+      onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+      className="rounded-md border border-rose-200 dark:border-rose-900/50 bg-rose-50/50 dark:bg-rose-950/20"
+    >
+      <summary className="cursor-pointer px-3 py-2 text-sm font-medium flex flex-wrap items-center gap-2">
+        <span>Availability check failures</span>
+        <span className="text-xs text-neutral-600 dark:text-neutral-400">
+          ({rows.length})
+        </span>
+        <div className="flex flex-wrap gap-1 ml-2">
+          {Object.entries(byCat).map(([c, n]) => (
+            <button
+              type="button"
+              key={c}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setFilter(filter === c ? "" : c);
+              }}
+              className={
+                "text-[11px] px-1.5 py-0.5 rounded font-mono uppercase " +
+                (filter === c
+                  ? "bg-rose-600 text-white"
+                  : "bg-rose-100 text-rose-900 dark:bg-rose-900/40 dark:text-rose-200 hover:bg-rose-200 dark:hover:bg-rose-900/60")
+              }
+              title={`Filter by ${catLabel(c)}`}
+            >
+              {catLabel(c)} {n}
+            </button>
+          ))}
+        </div>
+      </summary>
+      <div className="px-3 pb-3 overflow-x-auto">
+        <table className="text-xs border-collapse w-full">
+          <thead>
+            <tr className="text-left text-xs uppercase text-neutral-500 dark:text-neutral-400">
+              <th className="pr-4 pb-1">when</th>
+              <th className="pr-4 pb-1">domain</th>
+              <th className="pr-4 pb-1">provider</th>
+              <th className="pr-4 pb-1">category</th>
+              <th className="pr-4 pb-1">message</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.slice(0, 50).map((r) => (
+              <tr key={r.id} className="border-t border-rose-200/50 dark:border-rose-900/30">
+                <td className="pr-4 py-0.5 whitespace-nowrap">
+                  {new Date(r.checked_at).toLocaleString()}
+                </td>
+                <td className="pr-4 py-0.5 font-mono">{r.domain}</td>
+                <td className="pr-4 py-0.5 uppercase">{r.provider}</td>
+                <td className="pr-4 py-0.5">{catLabel(r.error_category)}</td>
+                <td className="pr-4 py-0.5">{r.error_message}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </details>
   );
 }

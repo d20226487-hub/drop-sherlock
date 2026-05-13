@@ -7,6 +7,7 @@ from .db import Base, SessionLocal, engine
 from .error_capture import DbExceptionMiddleware, install_db_log_handler
 from .routers import (
     analyze,
+    availability as availability_router,
     backlog as backlog_router,
     backups as backups_router,
     dashboard,
@@ -79,6 +80,9 @@ def _migrate_sqlite_columns() -> None:
         # invariant pattern: at most one Run per job is pinned; enforced
         # at the endpoint.
         ("runs", "is_pinned", "BOOLEAN DEFAULT 0"),
+        # Skip-reason for the availability cascade's skip-registered
+        # policy (added 2026-05-12). Empty = was not skipped.
+        ("run_domains", "skip_reason", "VARCHAR(256) DEFAULT ''"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding
@@ -97,6 +101,16 @@ def _migrate_sqlite_columns() -> None:
         # so the Notes lookup is index-served instead of full-scanning
         # domain_notes. See notes_by_domain in routers/database.py.
         ("ix_domain_notes_domain", "domain_notes", "domain"),
+        # Added 2026-05-12: drives the per-(job, criterion) lookup in the
+        # rewritten Database/Job rollup paths.
+        ("ix_job_criterion_pins_job_id", "job_criterion_pins", "job_id"),
+        ("ix_job_criterion_pins_run_id", "job_criterion_pins", "run_id"),
+        # Added 2026-05-12: drives the per-domain cascade cache lookup
+        # ("any recent check for this domain?") plus the per-run check
+        # log and the monthly usage stats.
+        ("ix_availability_checks_domain", "availability_checks", "domain"),
+        ("ix_availability_checks_checked_at", "availability_checks", "checked_at"),
+        ("ix_availability_checks_run_id", "availability_checks", "run_id"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in additions:
@@ -323,6 +337,103 @@ def _encrypt_legacy_secret_settings() -> None:
         db.close()
 
 
+def _migrate_legacy_pins_to_criterion_pins() -> None:
+    """One-shot: expand legacy Run.is_pinned + RunDomain.is_pinned rows into
+    the per-(job, criterion) `job_criterion_pins` table introduced
+    2026-05-12. Idempotent — only emits new rows when no pin exists for
+    (job, criterion).
+
+    Expansion rules:
+      1. For every Run with is_pinned=True: walk its CriterionResults
+         across all RunDomains; for each criterion the run produced data
+         for (cr.data_json non-empty OR cr.status == 'done'), insert
+         (job_id=run.job_id, criterion=cr.criterion, run_id=run.id) if
+         no pin exists yet.
+      2. For every RunDomain with is_pinned=True: same as above but the
+         per-criterion data is taken from that rd's CRs only — represents
+         a curator's intent that those criteria's verdicts come from
+         that run on the Database page.
+
+    Conflict resolution: Run.is_pinned expansion runs first; RunDomain
+    expansion only fills gaps. This favors the broader "this whole run is
+    canonical" intent over the per-domain pin when both were set on
+    different runs in the same job.
+    """
+    import logging
+
+    from sqlalchemy import select
+
+    from .models import CriterionResult, JobCriterionPin, Run, RunDomain
+    log = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        # Snapshot existing pins so we don't double-insert across reboots.
+        existing_pairs: set[tuple[int, str]] = {
+            (p.job_id, p.criterion)
+            for p in db.execute(select(JobCriterionPin)).scalars().all()
+        }
+        inserted = 0
+
+        def _criteria_with_data(run_id: int) -> set[str]:
+            """Set of criterion names this run has at least one populated
+            CriterionResult for. Status=='done' or non-empty data_json
+            both count (covers Wayback which sometimes has empty
+            data_json but a done verdict)."""
+            rows = (
+                db.query(CriterionResult.criterion)
+                .join(RunDomain, RunDomain.id == CriterionResult.run_domain_id)
+                .filter(RunDomain.run_id == run_id)
+                .filter(
+                    (CriterionResult.status == "done")
+                    | (CriterionResult.data_json != "")
+                )
+                .distinct()
+                .all()
+            )
+            return {r[0] for r in rows}
+
+        # Phase 1 — Run.is_pinned expansion
+        pinned_runs = db.query(Run).filter(Run.is_pinned == True).all()  # noqa: E712
+        for run in pinned_runs:
+            crits = _criteria_with_data(run.id)
+            for c in crits:
+                key = (run.job_id, c)
+                if key in existing_pairs:
+                    continue
+                db.add(JobCriterionPin(
+                    job_id=run.job_id, criterion=c, run_id=run.id,
+                ))
+                existing_pairs.add(key)
+                inserted += 1
+
+        # Phase 2 — RunDomain.is_pinned gap-fill (only criteria not yet
+        # covered by a Run-level pin for the same job).
+        pinned_rds = db.query(RunDomain).filter(RunDomain.is_pinned == True).all()  # noqa: E712
+        for rd in pinned_rds:
+            run = db.get(Run, rd.run_id)
+            if run is None:
+                continue
+            for cr in rd.results:
+                if not (cr.status == "done" or cr.data_json):
+                    continue
+                key = (run.job_id, cr.criterion)
+                if key in existing_pairs:
+                    continue
+                db.add(JobCriterionPin(
+                    job_id=run.job_id, criterion=cr.criterion, run_id=run.id,
+                ))
+                existing_pairs.add(key)
+                inserted += 1
+
+        if inserted:
+            db.commit()
+            log.info(
+                "expanded %s legacy pin(s) into job_criterion_pins", inserted,
+            )
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
@@ -332,6 +443,7 @@ async def lifespan(_: FastAPI):
     _migrate_wayback_concurrency_default()
     _reconcile_stale_failed_statuses()
     _encrypt_legacy_secret_settings()
+    _migrate_legacy_pins_to_criterion_pins()
     # Phase 2 — start capturing every error from any logger into error_log.
     # Idempotent so reload-on-edit dev scenarios don't double-attach.
     install_db_log_handler()
@@ -436,8 +548,15 @@ app.include_router(settings_router.router)
 app.include_router(errors_router.router)
 app.include_router(backlog_router.router)
 app.include_router(backups_router.router)
+app.include_router(availability_router.router)
 
 
 @app.get("/health")
-def health():
+async def health():
+    """Async on purpose: a `def` handler would be dispatched to Starlette's
+    thread pool, and a saturated thread pool (lots of slow sync GETs while
+    a big run is in flight) starves the healthcheck. With `async def` the
+    handler runs directly on the event loop and stays fast even under
+    threadpool pressure. The healthcheck only matters when Docker's
+    health probe can't reach a thread."""
     return {"ok": True}

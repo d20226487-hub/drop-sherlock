@@ -89,6 +89,9 @@ export function AiPreviewPanel({
                   {ts.fieldsHelp}
                 </p>
               </div>
+              {data.classify_context && (
+                <ClassifyContextTable context={data.classify_context} />
+              )}
               <div>
                 <button
                   type="button"
@@ -307,6 +310,52 @@ function ChainedCategoryPreview({
           )
         )}
       </div>
+    </div>
+  );
+}
+
+// "Site context" verifier (added 2026-05-13). Renders the actual
+// key/value pairs from `classify_context` — the structured dict that
+// gets serialised into the user message's "Site context (Wayback
+// classify, JSON)" block. The chips above only show field NAMES; this
+// table answers "but what VALUES are actually being sent?" without
+// making the user crack open the JSON view at the bottom of the panel.
+function ClassifyContextTable({
+  context,
+}: {
+  context: Record<string, unknown>;
+}) {
+  const entries = Object.entries(context);
+  if (entries.length === 0) return null;
+  return (
+    <div>
+      <div className="font-medium text-neutral-700 dark:text-neutral-300 mb-1">
+        Site context (from Wayback classify) — actual values sent
+      </div>
+      <div className="rounded border dark:border-neutral-800 overflow-hidden">
+        <table className="w-full text-[11px]">
+          <tbody>
+            {entries.map(([k, v]) => (
+              <tr
+                key={k}
+                className="border-t first:border-t-0 dark:border-neutral-800 hover:bg-neutral-50 dark:hover:bg-neutral-900/60"
+              >
+                <td className="px-2 py-1 align-top whitespace-nowrap font-mono text-neutral-600 dark:text-neutral-400 bg-neutral-50/60 dark:bg-neutral-900/40 w-1/3">
+                  {k}
+                </td>
+                <td className="px-2 py-1 align-top font-mono">
+                  {renderValue(v)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="mt-1 text-neutral-500 dark:text-neutral-400">
+        These values are appended to the user message exactly as shown
+        (JSON-encoded). Toggle "Show message" → "JSON" tab below to see
+        them in the final wire payload.
+      </p>
     </div>
   );
 }

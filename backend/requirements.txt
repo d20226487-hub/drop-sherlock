@@ -26,3 +26,8 @@ boto3==1.35.86
 # in FERNET_KEYS — decrypts continue working until the old data has been
 # re-encrypted, then the old key can be dropped from the list.
 cryptography==44.0.0
+# DNS resolution for the availability cascade's DNS pre-check (added
+# 2026-05-12). Stdlib `socket.gethostbyname` only tells us A-record
+# resolution; we need NS records + NXDOMAIN distinction, which need
+# dnspython. ~1 MB.
+dnspython==2.7.0

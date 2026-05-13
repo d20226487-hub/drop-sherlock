@@ -286,6 +286,13 @@ class AnalyzeSpec(BaseModel):
     # `ai_prompts.localize_prompt`); "en" leaves prompts untouched.
     # Unknown values are treated as "en" by the localizer.
     lang: Literal["en", "ru"] = "en"
+    # Availability cascade toggle (added 2026-05-12). When True, the
+    # runner calls the cascade before fetching Ahrefs/Wayback and
+    # applies the Settings → Domain availability skip policy. When
+    # False (default), the cascade is not invoked — analysis runs
+    # exactly as before. Per-domain results land in the
+    # availability_checks history table either way.
+    check_availability: bool = False
 
 
 # --- Preview response --------------------------------------------------------

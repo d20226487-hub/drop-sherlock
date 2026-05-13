@@ -3,17 +3,22 @@
 The Jobs/Runs tree is "how I batched the work"; the Database is "what do I
 know about each domain."
 
-Pin model (LOCKED 2026-05-08): every Database row's data comes from a
-manually-pinned RunDomain (`RunDomain.is_pinned=True`). At most one rd per
-`domain` is pinned at any time. When no rd is pinned for a domain, the
-row still appears (so the user can pin one) but every cell — Ahrefs
-verdicts, Wayback, AI provenance, final assessment — renders empty. There
-is NO automatic fallback to the latest run; the previous "latest-per-
-criterion" stitching has been removed at the user's request to make the
-Database surface fully curatorial.
+Pin model v2 (LOCKED 2026-05-12): each (job, criterion) can have at most
+one pinned Run. For each domain on the Database page, every criterion is
+sourced INDEPENDENTLY from whichever pinned Run provides it: walk the
+pins across all jobs that contain the domain, pick the most recent one
+per criterion (by Run.finished_at desc). A row therefore can carry data
+stitched from multiple runs — supports iterative workflows ("Wayback
+first; if good, Ahrefs"). There is NO fallback to non-pinned runs — an
+unpinned criterion renders empty.
 
-Notes remain domain-keyed (cross-run, decision #17) and are unaffected by
-the pin.
+When criteria come from multiple runs, FinalBanner becomes "partial"
+even if individual run rds had complete-final verdicts: we re-derive a
+synthetic final from the per-criterion AI verdicts and mark
+`final_partial=True` with `pinned_criteria=[…]` so the UI can show
+"Partial — based on W, B".
+
+Notes remain domain-keyed (cross-run) and are unaffected by the pin.
 """
 from __future__ import annotations
 
@@ -27,7 +32,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import CriterionResult, DomainNote, Job, Run, RunDomain
+from ..models import (
+    CriterionResult,
+    DomainNote,
+    Job,
+    JobCriterionPin,
+    Run,
+    RunDomain,
+)
 from ..schemas import AnalyzeSpec
 
 router = APIRouter(prefix="/database", tags=["database"])
@@ -41,6 +53,16 @@ class CriterionSummary(BaseModel):
     cached_from_run_id: int | None
     ai_cached_from_run_id: int | None
     sort_fields: list[str] = Field(default_factory=list)
+    # Per-criterion source attribution (added 2026-05-12). Populated when
+    # this criterion is sourced from a (job, criterion) pin — points at
+    # the pinned Run + its job, so the Database UI can render tooltips
+    # like "B from Run #3 in Job 'Q4 drops'". All null when criterion is
+    # not pinned (the column renders empty).
+    source_run_id: int | None = None
+    source_run_name: str = ""
+    source_job_id: int | None = None
+    source_job_name: str = ""
+    source_run_domain_id: int | None = None
 
 
 class PinOption(BaseModel):
@@ -78,6 +100,11 @@ class DomainRow(BaseModel):
     final_confidence: float | None = None
     final_bucket: str = ""
     final_partial: bool = False
+    # Sorted list of criterion names that have a pin contributing to this
+    # row (added 2026-05-12). Empty when no criterion is pinned for this
+    # domain. The UI uses it to render "Partial — based on W, B" alongside
+    # the FinalBanner whenever len(pinned_criteria) < enabled criteria.
+    pinned_criteria: list[str] = Field(default_factory=list)
     ai_provider: str = ""
     ai_model: str = ""
     spec_ai_provider: str = ""
@@ -263,23 +290,80 @@ def list_domains(
     default and the legacy behavior) the full list is returned."""
     all_rds: list[RunDomain] = db.query(RunDomain).all()
     rds_by_domain: dict[str, list[RunDomain]] = defaultdict(list)
+    rds_by_run_and_domain: dict[tuple[int, str], RunDomain] = {}
     for rd in all_rds:
         rds_by_domain[rd.domain].append(rd)
+        rds_by_run_and_domain[(rd.run_id, rd.domain)] = rd
 
     all_run_ids = {rd.run_id for rd in all_rds}
     runs = {r.id: r for r in db.query(Run).filter(Run.id.in_(all_run_ids)).all()} if all_run_ids else {}
     job_ids = {r.job_id for r in runs.values()}
     jobs = {j.id: j for j in db.query(Job).filter(Job.id.in_(job_ids)).all()} if job_ids else {}
 
-    # Eager-load CriterionResults for the pinned rds only — no need to walk
-    # the rest. We figure out which rds are pinned first, then load their
-    # CRs in a single query.
-    pinned_rd_ids = {rd.id for rd in all_rds if rd.is_pinned}
+    # Per-(job, criterion) pins. Build a lookup that the per-domain loop
+    # uses to resolve "which rd supplies criterion C for domain D?":
+    #   pins_by_job[job_id][criterion] = run_id
+    pin_rows: list[JobCriterionPin] = db.query(JobCriterionPin).all()
+    pins_by_job: dict[int, dict[str, int]] = defaultdict(dict)
+    for p in pin_rows:
+        pins_by_job[p.job_id][p.criterion] = p.run_id
+
+    # Set of (run_id, criterion) we actually need CriterionResults for —
+    # only the criteria that have a pin AND a matching rd exist for the
+    # domain in question. Compute once here so we can issue a single
+    # IN-list query for CRs rather than per-domain.
+    rd_ids_needed: set[int] = set()
+    # Pre-resolve per-(domain, criterion) → (rd, run, job) so the main
+    # loop doesn't re-walk pins_by_job.
+    sources_by_domain: dict[str, dict[str, tuple[RunDomain, Run, Job]]] = {}
+    for domain, domain_rds in rds_by_domain.items():
+        # Which jobs contain this domain (via their runs)?
+        jobs_for_domain: set[int] = set()
+        for d in domain_rds:
+            r = runs.get(d.run_id)
+            if r is None:
+                continue
+            jobs_for_domain.add(r.job_id)
+        if not jobs_for_domain:
+            sources_by_domain[domain] = {}
+            continue
+        per_crit: dict[str, tuple[RunDomain, Run, Job]] = {}
+        for crit in CRITERIA:
+            # Candidate (run_id, finished_at) per job-with-pin-for-this-crit
+            # — pick the most recent.
+            best: tuple[datetime, RunDomain, Run, Job] | None = None
+            for jid in jobs_for_domain:
+                run_id = pins_by_job.get(jid, {}).get(crit)
+                if run_id is None:
+                    continue
+                rd = rds_by_run_and_domain.get((run_id, domain))
+                if rd is None:
+                    # Pin points at a run that doesn't have this domain
+                    # (legitimate when the domain set differs between
+                    # runs in the same job). Skip — criterion stays empty
+                    # for this domain even though the job has a pin.
+                    continue
+                run = runs.get(run_id)
+                if run is None:
+                    continue
+                job = jobs.get(run.job_id)
+                if job is None:
+                    continue
+                stamp = run.finished_at or datetime.min
+                if best is None or stamp > best[0]:
+                    best = (stamp, rd, run, job)
+            if best is not None:
+                per_crit[crit] = (best[1], best[2], best[3])
+                rd_ids_needed.add(best[1].id)
+        sources_by_domain[domain] = per_crit
+
+    # Single IN-list for every CriterionResult we'll surface — covers
+    # exactly the rds resolved above.
     cr_rows: list[CriterionResult] = (
         db.query(CriterionResult)
-        .filter(CriterionResult.run_domain_id.in_(pinned_rd_ids))
+        .filter(CriterionResult.run_domain_id.in_(rd_ids_needed))
         .all()
-    ) if pinned_rd_ids else []
+    ) if rd_ids_needed else []
     crs_by_rd: dict[int, dict[str, CriterionResult]] = defaultdict(dict)
     for cr in cr_rows:
         crs_by_rd[cr.run_domain_id][cr.criterion] = cr
@@ -351,12 +435,13 @@ def list_domains(
                 finished_at=d.finished_at,
             ))
 
-        pinned_rd = next((d for d in domain_rds if d.is_pinned), None)
+        per_crit_sources = sources_by_domain.get(domain, {})
         note_row = notes_by_domain.get(domain)
-
         backlog_row = backlog_by_domain.get(domain)
-        if pinned_rd is None:
-            # Empty row — user has yet to pin. Still emit so it's pickable.
+
+        if not per_crit_sources:
+            # No criterion has a pin contributing to this domain. Emit an
+            # empty row so the user can still pin one.
             rows.append(DomainRow(
                 domain=domain,
                 is_pinned=False,
@@ -377,69 +462,153 @@ def list_domains(
             ))
             continue
 
-        run = runs.get(pinned_rd.run_id)
-        if run is None:
-            # Defensive — shouldn't happen, but skip rather than crash.
-            continue
-        job = jobs.get(run.job_id)
-        if job is None:
-            continue
-        spec = _spec_for_run(run.spec_json)
+        # Pick a "primary" source for the row-level pinned_* identity
+        # fields (click-through, finished_at sort, ai provenance fallback)
+        # — the most-recent contributing run wins. With per-criterion
+        # pinning the row no longer has a single canonical rd, but the
+        # frontend still wants ONE link target for the domain row chrome.
+        primary_rd, primary_run, primary_job = max(
+            per_crit_sources.values(),
+            key=lambda triple: triple[1].finished_at or datetime.min,
+        )
+
+        # Pre-load spec for every contributing run so we know which
+        # criteria each run had ENABLED — drives the per-criterion
+        # "enabled" flag on the response.
+        contributing_run_ids = {r.id for (_, r, _) in per_crit_sources.values()}
+        specs_by_run: dict[int, AnalyzeSpec | None] = {}
+        for rid in contributing_run_ids:
+            r = runs.get(rid)
+            specs_by_run[rid] = _spec_for_run(r.spec_json) if r else None
 
         spec_ai_provider = ""
         spec_ai_model = ""
-        enabled_map: dict[str, bool] = {c: False for c in CRITERIA}
-        sort_map: dict[str, list[str]] = {c: [] for c in CRITERIA}
-        if spec is not None:
-            if spec.ai is not None:
-                spec_ai_provider = spec.ai.provider or ""
-                spec_ai_model = spec.ai.model or ""
-            for c in CRITERIA:
-                cfg = getattr(spec.criteria, c, None)
-                if cfg is None:
-                    continue
-                enabled_map[c] = bool(cfg.enabled)
-                sort_rules = getattr(cfg, "sort", []) or []
-                sort_map[c] = [r.field for r in sort_rules]
-
-        crs_for_rd = crs_by_rd.get(pinned_rd.id, {})
+        primary_spec = specs_by_run.get(primary_run.id)
+        if primary_spec is not None and primary_spec.ai is not None:
+            spec_ai_provider = primary_spec.ai.provider or ""
+            spec_ai_model = primary_spec.ai.model or ""
 
         criteria_summary: dict[str, CriterionSummary] = {}
         any_cached = False
+        # Collect per-criterion AI verdicts for synthetic-final derivation
+        # below.
+        per_crit_ai_verdicts: dict[str, dict] = {}
         for c in CRITERIA:
-            cr = crs_for_rd.get(c)
+            src = per_crit_sources.get(c)
+            if src is None:
+                criteria_summary[c] = CriterionSummary(
+                    enabled=False, rows=0, cached_from_run_id=None,
+                    ai_cached_from_run_id=None, sort_fields=[],
+                )
+                continue
+            src_rd, src_run, src_job = src
+            src_spec = specs_by_run.get(src_run.id)
+            enabled = False
+            sort_fields: list[str] = []
+            if src_spec is not None:
+                cfg = getattr(src_spec.criteria, c, None)
+                if cfg is not None:
+                    enabled = bool(cfg.enabled)
+                    sort_rules = getattr(cfg, "sort", []) or []
+                    sort_fields = [r.field for r in sort_rules]
+            cr = crs_by_rd.get(src_rd.id, {}).get(c)
             criteria_summary[c] = CriterionSummary(
-                enabled=enabled_map[c],
+                enabled=enabled,
                 rows=_row_count(cr.data_json) if cr else 0,
                 cached_from_run_id=cr.cached_from_run_id if cr else None,
                 ai_cached_from_run_id=(
                     cr.ai_cached_from_run_id if cr else None
                 ),
-                sort_fields=sort_map[c],
+                sort_fields=sort_fields,
+                source_run_id=src_run.id,
+                source_run_name=src_run.name or "",
+                source_job_id=src_job.id,
+                source_job_name=src_job.name,
+                source_run_domain_id=src_rd.id,
             )
             if cr and cr.cached_from_run_id is not None:
                 any_cached = True
+            if cr and cr.ai_verdict_json:
+                try:
+                    v = json.loads(cr.ai_verdict_json)
+                    if isinstance(v, dict):
+                        per_crit_ai_verdicts[c] = v
+                except json.JSONDecodeError:
+                    pass
 
-        # Final assessment from the pinned rd's row (no fallback to other runs).
+        pinned_criteria_list = sorted(per_crit_sources.keys())
+
+        # Final-assessment synthesis.
+        #
+        # `partial` fires when a criterion with weight > 0 in the
+        # scoring config is missing from the pinned set — i.e., the
+        # user hasn't supplied data for something that would actually
+        # affect the score. Multi-source-vs-single-source no longer
+        # implies partial: stitching Wayback (default weight 0) from
+        # Run A and Ahrefs from Run B is a complete picture under
+        # default weights, and the score should display normally.
+        #
+        # Score source priority:
+        #   A. Single contributing rd whose own final_assessment_json
+        #      is non-partial — use it as-is (matches what the AI
+        #      synthesized end-of-run).
+        #   B. Otherwise — re-derive via scoring.compute_final() from
+        #      the per-criterion AI verdicts, weighted by the user's
+        #      scoring config. Same math the AI synth step uses.
+        weights = sc.get("weights") or {}
+        weighted_crits = {c for c, w in weights.items() if w > 0}
+        pinned_set = set(pinned_criteria_list)
+        partial = bool(weighted_crits - pinned_set)
+
+        contributing_rd_ids = {src[0].id for src in per_crit_sources.values()}
+        single_source_full = (
+            len(contributing_rd_ids) == 1
+            and primary_rd.final_assessment_json
+        )
         parsed: dict | None = None
-        if pinned_rd.final_assessment_json:
+        if single_source_full:
             try:
-                parsed = json.loads(pinned_rd.final_assessment_json)
+                parsed = json.loads(primary_rd.final_assessment_json)
             except json.JSONDecodeError:
                 parsed = None
-        final_summary_text = (pinned_rd.final_summary or "").strip()
-        partial = bool(isinstance(parsed, dict) and parsed.get("partial"))
-        if partial:
-            score = None
-            confidence = None
-            bucket = ""
-        else:
+        final_summary_text = (
+            (primary_rd.final_summary or "").strip()
+            if single_source_full else ""
+        )
+        underlying_partial = bool(
+            isinstance(parsed, dict) and parsed.get("partial")
+        )
+        if single_source_full and not underlying_partial:
+            # Case A — rd's recorded final is authoritative.
             score = _parse_final_score(parsed)
             confidence = _parse_final_confidence(parsed)
             bucket = _bucket_for(
                 parsed, final_summary_text,
                 good_threshold=good_t, mixed_threshold=mixed_t,
             )
+        else:
+            # Case B — synthesize from per-criterion AI verdicts.
+            from ..scoring import compute_final
+            synth_score, synth_conf = compute_final(
+                per_crit_ai_verdicts,
+                weights=weights or None,
+            )
+            score = synth_score
+            confidence = synth_conf
+            if score is None:
+                bucket = ""
+            elif score >= good_t:
+                bucket = "good"
+            elif score >= mixed_t:
+                bucket = "mixed"
+            else:
+                bucket = "low_quality"
+        # If the underlying rd flagged partial (AI noted some enabled
+        # criterion failed at synth time), respect that even if the
+        # weighted-set rule says complete — a failed criterion is still
+        # a real signal worth surfacing.
+        if underlying_partial:
+            partial = True
 
         verdict_provider = (
             isinstance(parsed, dict) and (parsed.get("provider") or "") or ""
@@ -457,11 +626,32 @@ def list_domains(
         if bucket:
             verdicts.add(bucket)
 
-        # Wayback per-criterion verdict for the pinned rd only.
+        # Wayback per-criterion verdict — sourced from whichever rd
+        # supplies the `wayback` criterion (may differ from primary_rd).
         wayback_assessment = ""
         wayback_confidence: float | None = None
         wayback_samples_count = 0
-        wayback_cr = crs_for_rd.get("wayback")
+        wayback_src = per_crit_sources.get("wayback")
+        wayback_cr = (
+            crs_by_rd.get(wayback_src[0].id, {}).get("wayback")
+            if wayback_src else None
+        )
+        # Backwards-compat alias for the unchanged Wayback parsing block
+        # below. crs_for_rd is used by both wayback and wayback_classify
+        # extraction in the legacy code path; the new sourcing above has
+        # already supplied wayback_cr, but the classify block below
+        # re-reads under the old name. We bridge by point-fetching the
+        # classify CR similarly.
+        crs_for_rd = {}
+        if wayback_cr is not None:
+            crs_for_rd["wayback"] = wayback_cr
+        classify_src = per_crit_sources.get("wayback_classify")
+        if classify_src is not None:
+            classify_cr_candidate = (
+                crs_by_rd.get(classify_src[0].id, {}).get("wayback_classify")
+            )
+            if classify_cr_candidate is not None:
+                crs_for_rd["wayback_classify"] = classify_cr_candidate
         if wayback_cr is not None and wayback_cr.ai_verdict_json:
             try:
                 w_parsed = json.loads(wayback_cr.ai_verdict_json)
@@ -549,18 +739,19 @@ def list_domains(
         rows.append(DomainRow(
             domain=domain,
             is_pinned=True,
-            pinned_run_domain_id=pinned_rd.id,
-            pinned_run_id=run.id,
-            pinned_job_id=job.id,
-            pinned_job_name=job.name,
-            pinned_run_name=run.name or "",
-            pinned_finished_at=pinned_rd.finished_at,
-            pinned_started_at=pinned_rd.started_at,
+            pinned_run_domain_id=primary_rd.id,
+            pinned_run_id=primary_run.id,
+            pinned_job_id=primary_job.id,
+            pinned_job_name=primary_job.name,
+            pinned_run_name=primary_run.name or "",
+            pinned_finished_at=primary_rd.finished_at,
+            pinned_started_at=primary_rd.started_at,
             final_summary=final_summary_text,
             final_score=score,
             final_confidence=confidence,
             final_bucket=bucket,
             final_partial=partial,
+            pinned_criteria=pinned_criteria_list,
             ai_provider=ai_provider,
             ai_model=ai_model,
             spec_ai_provider=spec_ai_provider,
@@ -636,9 +827,13 @@ def pin_domain(
     domain: str, payload: PinIn, db: Session = Depends(get_db)
 ) -> PinOut:
     """Pin a specific RunDomain as the definitive source for `domain` on
-    the Database page. Idempotent — already-pinned rd is a no-op. Clears
-    any other pin for the same domain in the same transaction so the
-    "at most one pinned per domain" invariant holds without a DB constraint."""
+    the Database page. Idempotent — already-pinned rd is a no-op.
+
+    Behavior post-2026-05-12: also expands into per-(job, criterion)
+    pins for every criterion this rd has CR data for, so the new
+    Database aggregation pipeline picks it up. The Database page UI's
+    "pin this rd" dropdown remains functional via this endpoint."""
+    from datetime import datetime as _dt
     domain = domain.strip()
     if not domain:
         raise HTTPException(400, "domain required")
@@ -651,7 +846,7 @@ def pin_domain(
             f"run_domain {payload.run_domain_id} belongs to domain "
             f"'{rd.domain}', not '{domain}'",
         )
-    # Clear any other pins for this domain.
+    # Clear any other pins for this domain (legacy per-domain pin).
     others = (
         db.query(RunDomain)
         .filter(RunDomain.domain == domain)
@@ -662,6 +857,31 @@ def pin_domain(
     for o in others:
         o.is_pinned = False
     rd.is_pinned = True
+    # Per-criterion expansion.
+    run = db.get(Run, rd.run_id)
+    if run is not None:
+        rd_crits = {
+            cr.criterion for cr in rd.results
+            if cr.status == "done" or cr.data_json
+        }
+        if rd_crits:
+            existing = (
+                db.query(JobCriterionPin)
+                .filter(JobCriterionPin.job_id == run.job_id)
+                .filter(JobCriterionPin.criterion.in_(rd_crits))
+                .all()
+            )
+            by_crit = {p.criterion: p for p in existing}
+            now = _dt.utcnow()
+            for c in rd_crits:
+                ex = by_crit.get(c)
+                if ex is None:
+                    db.add(JobCriterionPin(
+                        job_id=run.job_id, criterion=c, run_id=run.id,
+                    ))
+                elif ex.run_id != run.id:
+                    ex.run_id = run.id
+                    ex.updated_at = now
     db.commit()
     return PinOut(domain=domain, pinned_run_domain_id=rd.id)
 

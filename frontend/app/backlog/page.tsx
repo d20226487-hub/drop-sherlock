@@ -71,6 +71,82 @@ export default function BacklogPage() {
   // to ignore it temporarily without actually marking the rows.
   const [hintDismissed, setHintDismissed] = useState(false);
 
+  // Availability cascade column (added 2026-05-12). Map domain →
+  // latest cached check. Hydrated when `data` lands; per-row recheck +
+  // bulk recheck refresh it.
+  const [availabilityByDomain, setAvailabilityByDomain] = useState<
+    Record<
+      string,
+      {
+        status: import("@/lib/api").AvailabilityStatus;
+        provider: string;
+        registrar: string;
+        expires_on: string | null;
+        checked_at: string | null;
+      }
+    >
+  >({});
+  const [availabilityBusy, setAvailabilityBusy] = useState<Set<string>>(
+    new Set(),
+  );
+
+  async function recheckOne(domain: string) {
+    setAvailabilityBusy((prev) => new Set(prev).add(domain));
+    try {
+      const r = await api.checkAvailability(domain, false);
+      setAvailabilityByDomain((prev) => ({
+        ...prev,
+        [domain]: {
+          status: r.status,
+          provider: r.provider,
+          registrar: r.registrar,
+          expires_on: r.expires_on,
+          checked_at: r.checked_at,
+        },
+      }));
+    } catch {
+      // Surfaced on /errors via backend log handler.
+    } finally {
+      setAvailabilityBusy((prev) => {
+        const n = new Set(prev);
+        n.delete(domain);
+        return n;
+      });
+    }
+  }
+
+  async function recheckBulk() {
+    const domains = Array.from(selected)
+      .map((id) => data?.rows.find((r) => r.id === id)?.domain)
+      .filter((d): d is string => !!d);
+    if (domains.length === 0) return;
+    setAvailabilityBusy((prev) => {
+      const next = new Set(prev);
+      for (const d of domains) next.add(d);
+      return next;
+    });
+    try {
+      const r = await api.bulkCheckAvailability(domains, false);
+      setAvailabilityByDomain((prev) => {
+        const next = { ...prev };
+        for (const item of r.items) {
+          next[item.domain] = {
+            status: item.status,
+            provider: item.provider,
+            registrar: item.registrar,
+            expires_on: item.expires_on,
+            checked_at: new Date().toISOString(),
+          };
+        }
+        return next;
+      });
+    } catch {
+      // /errors picks this up.
+    } finally {
+      setAvailabilityBusy(new Set());
+    }
+  }
+
   // Build the export URL from the current filter state. `scope=filtered`
   // includes the filters; `scope=all` ignores them. Browser's native
   // `<a download>` handles the streaming response — no fetch+Blob needed.
@@ -182,6 +258,29 @@ export default function BacklogPage() {
           for (const id of prev) if (visibleIds.has(id)) next.add(id);
           return next;
         });
+        // Hydrate availability column from the cache history (no
+        // fresh cascade calls).
+        const domains = d.rows.map((r) => r.domain);
+        if (domains.length > 0) {
+          api
+            .latestAvailability(domains)
+            .then((rows) => {
+              const map: typeof availabilityByDomain = {};
+              for (const r of rows) {
+                map[r.domain] = {
+                  status: r.status,
+                  provider: r.provider,
+                  registrar: r.registrar,
+                  expires_on: r.expires_on,
+                  checked_at: r.checked_at,
+                };
+              }
+              setAvailabilityByDomain(map);
+            })
+            .catch(() => {
+              // Column stays empty — non-fatal.
+            });
+        }
       })
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false));
@@ -672,6 +771,16 @@ export default function BacklogPage() {
             </button>
             <button
               type="button"
+              onClick={recheckBulk}
+              disabled={bulkBusy || availabilityBusy.size > 0}
+              className="text-xs px-3 py-1 rounded-md bg-neutral-100 text-neutral-800 hover:bg-neutral-200 dark:bg-neutral-800 dark:text-neutral-200 dark:hover:bg-neutral-700 disabled:opacity-50"
+            >
+              {availabilityBusy.size > 0
+                ? t.pages.availability.bulkRecheckRunning
+                : t.pages.availability.bulkRecheck(selected.size)}
+            </button>
+            <button
+              type="button"
               onClick={handleBulkDelete}
               disabled={bulkBusy}
               className="text-xs px-3 py-1 rounded-md bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
@@ -779,6 +888,9 @@ export default function BacklogPage() {
                       {sortIndicator("max_price")}
                     </button>
                   </th>
+                  <th className="px-3 py-2 font-medium">
+                    {ts.cols.availability}
+                  </th>
                   <th className="px-3 py-2 font-medium">{ts.cols.comments}</th>
                 </tr>
               </thead>
@@ -842,6 +954,13 @@ export default function BacklogPage() {
                           }
                         />
                       </td>
+                      <td className="px-3 py-2 align-top text-xs">
+                        <BacklogAvailabilityCell
+                          availability={availabilityByDomain[r.domain]}
+                          busy={availabilityBusy.has(r.domain)}
+                          onRecheck={() => recheckOne(r.domain)}
+                        />
+                      </td>
                       <td className="px-3 py-2 align-top text-xs text-neutral-600 dark:text-neutral-400 max-w-[24rem]">
                         <EditableTextCell
                           value={r.comments}
@@ -885,6 +1004,80 @@ export default function BacklogPage() {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function BacklogAvailabilityCell({
+  availability,
+  busy,
+  onRecheck,
+}: {
+  availability?: {
+    status: import("@/lib/api").AvailabilityStatus;
+    provider: string;
+    registrar: string;
+    expires_on: string | null;
+    checked_at: string | null;
+  };
+  busy: boolean;
+  onRecheck: () => void;
+}) {
+  const { t } = useT();
+  const a = t.pages.availability;
+  const status = availability?.status ?? null;
+  const tone = (() => {
+    switch (status) {
+      case "available":
+        return "bg-emerald-100 text-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-200";
+      case "registered":
+        return "bg-neutral-100 text-neutral-800 dark:bg-neutral-800 dark:text-neutral-200";
+      case "error":
+        return "bg-rose-100 text-rose-900 dark:bg-rose-950/60 dark:text-rose-200";
+      default:
+        return "bg-neutral-100 text-neutral-600 dark:bg-neutral-800/60 dark:text-neutral-400";
+    }
+  })();
+  const label = (() => {
+    if (status === "available") return a.statusAvailable;
+    if (status === "registered") return a.statusRegistered;
+    if (status === "error") return a.statusError;
+    if (status === "unknown") return a.statusUnknown;
+    return null;
+  })();
+  return (
+    <div className="space-y-1">
+      {label ? (
+        <span
+          className={`inline-block px-2 py-0.5 rounded-full ${tone}`}
+          title={[
+            availability?.checked_at
+              ? a.checkedAt(new Date(availability.checked_at).toLocaleString())
+              : null,
+            availability?.provider ? a.sourceProvider(availability.provider) : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        >
+          {label}
+        </span>
+      ) : (
+        <span className="text-neutral-400 dark:text-neutral-500">—</span>
+      )}
+      {status === "registered" && availability && (availability.registrar || availability.expires_on) && (
+        <div className="text-[11px] text-neutral-600 dark:text-neutral-400 space-y-0.5">
+          {availability.registrar && <div>{a.registrar(availability.registrar)}</div>}
+          {availability.expires_on && <div>{a.expiresOn(availability.expires_on)}</div>}
+        </div>
+      )}
+      <button
+        type="button"
+        onClick={onRecheck}
+        disabled={busy}
+        className="text-[11px] px-1.5 py-0.5 rounded border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+      >
+        {busy ? a.rechecking : a.recheck}
+      </button>
     </div>
   );
 }

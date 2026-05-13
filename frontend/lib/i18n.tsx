@@ -263,6 +263,8 @@ const messagesEn = {
           "Reuse data from previous analyses across ALL jobs (cross-job cache)",
         crossCacheHelp:
           "When on, the runner looks across the entire database for any prior CR row whose criterion + filters/sort/limit hash matches what you're submitting now. Hits get copied forward — saves Ahrefs units and AI tokens. Untick to fetch everything fresh, even if you ran the same analysis before in another job.",
+        prefilledFromJob: (name: string, jobId: number) =>
+          `Criteria + AI pre-filled from "${name}" (job #${jobId}) — the job that produced the Wayback verdicts on these rows. Leave these settings as-is to maximize cache hits; any edit may change the params hash and cause fresh fetches.`,
       },
       submit: {
         cancel: "Cancel run",
@@ -454,20 +456,21 @@ const messagesEn = {
         cancel: "Cancel",
         cancelConfirm:
           "Cancel this run? Domains already finished will keep their data; in-flight ones stop.",
-        pinAll: "Pin entire run",
-        pinAllHint:
-          "Make every domain in this run the definitive source on the Database page. Replaces any prior pins for those domains.",
-        pinAllConfirm: (n: number, replaced: number) =>
-          replaced > 0
-            ? `Pin all ${n} domains in this run as definitive? This will replace ${replaced} existing pin${replaced === 1 ? "" : "s"} on those domains in other runs.`
-            : `Pin all ${n} domains in this run as definitive on the Database page?`,
-        pinAllResult: (pinned: number, replaced: number) =>
-          replaced > 0
-            ? `Pinned ${pinned} domain${pinned === 1 ? "" : "s"} (replaced ${replaced} prior pin${replaced === 1 ? "" : "s"}).`
-            : `Pinned ${pinned} domain${pinned === 1 ? "" : "s"}.`,
-        pinAllRunning: "Pinning…",
-        pinAllFailed: "Pin failed",
         pinIndicator: "★ pinned",
+        // Per-criterion pinning (added 2026-05-12)
+        pinPerCriterionHeading: "Per-criterion pins",
+        pinPerCriterionHint:
+          "For each criterion this Job uses, choose which Run supplies its data on the Database page. Lets you stitch an iterative cascade — Wayback from one Run, Ahrefs from another.",
+        pinAllCriteria: "Pin all populated",
+        pinAllCriteriaHint:
+          "Pin every criterion this Run has data for to this Run.",
+        pinAllCriteriaResult: (pinned: number, replaced: number) =>
+          replaced > 0
+            ? `Pinned ${pinned} criterion${pinned === 1 ? "" : "s"} (replaced ${replaced} prior).`
+            : `Pinned ${pinned} criterion${pinned === 1 ? "" : "s"}.`,
+        pinCriterionHere: "★ pinned here",
+        pinCriterionElsewhere: (runId: number) => `pinned to Run #${runId}`,
+        pinCriterionNone: "not pinned",
         retryFailed: (n: number) =>
           n > 0 ? `Retry ${n} failed` : "Retry failed",
         retryFailedHint:
@@ -483,6 +486,39 @@ const messagesEn = {
           `Retry dispatched — ${criteria} criteria across ${domains} domain${domains === 1 ? "" : "s"}. Waiting for workers to start…`,
         retryFailedNone: "No failed criteria to retry.",
         retryFailedFailed: "Retry failed",
+        // Filter + multi-select + bulk-retry (added 2026-05-12).
+        filterStatusLabel: "Status",
+        filterStatusAll: "all",
+        filterStatusPending: "pending",
+        filterStatusRunning: "running",
+        filterStatusDone: "done",
+        filterStatusFailed: "failed",
+        filterStatusCanceled: "canceled",
+        filterWaybackLabel: "Wayback CDX",
+        filterWaybackAny: "any",
+        filterWaybackZero: "0 rows",
+        filterWaybackNonzero: "≥ 1 row",
+        selectAllOnPage: "Select all on this page",
+        selectAllMatching: (n: number) =>
+          `Select all matching the current filter (${n})`,
+        clearSelection: "Clear selection",
+        bulkSelected: (n: number) =>
+          `${n} domain${n === 1 ? "" : "s"} selected`,
+        bulkRetry: (n: number) => `Retry selected (${n})`,
+        bulkRetryRunning: "Retrying…",
+        bulkRetryCriteriaHeading: "Criteria to retry",
+        bulkRetryCriteriaHint:
+          "Only criteria failed on the selected domains will be re-run. Unchecked criteria are left alone even if they failed.",
+        bulkRetryClassifyAutoNote:
+          "wayback_classify reads V2 page samples from the wayback row. Retrying wayback refetches those samples, so wayback_classify will be retried automatically alongside it to keep verdicts consistent — even though you unchecked it.",
+        bulkRetryResampleLabel: "Re-sample V2 only (skip CDX refetch)",
+        bulkRetryResampleHelp:
+          "Use when wayback shows V1 rows but the V2 samples are missing or stale (e.g. classify failed with \"needs V2 samples\"). Reuses the existing CDX rows, re-collects V2, and re-judges both the wayback verdict and wayback_classify. Skips the slow CDX call.",
+        bulkRetryConfirm: "Retry on selected",
+        bulkRetryNothing:
+          "Nothing to retry — none of the selected domains have failed criteria in the picked set.",
+        bulkRetryResult: (domains: number, criteria: number) =>
+          `Retrying ${criteria} criteria across ${domains} domain${domains === 1 ? "" : "s"}.`,
         retryOutcomeAllRecovered: (n: number) =>
           `All ${n} criteria recovered after retry.`,
         retryOutcomePartial: (recovered: number, stillFailed: number) =>
@@ -616,7 +652,7 @@ const messagesEn = {
           viewJson: "JSON",
         },
         finalBanner: {
-          heading: "Final assessment",
+          heading: "Ahrefs final assessment",
           summary: "Summary",
           recommendation: "Recommendation",
           partialHeading: "Partial result",
@@ -630,7 +666,7 @@ const messagesEn = {
           // its status is still pending/running. Replaces the previous
           // silent-render that let stale finals from prior runs slip
           // through during live polling.
-          pending: "Final assessment pending — waiting for all criteria to finish…",
+          pending: "Ahrefs final assessment pending — waiting for all criteria to finish…",
           // Provenance badge — shown when the final on screen was sourced
           // from a prior rd because this rd's own final is missing/partial
           // /unscorable. The id links to the source rd's domain page.
@@ -686,6 +722,7 @@ const messagesEn = {
         provider: "AI",
         note: "Note",
         criteria: "Criteria",
+        availability: "Availability",
         runs: "Runs",
         pin: "Pinned run",
         backlog: "Backlog",
@@ -770,6 +807,12 @@ const messagesEn = {
         minRecords: "Min records",
         minRecordsHelp:
           "Minimum row count in the chosen criterion (latest run).",
+        waybackConfMin: "Wayback conf ≥",
+        waybackConfMinHelp:
+          "Show only rows whose Wayback AI verdict confidence is at least this value (0..1). Rows without a Wayback verdict are hidden when this is > 0.",
+        ahrefsConfMin: "Ahrefs conf ≥",
+        ahrefsConfMinHelp:
+          "Show only rows whose Ahrefs Final Assessment confidence is at least this value (0..1). Rows without a final (or with a partial) are hidden when this is > 0.",
         clear: "Clear filters",
       },
       verdictSpread: (counts: Record<string, number>) => {
@@ -784,6 +827,10 @@ const messagesEn = {
       partialBadge: "partial",
       partialTooltip:
         "Partial result — at least one criterion failed. Score not computed. Open the domain page and Reanalyze to retry.",
+      // 2026-05-12: surfaced when partial-final comes from criteria
+      // stitched across multiple pinned Runs.
+      partialFromCriteria: (crits: string) =>
+        `Partial — based on ${crits}. Pin remaining criteria from their Runs to get a full verdict.`,
       noProvider: "no AI",
       criteriaCell: (parts: string[]) =>
         parts.length === 0 ? "—" : parts.join(", "),
@@ -843,11 +890,13 @@ const messagesEn = {
         pricing: "AI model pricing",
         waybackClassify: "Wayback classification (language + theme + category)",
         prompts: "AI prompts",
+        classifyContext: "Wayback classify → Ahrefs judges (site context)",
       },
       tabs: {
         api: "API",
         brain: "Brain",
         wayback: "Wayback classification",
+        availability: "Domain availability",
         others: "Others",
       },
       othersEmpty: "No settings here yet.",
@@ -1013,6 +1062,29 @@ const messagesEn = {
           `Remove pricing for ${provider} / ${model}? Future calls under this model will record cost = 0 until a row is added back.`,
         errInvalid: "Both rates must be non-negative numbers.",
       },
+      classifyContext: {
+        intro:
+          "When enabled, the Ahrefs judges (Backlinks / Anchors / Organic keywords by default) receive a \"Site context\" block built from this domain's Wayback classify verdict (theme, category, language). Helps the AI flag PBN-style theme mismatches — e.g. backlinks from gambling domains pointing at a pet-care site.",
+        masterToggle: "Pass Wayback classify context to Ahrefs judges",
+        criteriaHeading: "Which judges receive the context",
+        criteriaHelp:
+          "Refdomains is OFF by default — without anchors or surrounding snippets, theme inference on a domain-only row tends to hallucinate.",
+        fieldsHeading: "Which classify fields to include",
+        fieldsHelp:
+          "Field names match the wayback_classify verdict shape. Empty/missing fields are skipped at runtime.",
+        cacheNote:
+          "Changing criteria or fields invalidates the AI verdict cache for affected criteria. The next judging pass will re-call the AI.",
+        criterionNames: {
+          backlinks: "Backlinks",
+          refdomains: "Refdomains",
+          anchors: "Anchors",
+          keywords: "Organic keywords",
+        },
+        save: "Save",
+        saving: "Saving…",
+        resetDefaults: "Reset to defaults",
+        savedAt: (when: string) => `Saved ${when}`,
+      },
       scoring: {
         intro:
           "Tune how per-criterion AI verdicts roll up into the 0–100 final score, where the bucket boundaries fall, and when the pill greys out for low confidence.",
@@ -1051,7 +1123,7 @@ const messagesEn = {
           wayback_classify_theme_only:
             "Wayback classify — theme only (library mode)",
           wayback_category: "Wayback classify — category classification",
-          final: "Final assessment",
+          final: "Ahrefs final assessment",
           localize_ru:
             "Russian output directive (appended to every prompt on RU runs)",
         },
@@ -1173,6 +1245,59 @@ const messagesEn = {
       confirmBulkDismiss: (n: number) =>
         `Dismiss ${n} selected error${n === 1 ? "" : "s"}? Already-dismissed rows will be touched (timestamp updated).`,
     },
+    // Shared availability strings — used by the Analyze box, the
+    // Database/Backlog Availability column, and the Settings tab.
+    availability: {
+      // Status pills
+      statusAvailable: "available",
+      statusRegistered: "registered",
+      statusUnknown: "unknown",
+      statusError: "error",
+      // Column hover
+      checkedAt: (when: string) => `checked ${when}`,
+      expiresOn: (date: string) => `expires ${date}`,
+      registrar: (name: string) => `registrar: ${name}`,
+      sourceProvider: (p: string) => `via ${p}`,
+      // Actions
+      recheck: "Recheck",
+      rechecking: "Checking…",
+      bulkRecheck: (n: number) =>
+        `Recheck availability (${n} domain${n === 1 ? "" : "s"})`,
+      bulkRecheckRunning: "Checking…",
+      // Analyze page box
+      analyzeBoxTitle: "Domain availability",
+      analyzeBoxHint:
+        "Check each domain's registration status before Ahrefs/Wayback. Settings → Domain availability controls providers, rate limits, and the skip-registered policy.",
+      analyzeBoxToggle: "Check availability before analysis",
+      // Settings tab
+      settingsTabTitle: "Domain availability",
+      settingsProvidersHeading: "Providers",
+      settingsCascadeHeading: "Cascade order",
+      settingsCascadeHint:
+        "Providers are tried in this order. Disabled providers are skipped at runtime. RDAP is the authoritative source for .com / .net / .org; Domainr (RapidAPI) is a paid sanity check; WHOIS is a final fallback for TLDs without RDAP.",
+      settingsRateLimitsHeading: "Rate limits",
+      settingsRateLimitsHint:
+        "Hard ceiling: 10 req/sec per provider regardless of value below.",
+      settingsSkipHeading: "Skip-registered policy",
+      settingsSkipHint:
+        "When ON, registered domains whose expiration is beyond the horizon below are skipped during analysis — saves Ahrefs units. Domains about to drop still flow through.",
+      settingsCacheHeading: "Cache TTL (hours)",
+      settingsCacheHint:
+        "Reuse cached availability results within this window. Drop-hunters near close-to-drop dates may want 1h instead of the 24h default.",
+      settingsApiKeyHeading: "Domainr API key (RapidAPI)",
+      settingsApiKeyHint:
+        "Free Basic tier on RapidAPI gives 10,000 lookups/month. Encrypted at rest.",
+      settingsStatsHeading: "Usage this month",
+      settingsRecentHeading: "Recent checks",
+      // Error categories
+      errorCatDns: "DNS",
+      errorCatRdap: "RDAP",
+      errorCatDomainr: "Domainr",
+      errorCatWhois: "WHOIS",
+      errorCatQuota: "Quota",
+      errorCatNetwork: "Network",
+      errorCatParse: "Parse",
+    },
     backlog: {
       title: "Backlog",
       intro:
@@ -1186,6 +1311,7 @@ const messagesEn = {
         status: "Status",
         registrar: "Registrar",
         expirationDate: "Expiration",
+        availability: "Availability",
         comments: "Comments",
         desiredPrice: "Desired $",
         maxPrice: "Max $",
@@ -1583,6 +1709,8 @@ const messagesRu: Messages = {
           "Переиспользовать данные из прошлых анализов по ВСЕМ задачам (кросс-задачный кэш)",
         crossCacheHelp:
           "Когда включено, раннер ищет по всей базе любую прошлую CR-строку, чей хэш критерия + фильтров/сортировки/лимита совпадает с тем, что вы отправляете. Совпадения копируются — экономит юниты Ahrefs и AI-токены. Снимите галочку, чтобы получить всё свежим, даже если вы запускали такой же анализ раньше в другой задаче.",
+        prefilledFromJob: (name, jobId) =>
+          `Критерии + ИИ предзаполнены из «${name}» (задача #${jobId}) — той самой задачи, что породила Wayback-вердикты для этих строк. Оставьте настройки как есть, чтобы кэш сработал по максимуму; любая правка может изменить хэш параметров и привести к свежим запросам.`,
       },
       submit: {
         cancel: "Отменить запуск",
@@ -1769,20 +1897,21 @@ const messagesRu: Messages = {
         cancel: "Отмена",
         cancelConfirm:
           "Отменить этот запуск? Уже завершённые домены сохранят данные; в работе — остановятся.",
-        pinAll: "Зафиксировать весь запуск",
-        pinAllHint:
-          "Сделать каждый домен этого запуска основным источником на странице Базы. Перезапишет любые прежние пины этих доменов.",
-        pinAllConfirm: (n, replaced) =>
-          replaced > 0
-            ? `Зафиксировать все ${n} доменов этого запуска как основные? Это перезапишет ${replaced} существующих пинов на этих доменах в других запусках.`
-            : `Зафиксировать все ${n} доменов этого запуска как основные на странице Базы?`,
-        pinAllResult: (pinned, replaced) =>
-          replaced > 0
-            ? `Зафиксировано доменов: ${pinned} (перезаписано прежних пинов: ${replaced}).`
-            : `Зафиксировано доменов: ${pinned}.`,
-        pinAllRunning: "Фиксация…",
-        pinAllFailed: "Фиксация не удалась",
         pinIndicator: "★ зафиксирован",
+        // Per-criterion pinning (added 2026-05-12)
+        pinPerCriterionHeading: "Пины по критериям",
+        pinPerCriterionHint:
+          "Для каждого критерия в этом задании выберите запуск, который даёт его данные на странице Базы. Позволяет собрать итеративный каскад — Wayback из одного запуска, Ahrefs из другого.",
+        pinAllCriteria: "Зафиксировать все доступные",
+        pinAllCriteriaHint:
+          "Зафиксировать на этот запуск каждый критерий, по которому есть данные.",
+        pinAllCriteriaResult: (pinned: number, replaced: number) =>
+          replaced > 0
+            ? `Зафиксировано критериев: ${pinned} (перезаписано прежних: ${replaced}).`
+            : `Зафиксировано критериев: ${pinned}.`,
+        pinCriterionHere: "★ зафиксирован здесь",
+        pinCriterionElsewhere: (runId: number) => `зафиксирован на Run #${runId}`,
+        pinCriterionNone: "не зафиксирован",
         retryFailed: (n) => (n > 0 ? `Повторить ${n} с ошибкой` : "Повторить с ошибкой"),
         retryFailedHint:
           "Перезапустить каждую неудачную загрузку Ahrefs/Wayback и каждый неудачный AI-вердикт в этом запуске. Перезагружает данные где их нет; пере-судит где данные есть. Отключённые критерии не трогает.",
@@ -1797,6 +1926,37 @@ const messagesRu: Messages = {
           `Повтор отправлен — ${criteria} критериев на ${domains} домене(ах). Ждём, пока воркеры начнут…`,
         retryFailedNone: "Нет неудачных критериев для повтора.",
         retryFailedFailed: "Повтор не удался",
+        filterStatusLabel: "Статус",
+        filterStatusAll: "все",
+        filterStatusPending: "ожидание",
+        filterStatusRunning: "в работе",
+        filterStatusDone: "готово",
+        filterStatusFailed: "с ошибкой",
+        filterStatusCanceled: "отменено",
+        filterWaybackLabel: "Wayback CDX",
+        filterWaybackAny: "любое",
+        filterWaybackZero: "0 строк",
+        filterWaybackNonzero: "≥ 1 строки",
+        selectAllOnPage: "Выбрать все на этой странице",
+        selectAllMatching: (n: number) =>
+          `Выбрать все под фильтром (${n})`,
+        clearSelection: "Очистить выбор",
+        bulkSelected: (n: number) => `Выбрано: ${n}`,
+        bulkRetry: (n: number) => `Повторить выбранные (${n})`,
+        bulkRetryRunning: "Повтор…",
+        bulkRetryCriteriaHeading: "Какие критерии повторить",
+        bulkRetryCriteriaHint:
+          "Будут перезапущены только критерии, которые упали на выбранных доменах. Неотмеченные не трогаем, даже если они тоже упали.",
+        bulkRetryClassifyAutoNote:
+          "wayback_classify читает V2-снимки страниц из строки wayback. Повтор wayback заново собирает эти снимки, поэтому wayback_classify будет перезапущен автоматически рядом с ним — даже если вы сняли с него галочку — чтобы вердикты остались согласованными.",
+        bulkRetryResampleLabel: "Только пересобрать V2 (без перезапроса CDX)",
+        bulkRetryResampleHelp:
+          "Используйте, когда у wayback есть строки V1, но V2-снимки отсутствуют или устарели (например, classify упал с \"нужны V2-снимки\"). Переиспользует существующие CDX-строки, заново собирает V2 и пересудит как вердикт wayback, так и wayback_classify. Пропускает медленный CDX-запрос.",
+        bulkRetryConfirm: "Повторить на выбранных",
+        bulkRetryNothing:
+          "Повторять нечего — ни на одном из выбранных доменов нет упавших критериев из отмеченного набора.",
+        bulkRetryResult: (domains: number, criteria: number) =>
+          `Повтор: ${criteria} критериев на ${domains} домене(ах).`,
         retryOutcomeAllRecovered: (n) =>
           `Все ${n} критериев восстановлены после повтора.`,
         retryOutcomePartial: (recovered, stillFailed) =>
@@ -1955,7 +2115,7 @@ const messagesRu: Messages = {
           viewJson: "JSON",
         },
         finalBanner: {
-          heading: "Итоговая оценка",
+          heading: "Итоговая оценка Ahrefs",
           summary: "Резюме",
           recommendation: "Рекомендация",
           partialHeading: "Частичный результат",
@@ -1965,7 +2125,7 @@ const messagesRu: Messages = {
           partialFailed: "С ошибкой",
           partialHint:
             "Балл и резюме намеренно не показаны, потому что часть критериев упала. Нажмите «Переоценить ИИ», чтобы повторить.",
-          pending: "Итоговая оценка ожидается — ждём завершения всех критериев…",
+          pending: "Итоговая оценка Ahrefs ожидается — ждём завершения всех критериев…",
           fromPriorRun: (runId) => `Показана оценка из запуска №${runId}`,
           fromPriorRunHint:
             "текущий запуск был частичным. Запустите «Переоценить ИИ», чтобы получить свежую итоговую оценку.",
@@ -2026,6 +2186,7 @@ const messagesRu: Messages = {
         provider: "ИИ",
         note: "Заметка",
         criteria: "Критерии",
+        availability: "Доступность",
         runs: "Запуски",
         pin: "Закреплённый запуск",
         backlog: "Очередь",
@@ -2109,6 +2270,12 @@ const messagesRu: Messages = {
         minRecords: "Мин. записей",
         minRecordsHelp:
           "Минимальное число строк в выбранном критерии (последний запуск).",
+        waybackConfMin: "Wayback увер. ≥",
+        waybackConfMinHelp:
+          "Показывать только строки, где уверенность AI-вердикта Wayback не меньше этого значения (0..1). Строки без Wayback-вердикта скрываются, когда значение > 0.",
+        ahrefsConfMin: "Ahrefs увер. ≥",
+        ahrefsConfMinHelp:
+          "Показывать только строки, где уверенность Итоговой оценки Ahrefs не меньше этого значения (0..1). Строки без итоговой оценки (или с частичной) скрываются, когда значение > 0.",
         clear: "Очистить фильтры",
       },
       verdictSpread: (counts) => {
@@ -2132,6 +2299,8 @@ const messagesRu: Messages = {
       partialBadge: "частично",
       partialTooltip:
         "Частичный результат — хотя бы один критерий упал. Балл не вычислен. Откройте страницу домена и нажмите «Переоценить», чтобы повторить.",
+      partialFromCriteria: (crits: string) =>
+        `Частично — на основе ${crits}. Зафиксируйте остальные критерии из их запусков, чтобы получить полный вердикт.`,
       noProvider: "без ИИ",
       criteriaCell: (parts) => (parts.length === 0 ? "—" : parts.join(", ")),
       criterionRowCount: (key, rows) => `${key} (${rows})`,
@@ -2220,11 +2389,13 @@ const messagesRu: Messages = {
         pricing: "Цены AI-моделей",
         waybackClassify: "Классификация Wayback (язык + тематика + категория)",
         prompts: "Промпты ИИ",
+        classifyContext: "Wayback classify → судьи Ahrefs (контекст сайта)",
       },
       tabs: {
         api: "API",
         brain: "Мозг",
         wayback: "Классификация Wayback",
+        availability: "Доступность домена",
         others: "Прочее",
       },
       othersEmpty: "Пока здесь нет настроек.",
@@ -2399,6 +2570,29 @@ const messagesRu: Messages = {
           `Удалить цену для ${provider} / ${model}? Будущие вызовы по этой модели будут записывать стоимость = 0, пока строку не вернут.`,
         errInvalid: "Оба тарифа должны быть неотрицательными числами.",
       },
+      classifyContext: {
+        intro:
+          "Когда включено, судьи Ahrefs (Беклинки / Анкоры / Органические ключевые слова по умолчанию) получают блок «Контекст сайта», собранный из вердикта Wayback classify по этому домену (тематика, категория, язык). Помогает AI отмечать PBN-подобные несоответствия тематик — например, беклинки с гэмблинг-доменов на сайт о домашних животных.",
+        masterToggle: "Передавать контекст Wayback classify судьям Ahrefs",
+        criteriaHeading: "Какие судьи получают контекст",
+        criteriaHelp:
+          "Реф. домены отключены по умолчанию — без анкоров и окружающих сниппетов вывод тематики на строке домена часто галлюцинирует.",
+        fieldsHeading: "Какие поля classify включать",
+        fieldsHelp:
+          "Названия полей совпадают с формой вердикта wayback_classify. Пустые/отсутствующие поля пропускаются во время выполнения.",
+        cacheNote:
+          "Изменение критериев или полей сбрасывает кэш AI-вердиктов для затронутых критериев. Следующий проход судейства пересчитает AI.",
+        criterionNames: {
+          backlinks: "Беклинки",
+          refdomains: "Реф. домены",
+          anchors: "Анкоры",
+          keywords: "Органические ключевые слова",
+        },
+        save: "Сохранить",
+        saving: "Сохранение…",
+        resetDefaults: "Сбросить к значениям по умолчанию",
+        savedAt: (when) => `Сохранено: ${when}`,
+      },
       scoring: {
         intro:
           "Настройте, как покритериальные вердикты ИИ сворачиваются в итоговый балл 0–100, где проходят границы корзин и когда пилюля сереет из-за низкой уверенности.",
@@ -2437,7 +2631,7 @@ const messagesRu: Messages = {
           wayback_classify_theme_only:
             "Wayback classify — только тематика (режим библиотеки)",
           wayback_category: "Wayback classify — классификация категории",
-          final: "Итоговая оценка",
+          final: "Итоговая оценка Ahrefs",
           localize_ru:
             "Директива русского вывода (добавляется к каждому промпту в RU-запусках)",
         },
@@ -2586,6 +2780,50 @@ const messagesRu: Messages = {
       confirmBulkDismiss: (n) =>
         `Отклонить ${n} выбранных ошибок? У уже отклонённых обновится метка времени.`,
     },
+    availability: {
+      statusAvailable: "свободен",
+      statusRegistered: "занят",
+      statusUnknown: "неизвестно",
+      statusError: "ошибка",
+      checkedAt: (when: string) => `проверено ${when}`,
+      expiresOn: (date: string) => `истекает ${date}`,
+      registrar: (name: string) => `регистратор: ${name}`,
+      sourceProvider: (p: string) => `источник: ${p}`,
+      recheck: "Проверить",
+      rechecking: "Проверка…",
+      bulkRecheck: (n: number) => `Проверить доступность (${n})`,
+      bulkRecheckRunning: "Проверка…",
+      analyzeBoxTitle: "Доступность домена",
+      analyzeBoxHint:
+        "Проверять регистрационный статус каждого домена перед Ahrefs/Wayback. Настройки → Доступность домена управляют провайдерами, лимитами и политикой «пропускать зарегистрированные».",
+      analyzeBoxToggle: "Проверять доступность перед анализом",
+      settingsTabTitle: "Доступность домена",
+      settingsProvidersHeading: "Провайдеры",
+      settingsCascadeHeading: "Порядок каскада",
+      settingsCascadeHint:
+        "Провайдеры опрашиваются по очереди. Отключённые пропускаются. RDAP — авторитетный источник для .com / .net / .org; Domainr (RapidAPI) — платная подстраховка; WHOIS — последний резерв для TLD без RDAP.",
+      settingsRateLimitsHeading: "Лимиты",
+      settingsRateLimitsHint:
+        "Жёсткий потолок: 10 запросов/сек на провайдера независимо от значения ниже.",
+      settingsSkipHeading: "Политика «пропускать зарегистрированные»",
+      settingsSkipHint:
+        "Когда ВКЛ, зарегистрированные домены с истечением дальше горизонта ниже пропускаются при анализе — экономит юниты Ahrefs. Домены, скоро освобождающиеся, проходят анализ.",
+      settingsCacheHeading: "TTL кэша (часов)",
+      settingsCacheHint:
+        "Использовать кэшированный результат проверки в этом окне. Охотникам за дропами с близкими датами выпадения может понадобиться 1 час вместо 24.",
+      settingsApiKeyHeading: "API-ключ Domainr (RapidAPI)",
+      settingsApiKeyHint:
+        "Бесплатный Basic-тариф на RapidAPI даёт 10 000 запросов/мес. Шифруется в БД.",
+      settingsStatsHeading: "Использование в этом месяце",
+      settingsRecentHeading: "Недавние проверки",
+      errorCatDns: "DNS",
+      errorCatRdap: "RDAP",
+      errorCatDomainr: "Domainr",
+      errorCatWhois: "WHOIS",
+      errorCatQuota: "Квота",
+      errorCatNetwork: "Сеть",
+      errorCatParse: "Разбор",
+    },
     backlog: {
       title: "Очередь",
       intro:
@@ -2599,6 +2837,7 @@ const messagesRu: Messages = {
         status: "Статус",
         registrar: "Регистратор",
         expirationDate: "Истечение",
+        availability: "Доступность",
         comments: "Комментарии",
         desiredPrice: "Желаемая $",
         maxPrice: "Макс $",

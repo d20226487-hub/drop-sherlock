@@ -37,6 +37,25 @@ export type SettingsPayload = {
     language_mode: "ai" | "library";
     categories: WaybackClassifyCategory[];
   };
+  // Classify-context → Ahrefs judges (added 2026-05-13).
+  classify_context?: ClassifyContextEnvelope;
+};
+
+export type ClassifyContextConfig = {
+  enabled: boolean;
+  // Subset of allowed_criteria — the criteria that receive the "Site
+  // context" block in their user message.
+  criteria: string[];
+  // Subset of allowed_fields — the classify verdict fields projected
+  // into the context block.
+  fields: string[];
+};
+
+export type ClassifyContextEnvelope = {
+  config: ClassifyContextConfig;
+  defaults: ClassifyContextConfig;
+  allowed_criteria: string[];
+  allowed_fields: string[];
 };
 
 export type WaybackClassifyCategory = {
@@ -63,6 +82,41 @@ export type ScoringConfig = {
 export type ScoringConfigEnvelope = {
   config: ScoringConfig;
   defaults: ScoringConfig;
+};
+
+// Availability cascade (added 2026-05-12). Values match the backend's
+// `availability.common.STATUS_*` constants.
+export type AvailabilityStatus =
+  | "available"
+  | "registered"
+  | "unknown"
+  | "error";
+
+// Flat key→string config map for the Domain-availability Settings tab.
+// Mirrors `app_settings.AVAILABILITY_DEFAULTS`. The masked api-key
+// pattern follows the rest of the codebase: the GET payload sets
+// `availability__domainr__api_key` to "" and surfaces
+// `availability__domainr__api_key__set: true/false` so the UI can
+// render "set / not set" without ever receiving the key.
+export type AvailabilitySettings = {
+  availability__dns__enabled: string;
+  availability__rdap__enabled: string;
+  availability__domainr__enabled: string;
+  availability__whois__enabled: string;
+  availability__cascade_order: string;
+  availability__dns__rps: string;
+  availability__dns__max_concurrent: string;
+  availability__rdap__rps: string;
+  availability__rdap__max_concurrent: string;
+  availability__domainr__rps: string;
+  availability__domainr__max_concurrent: string;
+  availability__whois__rps: string;
+  availability__whois__max_concurrent: string;
+  availability__domainr__api_key: string;
+  availability__domainr__api_key__set: boolean;
+  availability__cache_ttl_hours: string;
+  availability__skip_registered: string;
+  availability__skip_horizon_days: string;
 };
 
 export type IntegrationStatus = {
@@ -253,6 +307,11 @@ export type AnalyzeSpec = {
   // "en" leaves prompts untouched. Carried on the spec so reruns +
   // reanalyze inherit the same language.
   lang?: "en" | "ru";
+  // Availability cascade toggle (added 2026-05-12). When true, the
+  // runner calls RDAP/DNS/etc. before Ahrefs/Wayback and applies the
+  // Settings → Domain availability skip-registered policy. Default
+  // off — old runs keep their existing behavior.
+  check_availability?: boolean;
 };
 
 export type CriterionVerdict = {
@@ -343,6 +402,14 @@ export type AiPreview = {
   language_mode?: "ai" | "library";
   category_system_prompt?: string;
   category_user_message?: string;
+  // Wayback classify → Ahrefs judge context (added 2026-05-13). The
+  // projected key-value dict that the user message's "Site context
+  // (Wayback classify, JSON)" block carries. Null when this criterion
+  // isn't receiving classify context (feature disabled, refdomains by
+  // default, no classify verdict for this rd, etc.). Render as a
+  // small key-value table so the user can verify actual values
+  // without parsing the JSON view.
+  classify_context?: Record<string, unknown> | null;
 };
 
 export type RunSummaryDomain = {
@@ -513,6 +580,11 @@ export type RunDomainProgress = {
   category?: string;
   category_confidence?: number | null;
   category_was?: string;
+  // Wayback CDX row count for this rd. Null = wayback didn't run on this
+  // rd or hasn't reached status=done yet; 0 = wayback returned cleanly
+  // with no snapshots (the "structurally nothing to classify" signal the
+  // Run-page Wayback CDX filter targets); >=1 = real CDX rows present.
+  wayback_rows?: number | null;
 };
 
 // AI cost accounting for one run, returned by /runs/{id}/cost. Cache hits
@@ -679,6 +751,14 @@ export type DatabaseCriterionSummary = {
   cached_from_run_id: number | null;
   ai_cached_from_run_id: number | null;
   sort_fields: string[];
+  // Per-criterion source attribution (added 2026-05-12). Populated when
+  // this criterion was sourced from a (job, criterion) pin — null when
+  // the criterion is not pinned.
+  source_run_id?: number | null;
+  source_run_name?: string;
+  source_job_id?: number | null;
+  source_job_name?: string;
+  source_run_domain_id?: number | null;
 };
 
 export type PinOption = {
@@ -710,6 +790,10 @@ export type DatabaseDomainRow = {
   final_confidence: number | null;
   final_bucket: string;
   final_partial: boolean;
+  // Sorted list of criterion names contributing to this row's view
+  // (added 2026-05-12). Empty when no criterion is pinned. The UI
+  // surfaces it as a "Partial — based on W, B" hint on the FinalBanner.
+  pinned_criteria?: string[];
   ai_provider: string;
   ai_model: string;
   spec_ai_provider: string;
@@ -837,22 +921,146 @@ export const api = {
       { method: "DELETE" },
     ),
 
-  pinEntireRun: (runId: number) =>
-    request<{ run_id: number; pinned: number; replaced: number }>(
-      `/runs/${runId}/pin-all`,
-      { method: "POST" },
-    ),
-
-  // Per-job Run pin (added 2026-05-10) — distinct from pinEntireRun
-  // (which sets the per-domain `RunDomain.is_pinned` flag for every rd
-  // in the run, drives the Database page) and from pinRunDomain
-  // (single-domain). This one toggles `Run.is_pinned` so the Job-page
-  // rollup pills count from it.
+  // Per-job Run pin (added 2026-05-10) — distinct from pinRunDomain
+  // (single-domain). Toggles `Run.is_pinned` so the Job-page rollup
+  // pills count from it.
   pinRun: (runId: number) =>
     request<PinRunResponse>(`/runs/${runId}/pin`, { method: "POST" }),
 
   unpinRun: (runId: number) =>
     request<PinRunResponse>(`/runs/${runId}/pin`, { method: "DELETE" }),
+
+  // Per-(job, criterion) pins (added 2026-05-12) — supersede the older
+  // per-domain / per-run pins for the Database page rollup. Each pin
+  // says "for this Job, criterion C is sourced from Run R."
+  listJobCriterionPins: (jobId: number) =>
+    request<{
+      job_id: number;
+      pins: {
+        criterion: string;
+        run_id: number;
+        run_name: string;
+        run_finished_at: string | null;
+      }[];
+    }>(`/jobs/${jobId}/criterion-pins`),
+
+  setJobCriterionPin: (jobId: number, criterion: string, runId: number) =>
+    request<{
+      job_id: number;
+      criterion: string;
+      run_id: number;
+      pinned: boolean;
+    }>(`/jobs/${jobId}/criterion-pins`, {
+      method: "POST",
+      body: JSON.stringify({ criterion, run_id: runId }),
+    }),
+
+  clearJobCriterionPin: (jobId: number, criterion: string) =>
+    request<{
+      job_id: number;
+      criterion: string;
+      run_id: number;
+      pinned: boolean;
+    }>(
+      `/jobs/${jobId}/criterion-pins/${encodeURIComponent(criterion)}`,
+      { method: "DELETE" },
+    ),
+
+  pinRunAllCriteria: (runId: number) =>
+    request<{
+      run_id: number;
+      job_id: number;
+      pinned_criteria: string[];
+      replaced: number;
+    }>(`/runs/${runId}/pin-all-criteria`, { method: "POST" }),
+
+  // Availability cascade (added 2026-05-12) — RDAP/Domainr/WHOIS/DNS
+  // cascade results for the domain-availability column + Settings tab.
+  checkAvailability: (domain: string, useCache: boolean = true) =>
+    request<{
+      domain: string;
+      status: AvailabilityStatus;
+      provider: string;
+      registrar: string;
+      expires_on: string | null;
+      from_cache: boolean;
+      checked_at: string | null;
+    }>("/availability/check", {
+      method: "POST",
+      body: JSON.stringify({ domain, use_cache: useCache }),
+    }),
+
+  bulkCheckAvailability: (domains: string[], useCache: boolean = true) =>
+    request<{
+      checked: number;
+      items: {
+        domain: string;
+        status: AvailabilityStatus;
+        provider: string;
+        registrar: string;
+        expires_on: string | null;
+        from_cache: boolean;
+      }[];
+    }>("/availability/bulk-check", {
+      method: "POST",
+      body: JSON.stringify({ domains, use_cache: useCache }),
+    }),
+
+  latestAvailability: (domains: string[]) =>
+    request<
+      {
+        domain: string;
+        status: AvailabilityStatus;
+        provider: string;
+        registrar: string;
+        expires_on: string | null;
+        checked_at: string | null;
+      }[]
+    >("/availability/latest", {
+      method: "POST",
+      // The endpoint shares the BulkCheckIn shape with bulkCheck —
+      // `use_cache` is ignored for reads.
+      body: JSON.stringify({ domains, use_cache: true }),
+    }),
+
+  availabilityStats: () =>
+    request<{
+      period_start: string;
+      providers: {
+        provider: string;
+        sent: number;
+        succeeded: number;
+        failed: number;
+      }[];
+    }>("/availability/stats"),
+
+  availabilityRecent: (limit: number = 100, runId?: number) =>
+    request<
+      {
+        id: number;
+        domain: string;
+        provider: string;
+        status: AvailabilityStatus;
+        checked_at: string;
+        latency_ms: number | null;
+        registrar: string;
+        expires_on: string | null;
+        error_message: string;
+        error_category: string;
+        run_id: number | null;
+      }[]
+    >(
+      `/availability/recent?limit=${limit}${runId != null ? `&run_id=${runId}` : ""}`,
+    ),
+
+  getAvailabilitySettings: () =>
+    request<AvailabilitySettings>("/settings/availability"),
+
+  setAvailabilitySetting: (key: string, value: string) =>
+    request<{ updated: string }>("/settings/availability", {
+      method: "PUT",
+      body: JSON.stringify({ key, value }),
+    }),
 
   bulkReanalyzeDomains: (
     runDomainIds: number[],
@@ -1049,6 +1257,42 @@ export const api = {
       { method: "POST", body: JSON.stringify(ai || {}) },
     ),
 
+  // Scoped retry — pick exact RDs + (optional) criterion allow-list.
+  // Drives the Run-page filter + multi-select + bulk-retry flow
+  // (added 2026-05-12).
+  retryRunBatch: (
+    runId: number,
+    runDomainIds: number[],
+    opts?: {
+      criteria?: string[] | null;
+      provider?: string;
+      model?: string;
+      // 2026-05-13: re-collect V2 page samples against the existing
+      // wayback CR's CDX rows instead of refetching CDX. Only meaningful
+      // when "wayback" is in the criteria allow-list (or criteria=null).
+      // Backend cascades wayback_classify so it picks up fresh samples.
+      waybackResampleOnly?: boolean;
+    },
+  ) =>
+    request<{
+      id: number;
+      status?: string;
+      domains?: number;
+      criteria?: number;
+    }>(
+      `/runs/${runId}/retry-batch`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          run_domain_ids: runDomainIds,
+          criteria: opts?.criteria ?? null,
+          provider: opts?.provider,
+          model: opts?.model,
+          wayback_resample_only: opts?.waybackResampleOnly ?? false,
+        }),
+      },
+    ),
+
   reanalyzeRunDomain: (
     runDomainId: number,
     ai?: { provider?: string; model?: string },
@@ -1168,6 +1412,20 @@ export const api = {
 
   resetScoringConfig: () =>
     request<ScoringConfigEnvelope>("/settings/scoring", { method: "DELETE" }),
+
+  getClassifyContext: () =>
+    request<ClassifyContextEnvelope>("/settings/classify-context"),
+
+  updateClassifyContext: (cfg: Partial<ClassifyContextConfig>) =>
+    request<ClassifyContextEnvelope>("/settings/classify-context", {
+      method: "PUT",
+      body: JSON.stringify(cfg),
+    }),
+
+  resetClassifyContext: () =>
+    request<ClassifyContextEnvelope>("/settings/classify-context", {
+      method: "DELETE",
+    }),
 
   listErrors: (opts: {
     category?: ErrorCategory | "all";

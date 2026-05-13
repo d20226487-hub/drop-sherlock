@@ -19,22 +19,30 @@ from ..app_settings import (
     delete_model_price,
     get_ai_prompt,
     get_categories,
+    get_classify_context_config,
     get_known_models,
     get_language_mode,
     get_rate_limits,
     get_scoring_config,
     provider_status,
     reset_ai_prompt,
+    reset_classify_context_config,
     reset_scoring_config,
     seed_pricing_for_known_models,
     set_ai_prompt,
     set_categories,
+    set_classify_context_config,
     set_known_models,
     set_language_mode,
     set_provider_creds,
     set_rate_limits,
     set_scoring_config,
     upsert_model_price,
+)
+from ..app_settings import (
+    DEFAULT_CLASSIFY_CONTEXT_CONFIG,
+    _CLASSIFY_CONTEXT_ALLOWED_CRITERIA,
+    _CLASSIFY_CONTEXT_ALLOWED_FIELDS,
 )
 from ..ai_prompts import PROMPT_KEYS
 from ..providers import ProviderConfigError, ProviderError, get_provider
@@ -71,6 +79,15 @@ def settings_root():
         "wayback_classify": {
             "language_mode": get_language_mode(),
             "categories": get_categories(),
+        },
+        # Classify-context → Ahrefs judges (added 2026-05-13). Surfaced on
+        # the bundled root so the Brain Settings tab renders without a
+        # second round-trip.
+        "classify_context": {
+            "config": get_classify_context_config(),
+            "defaults": DEFAULT_CLASSIFY_CONTEXT_CONFIG,
+            "allowed_criteria": list(_CLASSIFY_CONTEXT_ALLOWED_CRITERIA),
+            "allowed_fields": list(_CLASSIFY_CONTEXT_ALLOWED_FIELDS),
         },
     }
 
@@ -339,6 +356,48 @@ def reset_scoring_route():
     }
 
 
+# --- Classify context → Ahrefs judges --------------------------------------
+# Per-Settings toggle for passing wayback_classify outputs (theme, category,
+# language, ...) into the B/A/K judges' user messages. See app_settings.py
+# for the storage shape + default rationale (refdomains OFF by default
+# because no anchors/snippets = hallucination risk).
+
+class ClassifyContextConfigIn(BaseModel):
+    enabled: bool | None = None
+    criteria: list[str] | None = None
+    fields: list[str] | None = None
+
+
+def _classify_context_envelope() -> dict:
+    return {
+        "config": get_classify_context_config(),
+        "defaults": DEFAULT_CLASSIFY_CONTEXT_CONFIG,
+        "allowed_criteria": list(_CLASSIFY_CONTEXT_ALLOWED_CRITERIA),
+        "allowed_fields": list(_CLASSIFY_CONTEXT_ALLOWED_FIELDS),
+    }
+
+
+@router.get("/classify-context")
+def get_classify_context_route():
+    return _classify_context_envelope()
+
+
+@router.put("/classify-context")
+def update_classify_context_route(payload: ClassifyContextConfigIn):
+    raw = payload.model_dump(exclude_unset=True)
+    try:
+        set_classify_context_config(raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _classify_context_envelope()
+
+
+@router.delete("/classify-context")
+def reset_classify_context_route():
+    reset_classify_context_config()
+    return _classify_context_envelope()
+
+
 # --- Wayback classification settings ---------------------------------------
 # Two surfaces: language_mode (ai|library) and the predefined categories
 # list ({name, description?}). Categories are auto-sorted alphabetical by
@@ -390,3 +449,26 @@ def add_categories_route(payload: CategoriesIn):
     merged = add_categories([i.model_dump() for i in payload.items])
     return {"categories": merged}
 
+
+
+# --- Availability cascade settings (added 2026-05-12) ---------------------
+
+class AvailabilitySettingIn(BaseModel):
+    key: str
+    value: str
+
+
+@router.get("/availability")
+def get_availability_settings():
+    from ..app_settings import get_availability_config
+    return get_availability_config()
+
+
+@router.put("/availability")
+def set_availability_setting_route(payload: AvailabilitySettingIn):
+    from ..app_settings import set_availability_setting
+    try:
+        set_availability_setting(payload.key, payload.value)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"updated": payload.key}

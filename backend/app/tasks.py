@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -267,11 +267,29 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
     wayback_samples_for_ai: list[dict] | None = None
     if criterion == "wayback" and wayback_samples_raw:
         wayback_samples_for_ai = _trim_samples_for_ai(wayback_samples_raw)
+    # Mirror the runner's classify-context injection so the preview shows
+    # exactly what the AI would see if you re-judged this criterion right
+    # now. Preview path passes an empty sub_verdicts dict — _load_classify_
+    # context falls back to reading the classify CR row from the DB in
+    # that case, which is correct for a preview of an already-judged rd.
+    classify_context_for_ai: dict | None = None
+    if criterion in _CLASSIFY_CONTEXT_ELIGIBLE_CRITERIA:
+        from .app_settings import get_classify_context_config
+        classify_context_for_ai = _load_classify_context(
+            run_domain_id, criterion, {}, get_classify_context_config(),
+        )
+        if classify_context_for_ai is not None:
+            fields_sent = list(fields_sent) + [
+                "classify_context:" + ",".join(
+                    sorted(classify_context_for_ai.keys())
+                )
+            ]
     user_message = _build_user_message_for_criterion(
         criterion=criterion,
         domain=domain,
         rows=trimmed,
         wayback_samples=wayback_samples_for_ai,
+        classify_context=classify_context_for_ai,
     )
     # Provider/model — same provenance preference as the wayback_classify
     # branch above: actual verdict producer wins, falling back to the
@@ -297,6 +315,14 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
         # UI can render them as a table without re-parsing the JSON out of
         # `user_message`. Identical content; redundant by design.
         "rows": trimmed,
+        # Classify context that's folded into the user message (added
+        # 2026-05-13). Exposed structured so the UI can render a small
+        # key-value table — saves the user from scrolling to the bottom
+        # of the JSON view to verify what theme/category values were sent.
+        # None when the criterion isn't B/D/A/K, classify isn't enabled in
+        # Settings, this criterion isn't in the configured scope, or no
+        # classify verdict exists for this rd.
+        "classify_context": classify_context_for_ai,
     }
 
 
@@ -633,6 +659,15 @@ _ALL_CRITERIA = (
     "wayback", "wayback_classify",
 )
 
+# Criteria that CAN consume the wayback_classify "Site context" block
+# (added 2026-05-13). Whether a given criterion ACTUALLY receives it on a
+# specific judge call depends on the user's Settings config — see
+# `_load_classify_context`. wayback and wayback_classify never appear here
+# (wayback already sees V2 samples; classify is the source, not a consumer).
+_CLASSIFY_CONTEXT_ELIGIBLE_CRITERIA = frozenset(
+    ("backlinks", "refdomains", "anchors", "keywords")
+)
+
 
 def _collect_failed_criteria(
     rd: RunDomain, spec: AnalyzeSpec
@@ -660,6 +695,197 @@ def _collect_failed_criteria(
         if cr.ai_verdict_error:
             failed.append(c)
     return failed
+
+
+def _collect_resample_candidates(
+    rd: RunDomain, spec: AnalyzeSpec
+) -> list[str]:
+    """Return `["wayback"]` if this rd's wayback CR has ≥1 V1 row (so V2
+    re-sampling against the existing CDX is possible), else `[]`.
+
+    Powers the "Re-sample V2 only" workflow added 2026-05-13. Distinct
+    from `_collect_failed_criteria` — it ignores CR status entirely
+    because the dominant target is a wayback CR that's `status=done`
+    with rows but missing/incomplete samples (a state where the user
+    needs to force V2 collection without re-paying the CDX cost). Gates
+    on `wb_cfg.sample_pages` because re-sampling with that flag off
+    would be a no-op that still bills an AI re-judge."""
+    wb_cfg = _cfg_for_criterion(spec, "wayback")
+    if wb_cfg is None or not getattr(wb_cfg, "enabled", False):
+        return []
+    if not getattr(wb_cfg, "sample_pages", False):
+        return []
+    wb_cr = next(
+        (cr for cr in rd.results if cr.criterion == "wayback"), None,
+    )
+    if wb_cr is None or not wb_cr.data_json:
+        return []
+    try:
+        body = json.loads(wb_cr.data_json)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(body, dict):
+        return []
+    rows = body.get("wayback")
+    if not isinstance(rows, list) or len(rows) == 0:
+        return []
+    return ["wayback"]
+
+
+def _cascade_wayback_classify(
+    failed_per_rd: dict[int, list[str]], spec: AnalyzeSpec
+) -> None:
+    """Force `wayback_classify` into the retry set on every RD where
+    `wayback` is being retried, IF classify is enabled in the spec.
+
+    Why: a wayback retry refetches CDX + (with the 2026-05-13 fix)
+    re-collects V2 samples. That invalidates whatever verdict
+    wayback_classify produced last time, since classify reads its input
+    straight off the wayback CR's `data_json["samples"]`. Without this
+    cascade, the user has to remember to check the classify box
+    themselves — or worse, classify gets left with a stale verdict that
+    silently no longer reflects the data on the wayback CR.
+
+    The cascade overrides the user's allow-list on purpose: it's the
+    "you can't get this wrong" safety net. The bulk-retry frontend
+    surfaces this as a small note when the user has unchecked classify
+    so the auto-add is visible, not a surprise.
+
+    Idempotent — if classify is already in the list (e.g. it also
+    failed independently) we leave it alone."""
+    wbc_cfg = _cfg_for_criterion(spec, "wayback_classify")
+    if wbc_cfg is None or not getattr(wbc_cfg, "enabled", False):
+        return
+    for crits in failed_per_rd.values():
+        if "wayback" in crits and "wayback_classify" not in crits:
+            crits.append("wayback_classify")
+
+
+def retry_run_batch_now(
+    run_id: int,
+    run_domain_ids: list[int],
+    criteria: list[str] | None = None,
+    ai_override: dict | None = None,
+    wayback_resample_only: bool = False,
+) -> dict:
+    """Retry failed criteria on a subset of RDs, optionally narrowed to
+    a criterion allow-list. Sibling of `retry_failed_run_now` — same
+    guards, same per-RD plumbing, narrower scope.
+
+    `criteria=None` → every enabled criterion on the run (= same as
+    retry_failed_run_now's behavior, just scoped to the picked RDs).
+    `criteria=["wayback"]` → only retry wayback, even if classify also
+    failed on a given RD (drives the "refetch wayback without
+    re-running classify" use case).
+
+    `wayback_resample_only=True` → instead of selecting "failed"
+    criteria, target wayback CRs that have V1 rows and need V2
+    re-sampling (samples missing, stale, or partial). Skips the CDX
+    refetch entirely — re-samples V2 against the existing rows, then
+    re-judges the wayback verdict. The classify cascade still applies,
+    so classify gets re-judged off the fresh samples. Use case: the
+    cohort identified by the Wayback CDX ≥1 filter + classify failed.
+    Caller MUST include `"wayback"` in `criteria` (or pass `None` for
+    all) — otherwise this flag has nothing to act on and we error.
+
+    Returns the same envelope shape as retry_failed_run_now."""
+    if _REANALYZING_RUNS.is_active(run_id):
+        return {
+            "id": run_id, "found": True,
+            "error": "a run-level reanalysis is already in progress",
+        }
+    rd_id_set: set[int] = {int(i) for i in run_domain_ids if isinstance(i, int)}
+    if not rd_id_set:
+        return {"id": run_id, "found": True, "error": "no run_domain_ids"}
+    criteria_set = set(criteria) if criteria else None
+    if wayback_resample_only and criteria_set is not None and (
+        "wayback" not in criteria_set
+    ):
+        return {
+            "id": run_id, "found": True,
+            "error": (
+                "resample-only requires 'wayback' in the criteria "
+                "allow-list — nothing to resample otherwise"
+            ),
+        }
+
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return {"id": run_id, "found": False}
+        if run.status in ("pending", "running", "paused"):
+            return {
+                "id": run_id, "found": True,
+                "error": f"run is {run.status} — wait for it to finish",
+            }
+        try:
+            spec = AnalyzeSpec.model_validate(json.loads(run.spec_json or "{}"))
+        except Exception as e:  # noqa: BLE001
+            return {"id": run_id, "found": True, "error": f"bad spec: {e}"}
+        if ai_override:
+            spec.ai.provider = ai_override.get("provider") or spec.ai.provider
+            spec.ai.model = ai_override.get("model") or spec.ai.model
+        if not spec.ai or not spec.ai.provider:
+            return {
+                "id": run_id, "found": True,
+                "error": "no AI provider configured for this run",
+            }
+        spec.use_cache = False
+
+        # Per-RD retry list. Resample-only and the normal failed-retry
+        # path use different selection criteria — see the helpers'
+        # docstrings for the rationale.
+        failed_per_rd: dict[int, list[str]] = {}
+        for rd in run.domains:
+            if rd.id not in rd_id_set:
+                continue
+            if wayback_resample_only:
+                failed = _collect_resample_candidates(rd, spec)
+            else:
+                failed = _collect_failed_criteria(rd, spec)
+            if criteria_set is not None:
+                failed = [c for c in failed if c in criteria_set]
+            if failed:
+                failed_per_rd[rd.id] = failed
+        _cascade_wayback_classify(failed_per_rd, spec)
+    finally:
+        db.close()
+
+    if not failed_per_rd:
+        return {
+            "id": run_id, "found": True,
+            "error": (
+                "no failed criteria match the scope "
+                "(selected rds × allowed criteria)"
+            ),
+        }
+    busy = [
+        rd_id for rd_id in failed_per_rd
+        if _REANALYZING_RUN_DOMAINS.is_active(rd_id)
+    ]
+    if busy:
+        return {
+            "id": run_id, "found": True,
+            "error": (
+                f"reanalysis already in progress on {len(busy)} domain(s) — "
+                "wait for it to finish"
+            ),
+        }
+    for rd_id, crits in failed_per_rd.items():
+        task = asyncio.create_task(
+            _retry_failed_run_domain(
+                rd_id, crits, spec, track_set=True,
+                resample_only=wayback_resample_only,
+            )
+        )
+        _REANALYZING_RUN_DOMAINS.add_task(rd_id, task)
+        _track(task)
+    return {
+        "id": run_id, "found": True, "status": "started",
+        "domains": len(failed_per_rd),
+        "criteria": sum(len(v) for v in failed_per_rd.values()),
+    }
 
 
 def retry_failed_run_now(
@@ -709,6 +935,7 @@ def retry_failed_run_now(
             failed = _collect_failed_criteria(rd, spec)
             if failed:
                 failed_per_rd[rd.id] = failed
+        _cascade_wayback_classify(failed_per_rd, spec)
     finally:
         db.close()
 
@@ -753,17 +980,25 @@ async def _retry_failed_run_domain(
     spec: AnalyzeSpec,
     *,
     track_set: bool,
+    resample_only: bool = False,
 ) -> None:
     """Run `_reanalyze_run_domain_criterion` sequentially for each failed
     criterion on this RD, holding the rd-level reanalyzing lock for the
     full duration. Sequential (not parallel) because these calls share
     the same RD's CR rows and share the rd-level lock; parallelizing
     would race the per-criterion writes and the final-assessment
-    recompute."""
+    recompute.
+
+    `resample_only` propagates to the wayback branch only (other
+    criteria ignore it). The cascade ensures wayback_classify gets
+    re-judged after wayback's samples land, so we don't need to pass
+    the flag to the classify branch — its read of the wayback CR's
+    samples picks up the fresh data automatically."""
     try:
         for c in criteria:
             await _reanalyze_run_domain_criterion(
-                run_domain_id, c, spec, track_set=False
+                run_domain_id, c, spec, track_set=False,
+                resample_only=resample_only,
             )
     except Exception:  # noqa: BLE001
         log.exception(
@@ -852,6 +1087,7 @@ async def _reanalyze_run_domain_criterion(
     spec: AnalyzeSpec,
     *,
     track_set: bool,
+    resample_only: bool = False,
 ) -> None:
     """Wipe a SINGLE criterion's AI verdict on this domain (and the final
     assessment, which aggregates all criteria), then re-judge that one
@@ -973,6 +1209,60 @@ async def _reanalyze_run_domain_criterion(
                         break
             if criterion not in fetched_rows:
                 return  # fetch still failed; finish_criterion_row stored err
+
+            # Wayback V2 sample collection on retry (added 2026-05-13).
+            # Without this, a refetched wayback CR has rows but no samples —
+            # the wayback verdict re-judges V1-only, AND wayback_classify
+            # subsequently fails with "no samples available". Mirrors the
+            # runner block at process_run_for_domain (search for "Wayback
+            # V2: page-content sampling"). Guarded on ≥1 CDX row because
+            # V2 has nothing to sample otherwise (see _pick_wayback_samples).
+            if criterion == "wayback":
+                wb_cfg = getattr(spec.criteria, "wayback", None)
+                if (
+                    wb_cfg is not None
+                    and getattr(wb_cfg, "sample_pages", False)
+                    and fetched_rows["wayback"]
+                ):
+                    picks = _pick_wayback_samples(
+                        fetched_rows["wayback"],
+                        count=wb_cfg.sample_count,
+                        strategy=wb_cfg.sample_strategy,
+                        path_mode=wb_cfg.sample_path_mode,
+                        domain=domain,
+                    )
+                    if picks:
+                        samples = await _fetch_wayback_samples(samples=picks)
+                        _attach_wayback_samples(cr_id, samples)
+
+        # Resample-only branch (added 2026-05-13). The refetch path above
+        # didn't run because wayback's CR was already `status=done` with
+        # rows in fetched_rows. The user explicitly asked us to re-collect
+        # V2 anyway — the dominant trigger is a wayback CR with V1 rows
+        # but missing samples that left wayback_classify failing. Skips
+        # the CDX call entirely (free) and runs V2 sampling against the
+        # existing rows. The cascade adds wayback_classify after this
+        # criterion finishes, so classify reads the fresh samples on its
+        # own re-judge pass.
+        elif resample_only and criterion == "wayback":
+            wb_cfg = getattr(spec.criteria, "wayback", None)
+            cr_id = _criterion_row_ids(run_domain_id).get("wayback")
+            if (
+                cr_id is not None
+                and wb_cfg is not None
+                and getattr(wb_cfg, "sample_pages", False)
+                and fetched_rows.get("wayback")
+            ):
+                picks = _pick_wayback_samples(
+                    fetched_rows["wayback"],
+                    count=wb_cfg.sample_count,
+                    strategy=wb_cfg.sample_strategy,
+                    path_mode=wb_cfg.sample_path_mode,
+                    domain=domain,
+                )
+                if picks:
+                    samples = await _fetch_wayback_samples(samples=picks)
+                    _attach_wayback_samples(cr_id, samples)
 
         await _run_ai_for_domain(
             run_domain_id=run_domain_id,
@@ -1123,12 +1413,34 @@ async def process_run(run_id: int) -> None:
     if spec is None:
         return  # Already terminal, or row gone.
 
-    # 2. Fan out per-domain workers. The semaphore inside `limit("ahrefs")`
-    #    bounds actual concurrency; we can `gather` everything at once.
+    # 2. Fan out per-domain workers. Per-provider semaphores inside
+    #    `limit("...")` bound HTTP concurrency to each upstream, but we
+    #    ALSO need an outer cap on how many `_process_domain` coroutines
+    #    are concurrently active — otherwise a 352-domain run schedules
+    #    352 tasks on the event loop at once. Each task does small sync
+    #    SQLAlchemy ops between awaits (briefly blocking the loop), holds
+    #    open per-task state, and competes for the threadpool slots that
+    #    serve other endpoints (Settings, Database, /health). The loop
+    #    stays "live" but becomes laggy enough that Docker's healthcheck
+    #    times out and the UI feels frozen (regression observed
+    #    2026-05-12 on a 352-domain Wayback-only run).
+    #
+    #    32 is a conservative cap — for runs ≤ 32 domains it's a no-op,
+    #    and at hundreds of domains it keeps the loop responsive while
+    #    still saturating the per-provider rate limits (Wayback default
+    #    max_concurrent=1; Ahrefs ~4; Gemini RPM 60). Each completed
+    #    domain releases a slot for the next.
+    OUTER_CAP = 32
+    outer_sem = asyncio.Semaphore(OUTER_CAP)
+
+    async def _run_one(rd_id: int) -> None:
+        async with outer_sem:
+            await _process_domain(rd_id, spec, run_id)
+
     domain_ids = _get_domain_ids(run_id)
     try:
         await asyncio.gather(
-            *(_process_domain(rd_id, spec, run_id) for rd_id in domain_ids),
+            *(_run_one(rd_id) for rd_id in domain_ids),
             return_exceptions=False,
         )
         # Re-read status from DB rather than trusting the in-memory pause/cancel
@@ -1335,6 +1647,82 @@ def _create_cached_criterion_row(
         db.close()
 
 
+async def _run_availability_for_domain(
+    run_domain_id: int, domain: str, run_id: int,
+) -> None:
+    """Run the availability cascade for one domain, persist history
+    rows, apply the skip-registered policy + auto-upsert the
+    BacklogDomain row (approach-2 → approach-1 bridge).
+
+    Idempotent: safe to call after pause/resume; the cascade's own
+    cache TTL prevents double-fetching the same domain.
+    """
+    from datetime import date as _date
+    from .availability import check_availability_async
+    from .availability.common import STATUS_REGISTERED
+    from .app_settings import get_skip_registered_policy
+    from .models import BacklogDomain, RunDomain
+
+    result = await check_availability_async(domain, run_id=run_id)
+
+    # Approach-1↔approach-2 bridge: if the cascade returned an
+    # expiration date, write it into BacklogDomain.expiration_date.
+    # Creates the row if it doesn't exist yet (covers paste-into-
+    # Analyze domains that bypassed the backlog import flow).
+    if result.expires_on is not None:
+        bdb = SessionLocal()
+        try:
+            row = (
+                bdb.query(BacklogDomain)
+                .filter(BacklogDomain.domain == domain)
+                .one_or_none()
+            )
+            now = datetime.utcnow()
+            if row is None:
+                bdb.add(BacklogDomain(
+                    domain=domain,
+                    status="analyzed",
+                    expiration_date=result.expires_on,
+                    registrar=result.registrar or "",
+                    created_at=now,
+                    updated_at=now,
+                ))
+            else:
+                # Only update if blank or newer info — don't trample a
+                # user-edited date with a stale registry response.
+                if row.expiration_date != result.expires_on:
+                    row.expiration_date = result.expires_on
+                    row.updated_at = now
+                if result.registrar and not row.registrar:
+                    row.registrar = result.registrar
+                    row.updated_at = now
+            bdb.commit()
+        finally:
+            bdb.close()
+
+    # Skip policy: registered + expires beyond horizon → no Ahrefs.
+    policy = get_skip_registered_policy()
+    if (
+        policy["enabled"]
+        and result.status == STATUS_REGISTERED
+        and result.expires_on is not None
+    ):
+        horizon = _date.today() + timedelta(days=policy["horizon_days"])
+        if result.expires_on > horizon:
+            db = SessionLocal()
+            try:
+                rd = db.get(RunDomain, run_domain_id)
+                if rd is not None:
+                    rd.status = "done"
+                    rd.finished_at = datetime.utcnow()
+                    rd.skip_reason = (
+                        f"registered, expires {result.expires_on.isoformat()}"
+                    )
+                    db.commit()
+            finally:
+                db.close()
+
+
 async def _process_domain(
     run_domain_id: int, spec: AnalyzeSpec, run_id: int
 ) -> None:
@@ -1360,6 +1748,35 @@ async def _process_domain(
     domain = _begin_domain(run_domain_id)
     if domain is None:
         return
+
+    # Availability cascade (added 2026-05-12). Runs BEFORE Ahrefs/Wayback
+    # so the skip-registered policy can short-circuit expensive fetches
+    # for domains that don't drop within the user's horizon. Only fires
+    # when `spec.check_availability` is true — opt-in per-run via the
+    # Analyze page checkbox.
+    if getattr(spec, "check_availability", False):
+        try:
+            await _run_availability_for_domain(
+                run_domain_id=run_domain_id,
+                domain=domain,
+                run_id=run_id,
+            )
+            # _run_availability_for_domain may set RunDomain.skip_reason
+            # + status='done'. Re-check status to bail out cleanly.
+            post_status = _get_domain_status(run_domain_id)
+            if post_status in ("done", "failed", "canceled"):
+                return
+        except Exception as e:  # noqa: BLE001
+            # Availability cascade must not block analysis on errors —
+            # mark + log, then continue with Ahrefs/Wayback as if it
+            # had run. The Errors page picks up the exception via the
+            # log handler.
+            import logging
+            logging.getLogger(__name__).exception(
+                "availability cascade failed for %s in run %s: %s",
+                domain, run_id, e,
+            )
+
     # Map of already-completed criteria for this domain — used to skip
     # refetching after a resume. Key = criterion name, value = (cr_id, rows).
     already_done = _completed_criteria(run_domain_id)
@@ -1505,8 +1922,15 @@ async def _process_domain(
     if wbc_cfg is not None and wbc_cfg.enabled:
         existing_ids = _criterion_row_ids(run_domain_id)
         if "wayback_classify" not in existing_ids:
+            # params_hash must be the real classify-config hash (added
+            # 2026-05-13 with Option 1) so the cross-job verdict cache can
+            # match prior classify CRs that share the same language_mode.
+            # Previously stored as "" which made every cache lookup miss.
+            wbc_params_hash = compute_params_hash(
+                "wayback_classify", wbc_cfg,
+            )
             cr_id_wbc = _create_criterion_row(
-                run_domain_id, "wayback_classify", "", ""
+                run_domain_id, "wayback_classify", "", wbc_params_hash,
             )
             # _create_criterion_row defaults status to "running" — flip
             # back to pending until the AI step actually starts on it.
@@ -1576,7 +2000,30 @@ async def _run_ai_for_domain(
     else:
         cache_job_scope = _resolve_job_id(run_id) if cache_enabled else None
 
-    for criterion, rows in fetched_rows.items():
+    # Classify-context config: loaded once per domain. Drives whether the
+    # B/A/K (and optionally refdomains) judges receive a "Site context"
+    # block built from wayback_classify's verdict. Default ON in Settings,
+    # default criteria scope = B/A/K (refdomains off by default).
+    from .app_settings import get_classify_context_config
+    classify_ctx_config = get_classify_context_config()
+
+    # New v1 ordering (2026-05-13): wayback judge → wayback_classify
+    # post-step → B/D/A/K judges (with classify_context piped in). The
+    # per-criterion judge body is otherwise unchanged. The previous order
+    # was fetch-order = B → D → A → K → wayback, then classify, then
+    # final. Reordering is required so B/A/K can see classify's verdict
+    # at judge time. Per-domain wall-clock is unchanged (still sequential);
+    # only the per-pill flip order on the Run page differs.
+    judge_order: list[str] = []
+    if "wayback" in fetched_rows:
+        judge_order.append("wayback")
+    for c in ("backlinks", "refdomains", "anchors", "keywords"):
+        if c in fetched_rows:
+            judge_order.append(c)
+    classify_post_step_done = False
+
+    for criterion in judge_order:
+        rows = fetched_rows[criterion]
         if is_canceled(run_id) or is_paused(run_id):
             return
         cr_id = cr_id_by_criterion.get(criterion)
@@ -1592,6 +2039,30 @@ async def _run_ai_for_domain(
         # prompt to the AI; same goes for any criterion.
         if _criterion_status(cr_id) == "failed":
             continue
+        # Build classify_context BEFORE the cache-key check so the
+        # fields_sent sentinel correctly diverges from no-context hashes.
+        # See drop_sherlock_ai_pipeline.md (memory) for why: prompt_hash
+        # doesn't include the user_message, so we MUST also mutate the
+        # fields_sent list when the user_message gains a new block —
+        # otherwise the cache will serve stale verdicts judged without
+        # the context. Wayback + classify-itself never receive context;
+        # only the configured Ahrefs criteria do.
+        classify_context_for_ai: dict | None = None
+        if criterion in _CLASSIFY_CONTEXT_ELIGIBLE_CRITERIA:
+            classify_context_for_ai = _load_classify_context(
+                run_domain_id, criterion, sub_verdicts, classify_ctx_config,
+            )
+        fields_sent = AI_FIELD_TRIM.get(criterion, [])
+        if classify_context_for_ai is not None:
+            # Sentinel encodes the sorted set of context field NAMES so
+            # changing the Settings field-set in any way invalidates the
+            # cache. Field VALUES don't go into the sentinel — that would
+            # bust the cache per-domain (the whole point is per-criterion
+            # cache namespaces, not per-domain).
+            sentinel = "classify_context:" + ",".join(
+                sorted(classify_context_for_ai.keys())
+            )
+            fields_sent = list(fields_sent) + [sentinel]
         # Already judged in a prior worker — reuse and skip the API call.
         if criterion in cached_verdicts:
             sub_verdicts[criterion] = cached_verdicts[criterion]
@@ -1601,7 +2072,7 @@ async def _run_ai_for_domain(
             system_prompt,
             provider,
             resolved_model_for_hash,
-            fields_sent=AI_FIELD_TRIM.get(criterion, []),
+            fields_sent=fields_sent,
         )
         # Per-job AI cache: identical Ahrefs params + identical prompt +
         # identical provider/model → reuse the prior verdict. Editing the
@@ -1638,6 +2109,7 @@ async def _run_ai_for_domain(
             domain=domain,
             rows=trimmed,
             wayback_samples=wayback_samples_for_ai,
+            classify_context=classify_context_for_ai,
         )
         # Resolve the model up-front so we can persist it on the row no
         # matter which branch wins below. If the provider has no usable
@@ -1687,22 +2159,52 @@ async def _run_ai_for_domain(
                 provider=provider, model=resolved_model,
             )
 
+        # v1 sequencing (2026-05-13): right after wayback judges, run the
+        # classify post-step. This lets B/D/A/K iterations (which come
+        # later in judge_order) see classify's verdict in `sub_verdicts`
+        # when they build their user messages. The "second" classify
+        # post-step block below is a no-op when classify_post_step_done
+        # is True, but still fires when wayback wasn't in the run at all
+        # (so classify still reports its "no samples" failure).
+        if criterion == "wayback" and not classify_post_step_done:
+            wbc_cfg = getattr(spec.criteria, "wayback_classify", None)
+            if (
+                wbc_cfg is not None
+                and wbc_cfg.enabled
+                and not is_canceled(run_id)
+                and not is_paused(run_id)
+            ):
+                await _run_wayback_classify_for_domain(
+                    run_domain_id=run_domain_id,
+                    domain=domain,
+                    spec=spec,
+                    wbc_cfg=wbc_cfg,
+                    provider=provider,
+                    resolved_model=resolved_model_for_hash,
+                    cached_verdicts=cached_verdicts,
+                    sub_verdicts=sub_verdicts,
+                    run_id=run_id,
+                )
+            classify_post_step_done = True
+
     # Cancellation/pause check first — same semantics as before.
     if is_canceled(run_id) or is_paused(run_id):
         if cr_id_by_criterion:
             _stamp_last_analyzed(run_domain_id)
         return
 
-    # wayback_classify post-step (added 2026-05-09): runs AFTER the regular
-    # per-criterion judges because it depends on the wayback CR row's V2
-    # samples being available. Reuses the same provider/model/cache logic.
-    # Result is stored in wayback_classify's own CR.ai_verdict_json + added
-    # to sub_verdicts so partial detection treats it like any other
-    # criterion (i.e. "any enabled criterion that didn't produce a verdict
-    # makes the run partial").
+    # wayback_classify post-step (added 2026-05-09, made conditional
+    # 2026-05-13): in v1 sequencing this normally runs INLINE right
+    # after the wayback judge (see classify_post_step_done above) so
+    # B/A/K can see classify in sub_verdicts. This out-of-loop block
+    # remains as a fallback for the case where wayback isn't in
+    # judge_order at all (e.g. wayback criterion disabled in spec but
+    # classify enabled — classify still needs to fire so it reports
+    # its "no samples" failure rather than silently being skipped).
     wbc_cfg = getattr(spec.criteria, "wayback_classify", None)
     if (
-        wbc_cfg is not None
+        not classify_post_step_done
+        and wbc_cfg is not None
         and wbc_cfg.enabled
         and not is_canceled(run_id)
         and not is_paused(run_id)
@@ -1826,6 +2328,7 @@ def _build_user_message_for_criterion(
     domain: str,
     rows: list[dict],
     wayback_samples: list[dict] | None = None,
+    classify_context: dict | None = None,
 ) -> str:
     """Compact JSON payload sent to the model. The system prompt does the
     heavy explanation; the user message stays short to save tokens.
@@ -1834,7 +2337,15 @@ def _build_user_message_for_criterion(
     excerpt per archived snapshot). When present + non-empty + criterion
     is wayback, an extra "Page samples (JSON)" section is appended so
     the AI can reason about year-over-year theme drift on top of the
-    CDX activity rows. Other criteria ignore the parameter."""
+    CDX activity rows. Other criteria ignore the parameter.
+
+    `classify_context` is the projected wayback_classify verdict (theme,
+    category, language, ...) — see `_load_classify_context`. When non-None,
+    a "Site context (Wayback classify)" block is appended so the judge
+    can detect PBN-style theme mismatches (e.g. backlinks from gambling
+    domains pointing at a pet-care site). Caller is responsible for
+    deciding whether this criterion should receive context per the
+    Settings config — this builder just renders what it's given."""
     parts = [
         f"Domain: {domain}",
         f"Criterion: {criterion}",
@@ -1845,6 +2356,11 @@ def _build_user_message_for_criterion(
         parts.append(
             f"Page samples (JSON, chronological):"
             f"\n{json.dumps(wayback_samples, ensure_ascii=False)}"
+        )
+    if classify_context:
+        parts.append(
+            f"Site context (Wayback classify, JSON):"
+            f"\n{json.dumps(classify_context, ensure_ascii=False)}"
         )
     return "\n".join(parts) + "\n"
 
@@ -1883,16 +2399,26 @@ async def _run_wayback_classify_for_domain(
     paused worker), we skip the AI calls and just propagate the cached
     verdict into `sub_verdicts`.
 
-    Cache pathway: wayback_classify uses the standard per-job AI cache
-    (prompt_hash + params_hash). However its `params_hash` is derived
-    from `language_mode` only — there are no fetch-side params to hash.
+    Cross-job AI verdict cache (wired 2026-05-13 — was a no-op until then):
+    when `spec.use_cache` is on and a prior classify CR exists for this
+    domain with matching `params_hash + prompt_hash` (per-job by default,
+    cross-job when `spec.cross_job_cache=True`), the verdict is copied
+    forward via `_try_serve_verdict_from_cache` — no AI calls. Same
+    machinery the regular per-criterion loop uses for B/D/A/K/wayback.
+
+    `params_hash` for classify is derived from `language_mode` only —
+    no fetch-side params to hash. `prompt_hash` covers BOTH chained
+    prompts (combined/theme + category) so editing either invalidates.
     """
-    # Find / create the CR row for wayback_classify on this rd.
+    # Find / create the CR row for wayback_classify on this rd. Pass the
+    # real params_hash so cache lookups can match — see comment in
+    # _process_domain's classify CR creation site (added 2026-05-13).
     rd_crs = _criterion_row_ids(run_domain_id)
     cr_id = rd_crs.get("wayback_classify")
+    wbc_params_hash = compute_params_hash("wayback_classify", wbc_cfg)
     if cr_id is None:
         cr_id = _create_criterion_row(
-            run_domain_id, "wayback_classify", "", ""
+            run_domain_id, "wayback_classify", "", wbc_params_hash,
         )
 
     # Resume: reuse a verdict saved in a prior paused worker.
@@ -1900,6 +2426,58 @@ async def _run_wayback_classify_for_domain(
         sub_verdicts["wayback_classify"] = cached_verdicts["wayback_classify"]
         _set_criterion_status(cr_id, "done")
         return
+
+    # Cross-job AI verdict cache lookup (added 2026-05-13). Brings classify
+    # to parity with B/D/A/K/wayback — when the user re-runs analysis on
+    # domains that already have a classify verdict in another job (e.g.
+    # "Analyze selected" from the Database page with `cross_cache=1`),
+    # the prior verdict is copied forward without re-paying for the 2 AI
+    # calls. The cache key includes BOTH chained prompts (primary +
+    # category) hashed together, so editing either prompt invalidates.
+    language_mode = getattr(wbc_cfg, "language_mode", "ai")
+    primary_prompt_key = (
+        "wayback_classify_theme_only"
+        if language_mode == "library"
+        else "wayback_classify_combined"
+    )
+    primary_prompt = localize_prompt(
+        get_ai_prompt(primary_prompt_key), spec.lang,
+    )
+    category_prompt = localize_prompt(
+        get_ai_prompt("wayback_category"), spec.lang,
+    )
+    # Encode the category prompt's hash into `fields_sent` as a sentinel
+    # so changing it busts the cache without needing to extend
+    # compute_prompt_hash's signature.
+    import hashlib as _hashlib
+    category_prompt_hash = _hashlib.sha256(
+        category_prompt.encode("utf-8"),
+    ).hexdigest()
+    wbc_prompt_hash = compute_prompt_hash(
+        primary_prompt,
+        provider,
+        resolved_model,
+        fields_sent=[f"wayback_category:{category_prompt_hash}"],
+    )
+    cache_enabled = bool(spec.use_cache)
+    if cache_enabled:
+        if spec.cross_job_cache:
+            cache_job_scope: int | None = None
+        else:
+            cache_job_scope = _resolve_job_id(run_id)
+        verdict_from_cache = _try_serve_verdict_from_cache(
+            cr_id=cr_id,
+            domain=domain,
+            criterion="wayback_classify",
+            params_hash=wbc_params_hash,
+            prompt_hash=wbc_prompt_hash,
+            job_id=cache_job_scope,
+            run_id=run_id,
+        )
+        if verdict_from_cache is not None:
+            sub_verdicts["wayback_classify"] = verdict_from_cache
+            _set_criterion_status(cr_id, "done")
+            return
 
     # Find the wayback CR row + its samples. Failing here surfaces a
     # readable error so the user knows to enable Wayback or wait for it
@@ -1976,6 +2554,7 @@ async def _run_wayback_classify_for_domain(
 
     _store_ai_verdict(
         cr_id, verdict, error="",
+        prompt_hash=wbc_prompt_hash,
         provider=provider, model=resolved_model,
         usage=total_usage,
     )
@@ -1994,6 +2573,73 @@ def _criterion_row_ids(run_domain_id: int) -> dict[str, int]:
         return {r.criterion: r.id for r in rows}
     finally:
         db.close()
+
+
+def _load_classify_context(
+    run_domain_id: int,
+    criterion: str,
+    sub_verdicts: dict[str, dict],
+    config: dict,
+) -> dict | None:
+    """Build the classify-context dict that should be appended to a
+    criterion's user message. Returns None when:
+
+    - The classify-context feature is disabled in Settings.
+    - This criterion is not in the configured criterion scope (e.g.
+      refdomains is OFF by default — judge stays plain for refdomains).
+    - wayback_classify hasn't produced a verdict on this rd yet (failed,
+      pending, or not enabled in spec). We deliberately read from
+      `sub_verdicts` (the in-memory map built by _run_ai_for_domain)
+      rather than the CR row so the v1 sequencing (wayback → classify
+      → B/D/A/K) sees the just-judged classify verdict without an extra
+      DB hit. A future caller (e.g. preview) can pass `sub_verdicts={}`
+      and fall back to the DB read path below.
+    - The verdict has none of the configured fields (e.g. classify
+      didn't produce a primary_theme).
+
+    The dict is keyed by the SETTINGS-configured fields, in the
+    Settings-canonical order. Fields not present in the verdict are
+    skipped. Empty strings / empty lists are preserved so the AI can
+    see "language was detected as und" vs "no language info"."""
+    if not config.get("enabled"):
+        return None
+    if criterion not in (config.get("criteria") or ()):
+        return None
+    fields = config.get("fields") or ()
+    if not fields:
+        return None
+
+    verdict: dict | None = sub_verdicts.get("wayback_classify")
+    if not isinstance(verdict, dict):
+        # Fallback: read directly from the classify CR row. Used by the
+        # AI preview path (not the runner) — the runner always has the
+        # in-memory sub_verdicts populated by the time B/A/K judge.
+        db = SessionLocal()
+        try:
+            cr = (
+                db.query(CriterionResult)
+                .filter(
+                    CriterionResult.run_domain_id == run_domain_id,
+                    CriterionResult.criterion == "wayback_classify",
+                )
+                .one_or_none()
+            )
+            if cr is None or not cr.ai_verdict_json:
+                return None
+            try:
+                verdict = json.loads(cr.ai_verdict_json)
+            except json.JSONDecodeError:
+                return None
+        finally:
+            db.close()
+    if not isinstance(verdict, dict):
+        return None
+
+    projected: dict = {}
+    for f in fields:
+        if f in verdict:
+            projected[f] = verdict[f]
+    return projected if projected else None
 
 
 def _get_domain_status(run_domain_id: int) -> str:

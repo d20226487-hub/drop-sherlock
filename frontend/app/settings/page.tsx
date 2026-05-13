@@ -5,16 +5,24 @@ import { api, ProviderStatus, RateLimits, SettingsPayload } from "@/lib/api";
 import { ProviderCard } from "@/components/provider-card";
 import { WaybackClassifyEditor } from "@/components/wayback-classify-editor";
 import { RateLimitsTable } from "@/components/rate-limits-table";
+import { ClassifyContextEditor } from "@/components/classify-context-editor";
 import { PromptEditors } from "@/components/prompt-editors";
 import { ScoringEditor } from "@/components/scoring-editor";
 import { PricingEditor } from "@/components/pricing-editor";
 import { RetentionEditor } from "@/components/retention-editor";
 import { BackupsEditor } from "@/components/backups-editor";
 import { ImportLimitEditor } from "@/components/import-limit-editor";
+import { AvailabilityEditor } from "@/components/availability-editor";
 
-type SettingsTab = "api" | "brain" | "wayback" | "others";
+type SettingsTab = "api" | "brain" | "wayback" | "availability" | "others";
 
-const TABS: SettingsTab[] = ["api", "brain", "wayback", "others"];
+const TABS: SettingsTab[] = [
+  "api",
+  "brain",
+  "wayback",
+  "availability",
+  "others",
+];
 
 export default function SettingsPage() {
   const { t } = useT();
@@ -160,6 +168,13 @@ export default function SettingsPage() {
               </section>
 
               <section className="space-y-4">
+                <h2 className="text-lg font-semibold">
+                  {ts.sections.classifyContext}
+                </h2>
+                <ClassifyContextEditor />
+              </section>
+
+              <section className="space-y-4">
                 <h2 className="text-lg font-semibold">{ts.sections.prompts}</h2>
                 <PromptEditors />
               </section>
@@ -174,6 +189,12 @@ export default function SettingsPage() {
                 </h2>
                 <WaybackClassifyEditor />
               </section>
+            </div>
+          )}
+
+          {tab === "availability" && (
+            <div className="space-y-8">
+              <AvailabilityEditor />
             </div>
           )}
 

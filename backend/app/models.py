@@ -212,9 +212,114 @@ class RunDomain(Base):
     # now requires a pin — domains with no pin render with empty cells.
     is_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Skip-reason for the availability cascade (added 2026-05-12). Non-
+    # empty when the runner short-circuited Ahrefs/Wayback/AI because
+    # the availability check classified the domain as registered with a
+    # far-out expiration date (skip-registered policy). The RunDomain
+    # row still exists with status='done' so the run can complete, but
+    # no CriterionResult rows are written. The Run page UI shows the
+    # skip reason in place of the criteria pills.
+    #
+    # Examples: 'registered, expires 2028-04-12'.
+    # Empty string = was not skipped.
+    skip_reason: Mapped[str] = mapped_column(String(256), default="")
+
     run: Mapped[Run] = relationship(back_populates="domains")
     results: Mapped[list["CriterionResult"]] = relationship(
         back_populates="run_domain", cascade="all, delete-orphan", order_by="CriterionResult.id"
+    )
+
+
+class AvailabilityCheck(Base):
+    """History of domain-availability checks (added 2026-05-12).
+
+    Every cascade invocation appends one row PER provider that responded
+    (not just the final-answer provider) so the per-run check log shows
+    full cost — e.g. RDAP timed out, Domainr answered — both rows
+    written. The cascade's overall result is the *last* row for the
+    domain (the one that resolved the status).
+
+    `status` values:
+      - 'available'   — confirmed unregistered
+      - 'registered'  — confirmed registered; registrar/expires_on usually set
+      - 'unknown'     — provider answered but couldn't determine (rare)
+      - 'error'       — provider call failed (timeout, 429, 5xx, parse error)
+
+    `provider` values: 'dns' | 'rdap' | 'domainr' | 'whois'
+
+    `error_category` values: 'dns' | 'rdap' | 'domainr' | 'whois' |
+    'quota' | 'network' | 'parse'. Drives the Errors-page category
+    filter. NULL on successful checks.
+
+    `run_id` links the check to the Run that triggered it (null for
+    manual ad-hoc and bulk-recheck calls from the Database/Backlog
+    pages).
+    """
+    __tablename__ = "availability_checks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    domain: Mapped[str] = mapped_column(String(512), index=True)
+    provider: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(16))
+    checked_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, index=True,
+    )
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    registrar: Mapped[str] = mapped_column(String(255), default="")
+    # `expires_on` is a date (no time component) — that's what registry
+    # responses commit to. Stored as DATE for clean sorting + range
+    # queries (drives the skip-registered policy at runner time).
+    expires_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    error_category: Mapped[str] = mapped_column(String(16), default="")
+    raw_response: Mapped[str] = mapped_column(Text, default="")
+    # Optional link to the Run that triggered this check (null for
+    # manual / scheduled).
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("runs.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+
+
+class JobCriterionPin(Base):
+    """Per-job × per-criterion pin (added 2026-05-12).
+
+    Supersedes the older Run.is_pinned + RunDomain.is_pinned model for
+    Database-page rollup. A row here says: "for this Job, the canonical
+    source of criterion C is Run R." Multiple criteria within one Job can
+    point at different Runs — the workflow this enables is iterative
+    cascade (cheap Wayback first, expensive Ahrefs only on survivors;
+    each step lives in its own Run but the Job's final view stitches
+    them together).
+
+    Invariants:
+      - unique on (job_id, criterion) — at most one pin per criterion per job
+      - run_id must belong to job_id (enforced in the endpoint, not the DB)
+      - criterion ∈ CRITERIA (see routers/database.py CRITERIA tuple)
+
+    Migration: legacy Run.is_pinned=True expands at startup to one
+    JobCriterionPin row per criterion that pinned run has data for.
+    Legacy RunDomain.is_pinned=True expands similarly, on the rd's run.
+    """
+    __tablename__ = "job_criterion_pins"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "criterion", name="uq_job_criterion_pins_job_crit",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), index=True
+    )
+    criterion: Mapped[str] = mapped_column(String(32))
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
 
 

@@ -1,11 +1,12 @@
 "use client";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useT } from "@/lib/i18n";
 import {
   api,
   AIProvider,
+  AvailabilityStatus,
   DatabaseDomainList,
   DatabaseDomainRow,
   ProviderStatus,
@@ -27,6 +28,27 @@ import { CsvColumn, csvFilename, downloadBlob, toCsv } from "@/lib/csv";
 import { MultiSelectFilter } from "@/components/multi-select-filter";
 import { VerdictHoverCard } from "@/components/verdict-hover-card";
 import { BacklogActionsCell } from "@/components/backlog-actions-cell";
+
+// Helper: wrap children in a Next Link when href is non-null, otherwise
+// pass through. Used by the Database-page verdict cells so each cell
+// navigates to the rd that actually supplied its data (per-criterion
+// source rd, post-2026-05-12). Returning `<Link>{children}</Link>`
+// inherits the link's tab + accessibility behavior; when href is null
+// the cell stays static.
+function MaybeLink({
+  href,
+  children,
+}: {
+  href: string | null;
+  children: ReactNode;
+}) {
+  if (!href) return <>{children}</>;
+  return (
+    <Link href={href} className="hover:underline">
+      {children}
+    </Link>
+  );
+}
 
 const CRITERIA_KEYS = [
   "backlinks",
@@ -69,6 +91,12 @@ export default function DatabasePage() {
   // wayback_classify filters (added 2026-05-09).
   const [languages, setLanguages] = useState<string[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
+  // Confidence thresholds (added 2026-05-13). Each is a value in 0..1
+  // OR 0 = "no filter". Rows with null confidence (no verdict, partial
+  // final stub, etc.) are excluded when the corresponding min is > 0
+  // — they can't meet a threshold by definition.
+  const [waybackConfMin, setWaybackConfMin] = useState<number>(0);
+  const [ahrefsConfMin, setAhrefsConfMin] = useState<number>(0);
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
@@ -115,6 +143,80 @@ export default function DatabasePage() {
   const dataRef = useRef<DatabaseDomainList | null>(null);
   dataRef.current = data;
 
+  // Availability cascade results, keyed by domain. Hydrated alongside
+  // the database rows in `reload()`, refreshed per-row by the recheck
+  // button. Domains absent from the map render the Availability cell
+  // as "—" (never checked).
+  const [availabilityByDomain, setAvailabilityByDomain] = useState<
+    Record<
+      string,
+      {
+        status: AvailabilityStatus;
+        provider: string;
+        registrar: string;
+        expires_on: string | null;
+        checked_at: string | null;
+      }
+    >
+  >({});
+  const [recheckBusy, setRecheckBusy] = useState<Set<string>>(new Set());
+
+  async function handleRecheckAvailability(domain: string) {
+    setRecheckBusy((prev) => new Set(prev).add(domain));
+    try {
+      const r = await api.checkAvailability(domain, false);
+      setAvailabilityByDomain((prev) => ({
+        ...prev,
+        [domain]: {
+          status: r.status,
+          provider: r.provider,
+          registrar: r.registrar,
+          expires_on: r.expires_on,
+          checked_at: r.checked_at,
+        },
+      }));
+    } catch {
+      // Errors land on the Errors page via the backend log handler.
+      // Surface nothing here — the user can retry from the same button.
+    } finally {
+      setRecheckBusy((prev) => {
+        const next = new Set(prev);
+        next.delete(domain);
+        return next;
+      });
+    }
+  }
+
+  async function handleBulkRecheck() {
+    const domains = Array.from(selected);
+    if (domains.length === 0) return;
+    setRecheckBusy((prev) => {
+      const next = new Set(prev);
+      for (const d of domains) next.add(d);
+      return next;
+    });
+    try {
+      const r = await api.bulkCheckAvailability(domains, false);
+      setAvailabilityByDomain((prev) => {
+        const next = { ...prev };
+        for (const item of r.items) {
+          next[item.domain] = {
+            status: item.status,
+            provider: item.provider,
+            registrar: item.registrar,
+            expires_on: item.expires_on,
+            checked_at: new Date().toISOString(),
+          };
+        }
+        return next;
+      });
+    } catch {
+      // Same: errors land on /errors.
+    } finally {
+      setRecheckBusy(new Set());
+    }
+  }
+
   function reload(opts: { silent?: boolean } = {}) {
     let cancelled = false;
     if (!opts.silent) setError(null);
@@ -131,6 +233,31 @@ export default function DatabasePage() {
             for (const dom of prev) if (stillExists.has(dom)) next.add(dom);
             return next;
           });
+          // Hydrate availability column from the cache history. One
+          // read per refresh — never spawns a fresh cascade. Domains
+          // with no cached row stay rendered as "—".
+          const domains = d.rows.map((r) => r.domain);
+          if (domains.length > 0) {
+            api
+              .latestAvailability(domains)
+              .then((rows) => {
+                if (cancelled) return;
+                const map: typeof availabilityByDomain = {};
+                for (const r of rows) {
+                  map[r.domain] = {
+                    status: r.status,
+                    provider: r.provider,
+                    registrar: r.registrar,
+                    expires_on: r.expires_on,
+                    checked_at: r.checked_at,
+                  };
+                }
+                setAvailabilityByDomain(map);
+              })
+              .catch(() => {
+                // Non-fatal; column just stays empty.
+              });
+          }
         }
       })
       .catch((e: Error) => {
@@ -272,6 +399,25 @@ export default function DatabasePage() {
       if (!matchWayback(r)) return false;
       if (!matchLang(r)) return false;
       if (!matchCat(r)) return false;
+      // Confidence thresholds (added 2026-05-13). null verdicts are
+      // excluded when the threshold is > 0 — a row without a verdict
+      // can't be "above 0.7 confidence" by any meaningful definition.
+      if (waybackConfMin > 0) {
+        if (
+          typeof r.wayback_confidence !== "number" ||
+          r.wayback_confidence < waybackConfMin
+        ) {
+          return false;
+        }
+      }
+      if (ahrefsConfMin > 0) {
+        if (
+          typeof r.final_confidence !== "number" ||
+          r.final_confidence < ahrefsConfMin
+        ) {
+          return false;
+        }
+      }
       if (provider) {
         if (provider === "__none__") {
           if (r.ai_provider) return false;
@@ -317,6 +463,8 @@ export default function DatabasePage() {
     cache,
     notesFilter,
     minRecords,
+    waybackConfMin,
+    ahrefsConfMin,
   ]);
 
   const sorted = useMemo<DatabaseDomainRow[]>(() => {
@@ -460,6 +608,8 @@ export default function DatabasePage() {
     setNotesFilter("any");
     setPinFilter("any");
     setMinRecords(0);
+    setWaybackConfMin(0);
+    setAhrefsConfMin(0);
   }
 
   const csvColumns = useMemo<CsvColumn<DatabaseDomainRow>[]>(
@@ -582,7 +732,9 @@ export default function DatabasePage() {
     cache !== "any" ||
     notesFilter !== "any" ||
     pinFilter !== "any" ||
-    minRecords > 0;
+    minRecords > 0 ||
+    waybackConfMin > 0 ||
+    ahrefsConfMin > 0;
 
   if (error) {
     return (
@@ -830,6 +982,40 @@ export default function DatabasePage() {
             title={ts.filters.minRecordsHelp}
             className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none"
           />
+
+          <input
+            type="number"
+            min={0}
+            max={1}
+            step={0.05}
+            value={waybackConfMin || ""}
+            onChange={(e) => {
+              const v = parseFloat(e.target.value);
+              setWaybackConfMin(
+                Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0,
+              );
+            }}
+            placeholder={ts.filters.waybackConfMin}
+            title={ts.filters.waybackConfMinHelp}
+            className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none w-28"
+          />
+
+          <input
+            type="number"
+            min={0}
+            max={1}
+            step={0.05}
+            value={ahrefsConfMin || ""}
+            onChange={(e) => {
+              const v = parseFloat(e.target.value);
+              setAhrefsConfMin(
+                Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0,
+              );
+            }}
+            placeholder={ts.filters.ahrefsConfMin}
+            title={ts.filters.ahrefsConfMinHelp}
+            className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none w-28"
+          />
         </div>
       </section>
 
@@ -862,14 +1048,60 @@ export default function DatabasePage() {
                   // matching CR rows from ANY job can be reused on
                   // submit. The Analyze page reads `domains=` and
                   // pre-fills the textarea + ticks the cross-cache box.
+                  //
+                  // Additionally pass `source_job_id` — the dominant
+                  // job that produced the selected rows' WAYBACK
+                  // criterion (added 2026-05-13). Wayback's
+                  // `params_hash` is the cache-key-critical config for
+                  // this workflow; pre-filling the form from this
+                  // source job's spec guarantees the cache hits
+                  // instead of the user accidentally setting a
+                  // different limit / sample_pages / sample_count and
+                  // missing cache on every domain.
                   const list = Array.from(selected);
                   if (list.length === 0) return;
                   // Comma-separated; domains can't contain commas.
                   // encodeURIComponent handles any unicode/IDN domains.
                   const param = encodeURIComponent(list.join(","));
-                  router.push(
-                    `/analyze?domains=${param}&cross_cache=1`,
-                  );
+                  // Dominant wayback source job: count source_job_id
+                  // per selected row, pick the highest. Tie-break by
+                  // greatest source_run_id (most recent). Rows without
+                  // a wayback source (criterion not yet analyzed)
+                  // contribute nothing.
+                  const counts = new Map<number, { n: number; maxRun: number }>();
+                  if (data) {
+                    for (const r of data.rows) {
+                      if (!selected.has(r.domain)) continue;
+                      const wb = r.criteria?.wayback;
+                      const jid = wb?.source_job_id;
+                      const rid = wb?.source_run_id;
+                      if (typeof jid !== "number") continue;
+                      const cur = counts.get(jid) ?? { n: 0, maxRun: 0 };
+                      cur.n += 1;
+                      if (typeof rid === "number" && rid > cur.maxRun) {
+                        cur.maxRun = rid;
+                      }
+                      counts.set(jid, cur);
+                    }
+                  }
+                  let dominantJobId: number | null = null;
+                  let bestN = 0;
+                  let bestRun = 0;
+                  for (const [jid, { n, maxRun }] of counts) {
+                    if (
+                      n > bestN ||
+                      (n === bestN && maxRun > bestRun)
+                    ) {
+                      dominantJobId = jid;
+                      bestN = n;
+                      bestRun = maxRun;
+                    }
+                  }
+                  let url = `/analyze?domains=${param}&cross_cache=1`;
+                  if (dominantJobId !== null) {
+                    url += `&source_job_id=${dominantJobId}`;
+                  }
+                  router.push(url);
                 }}
                 disabled={deleting || reanalyzeBusy}
                 className="text-xs px-3 py-1 rounded-md border border-blue-300 dark:border-blue-900/60 text-blue-800 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/40 disabled:opacity-50"
@@ -1104,8 +1336,7 @@ export default function DatabasePage() {
                 <th className="px-3 py-2 font-medium">{ts.cols.note}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.backlog}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.criteria}</th>
-                <th className="px-3 py-2 font-medium">{ts.cols.runs}</th>
-                <th className="px-3 py-2 font-medium">{ts.cols.pin}</th>
+                <th className="px-3 py-2 font-medium">{ts.cols.availability}</th>
               </tr>
             </thead>
             <tbody>
@@ -1120,6 +1351,9 @@ export default function DatabasePage() {
                   onPin={(rdId) => handlePin(r.domain, rdId)}
                   onUnpin={() => handleUnpin(r.domain)}
                   onBacklogUpdated={() => reload({ silent: true })}
+                  availability={availabilityByDomain[r.domain]}
+                  recheckBusy={recheckBusy.has(r.domain)}
+                  onRecheck={() => handleRecheckAvailability(r.domain)}
                 />
               ))}
             </tbody>
@@ -1141,6 +1375,9 @@ function DomainListRow({
   onPin,
   onUnpin,
   onBacklogUpdated,
+  availability,
+  recheckBusy,
+  onRecheck,
 }: {
   row: DatabaseDomainRow;
   selected: boolean;
@@ -1150,17 +1387,73 @@ function DomainListRow({
   onPin: (runDomainId: number) => void;
   onUnpin: () => void;
   onBacklogUpdated: () => void;
+  availability?: {
+    status: AvailabilityStatus;
+    provider: string;
+    registrar: string;
+    expires_on: string | null;
+    checked_at: string | null;
+  };
+  recheckBusy: boolean;
+  onRecheck: () => void;
 }) {
   const { t } = useT();
   const ts = t.pages.database;
 
-  const href =
-    row.is_pinned &&
-    row.pinned_job_id != null &&
-    row.pinned_run_id != null &&
-    row.pinned_run_domain_id != null
-      ? `/jobs/${row.pinned_job_id}/runs/${row.pinned_run_id}/domains/${row.pinned_run_domain_id}`
-      : null;
+  // Per-criterion → rd link. Each verdict cell navigates to the rd
+  // that supplied that criterion's data (added 2026-05-12). Cleaner
+  // than the old single-link-on-domain-column behavior, which broke
+  // down once criteria could be stitched from multiple rds.
+  const hrefFor = (
+    keys: readonly string[],
+  ): string | null => {
+    for (const k of keys) {
+      const c = row.criteria[k];
+      if (
+        c &&
+        c.source_job_id != null &&
+        c.source_run_id != null &&
+        c.source_run_domain_id != null
+      ) {
+        return `/jobs/${c.source_job_id}/runs/${c.source_run_id}/domains/${c.source_run_domain_id}`;
+      }
+    }
+    return null;
+  };
+  // Final-verdict cell points at whichever Ahrefs rd we have — they're
+  // the weighted ones driving the score. Falls through B → D → A → K
+  // so something is linkable even if the user only pinned one.
+  const finalHref = hrefFor([
+    "backlinks", "refdomains", "anchors", "keywords",
+  ]);
+  const waybackHref = hrefFor(["wayback"]);
+  const classifyHref = hrefFor(["wayback_classify"]);
+
+  // Per-cell cached-data marker (added 2026-05-12). A criterion is
+  // "cached" if its underlying CR reused either raw data
+  // (cached_from_run_id) or an AI verdict (ai_cached_from_run_id) from
+  // a prior run. The row-level any_cached badge was confusing once
+  // criteria could be sourced from different runs — e.g. a fresh
+  // Ahrefs pin alongside a stale-cached Wayback pin would tag the
+  // whole row as cached even though the score itself was fresh. Now
+  // each verdict cell decides for itself.
+  const cachedFor = (keys: readonly string[]): boolean => {
+    for (const k of keys) {
+      const c = row.criteria[k];
+      if (
+        c &&
+        (c.cached_from_run_id != null || c.ai_cached_from_run_id != null)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const finalCached = cachedFor([
+    "backlinks", "refdomains", "anchors", "keywords",
+  ]);
+  const waybackCached = cachedFor(["wayback"]);
+  const classifyCached = cachedFor(["wayback_classify"]);
 
   const bucket: FinalBucket | null = isBucket(row.final_bucket)
     ? row.final_bucket
@@ -1190,6 +1483,9 @@ function DomainListRow({
     letter,
     rows: row.criteria[k].rows,
     fullName: t.pages.analyze.criteria[k],
+    sourceRunId: row.criteria[k].source_run_id ?? null,
+    sourceJobName: row.criteria[k].source_job_name ?? "",
+    sourceRunName: row.criteria[k].source_run_name ?? "",
   }));
 
   const finishedAt = row.pinned_finished_at
@@ -1225,78 +1521,120 @@ function DomainListRow({
         />
       </td>
       <td className="px-3 py-2 align-top">
-        {href ? (
-          <Link
-            href={href}
-            className="font-mono text-blue-600 dark:text-blue-400 hover:underline break-all"
-          >
-            {row.domain}
-          </Link>
-        ) : (
-          <span className="font-mono text-neutral-700 dark:text-neutral-300 break-all">
-            {row.domain}
-          </span>
-        )}
-        {row.is_pinned && (
-          <span
-            className="ml-1.5 text-amber-600 dark:text-amber-400"
-            title={ts.pin.pinnedHint}
-          >
-            ★
-          </span>
-        )}
+        <span className="font-mono text-neutral-700 dark:text-neutral-300 break-all">
+          {row.domain}
+        </span>
       </td>
       <td className="px-3 py-2 align-top">
         {!row.is_pinned ? (
           <span className="text-xs text-neutral-400 dark:text-neutral-500">
             —
           </span>
-        ) : row.final_partial ? (
+        ) : row.final_partial && score == null ? (
           <span
             className="text-xs px-2 py-0.5 rounded-full bg-neutral-200 text-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-300"
-            title={ts.partialTooltip}
+            title={
+              row.pinned_criteria && row.pinned_criteria.length > 0
+                ? ts.partialFromCriteria(
+                    row.pinned_criteria
+                      .map((c) =>
+                        (
+                          {
+                            backlinks: "B",
+                            refdomains: "D",
+                            anchors: "A",
+                            keywords: "K",
+                            wayback: "W",
+                            wayback_classify: "C",
+                          } as Record<string, string>
+                        )[c] ?? c,
+                      )
+                      .join(", "),
+                  )
+                : ts.partialTooltip
+            }
           >
             {ts.partialBadge}
           </span>
         ) : bucket ? (
           row.pinned_run_domain_id != null ? (
+            <MaybeLink href={finalHref}>
             <VerdictHoverCard
               runDomainId={row.pinned_run_domain_id}
               mode="final"
             >
               <span
-                className={`text-xs px-2 py-0.5 rounded-full cursor-help ${verdictTone}`}
+                className={`text-xs px-2 py-0.5 rounded-full cursor-help ${verdictTone} ${row.final_partial ? "ring-1 ring-dashed ring-neutral-400 dark:ring-neutral-500" : ""}`}
                 title={(() => {
                   const base =
                     score != null
                       ? `Score ${formatScore(score)} · bucket ${bucket}`
                       : bucket;
-                  if (confidence == null) return base;
-                  const conf = `${Math.round(confidence * 100)}% confidence`;
-                  const note = isLowConfidence(confidence)
-                    ? " (low — greyed)"
-                    : "";
-                  return `${base} · ${conf}${note}`;
+                  const parts: string[] = [base];
+                  if (confidence != null) {
+                    const conf = `${Math.round(confidence * 100)}% confidence`;
+                    const note = isLowConfidence(confidence)
+                      ? " (low — greyed)"
+                      : "";
+                    parts.push(`${conf}${note}`);
+                  }
+                  if (
+                    row.final_partial &&
+                    row.pinned_criteria &&
+                    row.pinned_criteria.length > 0
+                  ) {
+                    parts.push(
+                      ts.partialFromCriteria(
+                        row.pinned_criteria
+                          .map((c) =>
+                            (
+                              {
+                                backlinks: "B",
+                                refdomains: "D",
+                                anchors: "A",
+                                keywords: "K",
+                                wayback: "W",
+                                wayback_classify: "C",
+                              } as Record<string, string>
+                            )[c] ?? c,
+                          )
+                          .join(", "),
+                      ),
+                    );
+                  }
+                  return parts.join(" · ");
                 })()}
               >
                 {score != null ? formatScore(score) : bucket}
+                {row.final_partial && (
+                  <span className="ml-0.5 opacity-70">*</span>
+                )}
               </span>
             </VerdictHoverCard>
+            </MaybeLink>
           ) : (
+            <MaybeLink href={finalHref}>
             <span
               className={`text-xs px-2 py-0.5 rounded-full ${verdictTone}`}
               title={bucket}
             >
               {score != null ? formatScore(score) : bucket}
+              {row.final_partial && (
+                <span className="ml-0.5 opacity-70">*</span>
+              )}
             </span>
+            </MaybeLink>
           )
         ) : (
           <span className="text-xs text-neutral-400 dark:text-neutral-500">
             {ts.noVerdict}
           </span>
         )}
-        {row.is_pinned && row.any_cached && (
-          <span className="ml-2 text-[10px] uppercase tracking-wide text-violet-700 dark:text-violet-400">
+        {row.is_pinned && finalCached && (
+          <span
+            className="ml-2 text-[10px] uppercase tracking-wide text-violet-700 dark:text-violet-400"
+            title="One or more Ahrefs criteria reused data or AI verdict from a prior run"
+          >
             {ts.cachedTag}
           </span>
         )}
@@ -1307,9 +1645,14 @@ function DomainListRow({
             —
           </span>
         ) : row.wayback_assessment ? (
-          row.pinned_run_domain_id != null ? (
+          (row.criteria.wayback?.source_run_domain_id ??
+            row.pinned_run_domain_id) != null ? (
+            <MaybeLink href={waybackHref}>
             <VerdictHoverCard
-              runDomainId={row.pinned_run_domain_id}
+              runDomainId={
+                row.criteria.wayback?.source_run_domain_id ??
+                row.pinned_run_domain_id!
+              }
               mode="criterion"
               criterion="wayback"
             >
@@ -1336,7 +1679,9 @@ function DomainListRow({
                 )}
               </span>
             </VerdictHoverCard>
+            </MaybeLink>
           ) : (
+            <MaybeLink href={waybackHref}>
             <span
               className={`text-xs px-2 py-0.5 rounded-full ${criterionPillTone(
                 row.wayback_assessment,
@@ -1349,10 +1694,19 @@ function DomainListRow({
                 "good",
               )}
             </span>
+            </MaybeLink>
           )
         ) : (
           <span className="text-xs text-neutral-400 dark:text-neutral-500">
             {ts.noVerdict}
+          </span>
+        )}
+        {row.is_pinned && row.wayback_assessment && waybackCached && (
+          <span
+            className="ml-2 text-[10px] uppercase tracking-wide text-violet-700 dark:text-violet-400"
+            title="Wayback data or AI verdict reused from a prior run"
+          >
+            {ts.cachedTag}
           </span>
         )}
       </td>
@@ -1370,6 +1724,7 @@ function DomainListRow({
               row.language_confidence != null &&
               isLowConfidence(row.language_confidence);
             return (
+              <MaybeLink href={classifyHref}>
               <span
                 className={
                   "text-xs font-mono px-1.5 py-0.5 rounded " +
@@ -1392,6 +1747,7 @@ function DomainListRow({
                   <span className="ml-0.5 opacity-60">+{row.secondary_languages.length}</span>
                 )}
               </span>
+              </MaybeLink>
             );
           })()
         ) : (
@@ -1410,6 +1766,7 @@ function DomainListRow({
               row.theme_confidence != null &&
               isLowConfidence(row.theme_confidence);
             return (
+              <MaybeLink href={classifyHref}>
               <div
                 className={
                   "text-xs " +
@@ -1437,6 +1794,7 @@ function DomainListRow({
                   </span>
                 )}
               </div>
+              </MaybeLink>
             );
           })()
         ) : (
@@ -1448,6 +1806,7 @@ function DomainListRow({
         {!row.is_pinned ? (
           <span className="text-xs text-neutral-400 dark:text-neutral-500">—</span>
         ) : row.category ? (
+          <MaybeLink href={classifyHref}>
           <span
             className={`text-xs px-2 py-0.5 rounded-full ${
               row.category === "other"
@@ -1469,6 +1828,7 @@ function DomainListRow({
               <span className="ml-1 opacity-70">← {row.category_was}</span>
             )}
           </span>
+          </MaybeLink>
         ) : (
           <span className="text-xs text-neutral-400 dark:text-neutral-500">—</span>
         )}
@@ -1514,57 +1874,125 @@ function DomainListRow({
             <span className="text-neutral-400 dark:text-neutral-500">—</span>
           ) : (
             <div className="flex flex-wrap gap-1">
-              {enabledCriteriaPills.map(({ key, letter, rows, fullName }) => (
-                <span
-                  key={key}
-                  className="text-xs px-1.5 py-0.5 rounded font-medium tabular-nums bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
-                  title={`${fullName} (${rows.toLocaleString()})`}
-                >
-                  {letter}
-                </span>
-              ))}
+              {enabledCriteriaPills.map(
+                ({
+                  key,
+                  letter,
+                  rows,
+                  fullName,
+                  sourceRunId,
+                  sourceJobName,
+                  sourceRunName,
+                }) => {
+                  const sourceSuffix = sourceRunId
+                    ? `\nFrom Run #${sourceRunId}${
+                        sourceRunName ? ` "${sourceRunName}"` : ""
+                      }${sourceJobName ? ` (Job: ${sourceJobName})` : ""}`
+                    : "";
+                  return (
+                    <span
+                      key={key}
+                      className="text-xs px-1.5 py-0.5 rounded font-medium tabular-nums bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
+                      title={`${fullName} (${rows.toLocaleString()})${sourceSuffix}`}
+                    >
+                      {letter}
+                    </span>
+                  );
+                },
+              )}
             </div>
           )
         ) : (
           <span className="text-neutral-400 dark:text-neutral-500">—</span>
         )}
       </td>
-      <td className="px-3 py-2 align-top">
-        <div className="text-xs">
-          <span className="font-medium">{ts.runsBadge(row.total_runs)}</span>
-        </div>
-      </td>
-      <td className="px-3 py-2 align-top">
-        <div className="text-xs space-y-1">
-          <PinSelect
-            row={row}
-            pinBusy={pinBusy}
-            onPin={onPin}
-            ts={ts}
-          />
-          {row.is_pinned && (
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-neutral-500 dark:text-neutral-400">
-                {finishedAt}
-              </span>
-              <button
-                type="button"
-                onClick={onUnpin}
-                disabled={pinBusy}
-                className="text-[11px] px-1.5 py-0.5 rounded border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
-              >
-                {pinBusy ? ts.pin.unpinning : ts.pin.unpin}
-              </button>
-            </div>
-          )}
-          {pinError && (
-            <div className="text-red-600 dark:text-red-400">
-              {ts.pin.pinFailed}: {pinError}
-            </div>
-          )}
-        </div>
+      <td className="px-3 py-2 align-top text-xs">
+        <AvailabilityCell
+          status={availability?.status ?? null}
+          provider={availability?.provider ?? ""}
+          registrar={availability?.registrar ?? ""}
+          expiresOn={availability?.expires_on ?? null}
+          checkedAt={availability?.checked_at ?? null}
+          busy={recheckBusy}
+          onRecheck={onRecheck}
+        />
       </td>
     </tr>
+  );
+}
+
+function AvailabilityCell({
+  status,
+  provider,
+  registrar,
+  expiresOn,
+  checkedAt,
+  busy,
+  onRecheck,
+}: {
+  status: AvailabilityStatus | null;
+  provider: string;
+  registrar: string;
+  expiresOn: string | null;
+  checkedAt: string | null;
+  busy: boolean;
+  onRecheck: () => void;
+}) {
+  const { t } = useT();
+  const a = t.pages.availability;
+  const tone = (() => {
+    switch (status) {
+      case "available":
+        return "bg-emerald-100 text-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-200";
+      case "registered":
+        return "bg-neutral-100 text-neutral-800 dark:bg-neutral-800 dark:text-neutral-200";
+      case "error":
+        return "bg-rose-100 text-rose-900 dark:bg-rose-950/60 dark:text-rose-200";
+      default:
+        return "bg-neutral-100 text-neutral-600 dark:bg-neutral-800/60 dark:text-neutral-400";
+    }
+  })();
+  const label = (() => {
+    if (status === "available") return a.statusAvailable;
+    if (status === "registered") return a.statusRegistered;
+    if (status === "error") return a.statusError;
+    if (status === "unknown") return a.statusUnknown;
+    return null;
+  })();
+  return (
+    <div className="space-y-1">
+      {label ? (
+        <span
+          className={`inline-block px-2 py-0.5 rounded-full ${tone}`}
+          title={[
+            checkedAt
+              ? a.checkedAt(new Date(checkedAt).toLocaleString())
+              : null,
+            provider ? a.sourceProvider(provider) : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        >
+          {label}
+        </span>
+      ) : (
+        <span className="text-neutral-400 dark:text-neutral-500">—</span>
+      )}
+      {status === "registered" && (registrar || expiresOn) && (
+        <div className="text-[11px] text-neutral-600 dark:text-neutral-400 space-y-0.5">
+          {registrar && <div>{a.registrar(registrar)}</div>}
+          {expiresOn && <div>{a.expiresOn(expiresOn)}</div>}
+        </div>
+      )}
+      <button
+        type="button"
+        onClick={onRecheck}
+        disabled={busy}
+        className="text-[11px] px-1.5 py-0.5 rounded border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+      >
+        {busy ? a.rechecking : a.recheck}
+      </button>
+    </div>
   );
 }
 

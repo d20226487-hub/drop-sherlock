@@ -153,6 +153,17 @@ function AnalyzePageInner() {
   // from any matching job get reused.
   const fromDatabaseDomains = searchParams.get("domains");
   const fromDatabaseCrossCache = searchParams.get("cross_cache") === "1";
+  // Source job for pre-filling criteria + AI from the run that produced
+  // the selected rows' wayback verdicts (added 2026-05-13). Database
+  // page passes this so the form's params_hash matches the cached data
+  // — without it, default form values would produce a different
+  // params_hash and every domain would miss the cross-job cache.
+  const sourceJobIdParam = (() => {
+    const v = searchParams.get("source_job_id");
+    if (!v) return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  })();
   // Backlog → Analyze entry point: triggered by the Backlog page's "Send
   // to Analyze" button. The domain list is too big for a URL at
   // thousands-of-rows scale, so we hand it off via sessionStorage and
@@ -174,6 +185,18 @@ function AnalyzePageInner() {
   // the Database-entry banner is showing.
   const [crossJobCache, setCrossJobCache] = useState(false);
   const [fromDatabase, setFromDatabase] = useState(false);
+  // When the Database hand-off includes source_job_id, we fetch that
+  // job's spec and pre-fill criteria + AI from it. This banner state
+  // drives the green note that surfaces the auto-fill so the user
+  // knows they're aligned with the cache. Cleared when the user opens
+  // a fresh /analyze without the source param.
+  const [prefillSource, setPrefillSource] = useState<
+    { jobId: number; jobName: string } | null
+  >(null);
+  // Availability cascade toggle (added 2026-05-12). When ON, the runner
+  // calls RDAP/DNS/etc. before Ahrefs/Wayback. Off by default — opt in
+  // per-submit via the box at the top of the page.
+  const [checkAvailability, setCheckAvailability] = useState(false);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [previewLoading, setPreviewLoading] = useState(true);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -225,20 +248,64 @@ function AnalyzePageInner() {
     setDomainsRaw(list.join("\n"));
     setCrossJobCache(fromDatabaseCrossCache);
     setFromDatabase(true);
-    // Keep `?cross_cache=1` in URL state so the banner stays visible on
-    // back/forward; only strip the bulky `domains=` to keep the URL
-    // readable. The user's textarea now owns the domain list.
-    router.replace(
-      fromDatabaseCrossCache ? "/analyze?cross_cache=1" : "/analyze",
-    );
+    // Strip ONLY `domains=` (the bulky payload) — preserve every other
+    // URL param so the source_job_id pre-fill effect still has its
+    // input to act on. Building this URL as
+    // `/analyze?cross_cache=1` (the pre-2026-05-13 version) would
+    // accidentally strip `source_job_id=N` and cancel the in-flight
+    // pre-fill fetch (since sourceJobIdParam transitioning to null
+    // triggers the effect's cleanup → cancelled=true).
+    const remaining = new URLSearchParams(searchParams.toString());
+    remaining.delete("domains");
+    const qs = remaining.toString();
+    router.replace(qs ? `/analyze?${qs}` : "/analyze");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fromDatabaseDomains, fromDatabaseCrossCache]);
 
   function clearFromDatabase() {
     setFromDatabase(false);
     setCrossJobCache(false);
+    setPrefillSource(null);
     router.replace("/analyze");
   }
+
+  // Pre-fill criteria + AI from the source job (Database → Analyze
+  // hand-off, added 2026-05-13). Runs after the Database prefill effect
+  // has consumed the domain list. Pulls the source job's spec — same
+  // mechanism as `?rerun=N` — but only copies `criteria` + `ai` so the
+  // user's domain selection (which came from the URL above) isn't
+  // overwritten. Strips `source_job_id` from the URL on success so a
+  // back-button refresh doesn't re-overwrite user edits.
+  useEffect(() => {
+    if (sourceJobIdParam === null) return;
+    let cancelled = false;
+    api
+      .getJobSpec(sourceJobIdParam)
+      .then((r) => {
+        if (cancelled) return;
+        setCriteria(r.spec.criteria);
+        if (r.spec.ai) setAi(r.spec.ai);
+        setPrefillSource({
+          jobId: sourceJobIdParam,
+          jobName: r.name || `#${sourceJobIdParam}`,
+        });
+        // Strip ONLY `source_job_id` — preserve any other params
+        // (cross_cache=1, future additions) so we don't fight the
+        // Database prefill effect or future entry-point hand-offs.
+        const remaining = new URLSearchParams(searchParams.toString());
+        remaining.delete("source_job_id");
+        const qs = remaining.toString();
+        router.replace(qs ? `/analyze?${qs}` : "/analyze");
+      })
+      .catch(() => {
+        // Source job missing or fetch failed — leave defaults, no banner.
+        if (!cancelled) setPrefillSource(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceJobIdParam]);
 
   // Prefill from Backlog "Send to Analyze". Reads the domain list from
   // sessionStorage (set by the Backlog page right before the redirect),
@@ -289,11 +356,23 @@ function AnalyzePageInner() {
       // entry or manual tick). Backend defaults to false either way; we
       // only send when ON to keep the wire payload obvious in DevTools.
       ...(crossJobCache ? { cross_job_cache: true } : {}),
+      // Availability cascade — only send when ON so the wire payload
+      // stays obvious in DevTools.
+      ...(checkAvailability ? { check_availability: true } : {}),
       // Carry the current UI language so the backend appends a Russian-
       // output directive to the AI system prompts on RU runs.
       lang,
     }),
-    [domainsRaw, criteria, ai, rerunJobId, useCache, crossJobCache, lang],
+    [
+      domainsRaw,
+      criteria,
+      ai,
+      rerunJobId,
+      useCache,
+      crossJobCache,
+      checkAvailability,
+      lang,
+    ],
   );
 
   // --- Live preview (debounced) -------------------------------------------
@@ -383,6 +462,30 @@ function AnalyzePageInner() {
         </p>
       </div>
 
+      {/* Domain-availability cascade toggle — first box on the page so
+          it's the first thing the user reads. Opt-in per submit; the
+          actual provider config + skip policy live in Settings → Domain
+          availability. */}
+      <section className="rounded-md border border-neutral-200 dark:border-neutral-800 p-4 space-y-2 bg-neutral-50/50 dark:bg-neutral-900/30">
+        <header>
+          <h2 className="text-base font-semibold">
+            {t.pages.availability.analyzeBoxTitle}
+          </h2>
+          <p className="text-xs text-neutral-600 dark:text-neutral-400 mt-0.5">
+            {t.pages.availability.analyzeBoxHint}
+          </p>
+        </header>
+        <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={checkAvailability}
+            onChange={(e) => setCheckAvailability(e.target.checked)}
+            className="rounded border-neutral-300 dark:border-neutral-700"
+          />
+          <span>{t.pages.availability.analyzeBoxToggle}</span>
+        </label>
+      </section>
+
       {fromDatabase && (
         <div className="rounded-md border border-violet-300 dark:border-violet-700/50 bg-violet-50 dark:bg-[#1a1030] p-4 space-y-2">
           <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -419,6 +522,14 @@ function AnalyzePageInner() {
               </span>
             </span>
           </label>
+          {prefillSource && (
+            <p className="text-xs rounded-md px-2 py-1 bg-emerald-50 text-emerald-900 dark:bg-emerald-900/30 dark:text-emerald-200">
+              {ts.fromDatabaseBanner.prefilledFromJob(
+                prefillSource.jobName,
+                prefillSource.jobId,
+              )}
+            </p>
+          )}
         </div>
       )}
 

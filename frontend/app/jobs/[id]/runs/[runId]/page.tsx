@@ -205,12 +205,17 @@ export default function RunDetailPage({
   // reanalyze state so a busy reanalyze doesn't disable lifecycle buttons.
   const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [lifecycleError, setLifecycleError] = useState<string | null>(null);
-  const [pinAllBusy, setPinAllBusy] = useState(false);
-  const [pinAllError, setPinAllError] = useState<string | null>(null);
-  const [pinAllResult, setPinAllResult] = useState<{
+  // Per-criterion pins for this Job (added 2026-05-12). Keyed by
+  // criterion → run_id of whoever's currently pinned (across all runs in
+  // this job, not just this one). Loaded on mount + after every pin/
+  // unpin call.
+  const [critPins, setCritPins] = useState<Record<string, number>>({});
+  const [critPinBusy, setCritPinBusy] = useState<string | null>(null);
+  const [critPinAllResult, setCritPinAllResult] = useState<{
     pinned: number;
     replaced: number;
   } | null>(null);
+  const [critPinError, setCritPinError] = useState<string | null>(null);
   const [retryBusy, setRetryBusy] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
   // Snapshot of the dispatched retry: counts at submit time + the
@@ -300,23 +305,54 @@ export default function RunDetailPage({
     }
   }
 
-  async function handlePinAll() {
-    if (!run) return;
-    const total = run.domains.length;
-    if (total === 0) return;
-    // We don't know the replaced count up-front; show a generic confirm.
-    if (!window.confirm(ts.pinAllConfirm(total, 0))) return;
-    setPinAllBusy(true);
-    setPinAllError(null);
-    setPinAllResult(null);
+  const reloadCritPins = useCallback(async () => {
     try {
-      const r = await api.pinEntireRun(runId);
-      setPinAllResult({ pinned: r.pinned, replaced: r.replaced });
-      reload();
+      const r = await api.listJobCriterionPins(jobId);
+      const map: Record<string, number> = {};
+      for (const p of r.pins) map[p.criterion] = p.run_id;
+      setCritPins(map);
+    } catch {
+      // Non-fatal — the panel just stays empty.
+    }
+  }, [jobId]);
+
+  useEffect(() => {
+    reloadCritPins();
+  }, [reloadCritPins]);
+
+  async function handleToggleCritPin(criterion: string) {
+    setCritPinBusy(criterion);
+    setCritPinError(null);
+    setCritPinAllResult(null);
+    try {
+      if (critPins[criterion] === runId) {
+        await api.clearJobCriterionPin(jobId, criterion);
+      } else {
+        await api.setJobCriterionPin(jobId, criterion, runId);
+      }
+      await reloadCritPins();
     } catch (e) {
-      setPinAllError((e as Error).message || "pin failed");
+      setCritPinError((e as Error).message || "pin failed");
     } finally {
-      setPinAllBusy(false);
+      setCritPinBusy(null);
+    }
+  }
+
+  async function handlePinAllCriteria() {
+    setCritPinBusy("__all__");
+    setCritPinError(null);
+    setCritPinAllResult(null);
+    try {
+      const r = await api.pinRunAllCriteria(runId);
+      setCritPinAllResult({
+        pinned: r.pinned_criteria.length,
+        replaced: r.replaced,
+      });
+      await reloadCritPins();
+    } catch (e) {
+      setCritPinError((e as Error).message || "pin failed");
+    } finally {
+      setCritPinBusy(null);
     }
   }
 
@@ -335,6 +371,33 @@ export default function RunDetailPage({
       return { provider: "", model: "" };
     }
   }, [run?.spec_json]);
+
+  // Criteria this Run has CR data for — drives the per-criterion pin
+  // panel. A criterion appears if any domain in this Run has a CR row
+  // whose status=='done' OR has non-empty data (we approximate the
+  // backend's check via `d.criteria[c]` reflecting CR.status).
+  const criteriaInRun = useMemo<string[]>(() => {
+    if (!run) return [];
+    const ALL = [
+      "backlinks",
+      "refdomains",
+      "anchors",
+      "keywords",
+      "wayback",
+      "wayback_classify",
+    ];
+    const out: string[] = [];
+    for (const c of ALL) {
+      const any = run.domains.some(
+        (d) => d.criteria?.[c] === "done" || d.criteria?.[c] === "failed",
+      );
+      // "done" definitely has data; "failed" *may* have partial data
+      // (Ahrefs partial responses) — include both so the user can pin
+      // and the backend will filter out criteria with no CR data.
+      if (any) out.push(c);
+    }
+    return out;
+  }, [run]);
 
   // Counts strict fetch + AI failures from data already on the page.
   // Missing-CR-row cases (rare; only when a run aborted before a criterion
@@ -465,12 +528,39 @@ export default function RunDetailPage({
 
   useEffect(() => {
     reload();
-    const id = window.setInterval(() => {
-      reload();
-    }, 2000);
-    return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
+
+  // Adaptive polling. The naive 2s interval pegged the API at 75% CPU
+  // when ≥2 tabs sat on a run page (regression observed 2026-05-12 with
+  // a 352-domain Wayback run): /runs/{id} walks every RunDomain on
+  // every call, so polling cost scales with run size × open tabs. Fix:
+  //   - Terminal (done / failed / canceled): stop polling entirely.
+  //     The displayed data won't change without user action.
+  //   - Paused: 10s. Status only flips when the user clicks Resume on
+  //     this page, which triggers a manual reload anyway.
+  //   - Running / pending: 2s, same as before.
+  // Reanalyze in-flight forces 2s even on terminal runs so the live
+  // verdicts repaint promptly.
+  useEffect(() => {
+    if (!run) return;
+    const reanalyzing = !!status?.reanalyzing;
+    const terminal =
+      run.status === "done" ||
+      run.status === "failed" ||
+      run.status === "canceled";
+    if (terminal && !reanalyzing) {
+      // Nothing to watch — leave the displayed snapshot alone.
+      return;
+    }
+    const intervalMs =
+      run.status === "paused" && !reanalyzing ? 10_000 : 2_000;
+    const id = window.setInterval(() => {
+      reload();
+    }, intervalMs);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId, run?.status, status?.reanalyzing]);
 
   if (error) {
     return (
@@ -544,15 +634,6 @@ export default function RunDetailPage({
                         pendingRetry.domains,
                       )
                     : ts.retryFailed(failedCount.criteria)}
-              </button>
-              <button
-                type="button"
-                onClick={handlePinAll}
-                disabled={pinAllBusy || run.domains.length === 0}
-                title={ts.pinAllHint}
-                className="text-xs px-2 py-1 rounded-md border border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-900/40 disabled:opacity-50"
-              >
-                {pinAllBusy ? ts.pinAllRunning : ts.pinAll}
               </button>
               <ReanalyzeBar
                 defaultProvider={specAi.provider}
@@ -649,15 +730,82 @@ export default function RunDetailPage({
             {lifecycleError}
           </p>
         )}
-        {pinAllError && (
-          <p className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-800 dark:bg-red-950/40 dark:text-red-300">
-            {ts.pinAllFailed}: {pinAllError}
-          </p>
-        )}
-        {pinAllResult && (
-          <p className="text-sm rounded-md px-3 py-2 bg-emerald-50 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
-            {ts.pinAllResult(pinAllResult.pinned, pinAllResult.replaced)}
-          </p>
+        {run.status === "done" && criteriaInRun.length > 0 && (
+          <div className="rounded-md border border-neutral-200 dark:border-neutral-800 p-3 space-y-2 bg-neutral-50/50 dark:bg-neutral-900/30">
+            <div className="flex flex-wrap items-center gap-2 justify-between">
+              <div>
+                <div className="text-sm font-medium">
+                  {ts.pinPerCriterionHeading}
+                </div>
+                <div className="text-xs text-neutral-600 dark:text-neutral-400 max-w-2xl">
+                  {ts.pinPerCriterionHint}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handlePinAllCriteria}
+                disabled={critPinBusy !== null}
+                title={ts.pinAllCriteriaHint}
+                className="text-xs px-2 py-1 rounded-md border border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-900/40 disabled:opacity-50"
+              >
+                {ts.pinAllCriteria}
+              </button>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {criteriaInRun.map((c) => {
+                const pinnedTo = critPins[c];
+                const pinnedHere = pinnedTo === runId;
+                const pinnedElsewhere = pinnedTo !== undefined && !pinnedHere;
+                const letter = (
+                  {
+                    backlinks: "B",
+                    refdomains: "D",
+                    anchors: "A",
+                    keywords: "K",
+                    wayback: "W",
+                    wayback_classify: "C",
+                  } as Record<string, string>
+                )[c];
+                const tone = pinnedHere
+                  ? "border-emerald-400 bg-emerald-50 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200"
+                  : pinnedElsewhere
+                    ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
+                    : "border-neutral-300 bg-white text-neutral-700 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300";
+                const label = pinnedHere
+                  ? ts.pinCriterionHere
+                  : pinnedElsewhere
+                    ? ts.pinCriterionElsewhere(pinnedTo!)
+                    : ts.pinCriterionNone;
+                return (
+                  <button
+                    key={c}
+                    type="button"
+                    onClick={() => handleToggleCritPin(c)}
+                    disabled={critPinBusy !== null}
+                    title={`${c}: ${label}`}
+                    className={`flex items-center gap-1.5 text-xs px-2 py-1 rounded-md border ${tone} hover:opacity-80 disabled:opacity-50`}
+                  >
+                    <span className="font-mono font-bold">{letter}</span>
+                    <span className="opacity-70">·</span>
+                    <span>{label}</span>
+                  </button>
+                );
+              })}
+            </div>
+            {critPinError && (
+              <p className="text-xs rounded-md px-2 py-1 bg-red-50 text-red-800 dark:bg-red-950/40 dark:text-red-300">
+                {critPinError}
+              </p>
+            )}
+            {critPinAllResult && (
+              <p className="text-xs rounded-md px-2 py-1 bg-emerald-50 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
+                {ts.pinAllCriteriaResult(
+                  critPinAllResult.pinned,
+                  critPinAllResult.replaced,
+                )}
+              </p>
+            )}
+          </div>
         )}
         {retryError && (
           <p className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-800 dark:bg-red-950/40 dark:text-red-300">
@@ -717,27 +865,176 @@ export default function RunDetailPage({
         domains={run.domains}
         jobId={jobId}
         runId={runId}
+        runStatus={run.status}
+        onChanged={reload}
       />
     </div>
   );
 }
 
+type RunRowStatus = "pending" | "running" | "done" | "failed" | "canceled";
+type StatusFilterValue = "all" | RunRowStatus;
+// "any" = no filter; "zero" = wayback ran & returned 0 CDX rows (the
+// done-but-empty signal worth pairing with status=done to retry); "nonzero"
+// = wayback returned ≥1 row. Rows where wayback didn't run / hasn't reached
+// done yet have wayback_rows=null and only match "any" — they're
+// deliberately excluded from both "zero" and "nonzero" so a disabled-wayback
+// row doesn't get lumped in with structurally empty CDX results.
+type WaybackFilterValue = "any" | "zero" | "nonzero";
+
 function DomainsSection({
   domains,
   jobId,
   runId,
+  runStatus,
+  onChanged,
 }: {
   domains: RunDomainProgress[];
   jobId: number;
   runId: number;
+  runStatus: string;
+  onChanged: () => void;
 }) {
   const { t } = useT();
   const ts = t.pages.jobs.run;
+
+  // Status filter (added 2026-05-12). Applied BEFORE search/pagination
+  // so the page counts + select-all reflect the filtered set.
+  const [statusFilter, setStatusFilter] = useState<StatusFilterValue>("all");
+  // Wayback CDX row-count filter (added 2026-05-13). ANDed with statusFilter;
+  // common combo is status=done + cdx=zero → done-but-empty wayback for
+  // bulk-retry of wayback / wayback_classify on those rows.
+  const [waybackFilter, setWaybackFilter] = useState<WaybackFilterValue>("any");
+  const filtered = useMemo<RunDomainProgress[]>(() => {
+    return domains.filter((d) => {
+      if (statusFilter !== "all" && d.status !== statusFilter) return false;
+      if (waybackFilter === "zero" && d.wayback_rows !== 0) return false;
+      if (
+        waybackFilter === "nonzero" &&
+        !(typeof d.wayback_rows === "number" && d.wayback_rows >= 1)
+      )
+        return false;
+      return true;
+    });
+  }, [domains, statusFilter, waybackFilter]);
+
+  // Bulk selection (added 2026-05-12) — Set of RunDomain ids. Persists
+  // across pagination but clears when either filter changes (so the user
+  // doesn't accidentally retry rows they can no longer see).
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  useEffect(() => {
+    setSelected(new Set());
+  }, [statusFilter, waybackFilter]);
+
+  // Bulk-retry state.
+  const [bulkOpen, setBulkOpen] = useState(false);
+  // Which criteria the user picked. Defaults to "every criterion that
+  // actually has CR rows across the visible domains" (= enabled in the
+  // spec). Picker is shown only when bulk panel is open.
+  const enabledCriteria = useMemo<string[]>(() => {
+    const seen = new Set<string>();
+    for (const d of domains) {
+      for (const c of Object.keys(d.criteria || {})) seen.add(c);
+    }
+    return Array.from(seen).sort();
+  }, [domains]);
+  const [pickedCriteria, setPickedCriteria] = useState<Set<string>>(
+    () => new Set(),
+  );
+  useEffect(() => {
+    setPickedCriteria(new Set(enabledCriteria));
+  }, [enabledCriteria]);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkError, setBulkError] = useState<string | null>(null);
+  const [bulkResult, setBulkResult] = useState<string | null>(null);
+  // Re-sample V2 only mode (added 2026-05-13). Skips CDX refetch and
+  // re-collects V2 samples against the existing wayback CR's rows.
+  // Only meaningful when wayback is checked in the criterion picker;
+  // the checkbox is disabled otherwise.
+  const [waybackResampleOnly, setWaybackResampleOnly] = useState(false);
+  // If the user unchecks wayback after toggling resample-only, drop
+  // the flag so a later wayback re-check doesn't silently re-enable it.
+  useEffect(() => {
+    if (!pickedCriteria.has("wayback") && waybackResampleOnly) {
+      setWaybackResampleOnly(false);
+    }
+  }, [pickedCriteria, waybackResampleOnly]);
+
+  // Bulk retry needs the run to be terminal (matches the backend gate
+  // on /retry-batch). Disable the panel when the run is still active.
+  const retryEligible =
+    runStatus === "done" || runStatus === "failed" || runStatus === "canceled";
+
+  function toggleOne(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function togglePicked(c: string) {
+    setPickedCriteria((prev) => {
+      const next = new Set(prev);
+      if (next.has(c)) next.delete(c);
+      else next.add(c);
+      return next;
+    });
+  }
+
+  async function handleBulkRetry() {
+    if (selected.size === 0) return;
+    if (pickedCriteria.size === 0) {
+      setBulkError(ts.bulkRetryNothing);
+      return;
+    }
+    setBulkBusy(true);
+    setBulkError(null);
+    setBulkResult(null);
+    try {
+      const r = await api.retryRunBatch(runId, Array.from(selected), {
+        criteria: Array.from(pickedCriteria),
+        waybackResampleOnly,
+      });
+      setBulkResult(
+        ts.bulkRetryResult(r.domains ?? 0, r.criteria ?? 0),
+      );
+      setSelected(new Set());
+      setBulkOpen(false);
+      onChanged();
+    } catch (e) {
+      setBulkError((e as Error).message || "retry failed");
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   const matchDomain = useCallback(
     (d: RunDomainProgress, q: string) => d.domain.toLowerCase().includes(q),
     [],
   );
-  const search = usePaginatedSearch<RunDomainProgress>(domains, matchDomain);
+  const search = usePaginatedSearch<RunDomainProgress>(filtered, matchDomain);
+
+  // Page-level select-all checkbox covers the currently-visible page
+  // (post-filter, post-search, post-paginate). Cross-page bulk select
+  // would surprise users.
+  const pageIds = search.paged.map((d) => d.id);
+  const pageAllSelected =
+    pageIds.length > 0 && pageIds.every((id) => selected.has(id));
+  function togglePageSelect() {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (pageAllSelected) for (const id of pageIds) next.delete(id);
+      else for (const id of pageIds) next.add(id);
+      return next;
+    });
+  }
+  // "Select all matching filter" — across pages, but only the filtered
+  // (and searched) set.
+  function selectAllMatching() {
+    setSelected(new Set(search.filteredAll.map((d) => d.id)));
+  }
 
   const csvColumns = useMemo<CsvColumn<RunDomainProgress>[]>(
     () => [
@@ -820,14 +1117,215 @@ function DomainsSection({
       )}
       {domains.length > 0 && (
         <>
+          {/* Status filter (added 2026-05-12) + Wayback CDX filter
+              (added 2026-05-13). Both ANDed via the `filtered` useMemo. */}
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <label className="flex items-center gap-1.5">
+              <span className="font-medium text-neutral-700 dark:text-neutral-300">
+                {ts.filterStatusLabel}
+              </span>
+              <select
+                value={statusFilter}
+                onChange={(e) =>
+                  setStatusFilter(e.target.value as StatusFilterValue)
+                }
+                className="px-2 py-1 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950"
+              >
+                <option value="all">{ts.filterStatusAll}</option>
+                <option value="pending">{ts.filterStatusPending}</option>
+                <option value="running">{ts.filterStatusRunning}</option>
+                <option value="done">{ts.filterStatusDone}</option>
+                <option value="failed">{ts.filterStatusFailed}</option>
+                <option value="canceled">{ts.filterStatusCanceled}</option>
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5">
+              <span className="font-medium text-neutral-700 dark:text-neutral-300">
+                {ts.filterWaybackLabel}
+              </span>
+              <select
+                value={waybackFilter}
+                onChange={(e) =>
+                  setWaybackFilter(e.target.value as WaybackFilterValue)
+                }
+                className="px-2 py-1 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950"
+              >
+                <option value="any">{ts.filterWaybackAny}</option>
+                <option value="zero">{ts.filterWaybackZero}</option>
+                <option value="nonzero">{ts.filterWaybackNonzero}</option>
+              </select>
+            </label>
+            <span className="text-neutral-500 dark:text-neutral-400">
+              ({search.filteredTotal})
+            </span>
+          </div>
+
+          {/* Bulk action bar (added 2026-05-12) — appears once any row
+              is selected. The criterion picker shows the run's enabled
+              criteria; user can narrow to e.g. wayback-only retries. */}
+          {selected.size > 0 && (
+            <div className="rounded-md border border-amber-300 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-950/30 p-3 space-y-2">
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="font-medium text-amber-900 dark:text-amber-200">
+                  {ts.bulkSelected(selected.size)}
+                </span>
+                <div className="flex-1" />
+                <button
+                  type="button"
+                  onClick={() => setBulkOpen((v) => !v)}
+                  disabled={!retryEligible || bulkBusy}
+                  title={
+                    retryEligible
+                      ? ""
+                      : ts.retryFailedHint
+                  }
+                  className="text-xs px-2 py-1 rounded-md border border-amber-400 bg-white dark:bg-neutral-900 dark:border-amber-700 text-amber-900 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-900/40 disabled:opacity-50"
+                >
+                  {bulkBusy
+                    ? ts.bulkRetryRunning
+                    : ts.bulkRetry(selected.size)}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelected(new Set())}
+                  className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                >
+                  {ts.clearSelection}
+                </button>
+              </div>
+              {bulkOpen && retryEligible && (
+                <div className="rounded-md border border-amber-200 dark:border-amber-900/50 bg-white dark:bg-neutral-950 p-3 space-y-2">
+                  <div>
+                    <div className="text-sm font-medium">
+                      {ts.bulkRetryCriteriaHeading}
+                    </div>
+                    <p className="text-xs text-neutral-600 dark:text-neutral-400">
+                      {ts.bulkRetryCriteriaHint}
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {enabledCriteria.map((c) => (
+                      <label
+                        key={c}
+                        className="flex items-center gap-1.5 text-xs px-2 py-1 rounded border dark:border-neutral-700 cursor-pointer hover:bg-neutral-50 dark:hover:bg-neutral-900"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={pickedCriteria.has(c)}
+                          onChange={() => togglePicked(c)}
+                        />
+                        <span className="font-mono">{c}</span>
+                      </label>
+                    ))}
+                  </div>
+                  {/* Auto-cascade note (added 2026-05-13). Surfaces the
+                      server-side `_cascade_wayback_classify` behavior so
+                      the user isn't surprised when classify re-runs even
+                      though they unchecked it. Only renders when the
+                      cascade would actually fire on submit. */}
+                  {pickedCriteria.has("wayback") &&
+                    enabledCriteria.includes("wayback_classify") &&
+                    !pickedCriteria.has("wayback_classify") && (
+                      <p className="text-xs rounded-md px-2 py-1 bg-amber-100 dark:bg-amber-900/30 text-amber-900 dark:text-amber-200">
+                        {ts.bulkRetryClassifyAutoNote}
+                      </p>
+                    )}
+                  {/* Re-sample V2 only toggle (added 2026-05-13). Only
+                      offered when wayback is on the run; disabled when
+                      wayback isn't checked in the picker (the flag has
+                      nothing to act on otherwise — backend would 400). */}
+                  {enabledCriteria.includes("wayback") && (
+                    <div className="space-y-1 pt-1 border-t dark:border-neutral-800">
+                      <label className="flex items-center gap-2 text-xs cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={waybackResampleOnly}
+                          onChange={(e) =>
+                            setWaybackResampleOnly(e.target.checked)
+                          }
+                          disabled={!pickedCriteria.has("wayback")}
+                        />
+                        <span
+                          className={
+                            pickedCriteria.has("wayback")
+                              ? "font-medium"
+                              : "font-medium text-neutral-400 dark:text-neutral-600"
+                          }
+                        >
+                          {ts.bulkRetryResampleLabel}
+                        </span>
+                      </label>
+                      <p className="text-xs text-neutral-600 dark:text-neutral-400 pl-6">
+                        {ts.bulkRetryResampleHelp}
+                      </p>
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleBulkRetry}
+                      disabled={bulkBusy || pickedCriteria.size === 0}
+                      className="text-xs px-3 py-1 rounded-md bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50"
+                    >
+                      {bulkBusy
+                        ? ts.bulkRetryRunning
+                        : ts.bulkRetryConfirm}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setBulkOpen(false)}
+                      className="text-xs px-3 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                    >
+                      {t.common.cancel}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {bulkError && (
+                <p className="text-xs rounded-md px-2 py-1 bg-red-50 text-red-800 dark:bg-red-950/40 dark:text-red-300">
+                  {bulkError}
+                </p>
+              )}
+              {bulkResult && (
+                <p className="text-xs rounded-md px-2 py-1 bg-emerald-50 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
+                  {bulkResult}
+                </p>
+              )}
+            </div>
+          )}
+
           <PaginationTopBar
             state={search}
             searchPlaceholder="Search by domain…"
           />
+          {/* "Select all matching" link — only useful when the filter
+              + search has narrowed things AND there's more to grab
+              than just the visible page. */}
+          {search.filteredTotal > pageIds.length &&
+            search.filteredTotal !== selected.size && (
+              <div className="text-xs">
+                <button
+                  type="button"
+                  onClick={selectAllMatching}
+                  className="text-blue-600 dark:text-blue-400 hover:underline"
+                >
+                  {ts.selectAllMatching(search.filteredTotal)}
+                </button>
+              </div>
+            )}
           <div className="overflow-x-auto rounded-md border dark:border-neutral-800">
             <table className="w-full text-sm">
               <thead className="bg-neutral-100 dark:bg-neutral-900 text-left">
                 <tr>
+                  <th className="px-3 py-2 w-8">
+                    <input
+                      type="checkbox"
+                      checked={pageAllSelected}
+                      onChange={togglePageSelect}
+                      aria-label={ts.selectAllOnPage}
+                      className="cursor-pointer"
+                    />
+                  </th>
                   <th className="px-3 py-2 font-medium">{ts.cols.domain}</th>
                   <th className="px-3 py-2 font-medium">{ts.cols.status}</th>
                   <th className="px-3 py-2 font-medium">{ts.cols.criteria}</th>
@@ -843,11 +1341,26 @@ function DomainsSection({
               <tbody>
                 {search.paged.map((d) => {
                   const href = `/jobs/${jobId}/runs/${runId}/domains/${d.id}`;
+                  const isSel = selected.has(d.id);
                   return (
                     <tr
                       key={d.id}
-                      className="border-t dark:border-neutral-800 hover:bg-neutral-50 dark:hover:bg-neutral-900/60"
+                      className={
+                        "border-t dark:border-neutral-800 " +
+                        (isSel
+                          ? "bg-blue-50/70 dark:bg-blue-950/30"
+                          : "hover:bg-neutral-50 dark:hover:bg-neutral-900/60")
+                      }
                     >
+                      <td className="px-3 py-2 align-top">
+                        <input
+                          type="checkbox"
+                          checked={isSel}
+                          onChange={() => toggleOne(d.id)}
+                          aria-label={`Select ${d.domain}`}
+                          className="cursor-pointer"
+                        />
+                      </td>
                       <td className="px-3 py-2">
                         <Link
                           href={href}
@@ -858,7 +1371,7 @@ function DomainsSection({
                         {d.is_pinned && (
                           <span
                             className="ml-1.5 text-amber-600 dark:text-amber-400"
-                            title={ts.pinAllHint}
+                            title={ts.pinIndicator}
                           >
                             ★
                           </span>
