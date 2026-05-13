@@ -148,6 +148,14 @@ class Run(Base):
     # Invariant: at most one Run per job has is_pinned=1; enforced at
     # the pin endpoint inside one transaction.
     is_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Per-run scoring override (added 2026-05-13 wave J). JSON dict shaped
+    # like `{"weights": {"backlinks": 0.40, "refdomains": 0.20, ...}}` or
+    # empty string when the run uses the global Settings weights. When
+    # non-empty, the run's final scores were recomputed against these
+    # weights and persisted into each RunDomain.final_assessment_json /
+    # final_summary. Cleared by `DELETE /runs/{id}/recompute-final` which
+    # recomputes back to current global weights in the same pass.
+    scoring_override_json: Mapped[str] = mapped_column(Text, default="")
 
     job: Mapped[Job] = relationship(back_populates="runs")
     domains: Mapped[list["RunDomain"]] = relationship(

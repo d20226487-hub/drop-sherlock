@@ -531,6 +531,38 @@ const messagesEn = {
         exportVisibleHelp:
           "Download a CSV of the rows currently matching your search.",
         exportAllHelp: "Download every domain in this run.",
+        // Score-weights override panel (added 2026-05-13 wave J).
+        scoreWeightsHeading: "Score weights",
+        scoreWeightsHint:
+          "Recompute this run's final scores with custom criterion weights. The AI-written summary and recommendation stay untouched — only the numeric final + confidence are replaced. Partial rows (where a criterion failed at synth time) are skipped.",
+        scoreWeightsOverrideActive: "Custom weights applied to this run",
+        scoreWeightsOverrideGlobal: "Using global Settings weights",
+        scoreWeightsExclude: "exclude",
+        scoreWeightsSum: (s: number) => `Sum: ${s.toFixed(2)} / 1.00`,
+        scoreWeightsSumOk: "OK",
+        scoreWeightsSumOff: "should sum to 1.00",
+        scoreWeightsNormalize: "Normalize to 1.0",
+        scoreWeightsPreview: "Preview",
+        scoreWeightsApply: "Apply to this run",
+        scoreWeightsReset: "Reset to global",
+        scoreWeightsResetConfirm:
+          "Clear the per-run override and recompute scores using the current global Settings weights?",
+        scoreWeightsApplyConfirm:
+          "Rewrite the final score of every non-partial domain in this run with these weights? The AI-written prose stays unchanged.",
+        scoreWeightsBusyPreview: "Recomputing…",
+        scoreWeightsBusyApply: "Applying…",
+        scoreWeightsBusyReset: "Resetting…",
+        scoreWeightsPreviewTitle: "Recomputed scores (preview)",
+        scoreWeightsPreviewCount: (changed: number, total: number) =>
+          `${changed} of ${total} domain${total === 1 ? "" : "s"} would change`,
+        scoreWeightsColDomain: "Domain",
+        scoreWeightsColOld: "Old",
+        scoreWeightsColNew: "New",
+        scoreWeightsColDelta: "Δ",
+        scoreWeightsPartial: "—",
+        scoreWeightsFailedToLoad: "Could not load global weights",
+        scoreWeightsFailedPreview: "Preview failed",
+        scoreWeightsFailedApply: "Apply failed",
       },
       compare: {
         backLink: "← All jobs",
@@ -1969,6 +2001,37 @@ const messagesRu: Messages = {
         exportVisibleHelp:
           "Скачать CSV строк, которые сейчас подходят под поиск.",
         exportAllHelp: "Скачать каждый домен этого запуска.",
+        scoreWeightsHeading: "Веса итогового балла",
+        scoreWeightsHint:
+          "Пересчитать итоговые баллы этого запуска с другими весами критериев. Текст резюме и рекомендация от ИИ остаются без изменений — заменяется только числовой итог и доверие. Частичные строки (где критерий не прошёл синтез) пропускаются.",
+        scoreWeightsOverrideActive: "На запуск применены свои веса",
+        scoreWeightsOverrideGlobal: "Используются глобальные веса из Настроек",
+        scoreWeightsExclude: "исключить",
+        scoreWeightsSum: (s) => `Сумма: ${s.toFixed(2)} / 1.00`,
+        scoreWeightsSumOk: "OK",
+        scoreWeightsSumOff: "сумма должна быть 1.00",
+        scoreWeightsNormalize: "Нормализовать до 1.0",
+        scoreWeightsPreview: "Предпросмотр",
+        scoreWeightsApply: "Применить к запуску",
+        scoreWeightsReset: "Сбросить к глобальным",
+        scoreWeightsResetConfirm:
+          "Снять переопределение и пересчитать баллы по текущим глобальным весам?",
+        scoreWeightsApplyConfirm:
+          "Переписать итоговый балл каждого непустого домена в этом запуске с этими весами? Текст ИИ останется прежним.",
+        scoreWeightsBusyPreview: "Пересчёт…",
+        scoreWeightsBusyApply: "Применение…",
+        scoreWeightsBusyReset: "Сброс…",
+        scoreWeightsPreviewTitle: "Пересчитанные баллы (предпросмотр)",
+        scoreWeightsPreviewCount: (changed, total) =>
+          `Изменятся ${changed} из ${total}`,
+        scoreWeightsColDomain: "Домен",
+        scoreWeightsColOld: "Было",
+        scoreWeightsColNew: "Стало",
+        scoreWeightsColDelta: "Δ",
+        scoreWeightsPartial: "—",
+        scoreWeightsFailedToLoad: "Не удалось загрузить глобальные веса",
+        scoreWeightsFailedPreview: "Ошибка предпросмотра",
+        scoreWeightsFailedApply: "Ошибка применения",
       },
       compare: {
         backLink: "← Все задачи",

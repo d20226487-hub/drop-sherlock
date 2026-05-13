@@ -146,6 +146,13 @@ class RunDetail(BaseModel):
     error: str
     spec_json: str
     domains: list[RunDomainProgress]
+    # Per-run scoring override (added 2026-05-13 wave J). None = run uses
+    # global Settings weights; dict = {"weights": {<criterion>: <float>}}
+    # with the override that was last applied via the recompute endpoints.
+    # The UI's "Score weights" panel pre-fills from this so reopening the
+    # Run page after an apply shows the active weights, not the global
+    # defaults.
+    scoring_override: dict | None = None
 
 
 class RunStatus(BaseModel):
@@ -624,6 +631,7 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
                 wayback_rows=wayback_rows,
             )
         )
+    from ..tasks import get_run_scoring_override
     return RunDetail(
         id=run.id,
         name=run.name or "",
@@ -635,6 +643,7 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
         error=run.error,
         spec_json=run.spec_json,
         domains=progress,
+        scoring_override=get_run_scoring_override(run.id),
     )
 
 
@@ -1113,10 +1122,16 @@ def get_run_summary(run_id: int, db: Session = Depends(get_db)) -> dict:
 
 @runs_router.get("/{run_id}/cost")
 def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
-    """Aggregate per-run AI spend. Sums `ai_cost_usd` + `ai_input_tokens` /
-    `ai_output_tokens` across every CriterionResult for the run, plus the
-    final-synth columns on every RunDomain. Returns:
+    """Aggregate per-run AI spend AND Ahrefs unit spend. Sums `ai_cost_usd`
+    + `ai_input_tokens` / `ai_output_tokens` across every CriterionResult
+    for the run, plus the final-synth columns on every RunDomain. Also
+    sums `units_cost_actual` (what Ahrefs billed us, the real cost) +
+    `units_cost_total` (list price, what it would have cost without
+    Ahrefs's own server-side cache short-circuiting some requests) for
+    the B/D/A/K criteria. wayback doesn't bill Ahrefs units — its CDX
+    endpoint is free — so it's excluded from the Ahrefs-units totals.
 
+    Returns:
       total_cost_usd       — actual fresh-call $ (cache hits contribute 0)
       total_input_tokens   — across all calls, fresh + cached (visibility)
       total_output_tokens
@@ -1125,6 +1140,10 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
       missing_pricing      — list of {provider, model} pairs that have rows
                               but no pricing entry; their cost contribution
                               is 0 and totals are incomplete by that amount.
+      ahrefs_units_billed  — sum of units_cost_actual for B/D/A/K (added 2026-05-13)
+      ahrefs_units_list    — sum of units_cost_total for B/D/A/K (list price; difference vs billed = Ahrefs server-cache savings)
+      ahrefs_fresh_calls   — # of B/D/A/K CRs that actually hit the Ahrefs API
+      ahrefs_cached_calls  — # of B/D/A/K CRs served from our local cross-run cache (no Ahrefs API call)
     """
     run = db.get(Run, run_id)
     if run is None:
@@ -1139,6 +1158,10 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
             "fresh_calls": 0,
             "cache_hits": 0,
             "missing_pricing": [],
+            "ahrefs_units_billed": 0,
+            "ahrefs_units_list": 0,
+            "ahrefs_fresh_calls": 0,
+            "ahrefs_cached_calls": 0,
         }
 
     crs = (
@@ -1153,6 +1176,18 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
     fresh_calls = 0
     cache_hits = 0
     seen_models: set[tuple[str, str]] = set()
+    # Ahrefs unit accounting (added 2026-05-13). Sums over B/D/A/K only
+    # — wayback uses the free CDX endpoint, its CRs always have NULL
+    # units_cost_*. We filter by criterion explicitly rather than
+    # relying on NULL-units, because that's clearer + future-proof
+    # against accidentally counting some non-Ahrefs criterion.
+    AHREFS_CRITERIA = frozenset(
+        ("backlinks", "refdomains", "anchors", "keywords")
+    )
+    ahrefs_units_billed = 0
+    ahrefs_units_list = 0
+    ahrefs_fresh_calls = 0
+    ahrefs_cached_calls = 0
     for cr in crs:
         if cr.ai_input_tokens:
             total_in += int(cr.ai_input_tokens)
@@ -1166,6 +1201,20 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
             fresh_calls += 1
         if cr.ai_provider and cr.ai_model:
             seen_models.add((cr.ai_provider, cr.ai_model))
+        # Ahrefs units: only for B/D/A/K. units_cost_actual is non-null
+        # only on rows where an actual Ahrefs API call landed (fresh
+        # fetch). cached_from_run_id is non-null on rows served from
+        # our local cross-run cache (no Ahrefs call). The two are
+        # mutually exclusive in practice — _create_cached_criterion_row
+        # leaves units_cost_* NULL while setting cached_from_run_id.
+        if cr.criterion in AHREFS_CRITERIA:
+            if cr.units_cost_actual is not None:
+                ahrefs_units_billed += int(cr.units_cost_actual)
+                ahrefs_fresh_calls += 1
+            elif cr.cached_from_run_id is not None:
+                ahrefs_cached_calls += 1
+            if cr.units_cost_total is not None:
+                ahrefs_units_list += int(cr.units_cost_total)
 
     # Final-synth tokens land on RunDomain.
     for rd in run.domains:
@@ -1207,6 +1256,10 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
         "fresh_calls": fresh_calls,
         "cache_hits": cache_hits,
         "missing_pricing": missing_pricing,
+        "ahrefs_units_billed": ahrefs_units_billed,
+        "ahrefs_units_list": ahrefs_units_list,
+        "ahrefs_fresh_calls": ahrefs_fresh_calls,
+        "ahrefs_cached_calls": ahrefs_cached_calls,
     }
 
 
@@ -1658,6 +1711,139 @@ def unpin_run_route(
         job_id=run.job_id,
         is_pinned=False,
     )
+
+
+# --- Per-run scoring-weights override (added 2026-05-13 wave J) -------------
+# Three sibling endpoints that share the same recompute path in
+# `tasks.recompute_run_finals`:
+#   POST /runs/{id}/preview-final     — recompute without writing
+#   POST /runs/{id}/recompute-final   — recompute + persist override
+#   DELETE /runs/{id}/recompute-final — clear override + recompute with global
+#
+# Body shape for the POST endpoints: {"weights": {<criterion>: <float>, ...}}.
+# Weights are accepted in 0..1 (Shape A — sum-to-1 sliders on the UI) and
+# validated the same way as the global Settings endpoint. Excluding a
+# criterion = weight 0; `compute_final` renormalizes over what's left.
+
+class RecomputeFinalIn(BaseModel):
+    weights: dict[str, float]
+
+
+class RecomputeFinalRowOut(BaseModel):
+    run_domain_id: int
+    domain: str
+    score_old: float | None
+    score_new: float | None
+    confidence_new: float | None
+    bucket_new: str
+    partial: bool
+
+
+class RecomputeFinalOut(BaseModel):
+    run_id: int
+    preview: bool
+    weights_applied: dict[str, float]
+    override_active: bool
+    rows: list[RecomputeFinalRowOut]
+
+
+_RECOMPUTE_ALLOWED_CRITERIA: tuple[str, ...] = (
+    "backlinks", "refdomains", "anchors", "keywords",
+    "wayback", "wayback_classify",
+)
+
+
+def _validate_recompute_weights(weights: dict[str, float]) -> dict[str, float]:
+    """Coerce + validate the incoming weights dict. Drops unknown keys
+    (forward-compat), rejects non-numeric values + negatives, and enforces
+    sum>0. The UI uses Shape A (sum-to-1 inputs) but we don't STRICTLY
+    enforce sum==1 here — `compute_final` renormalizes internally, so a
+    tolerant validator means rounding noise (e.g. 0.4 + 0.2 + 0.3 + 0.1 +
+    0.0 + 0.0 = 1.0000000000000002) doesn't reject an otherwise-fine
+    request. The frontend shows the live sum so the user can see it
+    explicitly without the backend gatekeeping."""
+    out: dict[str, float] = {}
+    for c in _RECOMPUTE_ALLOWED_CRITERIA:
+        v = weights.get(c)
+        if v is None:
+            out[c] = 0.0
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"weights.{c} must be a number")
+        f = float(v)
+        if f < 0:
+            raise ValueError(f"weights.{c} must be non-negative")
+        if f > 1:
+            raise ValueError(f"weights.{c} must be in 0..1")
+        out[c] = f
+    if sum(out.values()) <= 0:
+        raise ValueError("at least one weight must be > 0")
+    return out
+
+
+@runs_router.post(
+    "/{run_id}/preview-final", response_model=RecomputeFinalOut,
+)
+def preview_run_final(
+    run_id: int, body: RecomputeFinalIn,
+) -> RecomputeFinalOut:
+    """Recompute every non-partial rd's final score in `run_id` using
+    the supplied weights. Pure preview — no DB writes. Returns the
+    per-domain old→new table so the UI can render a diff before the user
+    commits to applying the weights."""
+    try:
+        clean = _validate_recompute_weights(body.weights)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    from ..tasks import recompute_run_finals
+    try:
+        result = recompute_run_finals(run_id, clean, preview=True)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    return RecomputeFinalOut(**result)
+
+
+@runs_router.post(
+    "/{run_id}/recompute-final", response_model=RecomputeFinalOut,
+)
+def recompute_run_final(
+    run_id: int, body: RecomputeFinalIn,
+) -> RecomputeFinalOut:
+    """Persist the supplied weights as this run's `scoring_override_json`
+    and rewrite every non-partial rd's final_assessment_json /
+    final_summary using `compute_final` against the existing
+    sub-verdicts. The AI-written prose (summary, recommendation) is
+    left untouched — only the `final` and `confidence` numeric fields
+    are replaced. Partial rds (whose existing final is the
+    `{"partial": true}` stub) are skipped."""
+    try:
+        clean = _validate_recompute_weights(body.weights)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    from ..tasks import recompute_run_finals
+    try:
+        result = recompute_run_finals(run_id, clean, preview=False)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    return RecomputeFinalOut(**result)
+
+
+@runs_router.delete(
+    "/{run_id}/recompute-final", response_model=RecomputeFinalOut,
+)
+def reset_run_final(run_id: int) -> RecomputeFinalOut:
+    """Clear this run's `scoring_override_json` and recompute every
+    rd's final using the CURRENT global Settings weights. If global
+    Settings haven't changed since the original synth, this restores
+    the exact original scores; if they have, the rd finals will match
+    the new global config. Either way, the run is no longer in an
+    override state — `scoring_override` returns null in `/runs/{id}`."""
+    from ..tasks import recompute_run_finals
+    try:
+        result = recompute_run_finals(run_id, None, preview=False)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    return RecomputeFinalOut(**result)
 
 
 # --- Per-(job, criterion) pins (added 2026-05-12) ---------------------------

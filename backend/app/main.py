@@ -83,6 +83,12 @@ def _migrate_sqlite_columns() -> None:
         # Skip-reason for the availability cascade's skip-registered
         # policy (added 2026-05-12). Empty = was not skipped.
         ("run_domains", "skip_reason", "VARCHAR(256) DEFAULT ''"),
+        # Per-run scoring-weights override (added 2026-05-13 wave J).
+        # JSON shaped like `{"weights": {"backlinks": 0.4, ...}}` or "" if
+        # the run uses the global Settings weights. Set/cleared by the
+        # /runs/{id}/recompute-final endpoint family; rewrites every rd's
+        # final_assessment_json + final_summary in the same transaction.
+        ("runs", "scoring_override_json", "TEXT DEFAULT ''"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding

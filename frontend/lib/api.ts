@@ -599,6 +599,15 @@ export type RunCost = {
   fresh_calls: number;
   cache_hits: number;
   missing_pricing: { provider: string; model: string }[];
+  // Ahrefs unit accounting (added 2026-05-13). Sums across B/D/A/K
+  // criteria only — wayback's CDX endpoint is free and contributes 0.
+  // `billed` is what Ahrefs actually charged (their server-side cache
+  // may zero some requests); `list` is the would-have-been list price.
+  // Difference between the two = Ahrefs-side cache savings.
+  ahrefs_units_billed: number;
+  ahrefs_units_list: number;
+  ahrefs_fresh_calls: number;
+  ahrefs_cached_calls: number;
 };
 
 export type ModelPriceRow = {
@@ -620,6 +629,30 @@ export type RunDetail = {
   error: string;
   spec_json: string;
   domains: RunDomainProgress[];
+  // Per-run scoring override (added 2026-05-13 wave J). null = run uses
+  // global Settings weights; non-null = the override last applied via
+  // the /recompute-final endpoints. The Run-page "Score weights" panel
+  // pre-fills from this so reopening the page after an apply shows the
+  // active weights, not the global defaults.
+  scoring_override?: { weights: Record<string, number> } | null;
+};
+
+export type RecomputeFinalRow = {
+  run_domain_id: number;
+  domain: string;
+  score_old: number | null;
+  score_new: number | null;
+  confidence_new: number | null;
+  bucket_new: string;
+  partial: boolean;
+};
+
+export type RecomputeFinalResult = {
+  run_id: number;
+  preview: boolean;
+  weights_applied: Record<string, number>;
+  override_active: boolean;
+  rows: RecomputeFinalRow[];
 };
 
 export type CriterionDetail = {
@@ -1174,6 +1207,26 @@ export const api = {
 
   getRunCost: (runId: number) =>
     request<RunCost>(`/runs/${runId}/cost`),
+
+  // Per-run scoring override (added 2026-05-13 wave J). preview = no
+  // writes, returns the proposed table; recompute = persist override +
+  // rewrite finals; reset = clear override + recompute with global.
+  previewRunFinal: (runId: number, weights: Record<string, number>) =>
+    request<RecomputeFinalResult>(`/runs/${runId}/preview-final`, {
+      method: "POST",
+      body: JSON.stringify({ weights }),
+    }),
+
+  recomputeRunFinal: (runId: number, weights: Record<string, number>) =>
+    request<RecomputeFinalResult>(`/runs/${runId}/recompute-final`, {
+      method: "POST",
+      body: JSON.stringify({ weights }),
+    }),
+
+  resetRunFinal: (runId: number) =>
+    request<RecomputeFinalResult>(`/runs/${runId}/recompute-final`, {
+      method: "DELETE",
+    }),
 
   listPricing: () =>
     request<{ rows: ModelPriceRow[]; seeded: number }>(`/settings/pricing`),

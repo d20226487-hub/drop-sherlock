@@ -3029,6 +3029,227 @@ def _store_final_assessment(
         db.close()
 
 
+# --- Per-run scoring-weights override (added 2026-05-13 wave J) -------------
+#
+# These helpers power `POST /runs/{id}/preview-final` (pure recompute, no
+# writes), `POST /runs/{id}/recompute-final` (persist override + rewrite
+# every rd's final_assessment_json), and the DELETE form (clear override +
+# recompute with current global weights). Sub-verdicts are read once per
+# rd from the CR table — those rows are NEVER touched by the override
+# logic, only the rd-level final-assessment columns are.
+
+SCORING_CRITERIA: tuple[str, ...] = (
+    "backlinks", "refdomains", "anchors", "keywords",
+    "wayback", "wayback_classify",
+)
+
+
+def _collect_sub_verdicts_for_rd(rd_id: int) -> dict[str, dict]:
+    """Read the per-criterion AI verdicts saved on a RunDomain so we can
+    re-feed them into `compute_final` with different weights. Skips rows
+    whose `ai_verdict_json` is empty or unparseable — those criteria
+    simply won't contribute to the recomputed score, exactly like the
+    original synth path."""
+    out: dict[str, dict] = {}
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(CriterionResult)
+            .filter(CriterionResult.run_domain_id == rd_id)
+            .all()
+        )
+        for r in rows:
+            if not r.ai_verdict_json:
+                continue
+            try:
+                parsed = json.loads(r.ai_verdict_json)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                out[r.criterion] = parsed
+        return out
+    finally:
+        db.close()
+
+
+def _bucket_for_score(
+    score: float | None, good_threshold: float, mixed_threshold: float,
+) -> str:
+    """Mirror of the Database router's `_bucket_for` — kept local so the
+    recompute path doesn't have to import from a routers module."""
+    if score is None:
+        return ""
+    if score >= good_threshold:
+        return "quality"
+    if score >= mixed_threshold:
+        return "mixed"
+    return "low_quality"
+
+
+def recompute_run_finals(
+    run_id: int,
+    weights: dict[str, float] | None,
+    *,
+    preview: bool,
+) -> dict:
+    """Recompute final scores for every non-partial RunDomain in `run_id`
+    using the supplied `weights` (or current global Settings if None).
+    When `preview=False`, also persists the result: each rd's
+    `final_assessment_json.final`/`confidence` and `final_summary` are
+    rewritten, and the Run's `scoring_override_json` is set to the
+    supplied weights (or cleared when `weights is None`).
+
+    Partial rds (whose existing `final_assessment_json` is the
+    `{"partial": true, ...}` stub from a failed AI pipeline) are left
+    untouched — recomputing them would invent a score from incomplete
+    data. They appear in the returned table with `partial=true` so the
+    UI can render an em-dash.
+
+    Returns a summary dict with the per-domain old→new score table and
+    the effective weights actually applied (so the caller has a single
+    authoritative copy to render)."""
+    from .app_settings import get_scoring_config
+
+    scoring = get_scoring_config()
+    effective_weights = (
+        dict(weights) if weights is not None
+        else dict(scoring.get("weights") or {})
+    )
+    good_t = float(scoring.get("good_threshold") or 70.0)
+    mixed_t = float(scoring.get("mixed_threshold") or 40.0)
+
+    rows_out: list[dict] = []
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            raise LookupError(f"run {run_id} not found")
+        rds = (
+            db.query(RunDomain)
+            .filter(RunDomain.run_id == run_id)
+            .order_by(RunDomain.id)
+            .all()
+        )
+        for rd in rds:
+            old_parsed: dict | None = None
+            if rd.final_assessment_json:
+                try:
+                    old_parsed = json.loads(rd.final_assessment_json)
+                except json.JSONDecodeError:
+                    old_parsed = None
+            old_score = None
+            if isinstance(old_parsed, dict):
+                ov = old_parsed.get("final")
+                if isinstance(ov, (int, float)) and not isinstance(ov, bool):
+                    old_score = float(ov)
+
+            is_partial = bool(
+                isinstance(old_parsed, dict) and old_parsed.get("partial")
+            )
+            if is_partial:
+                rows_out.append({
+                    "run_domain_id": rd.id,
+                    "domain": rd.domain,
+                    "score_old": old_score,
+                    "score_new": None,
+                    "confidence_new": None,
+                    "bucket_new": "",
+                    "partial": True,
+                })
+                continue
+
+            sub_verdicts = _collect_sub_verdicts_for_rd(rd.id)
+            new_score, new_conf = compute_final(
+                sub_verdicts, weights=effective_weights or None,
+            )
+            new_score_rounded = (
+                round(new_score, 1) if new_score is not None else None
+            )
+            new_conf_rounded = (
+                round(new_conf, 3) if new_conf is not None else None
+            )
+            new_bucket = _bucket_for_score(new_score, good_t, mixed_t)
+            rows_out.append({
+                "run_domain_id": rd.id,
+                "domain": rd.domain,
+                "score_old": old_score,
+                "score_new": new_score_rounded,
+                "confidence_new": new_conf_rounded,
+                "bucket_new": new_bucket,
+                "partial": False,
+            })
+
+            if not preview and isinstance(old_parsed, dict):
+                # Mutate in place — keep the AI's prose (summary,
+                # recommendation, provider, model) and replace just the
+                # numeric fields. compute_final's renormalization makes
+                # missing-criterion behavior identical to weight=0.
+                if new_score_rounded is not None:
+                    old_parsed["final"] = new_score_rounded
+                else:
+                    old_parsed.pop("final", None)
+                if new_conf_rounded is not None:
+                    old_parsed["confidence"] = new_conf_rounded
+                else:
+                    old_parsed.pop("confidence", None)
+                rd.final_assessment_json = json.dumps(
+                    old_parsed, ensure_ascii=False,
+                )
+                rd.final_summary = (
+                    new_bucket if new_bucket in (
+                        "quality", "mixed", "low_quality"
+                    ) else ""
+                )
+
+        if not preview:
+            if weights is None:
+                run.scoring_override_json = ""
+            else:
+                run.scoring_override_json = json.dumps(
+                    {"weights": effective_weights}, ensure_ascii=False,
+                )
+            db.commit()
+        return {
+            "run_id": run_id,
+            "preview": preview,
+            "weights_applied": effective_weights,
+            "override_active": (
+                not preview and weights is not None
+            ) or (
+                preview and weights is not None
+            ),
+            "rows": rows_out,
+        }
+    finally:
+        db.close()
+
+
+def get_run_scoring_override(run_id: int) -> dict | None:
+    """Return the parsed `{weights: {...}}` override for a run, or None
+    when the run uses global Settings weights. Used by the Run-detail
+    endpoint so the UI can pre-populate the override panel."""
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None or not run.scoring_override_json:
+            return None
+        try:
+            parsed = json.loads(run.scoring_override_json)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        w = parsed.get("weights")
+        if not isinstance(w, dict):
+            return None
+        return {"weights": {
+            c: float(w[c]) for c in SCORING_CRITERIA
+            if isinstance(w.get(c), (int, float)) and not isinstance(w.get(c), bool)
+        }}
+    finally:
+        db.close()
+
+
 def _begin_domain(run_domain_id: int) -> str | None:
     db = SessionLocal()
     try:

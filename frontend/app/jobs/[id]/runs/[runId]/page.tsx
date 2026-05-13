@@ -5,6 +5,7 @@ import { useT } from "@/lib/i18n";
 import {
   api,
   AIProvider,
+  RecomputeFinalResult,
   RunCost,
   RunDetail,
   RunDomainProgress,
@@ -63,6 +64,37 @@ function CostPill({ cost }: { cost: RunCost }) {
   );
 }
 
+// Ahrefs units pill (added 2026-05-13). Sibling of CostPill — shows the
+// total Ahrefs units billed for B/D/A/K calls in this run. Hover reveals
+// the breakdown: list price vs billed (Ahrefs server-cache savings),
+// fresh vs cached call counts (our local cross-run cache savings).
+function AhrefsUnitsPill({ cost }: { cost: RunCost }) {
+  const saved = cost.ahrefs_units_list - cost.ahrefs_units_billed;
+  const tooltip = [
+    `Billed (real Ahrefs spend): ${cost.ahrefs_units_billed.toLocaleString()} units`,
+    cost.ahrefs_units_list !== cost.ahrefs_units_billed
+      ? `List price: ${cost.ahrefs_units_list.toLocaleString()} units (Ahrefs server-cache saved ${saved.toLocaleString()})`
+      : null,
+    `Fresh Ahrefs calls: ${cost.ahrefs_fresh_calls}`,
+    cost.ahrefs_cached_calls > 0
+      ? `Local cache hits: ${cost.ahrefs_cached_calls} (zero Ahrefs cost)`
+      : null,
+    "Wayback CDX is free and excluded from these totals.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return (
+    <span
+      className="px-2 py-0.5 rounded-md font-medium bg-sky-100 text-sky-800 dark:bg-sky-950/60 dark:text-sky-200"
+      title={tooltip}
+    >
+      <span className="opacity-70 mr-1">Ahrefs</span>
+      {cost.ahrefs_units_billed.toLocaleString()}
+      <span className="ml-1 opacity-70">units</span>
+    </span>
+  );
+}
+
 function formatDate(iso: string | null): string {
   if (!iso) return "—";
   try {
@@ -70,6 +102,411 @@ function formatDate(iso: string | null): string {
   } catch {
     return iso;
   }
+}
+
+// Per-run scoring-weights override panel (added 2026-05-13 wave J).
+// Recomputes finals against custom weights without touching per-criterion
+// AI verdicts. See `tasks.recompute_run_finals` for the backend contract.
+const SCORE_WEIGHTS_CRITERIA: ReadonlyArray<readonly [string, string]> = [
+  ["backlinks", "B"],
+  ["refdomains", "D"],
+  ["anchors", "A"],
+  ["keywords", "K"],
+  ["wayback", "W"],
+  ["wayback_classify", "C"],
+];
+
+function ScoreWeightsPanel({
+  runId,
+  currentOverride,
+  onApplied,
+}: {
+  runId: number;
+  currentOverride: { weights: Record<string, number> } | null;
+  onApplied: () => void;
+}) {
+  const { t } = useT();
+  const ts = t.pages.jobs.run;
+
+  // Track weights as strings so the input boxes preserve user-typed
+  // values like "0.40" without clobbering them on every render. Parsed
+  // to numbers only when submitting / computing sum.
+  const [weights, setWeights] = useState<Record<string, string>>({});
+  const [excluded, setExcluded] = useState<Record<string, boolean>>({});
+  const [loadingDefaults, setLoadingDefaults] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<RecomputeFinalResult | null>(null);
+  const [busy, setBusy] = useState<"" | "preview" | "apply" | "reset">("");
+  const [opError, setOpError] = useState<string | null>(null);
+
+  // Populate initial weights from either the active override or the
+  // global Settings defaults. We only run this once on mount and once
+  // when `currentOverride` flips (after an apply/reset).
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingDefaults(true);
+    setLoadError(null);
+    (async () => {
+      try {
+        let initial: Record<string, number>;
+        if (currentOverride) {
+          initial = currentOverride.weights;
+        } else {
+          const env = await api.getScoringConfig();
+          initial = (env.config.weights as Record<string, number>) ?? {};
+        }
+        if (cancelled) return;
+        const nextW: Record<string, string> = {};
+        const nextE: Record<string, boolean> = {};
+        for (const [c] of SCORE_WEIGHTS_CRITERIA) {
+          const v = Number(initial[c] ?? 0);
+          nextW[c] = Number.isFinite(v) ? v.toFixed(2) : "0.00";
+          nextE[c] = v === 0;
+        }
+        setWeights(nextW);
+        setExcluded(nextE);
+      } catch (e) {
+        if (cancelled) return;
+        setLoadError(
+          e instanceof Error ? e.message : ts.scoreWeightsFailedToLoad,
+        );
+      } finally {
+        if (!cancelled) setLoadingDefaults(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentOverride, ts.scoreWeightsFailedToLoad]);
+
+  const parsedWeights = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const [c] of SCORE_WEIGHTS_CRITERIA) {
+      if (excluded[c]) {
+        out[c] = 0;
+        continue;
+      }
+      const n = Number(weights[c] ?? "0");
+      out[c] = Number.isFinite(n) && n >= 0 ? n : 0;
+    }
+    return out;
+  }, [weights, excluded]);
+
+  const sum = useMemo(
+    () => Object.values(parsedWeights).reduce((a, b) => a + b, 0),
+    [parsedWeights],
+  );
+  const sumOk = Math.abs(sum - 1) < 0.005;
+
+  const handleNormalize = useCallback(() => {
+    if (sum <= 0) return;
+    const next: Record<string, string> = {};
+    for (const [c] of SCORE_WEIGHTS_CRITERIA) {
+      const v = parsedWeights[c] / sum;
+      next[c] = v.toFixed(2);
+    }
+    setWeights(next);
+  }, [parsedWeights, sum]);
+
+  const handlePreview = useCallback(async () => {
+    setBusy("preview");
+    setOpError(null);
+    try {
+      const result = await api.previewRunFinal(runId, parsedWeights);
+      setPreview(result);
+    } catch (e) {
+      setOpError(
+        e instanceof Error ? e.message : ts.scoreWeightsFailedPreview,
+      );
+    } finally {
+      setBusy("");
+    }
+  }, [runId, parsedWeights, ts.scoreWeightsFailedPreview]);
+
+  const handleApply = useCallback(async () => {
+    if (!window.confirm(ts.scoreWeightsApplyConfirm)) return;
+    setBusy("apply");
+    setOpError(null);
+    try {
+      await api.recomputeRunFinal(runId, parsedWeights);
+      setPreview(null);
+      onApplied();
+    } catch (e) {
+      setOpError(
+        e instanceof Error ? e.message : ts.scoreWeightsFailedApply,
+      );
+    } finally {
+      setBusy("");
+    }
+  }, [
+    runId,
+    parsedWeights,
+    onApplied,
+    ts.scoreWeightsApplyConfirm,
+    ts.scoreWeightsFailedApply,
+  ]);
+
+  const handleReset = useCallback(async () => {
+    if (!window.confirm(ts.scoreWeightsResetConfirm)) return;
+    setBusy("reset");
+    setOpError(null);
+    try {
+      await api.resetRunFinal(runId);
+      setPreview(null);
+      onApplied();
+    } catch (e) {
+      setOpError(
+        e instanceof Error ? e.message : ts.scoreWeightsFailedApply,
+      );
+    } finally {
+      setBusy("");
+    }
+  }, [
+    runId,
+    onApplied,
+    ts.scoreWeightsResetConfirm,
+    ts.scoreWeightsFailedApply,
+  ]);
+
+  const previewChangedCount = useMemo(() => {
+    if (!preview) return 0;
+    return preview.rows.filter((r) => {
+      if (r.partial) return false;
+      if (r.score_old === null && r.score_new === null) return false;
+      if (r.score_old === null || r.score_new === null) return true;
+      return Math.abs(r.score_old - r.score_new) >= 0.05;
+    }).length;
+  }, [preview]);
+
+  const overrideActive = !!currentOverride;
+
+  return (
+    <div className="rounded-md border border-neutral-200 dark:border-neutral-800 p-3 space-y-3 bg-neutral-50/50 dark:bg-neutral-900/30">
+      <div className="flex flex-wrap items-center gap-2 justify-between">
+        <div>
+          <div className="text-sm font-medium">{ts.scoreWeightsHeading}</div>
+          <div className="text-xs text-neutral-600 dark:text-neutral-400 max-w-2xl">
+            {ts.scoreWeightsHint}
+          </div>
+        </div>
+        <span
+          className={
+            overrideActive
+              ? "text-xs px-2 py-0.5 rounded-md border border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
+              : "text-xs px-2 py-0.5 rounded-md border border-neutral-300 bg-white text-neutral-600 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
+          }
+        >
+          {overrideActive
+            ? ts.scoreWeightsOverrideActive
+            : ts.scoreWeightsOverrideGlobal}
+        </span>
+      </div>
+
+      {loadingDefaults ? (
+        <div className="text-xs text-neutral-500">…</div>
+      ) : loadError ? (
+        <p className="text-xs text-red-600 dark:text-red-400">{loadError}</p>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+            {SCORE_WEIGHTS_CRITERIA.map(([c, letter]) => {
+              const isExcluded = !!excluded[c];
+              return (
+                <div
+                  key={c}
+                  className={
+                    "flex flex-col gap-1 rounded-md border p-2 " +
+                    (isExcluded
+                      ? "border-neutral-200 bg-neutral-100 text-neutral-500 dark:border-neutral-800 dark:bg-neutral-900/50 dark:text-neutral-500"
+                      : "border-neutral-300 bg-white dark:border-neutral-700 dark:bg-neutral-900")
+                  }
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium">
+                      <span className="inline-block w-5 text-center rounded bg-neutral-200 dark:bg-neutral-800 mr-1">
+                        {letter}
+                      </span>
+                      {c}
+                    </span>
+                  </div>
+                  <input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={weights[c] ?? "0.00"}
+                    disabled={isExcluded || busy !== ""}
+                    onChange={(e) => {
+                      setWeights((w) => ({ ...w, [c]: e.target.value }));
+                      setPreview(null);
+                    }}
+                    className="w-full px-2 py-1 text-sm rounded-md border border-neutral-300 bg-white dark:border-neutral-700 dark:bg-neutral-950 disabled:opacity-50"
+                  />
+                  <label className="flex items-center gap-1 text-xs cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={isExcluded}
+                      disabled={busy !== ""}
+                      onChange={(e) => {
+                        setExcluded((x) => ({
+                          ...x,
+                          [c]: e.target.checked,
+                        }));
+                        if (e.target.checked) {
+                          setWeights((w) => ({ ...w, [c]: "0.00" }));
+                        }
+                        setPreview(null);
+                      }}
+                    />
+                    {ts.scoreWeightsExclude}
+                  </label>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 justify-between">
+            <div className="text-xs">
+              {ts.scoreWeightsSum(sum)}{" "}
+              <span
+                className={
+                  sumOk
+                    ? "text-emerald-700 dark:text-emerald-400"
+                    : "text-amber-700 dark:text-amber-300"
+                }
+              >
+                {sumOk ? ts.scoreWeightsSumOk : ts.scoreWeightsSumOff}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleNormalize}
+                disabled={busy !== "" || sum <= 0}
+                className="text-xs px-2 py-1 rounded-md border border-neutral-300 bg-white text-neutral-700 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+              >
+                {ts.scoreWeightsNormalize}
+              </button>
+              <button
+                type="button"
+                onClick={handlePreview}
+                disabled={busy !== "" || sum <= 0}
+                className="text-xs px-2 py-1 rounded-md border border-sky-300 bg-sky-50 text-sky-900 dark:border-sky-900/60 dark:bg-sky-950/40 dark:text-sky-200 hover:bg-sky-100 dark:hover:bg-sky-900/40 disabled:opacity-50"
+              >
+                {busy === "preview"
+                  ? ts.scoreWeightsBusyPreview
+                  : ts.scoreWeightsPreview}
+              </button>
+              <button
+                type="button"
+                onClick={handleApply}
+                disabled={busy !== "" || sum <= 0}
+                className="text-xs px-2 py-1 rounded-md border border-emerald-400 bg-emerald-50 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200 hover:bg-emerald-100 dark:hover:bg-emerald-900/40 disabled:opacity-50"
+              >
+                {busy === "apply"
+                  ? ts.scoreWeightsBusyApply
+                  : ts.scoreWeightsApply}
+              </button>
+              {overrideActive && (
+                <button
+                  type="button"
+                  onClick={handleReset}
+                  disabled={busy !== ""}
+                  className="text-xs px-2 py-1 rounded-md border border-neutral-300 bg-white text-neutral-700 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+                >
+                  {busy === "reset"
+                    ? ts.scoreWeightsBusyReset
+                    : ts.scoreWeightsReset}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {opError && (
+            <p className="text-xs rounded-md px-2 py-1 bg-red-50 text-red-800 dark:bg-red-950/40 dark:text-red-300">
+              {opError}
+            </p>
+          )}
+
+          {preview && (
+            <div className="rounded-md border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900/50">
+              <div className="px-3 py-1.5 text-xs border-b border-neutral-200 dark:border-neutral-800 flex items-center justify-between">
+                <span className="font-medium">
+                  {ts.scoreWeightsPreviewTitle}
+                </span>
+                <span className="text-neutral-500">
+                  {ts.scoreWeightsPreviewCount(
+                    previewChangedCount,
+                    preview.rows.length,
+                  )}
+                </span>
+              </div>
+              <div className="max-h-72 overflow-auto">
+                <table className="w-full text-xs">
+                  <thead className="text-left text-neutral-500 sticky top-0 bg-white dark:bg-neutral-900/80">
+                    <tr>
+                      <th className="px-3 py-1 font-medium">
+                        {ts.scoreWeightsColDomain}
+                      </th>
+                      <th className="px-3 py-1 font-medium">
+                        {ts.scoreWeightsColOld}
+                      </th>
+                      <th className="px-3 py-1 font-medium">
+                        {ts.scoreWeightsColNew}
+                      </th>
+                      <th className="px-3 py-1 font-medium">
+                        {ts.scoreWeightsColDelta}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {preview.rows.map((r) => {
+                      const delta =
+                        r.score_old != null && r.score_new != null
+                          ? r.score_new - r.score_old
+                          : null;
+                      const deltaCls = !delta
+                        ? "text-neutral-400"
+                        : delta > 0
+                          ? "text-emerald-700 dark:text-emerald-400"
+                          : "text-red-700 dark:text-red-400";
+                      return (
+                        <tr
+                          key={r.run_domain_id}
+                          className="border-t border-neutral-100 dark:border-neutral-800/60"
+                        >
+                          <td className="px-3 py-1">{r.domain}</td>
+                          <td className="px-3 py-1 tabular-nums">
+                            {r.partial
+                              ? ts.scoreWeightsPartial
+                              : (r.score_old ?? ts.scoreWeightsPartial)}
+                          </td>
+                          <td className="px-3 py-1 tabular-nums">
+                            {r.partial
+                              ? ts.scoreWeightsPartial
+                              : (r.score_new ?? ts.scoreWeightsPartial)}
+                          </td>
+                          <td
+                            className={
+                              "px-3 py-1 tabular-nums " + deltaCls
+                            }
+                          >
+                            {delta == null
+                              ? ""
+                              : (delta > 0 ? "+" : "") + delta.toFixed(1)}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
 }
 
 const CRITERIA_ORDER = [
@@ -716,6 +1153,11 @@ export default function RunDetailPage({
           {cost && (cost.fresh_calls > 0 || cost.cache_hits > 0) && (
             <CostPill cost={cost} />
           )}
+          {cost &&
+            (cost.ahrefs_fresh_calls > 0 ||
+              cost.ahrefs_cached_calls > 0) && (
+              <AhrefsUnitsPill cost={cost} />
+            )}
         </div>
         {run.error && (
           <p className="text-sm text-red-600 dark:text-red-400">{run.error}</p>
@@ -729,6 +1171,13 @@ export default function RunDetailPage({
           <p className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-800 dark:bg-red-950/40 dark:text-red-300">
             {lifecycleError}
           </p>
+        )}
+        {run.status === "done" && (
+          <ScoreWeightsPanel
+            runId={runId}
+            currentOverride={run.scoring_override ?? null}
+            onApplied={reload}
+          />
         )}
         {run.status === "done" && criteriaInRun.length > 0 && (
           <div className="rounded-md border border-neutral-200 dark:border-neutral-800 p-3 space-y-2 bg-neutral-50/50 dark:bg-neutral-900/30">
