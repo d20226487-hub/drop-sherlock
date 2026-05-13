@@ -87,15 +87,51 @@ class SubmitJobIn(BaseModel):
 class SubmitJobOut(BaseModel):
     job_id: int
     run_id: int
+    # Domains rejected because they're on the ban list (added wave L).
+    # Per the (β) design call, banned domains are filtered at the
+    # Analyze submit endpoint too — not just at Backlog insertion. The
+    # frontend renders a "X domains skipped (banned)" notice when this
+    # is non-empty.
+    skipped_banned: list[str] = []
 
 
 @router.post("/jobs", response_model=SubmitJobOut)
 async def submit_job(
     payload: SubmitJobIn, db: Session = Depends(get_db)
 ) -> SubmitJobOut:
+    from .backlog import _normalize_domain
+    from ..ban_filter import filter_banned
+
     cleaned_domains = [d.strip() for d in payload.spec.domains if d.strip()]
     if not cleaned_domains:
         raise HTTPException(400, "at least one domain is required")
+
+    # Ban-list pre-filter (added 2026-05-13 wave L, per design call β):
+    # drop banned domains from the run BEFORE it costs anything. We
+    # normalize for the lookup but keep the user's original casing on
+    # any domains that pass — the runner does its own normalization.
+    normalized_for_check = [_normalize_domain(d) for d in cleaned_domains]
+    pairs = list(zip(cleaned_domains, normalized_for_check))
+    _, banned_normalized = filter_banned(
+        db, [n for n in normalized_for_check if n],
+    )
+    if banned_normalized:
+        skipped_banned = [
+            original for original, norm in pairs
+            if norm and norm in banned_normalized
+        ]
+        cleaned_domains = [
+            original for original, norm in pairs
+            if not (norm and norm in banned_normalized)
+        ]
+        if not cleaned_domains:
+            raise HTTPException(
+                400,
+                f"all submitted domains are banned: "
+                f"{', '.join(sorted(banned_normalized))}",
+            )
+    else:
+        skipped_banned = []
 
     enabled_count = sum(
         1
@@ -157,7 +193,9 @@ async def submit_job(
     # the runner so this is safe to call before returning.
     dispatch_run(run.id)
 
-    return SubmitJobOut(job_id=job.id, run_id=run.id)
+    return SubmitJobOut(
+        job_id=job.id, run_id=run.id, skipped_banned=skipped_banned,
+    )
 
 
 def _autoname(domains: list[str]) -> str:

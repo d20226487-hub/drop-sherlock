@@ -596,6 +596,43 @@ export default function DatabasePage() {
     }
   }
 
+  // Bulk-ban (added 2026-05-13 wave L). Sends the selected rows to the
+  // ban list via the /database/domains/bulk-ban endpoint, which reuses
+  // the same normalization as the rest of the app. Existing
+  // BacklogDomain rows are untouched per design call (a).
+  const [bulkBanBusy, setBulkBanBusy] = useState(false);
+  const [bulkBanResult, setBulkBanResult] = useState<{
+    added: number;
+    already: number;
+    invalid: number;
+    error?: string;
+  } | null>(null);
+  async function handleBulkBan() {
+    if (selected.size === 0 || bulkBanBusy) return;
+    const list = Array.from(selected);
+    if (!window.confirm(ts.bulkBanConfirm(list.length))) return;
+    setBulkBanBusy(true);
+    setBulkBanResult(null);
+    try {
+      const r = await api.bulkBanFromDatabase(list);
+      setBulkBanResult({
+        added: r.added,
+        already: r.already_banned,
+        invalid: r.invalid,
+      });
+      reload({ silent: true });
+    } catch (e) {
+      setBulkBanResult({
+        added: 0,
+        already: 0,
+        invalid: 0,
+        error: (e as Error).message || "bulk-ban failed",
+      });
+    } finally {
+      setBulkBanBusy(false);
+    }
+  }
+
   function clearFilters() {
     setVerdicts([]);
     setWaybackVerdicts([]);
@@ -1143,6 +1180,15 @@ export default function DatabasePage() {
               </button>
               <button
                 type="button"
+                onClick={handleBulkBan}
+                disabled={deleting || reanalyzeBusy || bulkBacklogBusy || bulkBanBusy}
+                title={ts.bulkBanHint}
+                className="text-xs px-3 py-1 rounded-md border border-rose-400 dark:border-rose-700 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/40 disabled:opacity-50"
+              >
+                {bulkBanBusy ? ts.bulkBanBusy : ts.bulkBan(selected.size)}
+              </button>
+              <button
+                type="button"
                 onClick={handleDeleteSelected}
                 disabled={deleting || reanalyzeBusy || bulkBacklogBusy}
                 className="text-xs px-3 py-1 rounded-md bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1159,6 +1205,17 @@ export default function DatabasePage() {
                     bulkBacklogResult.updated ?? 0,
                     bulkBacklogResult.created ?? 0,
                     bulkBacklogResult.status,
+                  )}
+            </div>
+          )}
+          {bulkBanResult && (
+            <div className="text-xs text-rose-800 dark:text-rose-300 pt-1 border-t border-rose-200 dark:border-rose-900/60">
+              {bulkBanResult.error
+                ? `${ts.bulkBanFailed}: ${bulkBanResult.error}`
+                : ts.bulkBanResult(
+                    bulkBanResult.added,
+                    bulkBanResult.already,
+                    bulkBanResult.invalid,
                   )}
             </div>
           )}
@@ -1524,6 +1581,14 @@ function DomainListRow({
         <span className="font-mono text-neutral-700 dark:text-neutral-300 break-all">
           {row.domain}
         </span>
+        {row.is_banned && (
+          <span
+            className="ml-2 inline-block text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300"
+            title={ts.bannedBadgeHint}
+          >
+            {ts.bannedBadge}
+          </span>
+        )}
       </td>
       <td className="px-3 py-2 align-top">
         {!row.is_pinned ? (

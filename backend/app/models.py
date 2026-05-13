@@ -359,6 +359,14 @@ class CriterionResult(Base):
     # ai_verdict_error captures that).
     ai_verdict_json: Mapped[str] = mapped_column(Text, default="")
     ai_verdict_error: Mapped[str] = mapped_column(Text, default="")
+    # Russian translation of `ai_verdict_json` (added 2026-05-13 wave K2).
+    # Mirror with translated `key_findings` + `red_flags` arrays —
+    # everything else (assessment enum, confidence, primary_theme,
+    # category, etc.) copied unchanged. Empty when not yet translated.
+    # Populated alongside `RunDomain.final_assessment_ru_json` by the
+    # bulk POST /database/translate-verdicts endpoint. Display logic in
+    # routers/jobs.get_run_domain_detail prefers this when populated.
+    ai_verdict_ru_json: Mapped[str] = mapped_column(Text, default="")
 
     # Per-job cache support. `params_hash` uniquely identifies the Ahrefs
     # request shape (criterion + filters + sort + limit) so a rerun with the
@@ -479,4 +487,28 @@ class ModelPricing(Base):
     output_per_million: Mapped[float] = mapped_column(Float, default=0.0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+# --- Domain ban list (added 2026-05-13 wave L) -----------------------------
+#
+# Permanent "never want this domain again" filter. Distinct from the
+# Backlog `discarded` status (which is a soft per-decision flag) — a ban
+# is a hard, recurring pre-filter applied at every domain-ingestion
+# point: backlog CSV import, the Database page Order/Discard upserts,
+# the availability cascade's auto-create bridge, and the Analyze
+# submit. Existing BacklogDomain rows are NEVER touched by banning
+# (pure pre-filter) — un-banning has no inverse cleanup work to do.
+
+class DomainBan(Base):
+    """One row per banned domain. Lowercase-normalized — same normalization
+    used everywhere else in the app (no protocol, no path)."""
+    __tablename__ = "domain_bans"
+
+    domain: Mapped[str] = mapped_column(String(512), primary_key=True)
+    # Optional free-form note explaining why this domain was banned.
+    # Empty string by default — UI shows the note column muted when empty.
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow,
     )

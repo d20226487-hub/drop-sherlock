@@ -1679,14 +1679,33 @@ async def _run_availability_for_domain(
             )
             now = datetime.utcnow()
             if row is None:
-                bdb.add(BacklogDomain(
-                    domain=domain,
-                    status="analyzed",
-                    expiration_date=result.expires_on,
-                    registrar=result.registrar or "",
-                    created_at=now,
-                    updated_at=now,
-                ))
+                # Ban-list pre-filter (added 2026-05-13 wave L): refuse
+                # to auto-create a BacklogDomain for a banned domain
+                # via the availability cascade. Per (a), this branch is
+                # the only one that creates a NEW row — existing rows
+                # (the else branch below) are still updated normally.
+                # This is the leaky path the central-guard design was
+                # built to plug; without it, analyzing a banned domain
+                # with check_availability=true would silently re-insert
+                # it into the backlog. We only skip the upsert — the
+                # rest of `_run_availability_for_domain` (skip-policy
+                # check etc.) still runs.
+                from .ban_filter import is_banned
+                if is_banned(bdb, domain):
+                    log.info(
+                        "skipping availability auto-upsert for banned "
+                        "domain=%s",
+                        domain,
+                    )
+                else:
+                    bdb.add(BacklogDomain(
+                        domain=domain,
+                        status="analyzed",
+                        expiration_date=result.expires_on,
+                        registrar=result.registrar or "",
+                        created_at=now,
+                        updated_at=now,
+                    ))
             else:
                 # Only update if blank or newer info — don't trample a
                 # user-edited date with a stale registry response.
@@ -3365,13 +3384,190 @@ async def translate_final_for_rd(rd_id: int) -> dict:
         db.close()
 
 
+_TRANSLATE_CRITERIA_SYSTEM_PROMPT = (
+    "You are a professional translator. The input is a JSON object "
+    "keyed by criterion name; each value is an object with "
+    "\"key_findings\" and/or \"red_flags\" arrays of short English "
+    "sentences. Translate each array element to Russian, preserving "
+    "SEO and link-building terminology naturally (e.g. \"backlinks\" "
+    "→ \"бэклинки\", \"anchor text\" → \"анкорный текст\", \"domain "
+    "rating\" → \"рейтинг домена\", \"referring domains\" → "
+    "\"ссылающиеся домены\"). Keep array shape and order intact. If a "
+    "string is already in Russian, return it unchanged. Return a JSON "
+    "object with the SAME criterion keys and the same array structure, "
+    "with translated string values. Do not add other keys, do not "
+    "rewrite into prose, do not add commentary."
+)
+
+_TRANSLATABLE_CRITERION_FIELDS = ("key_findings", "red_flags")
+
+
+async def translate_criterion_verdicts_for_rd(rd_id: int) -> dict:
+    """Translate per-criterion `key_findings` and `red_flags` arrays
+    on every CR row of an rd. One LLM call per rd packages all six
+    criteria; the response is split back out and persisted on each CR's
+    `ai_verdict_ru_json`. Idempotent — skips CRs whose `ai_verdict_ru_json`
+    is already populated.
+
+    Other per-criterion fields (assessment enum, confidence, primary_theme,
+    category, category_reasoning, history, etc.) are mirrored from the
+    original verdict so the translated payload has the same shape — only
+    the arrays are translated.
+
+    Returns the same {status, error} contract as
+    `translate_final_for_rd` — at the rd level. Per-CR detail is rolled
+    up: any failure on the call → "failed" overall; nothing-to-do →
+    "skipped"; at least one CR translated → "translated"."""
+    db = SessionLocal()
+    try:
+        crs = (
+            db.query(CriterionResult)
+            .filter(CriterionResult.run_domain_id == rd_id)
+            .all()
+        )
+        if not crs:
+            return {"status": "skipped", "error": None}
+
+        # Build the payload: only CRs that (a) have a parseable verdict,
+        # (b) lack an existing translation, (c) contain at least one
+        # translatable array.
+        per_crit_payload: dict[str, dict[str, list[str]]] = {}
+        per_crit_parsed: dict[str, dict] = {}
+        crs_to_persist: dict[str, CriterionResult] = {}
+        for cr in crs:
+            if cr.ai_verdict_ru_json:
+                continue
+            if not cr.ai_verdict_json:
+                continue
+            try:
+                parsed = json.loads(cr.ai_verdict_json)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            arrays: dict[str, list[str]] = {}
+            for f in _TRANSLATABLE_CRITERION_FIELDS:
+                v = parsed.get(f)
+                if isinstance(v, list) and any(
+                    isinstance(s, str) and s.strip() for s in v
+                ):
+                    arrays[f] = [
+                        s if isinstance(s, str) else str(s) for s in v
+                    ]
+            if not arrays:
+                # Nothing to translate on this CR — but still mirror the
+                # original into _ru_json so future reads short-circuit.
+                cr.ai_verdict_ru_json = cr.ai_verdict_json
+                continue
+            # Cyrillic short-circuit: if every translatable string is
+            # already mostly Russian, skip the API call for this CR.
+            combined = " ".join(
+                s for vals in arrays.values() for s in vals
+            )
+            if _cyrillic_ratio(combined) >= 0.5:
+                cr.ai_verdict_ru_json = cr.ai_verdict_json
+                continue
+            per_crit_payload[cr.criterion] = arrays
+            per_crit_parsed[cr.criterion] = parsed
+            crs_to_persist[cr.criterion] = cr
+
+        if not per_crit_payload:
+            db.commit()  # commit cyrillic-mirror writes (if any)
+            return {"status": "skipped", "error": None}
+
+        # Resolve provider/model from one of the CRs' AI provenance,
+        # falling back to the rd's run.spec.ai.
+        provider = ""
+        model = ""
+        for cr in crs:
+            if cr.ai_provider:
+                provider = cr.ai_provider
+                model = cr.ai_model or ""
+                break
+        if not provider:
+            rd = db.get(RunDomain, rd_id)
+            if rd is not None:
+                run = db.get(Run, rd.run_id)
+                if run is not None and run.spec_json:
+                    try:
+                        spec_dict = json.loads(run.spec_json)
+                        ai_cfg = (spec_dict or {}).get("ai") or {}
+                        provider = ai_cfg.get("provider") or ""
+                        model = ai_cfg.get("model") or ""
+                    except json.JSONDecodeError:
+                        pass
+        if not provider:
+            return {"status": "failed", "error": "no AI provider on rd"}
+
+        user_message = json.dumps(per_crit_payload, ensure_ascii=False)
+        try:
+            async with limit(provider):
+                translated, _raw, _usage = await judge(
+                    provider=provider,
+                    system_prompt=_TRANSLATE_CRITERIA_SYSTEM_PROMPT,
+                    user_message=user_message,
+                    model_override=model or None,
+                )
+        except (ProviderConfigError, ProviderError, ValueError) as e:
+            return {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "criterion translate failed for rd=%s", rd_id,
+            )
+            return {"status": "failed", "error": f"unexpected: {e!r}"}
+
+        if not isinstance(translated, dict):
+            return {"status": "failed", "error": "translation not a dict"}
+
+        # Persist translations onto each CR's _ru_json. Re-read the rows
+        # in case the session was refreshed mid-await.
+        any_persisted = False
+        for criterion_name, payload in per_crit_payload.items():
+            tr = translated.get(criterion_name)
+            if not isinstance(tr, dict):
+                continue
+            ru_parsed = dict(per_crit_parsed[criterion_name])
+            for f in _TRANSLATABLE_CRITERION_FIELDS:
+                if f not in payload:
+                    continue
+                tr_arr = tr.get(f)
+                if isinstance(tr_arr, list):
+                    # Replace strings element-wise; preserve length so the
+                    # UI's index-based rendering stays stable.
+                    new_arr = [
+                        s if isinstance(s, str) else str(s) for s in tr_arr
+                    ]
+                    # Pad/truncate defensively to match the original len.
+                    orig_len = len(payload[f])
+                    if len(new_arr) < orig_len:
+                        new_arr = new_arr + payload[f][len(new_arr):]
+                    elif len(new_arr) > orig_len:
+                        new_arr = new_arr[:orig_len]
+                    ru_parsed[f] = new_arr
+            cr_row = crs_to_persist[criterion_name]
+            cr_row = db.get(CriterionResult, cr_row.id) or cr_row
+            cr_row.ai_verdict_ru_json = json.dumps(
+                ru_parsed, ensure_ascii=False,
+            )
+            any_persisted = True
+
+        db.commit()
+        return {
+            "status": "translated" if any_persisted else "skipped",
+            "error": None,
+        }
+    finally:
+        db.close()
+
+
 async def translate_database_view_verdicts(
     rd_ids: list[int], *, concurrency: int = 8,
 ) -> dict:
     """Fan-out translator for the bulk endpoint. Translates every rd in
     `rd_ids` (deduped). Concurrency-capped so we don't overwhelm the
-    provider's per-key rate limit — each translation is one API call,
-    so 8-wide is well below the typical 60 rpm ceiling for Gemini Flash.
+    provider's per-key rate limit — each rd costs TWO API calls (final
+    + per-criterion arrays), so 8-wide × 2 = ~16 concurrent in-flight,
+    well below the typical 60 rpm ceiling for Gemini Flash.
     """
     seen: set[int] = set()
     unique_ids: list[int] = []
@@ -3383,7 +3579,27 @@ async def translate_database_view_verdicts(
 
     async def _one(rd_id: int) -> dict:
         async with sem:
-            return await translate_final_for_rd(rd_id)
+            final_result = await translate_final_for_rd(rd_id)
+            crit_result = await translate_criterion_verdicts_for_rd(rd_id)
+            # Roll up: failure on either step ⇒ failed; translated on
+            # either ⇒ translated; otherwise skipped.
+            if (
+                final_result["status"] == "failed"
+                or crit_result["status"] == "failed"
+            ):
+                return {
+                    "status": "failed",
+                    "error": (
+                        final_result.get("error")
+                        or crit_result.get("error")
+                    ),
+                }
+            if (
+                final_result["status"] == "translated"
+                or crit_result["status"] == "translated"
+            ):
+                return {"status": "translated", "error": None}
+            return {"status": "skipped", "error": None}
 
     results = await asyncio.gather(
         *[_one(r) for r in unique_ids], return_exceptions=False,

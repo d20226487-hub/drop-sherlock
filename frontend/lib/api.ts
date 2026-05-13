@@ -868,6 +868,28 @@ export type DatabaseDomainRow = {
   // actions without bouncing back to the Backlog page.
   backlog_id: number | null;
   backlog_status: BacklogStatus | null;
+  // Ban-list flag (added 2026-05-13 wave L). True when the domain is
+  // on the ban list. The row stays visible per design call (i) — the
+  // UI renders a small "banned" badge in the domain cell.
+  is_banned?: boolean;
+};
+
+export type BanRow = {
+  domain: string;
+  note: string;
+  created_at: string;
+};
+
+export type BanListResponse = {
+  total: number;
+  rows: BanRow[];
+};
+
+export type BanAddBulkResult = {
+  added: number;
+  already_banned: number;
+  invalid: number;
+  rows_added: string[];
 };
 
 export type DomainNote = {
@@ -1227,6 +1249,41 @@ export const api = {
     request<RecomputeFinalResult>(`/runs/${runId}/recompute-final`, {
       method: "DELETE",
     }),
+
+  // Ban list (added 2026-05-13 wave L). All endpoints share the
+  // `/banlist` prefix; the bulk-ban-from-Database action lives under
+  // `/database/domains/bulk-ban` because that endpoint composes pin
+  // resolution from the Database side.
+  listBans: () => request<BanListResponse>(`/banlist`),
+
+  addBans: (rows: { domain: string; note?: string }[]) =>
+    request<BanAddBulkResult>(`/banlist`, {
+      method: "POST",
+      body: JSON.stringify({
+        rows: rows.map((r) => ({ domain: r.domain, note: r.note ?? "" })),
+      }),
+    }),
+
+  deleteBan: (domain: string) =>
+    request<{ deleted: boolean; domain: string }>(
+      `/banlist/${encodeURIComponent(domain)}`,
+      { method: "DELETE" },
+    ),
+
+  bulkDeleteBans: (domains: string[]) =>
+    request<{ deleted: number }>(`/banlist/bulk-delete`, {
+      method: "POST",
+      body: JSON.stringify({ domains }),
+    }),
+
+  bulkBanFromDatabase: (domains: string[], note: string = "") =>
+    request<{ added: number; already_banned: number; invalid: number }>(
+      `/database/domains/bulk-ban`,
+      {
+        method: "POST",
+        body: JSON.stringify({ domains, note }),
+      },
+    ),
 
   listPricing: () =>
     request<{ rows: ModelPriceRow[]; seeded: number }>(`/settings/pricing`),

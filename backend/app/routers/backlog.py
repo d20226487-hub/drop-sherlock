@@ -119,6 +119,10 @@ class ImportResult(BaseModel):
     inserted: int
     skipped_duplicates: int
     skipped_invalid: int
+    # Domains rejected because they appear on the ban list (added wave L).
+    # Distinct from duplicates so the user can tell "this was already in
+    # the backlog" apart from "this is permanently banned".
+    skipped_banned: int = 0
     # Subset of rejected-row diagnostics the UI surfaces ("row 12: bad
     # date"). Capped on the backend to keep the response small for huge
     # imports — UI shows the first ~20 with a "+N more" hint.
@@ -722,6 +726,16 @@ def import_rows(payload: ImportIn, db: Session = Depends(get_db)) -> ImportResul
             errors=errors,
         )
 
+    # Ban-list pre-filter (added 2026-05-13 wave L). Surfaced as a
+    # separate counter so the user can tell "duplicate" apart from
+    # "banned" in the import summary.
+    from ..ban_filter import filter_banned
+    domains_for_ban_check = [r.domain for r in valid]
+    _allowed, banned_set = filter_banned(db, domains_for_ban_check)
+    if banned_set:
+        valid = [r for r in valid if r.domain not in banned_set]
+    skipped_banned = len(banned_set)
+
     # One query to find which of the payload's domains are already in the
     # DB — vastly faster than per-row INSERT-with-IntegrityError-catch.
     domains = [r.domain for r in valid]
@@ -730,7 +744,7 @@ def import_rows(payload: ImportIn, db: Session = Depends(get_db)) -> ImportResul
         for (d,) in db.query(BacklogDomain.domain)
         .filter(BacklogDomain.domain.in_(domains))
         .all()
-    }
+    } if domains else set()
     db_dupes = 0
     inserted = 0
     for r in valid:
@@ -751,10 +765,13 @@ def import_rows(payload: ImportIn, db: Session = Depends(get_db)) -> ImportResul
         inserted += 1
     db.commit()
 
-    skipped_invalid = len(payload.rows) - len(valid) - intra_payload_dupes
+    skipped_invalid = (
+        len(payload.rows) - len(valid) - intra_payload_dupes - skipped_banned
+    )
     return ImportResult(
         inserted=inserted,
         skipped_duplicates=intra_payload_dupes + db_dupes,
         skipped_invalid=skipped_invalid,
+        skipped_banned=skipped_banned,
         errors=errors,
     )

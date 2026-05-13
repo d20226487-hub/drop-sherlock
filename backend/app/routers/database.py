@@ -150,6 +150,12 @@ class DomainRow(BaseModel):
     # null when the domain has no backlog row yet.
     backlog_id: int | None = None
     backlog_status: str | None = None
+    # Ban-list flag (added 2026-05-13 wave L). True when this domain is
+    # on the ban list — drives the "banned" badge on Database rows.
+    # Banning is orthogonal to pin/backlog status: a row can be both
+    # pinned AND banned (per design call (i), the row stays visible
+    # after banning so the user retains the audit trail).
+    is_banned: bool = False
 
 
 class DomainListResponse(BaseModel):
@@ -399,6 +405,19 @@ def list_domains(
             .all()
         }
 
+    # Banned-domain lookup (added 2026-05-13 wave L). Single IN-list
+    # against `domain_bans` — same pattern as backlog_by_domain above.
+    # Drives the per-row `is_banned` flag for the badge.
+    from ..models import DomainBan
+    banned_set: set[str] = set()
+    if domain_keys:
+        banned_set = {
+            b.domain
+            for b in db.query(DomainBan)
+            .filter(DomainBan.domain.in_(domain_keys))
+            .all()
+        }
+
     from ..app_settings import get_scoring_config
     sc = get_scoring_config()
     good_t = sc["good_threshold"]
@@ -457,6 +476,7 @@ def list_domains(
                 note=(note_row.note if note_row else ""),
                 note_updated_at=(note_row.updated_at if note_row else None),
                 pin_options_count=len(pin_options),
+                is_banned=domain in banned_set,
                 backlog_id=backlog_row.id if backlog_row else None,
                 backlog_status=backlog_row.status if backlog_row else None,
             ))
@@ -805,6 +825,7 @@ def list_domains(
             note=(note_row.note if note_row else ""),
             note_updated_at=(note_row.updated_at if note_row else None),
             pin_options_count=len(pin_options),
+            is_banned=domain in banned_set,
             backlog_id=backlog_row.id if backlog_row else None,
             backlog_status=backlog_row.status if backlog_row else None,
         ))
@@ -1108,6 +1129,78 @@ async def bulk_reanalyze(payload: BulkReanalyzeIn) -> BulkReanalyzeOut:
     return BulkReanalyzeOut(started=started, skipped=skipped, items=items)
 
 
+# --- Bulk ban: Database page → Ban List (added 2026-05-13 wave L) ----------
+# `POST /database/domains/bulk-ban` lets the user multi-select Database
+# rows and ban them in one call. Domains are normalized via the shared
+# `_normalize_domain` helper so the keys match what the ban filter checks
+# at every other insertion point. Existing BacklogDomain rows are NOT
+# touched — per the (a) design call, banning is a pure pre-filter.
+
+class BulkBanIn(BaseModel):
+    domains: list[str]
+    note: str = ""
+
+
+class BulkBanOut(BaseModel):
+    added: int
+    already_banned: int
+    invalid: int
+
+
+@router.post("/domains/bulk-ban", response_model=BulkBanOut)
+def bulk_ban_domains(
+    payload: BulkBanIn, db: Session = Depends(get_db),
+) -> BulkBanOut:
+    """Add the supplied domains to the ban list. Idempotent. Note is
+    applied to every newly-added row (existing banned rows keep their
+    own note unless empty AND a non-empty new note is supplied — same
+    merge rule as the /banlist POST endpoint).
+
+    The user picks domains via Database-page multi-select; we don't
+    require them to first toggle anything else (no auto-discard — per
+    the (a) design call the ban list is orthogonal to backlog status)."""
+    from ..models import DomainBan
+    from .backlog import _normalize_domain
+
+    if not payload.domains:
+        return BulkBanOut(added=0, already_banned=0, invalid=0)
+    seen: set[str] = set()
+    normalized: list[str] = []
+    invalid = 0
+    for d in payload.domains:
+        n = _normalize_domain(d or "")
+        if not n:
+            invalid += 1
+            continue
+        if n in seen:
+            continue
+        seen.add(n)
+        normalized.append(n)
+    if not normalized:
+        return BulkBanOut(added=0, already_banned=0, invalid=invalid)
+    existing = {
+        b.domain: b
+        for b in db.query(DomainBan)
+        .filter(DomainBan.domain.in_(normalized))
+        .all()
+    }
+    added = 0
+    already = 0
+    now = datetime.utcnow()
+    note = (payload.note or "").strip()
+    for d in normalized:
+        existing_row = existing.get(d)
+        if existing_row is not None:
+            if note and not existing_row.note:
+                existing_row.note = note
+            already += 1
+            continue
+        db.add(DomainBan(domain=d, note=note, created_at=now))
+        added += 1
+    db.commit()
+    return BulkBanOut(added=added, already_banned=already, invalid=invalid)
+
+
 # --- Bulk Russian translation of final-assessment prose (2026-05-13 wave K)
 # Translates `summary` and `recommendation` on every rd currently surfaced
 # by the Database page (one row per unique domain, sourced via the same
@@ -1265,6 +1358,13 @@ def set_backlog_status(
         )
     # Auto-create for ad-hoc analyzed domains. Other backlog fields stay
     # at their defaults (registrar/expiration/comments/prices left empty).
+    # Ban-list check (added 2026-05-13 wave L): refuse to create a new
+    # BacklogDomain for banned domains. Per the (a) design call,
+    # banning is a pure pre-filter — existing rows above were updated
+    # freely; only the CREATE path consults the ban list.
+    from ..ban_filter import is_banned
+    if is_banned(db, normalized):
+        raise HTTPException(409, f"domain is banned: {normalized}")
     row = BacklogDomain(
         domain=normalized,
         status=payload.status,
@@ -1292,6 +1392,10 @@ class BulkBacklogStatusOut(BaseModel):
     updated: int
     created: int
     skipped: int
+    # Domains rejected because they're on the ban list (added wave L).
+    # Banned domains that ALREADY have a BacklogDomain row are still
+    # updated normally per (a) — only the create branch refuses.
+    skipped_banned: int = 0
     status: str
 
 
@@ -1336,14 +1440,24 @@ def bulk_set_backlog_status(
         .filter(BacklogDomain.domain.in_(normalized))
         .all()
     }
+    # Ban check (added 2026-05-13 wave L): only blocks the CREATE branch
+    # per (a) — existing BacklogDomain rows whose domain is banned can
+    # still be updated. Lets the user retroactively pin a status on
+    # already-recorded domains without un-banning first.
+    from ..ban_filter import filter_banned
+    create_candidates = [d for d in normalized if d not in existing]
+    _allowed_creates, banned_for_create = filter_banned(db, create_candidates)
     updated = 0
     created = 0
+    skipped_banned = 0
     for d in normalized:
         row = existing.get(d)
         if row is not None:
             row.status = payload.status
             row.updated_at = now
             updated += 1
+        elif d in banned_for_create:
+            skipped_banned += 1
         else:
             db.add(BacklogDomain(
                 domain=d,
@@ -1357,5 +1471,6 @@ def bulk_set_backlog_status(
         updated=updated,
         created=created,
         skipped=len(payload.domains) - len(normalized),
+        skipped_banned=skipped_banned,
         status=payload.status,
     )

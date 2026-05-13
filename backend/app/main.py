@@ -10,6 +10,7 @@ from .routers import (
     availability as availability_router,
     backlog as backlog_router,
     backups as backups_router,
+    banlist as banlist_router,
     dashboard,
     database as database_router,
     errors as errors_router,
@@ -94,6 +95,11 @@ def _migrate_sqlite_columns() -> None:
         # translated `summary` + `recommendation`. Empty when not yet
         # translated; populated by POST /database/translate-verdicts.
         ("run_domains", "final_assessment_ru_json", "TEXT DEFAULT ''"),
+        # Russian translation of per-criterion AI verdict (added
+        # 2026-05-13 wave K2). Mirror of `ai_verdict_json` with
+        # translated `key_findings` + `red_flags` arrays. Same
+        # endpoint populates both.
+        ("criterion_results", "ai_verdict_ru_json", "TEXT DEFAULT ''"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding
@@ -560,6 +566,7 @@ app.include_router(errors_router.router)
 app.include_router(backlog_router.router)
 app.include_router(backups_router.router)
 app.include_router(availability_router.router)
+app.include_router(banlist_router.router)
 
 
 @app.get("/health")

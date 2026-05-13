@@ -787,6 +787,23 @@ def get_run_domain_detail(
                 ai_verdict = json.loads(picked_cr.ai_verdict_json)
             except json.JSONDecodeError:
                 ai_verdict = None
+        # Russian-translation overlay (2026-05-13 wave K2): when the CR
+        # has `ai_verdict_ru_json` populated by the bulk
+        # POST /database/translate-verdicts endpoint, replace
+        # key_findings + red_flags arrays in the response. Other fields
+        # (assessment, confidence, primary_theme, category, etc.) come
+        # from the canonical ai_verdict_json so any future re-judge on
+        # the original is reflected. No UI toggle — RU is preferred
+        # whenever present.
+        if ai_verdict is not None and picked_cr.ai_verdict_ru_json:
+            try:
+                ru_v = json.loads(picked_cr.ai_verdict_ru_json)
+            except json.JSONDecodeError:
+                ru_v = None
+            if isinstance(ru_v, dict):
+                for f in ("key_findings", "red_flags"):
+                    if isinstance(ru_v.get(f), list):
+                        ai_verdict[f] = ru_v[f]
         is_stitched = picked_rd.id != rd.id
         criteria[criterion_name] = {
             "status": picked_cr.status,

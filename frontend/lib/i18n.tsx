@@ -48,6 +48,11 @@ const messagesEn = {
     database: "Database",
     errors: "Errors",
     settings: "Settings",
+    databaseDropdown: {
+      label: "Database",
+      analyzeList: "Analyze List",
+      banList: "Ban List",
+    },
   },
   pages: {
     dashboard: {
@@ -781,6 +786,19 @@ const messagesEn = {
           return `${parts.join(" · ")} (status = ${status}).`;
         },
       },
+      // Ban-list bulk action + per-row badge (added 2026-05-13 wave L).
+      bulkBan: (n: number) => `Add ${n} to Ban List`,
+      bulkBanBusy: "Adding…",
+      bulkBanHint:
+        "Permanently exclude these domains from future analysis and Backlog imports. Existing Backlog rows (if any) are not affected.",
+      bulkBanConfirm: (n: number) =>
+        `Add ${n} domain${n === 1 ? "" : "s"} to the Ban List? They'll be silently rejected from future Analyze submissions, Backlog imports, and the availability-cascade auto-upsert. Existing Backlog rows stay as-is.`,
+      bulkBanResult: (added: number, already: number, invalid: number) =>
+        `Banned ${added} · already banned ${already} · invalid ${invalid}.`,
+      bulkBanFailed: "Bulk-ban failed",
+      bannedBadge: "banned",
+      bannedBadgeHint:
+        "On the Ban List. Future Analyze submissions and Backlog imports for this domain are silently rejected.",
       pin: {
         notPinnedBadge: "not pinned",
         notPinnedHint:
@@ -1330,6 +1348,37 @@ const messagesEn = {
       errorCatNetwork: "Network",
       errorCatParse: "Parse",
     },
+    banlist: {
+      title: "Ban List",
+      hint:
+        "Permanent filter — domains here are silently rejected at every ingestion point: Backlog imports, Database Order/Discard actions, the availability cascade, and Analyze submissions. Distinct from a Backlog 'discarded' status, which is a per-decision soft flag. Existing Backlog rows are not affected when you ban a domain — banning is a pure pre-filter.",
+      searchPlaceholder: "Search by domain or note…",
+      importOpen: "Import CSV",
+      importClose: "Close import",
+      importTitle: "Import from CSV",
+      importHint:
+        "One row per domain. Optional second column = note. Empty lines and #-prefixed lines are ignored. Already-banned domains are merged (note overwritten only when blank).",
+      importPlaceholder:
+        "example.com\nshady-pbn.net, suspicious anchors profile\n# comment lines are ignored",
+      importSubmit: "Import",
+      importBusy: "Importing…",
+      importResult: (added: number, already: number, invalid: number) =>
+        `Added ${added}, already banned ${already}, invalid ${invalid}.`,
+      loading: "Loading…",
+      emptyAll: "No domains on the ban list yet.",
+      emptyFiltered: "No banned domains match the current search.",
+      colDomain: "Domain",
+      colNote: "Note",
+      colCreatedAt: "Banned at",
+      colActions: "",
+      unbanOne: "Unban",
+      unbanSelected: (n: number) => `Unban ${n} selected`,
+      unbanSelectedConfirm: (n: number) =>
+        `Remove ${n} domain${n === 1 ? "" : "s"} from the ban list? They'll be eligible for analysis and Backlog import again. Existing Backlog rows (if any) are unaffected either way.`,
+      selectAll: "Select all visible",
+      totalLine: (total: number, visible: number, selectedCount: number) =>
+        `${total} banned · ${visible} visible · ${selectedCount} selected`,
+    },
     backlog: {
       title: "Backlog",
       intro:
@@ -1508,6 +1557,11 @@ const messagesRu: Messages = {
     database: "База",
     errors: "Ошибки",
     settings: "Настройки",
+    databaseDropdown: {
+      label: "База",
+      analyzeList: "Список для анализа",
+      banList: "Бан-лист",
+    },
   },
   pages: {
     dashboard: {
@@ -2275,6 +2329,18 @@ const messagesRu: Messages = {
           return `${parts.join(" · ")} (статус = ${status}).`;
         },
       },
+      bulkBan: (n) => `В бан-лист (${n})`,
+      bulkBanBusy: "Добавление…",
+      bulkBanHint:
+        "Навсегда исключить выбранные домены из будущих анализов и импортов в Очередь. Существующие записи в Очереди не меняются.",
+      bulkBanConfirm: (n) =>
+        `Добавить ${n} доменов в бан-лист? Они будут молча отклоняться при отправке в Анализ, импорте в Очередь и в авто-апсерте через проверку доступности. Существующие записи в Очереди остаются без изменений.`,
+      bulkBanResult: (added, already, invalid) =>
+        `Забанено ${added} · уже было ${already} · некорректных ${invalid}.`,
+      bulkBanFailed: "Не удалось забанить",
+      bannedBadge: "забанен",
+      bannedBadgeHint:
+        "В бан-листе. Будущие отправки в Анализ и импорты в Очередь для этого домена будут молча отклоняться.",
       pin: {
         notPinnedBadge: "не закреплён",
         notPinnedHint:
@@ -2886,6 +2952,37 @@ const messagesRu: Messages = {
       errorCatQuota: "Квота",
       errorCatNetwork: "Сеть",
       errorCatParse: "Разбор",
+    },
+    banlist: {
+      title: "Бан-лист",
+      hint:
+        "Постоянный фильтр — домены отсюда молча отклоняются на каждой точке загрузки: импорт в Очередь, действия Order/Discard на странице Базы, цепочка проверки доступности и отправка Анализа. Это не то же самое, что Backlog-статус «discarded» — тот ставится для разовых решений. Существующие строки в Очереди не меняются при добавлении домена в бан-лист — это чисто предварительный фильтр.",
+      searchPlaceholder: "Поиск по домену или примечанию…",
+      importOpen: "Импорт CSV",
+      importClose: "Закрыть импорт",
+      importTitle: "Импорт из CSV",
+      importHint:
+        "Одна строка — один домен. Опциональная вторая колонка = примечание. Пустые строки и строки с # игнорируются. Уже забаненные домены пропускаются (примечание перезаписывается, только если было пустым).",
+      importPlaceholder:
+        "example.com\nshady-pbn.net, подозрительный анкор-профиль\n# строки с # игнорируются",
+      importSubmit: "Импортировать",
+      importBusy: "Импорт…",
+      importResult: (added, already, invalid) =>
+        `Добавлено ${added}, уже было в бане ${already}, некорректных ${invalid}.`,
+      loading: "Загрузка…",
+      emptyAll: "В бан-листе пока пусто.",
+      emptyFiltered: "По текущему поиску забаненных доменов нет.",
+      colDomain: "Домен",
+      colNote: "Примечание",
+      colCreatedAt: "Забанен",
+      colActions: "",
+      unbanOne: "Снять бан",
+      unbanSelected: (n) => `Снять бан с ${n}`,
+      unbanSelectedConfirm: (n) =>
+        `Убрать ${n} доменов из бан-листа? Они снова смогут попасть в анализ и в Очередь через импорт. На существующие записи в Очереди это не влияет.`,
+      selectAll: "Выбрать все видимые",
+      totalLine: (total, visible, selectedCount) =>
+        `${total} забанено · ${visible} видно · ${selectedCount} выбрано`,
     },
     backlog: {
       title: "Очередь",
