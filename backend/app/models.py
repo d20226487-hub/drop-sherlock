@@ -179,6 +179,14 @@ class RunDomain(Base):
     # "quality"|"mixed"|"low_quality") for the summary-table column without
     # needing to parse JSON for every row.
     final_assessment_json: Mapped[str] = mapped_column(Text, default="")
+    # Russian translation of `final_assessment_json` (added 2026-05-13
+    # wave K). Same shape as the original — only `summary` and
+    # `recommendation` are translated; other fields (final, confidence,
+    # provider, model) are mirrored unchanged. Empty when the rd has
+    # never been translated. Display logic prefers this over the original
+    # whenever it's populated; no UI toggle. Populated by the bulk
+    # `POST /database/translate-verdicts` endpoint.
+    final_assessment_ru_json: Mapped[str] = mapped_column(Text, default="")
     final_summary: Mapped[str] = mapped_column(String(20), default="")
     # Updated whenever the AI step completes for this domain (fresh judge,
     # reanalyze, or cache copy). `finished_at` represents the ORIGINAL run

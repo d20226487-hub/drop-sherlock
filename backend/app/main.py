@@ -89,6 +89,11 @@ def _migrate_sqlite_columns() -> None:
         # /runs/{id}/recompute-final endpoint family; rewrites every rd's
         # final_assessment_json + final_summary in the same transaction.
         ("runs", "scoring_override_json", "TEXT DEFAULT ''"),
+        # Russian translation of the final-assessment prose (added
+        # 2026-05-13 wave K). Mirror of final_assessment_json with
+        # translated `summary` + `recommendation`. Empty when not yet
+        # translated; populated by POST /database/translate-verdicts.
+        ("run_domains", "final_assessment_ru_json", "TEXT DEFAULT ''"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding

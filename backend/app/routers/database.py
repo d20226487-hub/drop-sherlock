@@ -1108,6 +1108,48 @@ async def bulk_reanalyze(payload: BulkReanalyzeIn) -> BulkReanalyzeOut:
     return BulkReanalyzeOut(started=started, skipped=skipped, items=items)
 
 
+# --- Bulk Russian translation of final-assessment prose (2026-05-13 wave K)
+# Translates `summary` and `recommendation` on every rd currently surfaced
+# by the Database page (one row per unique domain, sourced via the same
+# per-(job, criterion) pin logic the page uses for display). Other prose
+# (per-criterion key_findings/red_flags, category_reasoning) is left in
+# English. Idempotent — re-running skips already-translated rds.
+
+class TranslateVerdictsOut(BaseModel):
+    total: int
+    translated: int
+    skipped: int
+    failed: int
+    errors: list[str]
+
+
+@router.post("/translate-verdicts", response_model=TranslateVerdictsOut)
+async def translate_database_verdicts(
+    db: Session = Depends(get_db),
+) -> TranslateVerdictsOut:
+    """Translate the final-assessment prose (summary + recommendation)
+    of every rd backing the Database page to Russian. Stores the
+    translation in `run_domains.final_assessment_ru_json` alongside the
+    original — display code prefers it whenever populated; no UI toggle.
+    Rds whose prose is already mostly Russian get their original mirrored
+    into the _ru slot so subsequent reads short-circuit consistently."""
+    # Re-resolve the set of "current" rd ids using the same pin-driven
+    # source logic as `list_domains` so the bulk action targets exactly
+    # what the page shows.
+    response = list_domains(db=db, offset=0, limit=None)
+    rd_ids: list[int] = []
+    for row in response.rows:
+        if row.pinned_run_domain_id is not None:
+            rd_ids.append(row.pinned_run_domain_id)
+    if not rd_ids:
+        return TranslateVerdictsOut(
+            total=0, translated=0, skipped=0, failed=0, errors=[],
+        )
+    from ..tasks import translate_database_view_verdicts
+    result = await translate_database_view_verdicts(rd_ids)
+    return TranslateVerdictsOut(**result)
+
+
 # --- Lazy pin_options (added 2026-05-10) -----------------------------------
 # Returns the full pinnable-runs list for ONE domain — used when the user
 # opens the pin dropdown on the Database page. The /database/domains

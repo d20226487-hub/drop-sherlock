@@ -828,12 +828,33 @@ def get_run_domain_detail(
     # prior rd whose final has a usable score (skip partials and
     # summary-only finals from wayback-only reruns).
     def _final_dict(d: RunDomain) -> dict | None:
+        # Russian-translation overlay (2026-05-13 wave K): when the rd
+        # has `final_assessment_ru_json` populated (by the bulk
+        # `POST /database/translate-verdicts` endpoint), use its
+        # `summary` and `recommendation` over the original. Numeric
+        # fields (`final`, `confidence`) come from the canonical
+        # `final_assessment_json` so any subsequent recompute on the
+        # original is reflected. No UI toggle — display always prefers
+        # RU when present.
         if not d.final_assessment_json:
             return None
         try:
-            return json.loads(d.final_assessment_json)
+            parsed = json.loads(d.final_assessment_json)
         except json.JSONDecodeError:
             return None
+        if not isinstance(parsed, dict):
+            return parsed
+        if d.final_assessment_ru_json:
+            try:
+                ru = json.loads(d.final_assessment_ru_json)
+            except json.JSONDecodeError:
+                ru = None
+            if isinstance(ru, dict):
+                if isinstance(ru.get("summary"), str):
+                    parsed["summary"] = ru["summary"]
+                if isinstance(ru.get("recommendation"), str):
+                    parsed["recommendation"] = ru["recommendation"]
+        return parsed
 
     def _is_partial_final(parsed: dict | None) -> bool:
         return bool(isinstance(parsed, dict) and parsed.get("partial"))

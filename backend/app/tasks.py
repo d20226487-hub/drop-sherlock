@@ -3224,6 +3224,183 @@ def recompute_run_finals(
         db.close()
 
 
+# --- Russian translation of final-assessment prose (2026-05-13 wave K) -----
+#
+# One-shot bulk translation triggered from the Database page. Translates
+# ONLY `summary` and `recommendation` (the long prose) — per-criterion
+# `key_findings` / `red_flags` arrays are intentionally left in English
+# per the user's scope. Idempotent: skips rds that already have a
+# `final_assessment_ru_json` populated, or whose prose is already in
+# Russian (Cyrillic-ratio heuristic).
+
+_TRANSLATE_SYSTEM_PROMPT = (
+    "You are a professional translator. Translate the given English "
+    "text fields to Russian, preserving SEO and link-building "
+    "terminology naturally (e.g. \"backlinks\" → \"бэклинки\", "
+    "\"anchor text\" → \"анкорный текст\", \"domain rating\" → "
+    "\"рейтинг домена\"). Keep the same tone and length. If a field's "
+    "text is already in Russian, return it unchanged. Output a single "
+    "JSON object with EXACTLY two string keys: \"summary\" and "
+    "\"recommendation\". Do not add commentary, markdown, or any other "
+    "keys."
+)
+
+
+def _cyrillic_ratio(s: str) -> float:
+    """Fraction of alphabetic chars in `s` that are Cyrillic. Used to
+    short-circuit translation when the prose is already in Russian (or
+    mostly so — covers the mixed Russian/English case from prompt drift
+    where the AI sometimes leaks an English phrase into a RU verdict)."""
+    if not s:
+        return 0.0
+    letters = sum(1 for c in s if c.isalpha())
+    if letters == 0:
+        return 0.0
+    cyr = sum(1 for c in s if "Ѐ" <= c <= "ӿ")
+    return cyr / letters
+
+
+async def translate_final_for_rd(rd_id: int) -> dict:
+    """Translate one rd's `final_assessment_json.summary` and
+    `.recommendation` to Russian and persist in `final_assessment_ru_json`.
+    Idempotent.
+
+    Returns `{status, error}` where status is one of:
+      - "translated" — wrote a fresh translation
+      - "skipped"    — already translated / already Russian / nothing to
+                       translate (no JSON, partial stub, empty prose)
+      - "failed"     — provider error, parse error, etc.
+    """
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, rd_id)
+        if rd is None:
+            return {"status": "failed", "error": "rd not found"}
+        if rd.final_assessment_ru_json:
+            return {"status": "skipped", "error": None}
+        if not rd.final_assessment_json:
+            return {"status": "skipped", "error": None}
+        try:
+            parsed = json.loads(rd.final_assessment_json)
+        except json.JSONDecodeError:
+            return {"status": "failed", "error": "final_assessment_json parse"}
+        if not isinstance(parsed, dict):
+            return {"status": "failed", "error": "final not a dict"}
+        if parsed.get("partial"):
+            # Partial stubs have no prose to translate.
+            return {"status": "skipped", "error": None}
+
+        summary = str(parsed.get("summary") or "")
+        recommendation = str(parsed.get("recommendation") or "")
+        if not summary.strip() and not recommendation.strip():
+            return {"status": "skipped", "error": None}
+
+        # Already Russian? Mirror the original into the _ru slot so future
+        # reads short-circuit; no API call needed.
+        if _cyrillic_ratio(summary + recommendation) >= 0.5:
+            rd.final_assessment_ru_json = rd.final_assessment_json
+            db.commit()
+            return {"status": "skipped", "error": None}
+
+        # Provider + model: prefer the rd's own verdict provenance so we
+        # translate with the same model that originally synthesized the
+        # prose (consistent terminology and tone). Fall back to the run's
+        # spec.ai if the rd doesn't carry provider info.
+        provider = str(parsed.get("provider") or "")
+        model = str(parsed.get("model") or "")
+        if not provider:
+            run = db.get(Run, rd.run_id)
+            if run is not None and run.spec_json:
+                try:
+                    spec_dict = json.loads(run.spec_json)
+                    ai_cfg = (spec_dict or {}).get("ai") or {}
+                    provider = ai_cfg.get("provider") or ""
+                    model = ai_cfg.get("model") or ""
+                except json.JSONDecodeError:
+                    pass
+        if not provider:
+            return {"status": "failed", "error": "no AI provider on rd"}
+
+        user_message = json.dumps(
+            {"summary": summary, "recommendation": recommendation},
+            ensure_ascii=False,
+        )
+        try:
+            async with limit(provider):
+                translated, _raw, _usage = await judge(
+                    provider=provider,
+                    system_prompt=_TRANSLATE_SYSTEM_PROMPT,
+                    user_message=user_message,
+                    model_override=model or None,
+                )
+        except (ProviderConfigError, ProviderError, ValueError) as e:
+            return {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "translate failed for rd=%s", rd_id,
+            )
+            return {"status": "failed", "error": f"unexpected: {e!r}"}
+
+        if not isinstance(translated, dict):
+            return {"status": "failed", "error": "translation not a dict"}
+
+        # Re-read rd in case the DB session was refreshed between the
+        # async judge call and now. Persist the original-shape dict with
+        # overlaid translated prose — keeps numeric fields (final,
+        # confidence, provider, model) consistent with the source.
+        rd = db.get(RunDomain, rd_id)
+        if rd is None:
+            return {"status": "failed", "error": "rd disappeared mid-translate"}
+        ru_parsed = dict(parsed)
+        if isinstance(translated.get("summary"), str):
+            ru_parsed["summary"] = translated["summary"]
+        if isinstance(translated.get("recommendation"), str):
+            ru_parsed["recommendation"] = translated["recommendation"]
+        rd.final_assessment_ru_json = json.dumps(
+            ru_parsed, ensure_ascii=False,
+        )
+        db.commit()
+        return {"status": "translated", "error": None}
+    finally:
+        db.close()
+
+
+async def translate_database_view_verdicts(
+    rd_ids: list[int], *, concurrency: int = 8,
+) -> dict:
+    """Fan-out translator for the bulk endpoint. Translates every rd in
+    `rd_ids` (deduped). Concurrency-capped so we don't overwhelm the
+    provider's per-key rate limit — each translation is one API call,
+    so 8-wide is well below the typical 60 rpm ceiling for Gemini Flash.
+    """
+    seen: set[int] = set()
+    unique_ids: list[int] = []
+    for r in rd_ids:
+        if r not in seen:
+            seen.add(r)
+            unique_ids.append(r)
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def _one(rd_id: int) -> dict:
+        async with sem:
+            return await translate_final_for_rd(rd_id)
+
+    results = await asyncio.gather(
+        *[_one(r) for r in unique_ids], return_exceptions=False,
+    )
+    counts = {"translated": 0, "skipped": 0, "failed": 0}
+    errors: list[str] = []
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        if r["status"] == "failed" and r.get("error") and len(errors) < 10:
+            errors.append(r["error"])
+    return {
+        "total": len(unique_ids),
+        **counts,
+        "errors": errors,
+    }
+
+
 def get_run_scoring_override(run_id: int) -> dict | None:
     """Return the parsed `{weights: {...}}` override for a run, or None
     when the run uses global Settings weights. Used by the Run-detail
