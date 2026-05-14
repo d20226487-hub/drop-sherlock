@@ -1405,6 +1405,7 @@ const messagesEn = {
         backordered: "Ordered",
         bought: "Bought",
         discarded: "Discarded",
+        banned: "Banned",
       },
       filters: {
         heading: "Filters",
@@ -1502,6 +1503,8 @@ const messagesEn = {
             `Added ${n} new domain${n === 1 ? "" : "s"}.`,
           skippedDupes: (n: number) =>
             `Skipped ${n} duplicate${n === 1 ? "" : "s"} (already in backlog).`,
+          skippedBanned: (n: number) =>
+            `Skipped ${n} banned domain${n === 1 ? "" : "s"} (on the Ban List).`,
           skippedInvalid: (n: number) =>
             `Skipped ${n} invalid row${n === 1 ? "" : "s"}.`,
           errorsHeading: "Issues:",
@@ -3010,6 +3013,7 @@ const messagesRu: Messages = {
         backordered: "Заказан",
         bought: "Куплен",
         discarded: "Отброшен",
+        banned: "Забанен",
       },
       filters: {
         heading: "Фильтры",
@@ -3122,6 +3126,7 @@ const messagesRu: Messages = {
           heading: "Импорт завершён",
           inserted: (n) => `Добавлено новых доменов: ${n}.`,
           skippedDupes: (n) => `Пропущено дубликатов (уже в очереди): ${n}.`,
+          skippedBanned: (n) => `Пропущено забаненных доменов: ${n}.`,
           skippedInvalid: (n) => `Пропущено некорректных строк: ${n}.`,
           errorsHeading: "Замечания:",
           moreErrors: (n) => `… и ещё ${n}`,

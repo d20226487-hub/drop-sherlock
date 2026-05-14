@@ -375,6 +375,124 @@ def test_backlog_delete_does_not_remove_ban(fresh_db):
     assert ban.note == "permanent"  # the original note survives unchanged
 
 
+def test_banning_flips_existing_backlog_status_to_banned(fresh_db):
+    """Per wave-O design (β): adding a domain to the ban list while it
+    already has a BacklogDomain row flips that row's status to 'banned'.
+    The flip applies to NEW ban actions only — existing entries on the
+    ban list are NOT retroactively pushed onto pre-existing backlog
+    rows (no startup backfill — see the conversation thread)."""
+    from app.models import BacklogDomain
+
+    fresh_db.add(BacklogDomain(
+        domain="flip-me.kz",
+        status="analyzed",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    ))
+    fresh_db.commit()
+
+    client = _client()
+    r = client.post(
+        "/banlist",
+        auth=("admin", "changeme"),
+        json={"rows": [{"domain": "flip-me.kz", "note": "junk"}]},
+    )
+    assert r.status_code == 200
+    assert r.json()["added"] == 1
+
+    fresh_db.expire_all()
+    row = fresh_db.query(BacklogDomain).filter(
+        BacklogDomain.domain == "flip-me.kz",
+    ).one()
+    assert row.status == "banned"
+
+
+def test_banning_no_op_when_no_backlog_row(fresh_db):
+    """If the banned domain has no BacklogDomain row, the ban succeeds
+    and no backlog row is created (banning is a pure pre-filter — it
+    does not auto-create backlog rows). Pinning this so the status
+    flip helper never accidentally inserts."""
+    from app.models import BacklogDomain
+
+    client = _client()
+    r = client.post(
+        "/banlist",
+        auth=("admin", "changeme"),
+        json={"rows": [{"domain": "no-row.kz", "note": ""}]},
+    )
+    assert r.status_code == 200
+    assert r.json()["added"] == 1
+    assert fresh_db.query(BacklogDomain).filter(
+        BacklogDomain.domain == "no-row.kz",
+    ).count() == 0
+
+
+def test_unbanning_leaves_backlog_status_alone(fresh_db):
+    """Per wave-O design call (β): unbanning leaves the BacklogDomain
+    status at 'banned' — the user re-statuses manually if they change
+    their mind. This test pins that we don't accidentally introduce
+    auto-revert later without re-discussing."""
+    from app.models import BacklogDomain
+
+    fresh_db.add(BacklogDomain(
+        domain="ping-pong.kz",
+        status="discarded",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    ))
+    fresh_db.commit()
+
+    client = _client()
+    # Ban → status flips to 'banned'.
+    client.post(
+        "/banlist",
+        auth=("admin", "changeme"),
+        json={"rows": [{"domain": "ping-pong.kz", "note": ""}]},
+    )
+    fresh_db.expire_all()
+    row = fresh_db.query(BacklogDomain).filter(
+        BacklogDomain.domain == "ping-pong.kz",
+    ).one()
+    assert row.status == "banned"
+
+    # Unban → status stays at 'banned'.
+    r = client.delete(
+        "/banlist/ping-pong.kz", auth=("admin", "changeme"),
+    )
+    assert r.status_code == 200
+    fresh_db.expire_all()
+    row = fresh_db.query(BacklogDomain).filter(
+        BacklogDomain.domain == "ping-pong.kz",
+    ).one()
+    assert row.status == "banned", (
+        "unbanning auto-reverted the backlog status — design call (β) "
+        "specifies it should stay at 'banned' until the user re-statuses"
+    )
+
+
+def test_backlog_import_surfaces_skipped_banned_count(fresh_db):
+    """Wave-O surfaces `skipped_banned` in the import-result UI. The
+    backend was already returning it (added wave L); this test pins the
+    schema field stays present + non-zero when something is filtered."""
+    _ban(fresh_db, "blocked.kz")
+    client = _client()
+    r = client.post(
+        "/backlog/import",
+        auth=("admin", "changeme"),
+        json={
+            "rows": [
+                {"domain": "good.kz"},
+                {"domain": "blocked.kz"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "skipped_banned" in body
+    assert body["skipped_banned"] == 1
+    assert body["inserted"] == 1
+
+
 def test_database_domains_exposes_is_banned(fresh_db):
     """A row whose domain is on the ban list should come back from
     /database/domains with is_banned=True (drives the row badge)."""

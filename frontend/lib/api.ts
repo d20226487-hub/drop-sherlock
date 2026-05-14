@@ -1907,6 +1907,11 @@ export type BacklogImportResult = {
   inserted: number;
   skipped_duplicates: number;
   skipped_invalid: number;
+  // Domains rejected because they appear on the ban list (added wave L,
+  // surfaced in import-result UI in wave O). Distinct counter from
+  // duplicates so the user can tell "already in backlog" apart from
+  // "permanently banned".
+  skipped_banned?: number;
   errors: { row_index: number; message: string }[];
 };
 
@@ -1919,7 +1924,8 @@ export type BacklogStatus =
   | "order"
   | "backordered"
   | "bought"
-  | "discarded";
+  | "discarded"
+  | "banned";
 
 export const BACKLOG_STATUSES: BacklogStatus[] = [
   "backlog",
@@ -1929,6 +1935,7 @@ export const BACKLOG_STATUSES: BacklogStatus[] = [
   "backordered",
   "bought",
   "discarded",
+  "banned",
 ];
 
 export type BacklogRow = {

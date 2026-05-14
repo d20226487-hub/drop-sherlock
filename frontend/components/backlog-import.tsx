@@ -487,6 +487,11 @@ export function BacklogImport({
                   {ts.result.skippedDupes(result.skipped_duplicates)}
                 </li>
               )}
+              {(result.skipped_banned ?? 0) > 0 && (
+                <li className="text-rose-700 dark:text-rose-400">
+                  {ts.result.skippedBanned(result.skipped_banned ?? 0)}
+                </li>
+              )}
               {result.skipped_invalid > 0 && (
                 <li className="text-amber-700 dark:text-amber-400">
                   {ts.result.skippedInvalid(result.skipped_invalid)}

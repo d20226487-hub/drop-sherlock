@@ -20,6 +20,8 @@ const STATUS_TONE: Record<BacklogStatus, string> = {
     "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200 font-semibold",
   discarded:
     "bg-neutral-200 text-neutral-500 dark:bg-neutral-800/60 dark:text-neutral-500 line-through",
+  banned:
+    "bg-rose-100 text-rose-800 dark:bg-rose-950/40 dark:text-rose-300 line-through font-medium",
 };
 
 type Props = {

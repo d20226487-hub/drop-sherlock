@@ -25,8 +25,35 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import DomainBan
+from ..models import BacklogDomain, DomainBan
 from .backlog import _normalize_domain
+
+
+def _flip_backlog_status_to_banned(
+    db: Session, domains: list[str],
+) -> int:
+    """When the user adds a domain to the ban list, propagate that
+    intent onto any existing BacklogDomain row by flipping its status
+    to 'banned'. Per design call (β), unbanning leaves the status
+    alone — the user re-statuses manually if they change their mind.
+    Returns the count of rows actually flipped (excludes rows already
+    at 'banned')."""
+    if not domains:
+        return 0
+    now = datetime.utcnow()
+    rows = (
+        db.query(BacklogDomain)
+        .filter(BacklogDomain.domain.in_(domains))
+        .all()
+    )
+    flipped = 0
+    for row in rows:
+        if row.status == "banned":
+            continue
+        row.status = "banned"
+        row.updated_at = now
+        flipped += 1
+    return flipped
 
 router = APIRouter(prefix="/banlist", tags=["banlist"])
 
@@ -141,6 +168,11 @@ def add_bans(
         db.add(DomainBan(domain=d, note=note, created_at=now))
         rows_added.append(d)
         added += 1
+    # Status propagation (added 2026-05-14 wave O): flip any existing
+    # BacklogDomain rows for the newly-added domains to status='banned'.
+    # Only NEW bans trigger this — re-adding an already-banned domain
+    # is a no-op (the prior add already flipped the status if relevant).
+    _flip_backlog_status_to_banned(db, rows_added)
     db.commit()
     return BanAddBulkOut(
         added=added,

@@ -61,6 +61,12 @@ class DomainNote(Base):
 #   bought        — domain is acquired and owned (TERMINAL — the
 #                   transferred-and-yours state)
 #   discarded    — decided to pass on it (TERMINAL)
+#   banned       — added to the ban list AFTER having a backlog row.
+#                   Auto-set when a domain with an existing
+#                   BacklogDomain row is added to DomainBan; never set
+#                   for ban actions on domains without a backlog row.
+#                   Per design (β), unbanning leaves status='banned'
+#                   intact — the user re-statuses manually if desired.
 BACKLOG_STATUSES = (
     "backlog",
     "in_progress",
@@ -69,6 +75,7 @@ BACKLOG_STATUSES = (
     "backordered",
     "bought",
     "discarded",
+    "banned",
 )
 
 

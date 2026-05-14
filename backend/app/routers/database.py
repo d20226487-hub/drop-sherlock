@@ -1186,6 +1186,7 @@ def bulk_ban_domains(
     }
     added = 0
     already = 0
+    rows_added: list[str] = []
     now = datetime.utcnow()
     note = (payload.note or "").strip()
     for d in normalized:
@@ -1196,7 +1197,13 @@ def bulk_ban_domains(
             already += 1
             continue
         db.add(DomainBan(domain=d, note=note, created_at=now))
+        rows_added.append(d)
         added += 1
+    # Status propagation (added 2026-05-14 wave O): flip any existing
+    # BacklogDomain rows for the newly-added domains to status='banned'.
+    # See routers/banlist._flip_backlog_status_to_banned for rationale.
+    from .banlist import _flip_backlog_status_to_banned
+    _flip_backlog_status_to_banned(db, rows_added)
     db.commit()
     return BulkBanOut(added=added, already_banned=already, invalid=invalid)
 
