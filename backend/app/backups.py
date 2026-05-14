@@ -27,10 +27,20 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import settings
+
+# Process-level lock shared with the monthly VACUUM job in
+# db_maintenance.py. Backup uses sqlite3.Connection.backup (page-by-page,
+# coexists with writes) but VACUUM rewrites the whole file and takes an
+# exclusive lock — running both at the same time risks lock contention
+# and unbounded latency on the user-facing endpoints. Both grab this
+# non-blocking; whichever loses skips its run with a log line and waits
+# for the next cycle.
+MAINTENANCE_LOCK = threading.Lock()
 
 log = logging.getLogger(__name__)
 
@@ -157,6 +167,24 @@ def run_backup(*, keep: int | None = None, prerestore: bool = False) -> dict:
 
     Raises RuntimeError when the configured DB isn't SQLite (the caller
     is expected to gate the call on `_resolve_db_path()` if it cares)."""
+    # Coordinate with the monthly VACUUM job — both grab the shared
+    # MAINTENANCE_LOCK non-blocking so neither waits on the other.
+    # Backup is a regular nightly operation; if VACUUM is mid-run we
+    # let it finish and pick up on the next scheduled cycle.
+    acquired = MAINTENANCE_LOCK.acquire(blocking=False)
+    if not acquired:
+        raise RuntimeError(
+            "another maintenance job (VACUUM?) is running; skipping backup"
+        )
+    try:
+        return _run_backup_locked(keep=keep, prerestore=prerestore)
+    finally:
+        MAINTENANCE_LOCK.release()
+
+
+def _run_backup_locked(
+    *, keep: int | None, prerestore: bool,
+) -> dict:
     src = _resolve_db_path()
     if src is None:
         raise RuntimeError(

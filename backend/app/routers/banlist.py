@@ -18,10 +18,12 @@ other routers can call it without importing this module).
 """
 from __future__ import annotations
 
-from datetime import datetime
+import json
+from datetime import date, datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -29,31 +31,125 @@ from ..models import BacklogDomain, DomainBan
 from .backlog import _normalize_domain
 
 
-def _flip_backlog_status_to_banned(
-    db: Session, domains: list[str],
+def _serialize_backlog_row(row: BacklogDomain) -> str:
+    """Capture every column we need to faithfully recreate this row on
+    unban. ISO strings for dates/datetimes — JSON-safe, and `fromisoformat`
+    parses them back losslessly."""
+    payload = {
+        "status": row.status,
+        "registrar": row.registrar or "",
+        "expiration_date": (
+            row.expiration_date.isoformat() if row.expiration_date else None
+        ),
+        "comments": row.comments or "",
+        "desired_price": row.desired_price,
+        "max_price": row.max_price,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _snapshot_and_delete_backlog(
+    db: Session, domains_to_snapshot: dict[str, "DomainBan"],
 ) -> int:
-    """When the user adds a domain to the ban list, propagate that
-    intent onto any existing BacklogDomain row by flipping its status
-    to 'banned'. Per design call (β), unbanning leaves the status
-    alone — the user re-statuses manually if they change their mind.
-    Returns the count of rows actually flipped (excludes rows already
-    at 'banned')."""
-    if not domains:
+    """Symmetric ban semantic (locked 2026-05-14, supersedes wave-O β):
+    when a domain is added to the ban list, capture its BacklogDomain row
+    (if any) onto the corresponding new DomainBan's `backlog_snapshot_json`
+    column, then delete the Backlog row. On unban we restore from the
+    snapshot. Returns the count of Backlog rows actually deleted.
+
+    `domains_to_snapshot` maps normalized domain → the newly-added
+    DomainBan instance that should receive the snapshot. Callers pass
+    only the domains that are *newly* banned in this transaction —
+    re-banning an already-banned domain leaves the prior snapshot
+    alone (the Backlog row is already gone)."""
+    if not domains_to_snapshot:
         return 0
-    now = datetime.utcnow()
     rows = (
         db.query(BacklogDomain)
-        .filter(BacklogDomain.domain.in_(domains))
+        .filter(BacklogDomain.domain.in_(list(domains_to_snapshot.keys())))
         .all()
     )
-    flipped = 0
+    deleted = 0
     for row in rows:
-        if row.status == "banned":
+        ban = domains_to_snapshot.get(row.domain)
+        if ban is None:
             continue
-        row.status = "banned"
-        row.updated_at = now
-        flipped += 1
-    return flipped
+        ban.backlog_snapshot_json = _serialize_backlog_row(row)
+        db.delete(row)
+        deleted += 1
+    return deleted
+
+
+def _restore_backlog_from_snapshot(
+    db: Session,
+    ban: DomainBan,
+    *,
+    existing_domains: set[str] | None = None,
+) -> bool:
+    """Inverse of `_snapshot_and_delete_backlog`. Recreates the Backlog
+    row from the JSON snapshot when unbanning. No-op when the ban has no
+    snapshot (banned domains that never had a Backlog row) or when a
+    Backlog row already exists for this domain (defensive — shouldn't
+    happen since ingestion is ban-guarded). Returns True if a row was
+    recreated.
+
+    `existing_domains` is an optional preloaded set of domain strings
+    that ALREADY have a BacklogDomain row — bulk callers preload it
+    once for the whole batch to avoid an N+1 SELECT-per-ban. When
+    omitted, falls back to a single-row SELECT (cheap for the single-
+    domain unban endpoint).
+    """
+    if not ban.backlog_snapshot_json:
+        return False
+    if existing_domains is None:
+        existing = (
+            db.query(BacklogDomain)
+            .filter(BacklogDomain.domain == ban.domain)
+            .first()
+        )
+        if existing is not None:
+            return False
+    elif ban.domain in existing_domains:
+        return False
+    try:
+        data = json.loads(ban.backlog_snapshot_json)
+    except (ValueError, TypeError):
+        return False
+    exp_raw = data.get("expiration_date")
+    created_raw = data.get("created_at")
+    updated_raw = data.get("updated_at")
+    db.add(
+        BacklogDomain(
+            domain=ban.domain,
+            # Force status='banned' on restore — the user wants the row
+            # to be clearly identifiable as "previously banned" in the
+            # Backlog at Status=Banned, and to re-status manually if
+            # they want it back in the active triage flow. The snapshot
+            # still preserves the prior status in the JSON for audit;
+            # we just don't honor it on restore.
+            status="banned",
+            registrar=data.get("registrar") or "",
+            expiration_date=(
+                date.fromisoformat(exp_raw) if exp_raw else None
+            ),
+            comments=data.get("comments") or "",
+            desired_price=data.get("desired_price"),
+            max_price=data.get("max_price"),
+            created_at=(
+                datetime.fromisoformat(created_raw)
+                if created_raw
+                else datetime.utcnow()
+            ),
+            updated_at=(
+                datetime.fromisoformat(updated_raw)
+                if updated_raw
+                else datetime.utcnow()
+            ),
+        )
+    )
+    return True
 
 router = APIRouter(prefix="/banlist", tags=["banlist"])
 
@@ -65,7 +161,15 @@ class BanRow(BaseModel):
 
 
 class BanListResponse(BaseModel):
+    # `total` is the unfiltered ban-list size (drives the totalLine
+    # footer and lets the frontend reason about "this much exists").
+    # `filtered_total` is the count after `search` is applied — drives
+    # pagination math and the "X of Y" hint. `page`/`per_page` echo
+    # the inputs so the UI can self-correct after the search-reset.
     total: int
+    filtered_total: int
+    page: int
+    per_page: int
     rows: list[BanRow]
 
 
@@ -97,14 +201,37 @@ class BanBulkDeleteOut(BaseModel):
 
 
 @router.get("", response_model=BanListResponse)
-def list_bans(db: Session = Depends(get_db)) -> BanListResponse:
+def list_bans(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=500),
+    search: str = "",
+    db: Session = Depends(get_db),
+) -> BanListResponse:
+    """Server-paginated ban list. `search` is a case-insensitive
+    substring match on domain OR note. Replaces the prior load-all
+    behavior (2026-05-14 perf pass) so the page scales past 10k bans
+    without shipping the entire table on every reload."""
+    base = db.query(DomainBan)
+    total = base.count()
+    q = base
+    if search and search.strip():
+        needle = f"%{search.strip().lower()}%"
+        q = q.filter(
+            (func.lower(DomainBan.domain).like(needle))
+            | (func.lower(DomainBan.note).like(needle))
+        )
+    filtered_total = q.count() if (search and search.strip()) else total
     rows = (
-        db.query(DomainBan)
-        .order_by(DomainBan.created_at.desc(), DomainBan.domain.asc())
+        q.order_by(DomainBan.created_at.desc(), DomainBan.domain.asc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
         .all()
     )
     return BanListResponse(
-        total=len(rows),
+        total=total,
+        filtered_total=filtered_total,
+        page=page,
+        per_page=per_page,
         rows=[
             BanRow(domain=r.domain, note=r.note or "", created_at=r.created_at)
             for r in rows
@@ -145,35 +272,50 @@ def add_bans(
             added=0, already_banned=0, invalid=invalid, rows_added=[],
         )
 
-    existing = {
-        b.domain: b
-        for b in db.query(DomainBan)
-        .filter(DomainBan.domain.in_([d for d, _ in normalized]))
-        .all()
-    }
+    # Chunked commit (added 2026-05-14): process the normalized list in
+    # batches of CHUNK_SIZE and commit each. Keeps a 5k-row CSV import
+    # from holding a single write lock for seconds and starving other
+    # writers (analyze submits, status changes). Counters accumulate
+    # across chunks. Per-chunk semantics match the old single-tx path:
+    # existing-domain note merge, new bans get snapshots, _snapshot_and
+    # _delete_backlog runs against the current chunk's new-ban dict.
+    CHUNK_SIZE = 500
     added = 0
     already = 0
     rows_added: list[str] = []
     now = datetime.utcnow()
-    for d, note in normalized:
-        if d in existing:
-            # Note merge: only overwrite when the new note is non-empty
-            # AND differs — lets the user re-import a CSV with updated
-            # notes without losing earlier annotations on rows whose
-            # note column was blank.
-            if note and existing[d].note != note:
-                existing[d].note = note
-            already += 1
-            continue
-        db.add(DomainBan(domain=d, note=note, created_at=now))
-        rows_added.append(d)
-        added += 1
-    # Status propagation (added 2026-05-14 wave O): flip any existing
-    # BacklogDomain rows for the newly-added domains to status='banned'.
-    # Only NEW bans trigger this — re-adding an already-banned domain
-    # is a no-op (the prior add already flipped the status if relevant).
-    _flip_backlog_status_to_banned(db, rows_added)
-    db.commit()
+    for chunk_start in range(0, len(normalized), CHUNK_SIZE):
+        chunk = normalized[chunk_start : chunk_start + CHUNK_SIZE]
+        chunk_domains = [d for d, _ in chunk]
+        existing = {
+            b.domain: b
+            for b in db.query(DomainBan)
+            .filter(DomainBan.domain.in_(chunk_domains))
+            .all()
+        }
+        new_bans_by_domain: dict[str, DomainBan] = {}
+        for d, note in chunk:
+            if d in existing:
+                # Note merge: only overwrite when the new note is non-empty
+                # AND differs — lets the user re-import a CSV with updated
+                # notes without losing earlier annotations on rows whose
+                # note column was blank.
+                if note and existing[d].note != note:
+                    existing[d].note = note
+                already += 1
+                continue
+            ban = DomainBan(domain=d, note=note, created_at=now)
+            db.add(ban)
+            rows_added.append(d)
+            new_bans_by_domain[d] = ban
+            added += 1
+        # Snapshot + delete the matching Backlog rows for THIS chunk.
+        # (Locked 2026-05-14, supersedes wave-O β.) Only NEW bans
+        # trigger this — re-banning an already-banned domain is a no-op
+        # (the prior ban already snapshotted + deleted the Backlog row
+        # if relevant).
+        _snapshot_and_delete_backlog(db, new_bans_by_domain)
+        db.commit()
     return BanAddBulkOut(
         added=added,
         already_banned=already,
@@ -184,18 +326,19 @@ def add_bans(
 
 @router.delete("/{domain}")
 def delete_ban(domain: str, db: Session = Depends(get_db)) -> dict:
-    """Unban a single domain. Idempotent — un-banning an absent domain
-    is a 404 only if the URL didn't normalize; for the bulk-unban use
-    case prefer POST /banlist/bulk-delete."""
+    """Unban a single domain. Restores the Backlog row from the snapshot
+    captured at ban time (if any) — symmetric ban/unban (locked
+    2026-05-14)."""
     d = _normalize_domain(domain)
     if not d:
         raise HTTPException(400, "invalid domain")
     row = db.get(DomainBan, d)
     if row is None:
         raise HTTPException(404, "not banned")
+    restored = _restore_backlog_from_snapshot(db, row)
     db.delete(row)
     db.commit()
-    return {"deleted": True, "domain": d}
+    return {"deleted": True, "domain": d, "restored": restored}
 
 
 @router.post("/bulk-delete", response_model=BanBulkDeleteOut)
@@ -209,6 +352,26 @@ def bulk_delete_bans(
     }
     if not normalized:
         return BanBulkDeleteOut(deleted=0)
+    # Restore Backlog rows BEFORE deleting the bans so we can read each
+    # ban's snapshot. Preload existing Backlog domains in ONE IN-list
+    # query so the restore helper doesn't do a SELECT-per-ban (was the
+    # N+1 flagged in the 2026-05-14 perf audit). `synchronize_session=
+    # False` is safe because we commit once at the end.
+    bans = (
+        db.query(DomainBan)
+        .filter(DomainBan.domain.in_(normalized))
+        .all()
+    )
+    existing_domains = {
+        d
+        for (d,) in db.query(BacklogDomain.domain)
+        .filter(BacklogDomain.domain.in_(normalized))
+        .all()
+    }
+    for ban in bans:
+        _restore_backlog_from_snapshot(
+            db, ban, existing_domains=existing_domains,
+        )
     deleted = (
         db.query(DomainBan)
         .filter(DomainBan.domain.in_(normalized))

@@ -237,6 +237,41 @@ export function AvailabilityEditor() {
         </div>
       </section>
 
+      {/* Retention prune — added 2026-05-14. Bounds the
+          availability_checks history table so the DB file doesn't grow
+          forever. Daily APScheduler job + one-shot on boot. 0 in either
+          field disables that cap. */}
+      <section className="space-y-2">
+        <header>
+          <h3 className="text-base font-semibold">{a.settingsRetentionHeading}</h3>
+          <p className="text-xs text-neutral-600 dark:text-neutral-400">
+            {a.settingsRetentionHint}
+          </p>
+        </header>
+        <div className="flex items-center gap-2 text-sm">
+          <span>{a.settingsRetentionDaysLabel}</span>
+          <NumberInput
+            value={cfg.availability__retention_days}
+            disabled={busy}
+            onSave={(v) => setOne("availability__retention_days", v)}
+          />
+          <span className="text-xs text-neutral-500 dark:text-neutral-400">
+            {a.settingsRetentionDaysHint}
+          </span>
+        </div>
+        <div className="flex items-center gap-2 text-sm">
+          <span>{a.settingsPerDomainKeepLabel}</span>
+          <NumberInput
+            value={cfg.availability__per_domain_keep}
+            disabled={busy}
+            onSave={(v) => setOne("availability__per_domain_keep", v)}
+          />
+          <span className="text-xs text-neutral-500 dark:text-neutral-400">
+            {a.settingsPerDomainKeepHint}
+          </span>
+        </div>
+      </section>
+
       {/* Usage stats + recent log */}
       <UsageSection />
     </div>

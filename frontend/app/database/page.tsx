@@ -109,11 +109,9 @@ export default function DatabasePage() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
 
-  // Per-row pin state. Key is the domain string. busy=true while a
-  // pin/unpin request is in flight; error holds the last pin error to
-  // show inline.
-  const [pinBusy, setPinBusy] = useState<Set<string>>(new Set());
-  const [pinError, setPinError] = useState<Record<string, string>>({});
+  // pinBusy / pinError were removed 2026-05-14 alongside the dead
+  // PinSelect — see the PinSelect-removed comment near the bottom of
+  // the file.
 
   const [verdictSort, setVerdictSort] = useState<"asc" | "desc" | null>(null);
 
@@ -312,51 +310,10 @@ export default function DatabasePage() {
     });
   }
 
-  async function handlePin(domain: string, runDomainId: number) {
-    setPinBusy((prev) => new Set(prev).add(domain));
-    setPinError((prev) => {
-      const { [domain]: _drop, ...rest } = prev;
-      return rest;
-    });
-    try {
-      await api.pinDomain(domain, runDomainId);
-      reload({ silent: true });
-    } catch (e) {
-      setPinError((prev) => ({
-        ...prev,
-        [domain]: (e as Error).message || "pin failed",
-      }));
-    } finally {
-      setPinBusy((prev) => {
-        const next = new Set(prev);
-        next.delete(domain);
-        return next;
-      });
-    }
-  }
-
-  async function handleUnpin(domain: string) {
-    setPinBusy((prev) => new Set(prev).add(domain));
-    setPinError((prev) => {
-      const { [domain]: _drop, ...rest } = prev;
-      return rest;
-    });
-    try {
-      await api.unpinDomain(domain);
-      reload({ silent: true });
-    } catch (e) {
-      setPinError((prev) => ({
-        ...prev,
-        [domain]: (e as Error).message || "unpin failed",
-      }));
-    } finally {
-      setPinBusy((prev) => {
-        const next = new Set(prev);
-        next.delete(domain);
-        return next;
-      });
-    }
-  }
+  // handlePin / handleUnpin were removed 2026-05-14 alongside the dead
+  // PinSelect — see the PinSelect-removed comment near the bottom of
+  // the file. Pin management now lives on the Run page (per-criterion
+  // pins panel) and the Job page (read-only widget).
 
   const filtered = useMemo<DatabaseDomainRow[]>(() => {
     if (!data) return [];
@@ -1403,10 +1360,6 @@ export default function DatabasePage() {
                   row={r}
                   selected={selected.has(r.domain)}
                   onToggle={() => toggleOne(r.domain)}
-                  pinBusy={pinBusy.has(r.domain)}
-                  pinError={pinError[r.domain]}
-                  onPin={(rdId) => handlePin(r.domain, rdId)}
-                  onUnpin={() => handleUnpin(r.domain)}
                   onBacklogUpdated={() => reload({ silent: true })}
                   availability={availabilityByDomain[r.domain]}
                   recheckBusy={recheckBusy.has(r.domain)}
@@ -1427,10 +1380,6 @@ function DomainListRow({
   row,
   selected,
   onToggle,
-  pinBusy,
-  pinError,
-  onPin,
-  onUnpin,
   onBacklogUpdated,
   availability,
   recheckBusy,
@@ -1439,10 +1388,6 @@ function DomainListRow({
   row: DatabaseDomainRow;
   selected: boolean;
   onToggle: () => void;
-  pinBusy: boolean;
-  pinError: string | undefined;
-  onPin: (runDomainId: number) => void;
-  onUnpin: () => void;
   onBacklogUpdated: () => void;
   availability?: {
     status: AvailabilityStatus;
@@ -1596,31 +1541,63 @@ function DomainListRow({
             —
           </span>
         ) : row.final_partial && score == null ? (
-          <span
-            className="text-xs px-2 py-0.5 rounded-full bg-neutral-200 text-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-300"
-            title={
-              row.pinned_criteria && row.pinned_criteria.length > 0
-                ? ts.partialFromCriteria(
-                    row.pinned_criteria
-                      .map((c) =>
-                        (
-                          {
-                            backlinks: "B",
-                            refdomains: "D",
-                            anchors: "A",
-                            keywords: "K",
-                            wayback: "W",
-                            wayback_classify: "C",
-                          } as Record<string, string>
-                        )[c] ?? c,
-                      )
-                      .join(", "),
-                  )
-                : ts.partialTooltip
+          // No score available → render whichever cause applies. Failed
+          // takes precedence (red, error condition); underweight is the
+          // milder "subset" badge (amber). Tooltip uses the cause-
+          // appropriate text so the user knows what's missing rather
+          // than what's present.
+          (() => {
+            const LETTERS: Record<string, string> = {
+              backlinks: "B",
+              refdomains: "D",
+              anchors: "A",
+              keywords: "K",
+              wayback: "W",
+              wayback_classify: "C",
+            };
+            const lettersFor = (xs?: string[]) =>
+              (xs ?? []).map((c) => LETTERS[c] ?? c).join(", ");
+            if (row.final_failed) {
+              return (
+                <span
+                  className="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-200"
+                  title={ts.failedTooltip}
+                >
+                  {ts.failedBadge}
+                </span>
+              );
             }
-          >
-            {ts.partialBadge}
-          </span>
+            if (row.final_underweight) {
+              const missing = lettersFor(row.missing_weighted_criteria);
+              return (
+                <span
+                  className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-200"
+                  title={
+                    missing
+                      ? ts.underweightMissing(missing)
+                      : ts.underweightTooltip
+                  }
+                >
+                  {ts.underweightBadge}
+                </span>
+              );
+            }
+            // Fallback: legacy combined partial (e.g. an old row without
+            // the split fields). Tooltip still names what IS pinned —
+            // we don't know which side caused it.
+            return (
+              <span
+                className="text-xs px-2 py-0.5 rounded-full bg-neutral-200 text-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-300"
+                title={
+                  row.pinned_criteria && row.pinned_criteria.length > 0
+                    ? ts.partialFromCriteria(lettersFor(row.pinned_criteria))
+                    : ts.partialTooltip
+                }
+              >
+                {ts.partialBadge}
+              </span>
+            );
+          })()
         ) : bucket ? (
           row.pinned_run_domain_id != null ? (
             <MaybeLink href={finalHref}>
@@ -1629,8 +1606,18 @@ function DomainListRow({
               mode="final"
             >
               <span
-                className={`text-xs px-2 py-0.5 rounded-full cursor-help ${verdictTone} ${row.final_partial ? "ring-1 ring-dashed ring-neutral-400 dark:ring-neutral-500" : ""}`}
+                className={`text-xs px-2 py-0.5 rounded-full cursor-help ${verdictTone} ${row.final_failed ? "ring-1 ring-dashed ring-red-400 dark:ring-red-500" : row.final_underweight ? "ring-1 ring-dashed ring-amber-400 dark:ring-amber-500" : row.final_partial ? "ring-1 ring-dashed ring-neutral-400 dark:ring-neutral-500" : ""}`}
                 title={(() => {
+                  const LETTERS: Record<string, string> = {
+                    backlinks: "B",
+                    refdomains: "D",
+                    anchors: "A",
+                    keywords: "K",
+                    wayback: "W",
+                    wayback_classify: "C",
+                  };
+                  const lettersFor = (xs?: string[]) =>
+                    (xs ?? []).map((c) => LETTERS[c] ?? c).join(", ");
                   const base =
                     score != null
                       ? `Score ${formatScore(score)} · bucket ${bucket}`
@@ -1643,28 +1630,24 @@ function DomainListRow({
                       : "";
                     parts.push(`${conf}${note}`);
                   }
-                  if (
+                  // Cause-specific tooltip line. Failed wins over
+                  // underweight when both are true.
+                  if (row.final_failed) {
+                    parts.push(ts.failedTooltip);
+                  } else if (row.final_underweight) {
+                    const missing = lettersFor(row.missing_weighted_criteria);
+                    parts.push(
+                      missing
+                        ? ts.underweightMissing(missing)
+                        : ts.underweightTooltip,
+                    );
+                  } else if (
                     row.final_partial &&
                     row.pinned_criteria &&
                     row.pinned_criteria.length > 0
                   ) {
                     parts.push(
-                      ts.partialFromCriteria(
-                        row.pinned_criteria
-                          .map((c) =>
-                            (
-                              {
-                                backlinks: "B",
-                                refdomains: "D",
-                                anchors: "A",
-                                keywords: "K",
-                                wayback: "W",
-                                wayback_classify: "C",
-                              } as Record<string, string>
-                            )[c] ?? c,
-                          )
-                          .join(", "),
-                      ),
+                      ts.partialFromCriteria(lettersFor(row.pinned_criteria)),
                     );
                   }
                   return parts.join(" · ");
@@ -1672,7 +1655,25 @@ function DomainListRow({
               >
                 {score != null ? formatScore(score) : bucket}
                 {row.final_partial && (
-                  <span className="ml-0.5 opacity-70">*</span>
+                  <span
+                    className={
+                      "ml-0.5 " +
+                      (row.final_failed
+                        ? "text-red-700 dark:text-red-400"
+                        : row.final_underweight
+                          ? "text-amber-700 dark:text-amber-400"
+                          : "opacity-70")
+                    }
+                    aria-label={
+                      row.final_failed
+                        ? ts.failedBadge
+                        : row.final_underweight
+                          ? ts.underweightBadge
+                          : ts.partialBadge
+                    }
+                  >
+                    *
+                  </span>
                 )}
               </span>
             </VerdictHoverCard>
@@ -2061,86 +2062,8 @@ function AvailabilityCell({
   );
 }
 
-// Lazy-loading pin dropdown. The /database/domains response only sends
-// pin_options_count to keep the payload small; we fetch the full list
-// on first focus/click of the select. After load it's cached on the
-// component so toggling stays snappy.
-function PinSelect({
-  row,
-  pinBusy,
-  onPin,
-  ts,
-}: {
-  row: DatabaseDomainRow;
-  pinBusy: boolean;
-  onPin: (runDomainId: number) => void;
-  ts: ReturnType<typeof useT>["t"]["pages"]["database"];
-}) {
-  const [options, setOptions] = useState<
-    | null
-    | { run_domain_id: number; run_id: number; run_name: string; status: string }[]
-  >(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function ensureLoaded() {
-    if (options !== null || loading) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const r = await api.getDomainPinOptions(row.domain);
-      setOptions(r.options);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // Pre-render: just the currently-pinned option as a synthetic entry
-  // so the select shows the active selection without a network call.
-  // After loading, the full list takes over.
-  const renderOptions = options ?? (
-    row.is_pinned && row.pinned_run_domain_id != null
-      ? [{
-          run_domain_id: row.pinned_run_domain_id,
-          run_id: row.pinned_run_id ?? 0,
-          run_name: row.pinned_run_name,
-          status: "done",
-        }]
-      : []
-  );
-
-  return (
-    <>
-      <select
-        value={row.pinned_run_domain_id ?? ""}
-        disabled={pinBusy || row.pin_options_count === 0}
-        onMouseDown={() => void ensureLoaded()}
-        onFocus={() => void ensureLoaded()}
-        onChange={(e) => {
-          const v = e.target.value;
-          if (!v) return;
-          const id = parseInt(v, 10);
-          if (Number.isFinite(id)) onPin(id);
-        }}
-        className="rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-1.5 py-1 outline-none disabled:opacity-50 max-w-[16rem]"
-        title={row.is_pinned ? ts.pin.pinnedHint : ts.pin.notPinnedHint}
-      >
-        {!row.is_pinned && (
-          <option value="">{ts.pin.pickPlaceholder}</option>
-        )}
-        {renderOptions.map((o) => (
-          <option key={o.run_domain_id} value={o.run_domain_id}>
-            {ts.pin.runOption(o.run_id, o.run_name, o.status)}
-          </option>
-        ))}
-      </select>
-      {error && (
-        <div className="text-[11px] text-rose-600 dark:text-rose-400">
-          {error}
-        </div>
-      )}
-    </>
-  );
-}
+// PinSelect was removed 2026-05-14 — never mounted in the JSX, dead
+// since the Database page was restructured to surface per-criterion
+// source attribution via cell tooltips. Pin management now happens on
+// the Run page's "Per-criterion pins" panel and the Job page's read-
+// only pins widget.

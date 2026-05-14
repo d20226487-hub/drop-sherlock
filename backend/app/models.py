@@ -519,3 +519,12 @@ class DomainBan(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow,
     )
+    # Snapshot of the BacklogDomain row at the moment of banning (JSON
+    # dict with status / registrar / expiration_date / comments /
+    # desired_price / max_price / created_at / updated_at). Empty string
+    # when banning happened without a matching Backlog row (e.g., CSV
+    # Ban List import of unknown domains). On unban, the snapshot is
+    # used to restore the Backlog row — symmetric ban/unban semantics
+    # (locked 2026-05-14, supersedes the wave-O β "leave-status-alone"
+    # design after the user hit the discoverability problem).
+    backlog_snapshot_json: Mapped[str] = mapped_column(Text, default="")

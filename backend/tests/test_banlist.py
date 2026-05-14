@@ -375,17 +375,21 @@ def test_backlog_delete_does_not_remove_ban(fresh_db):
     assert ban.note == "permanent"  # the original note survives unchanged
 
 
-def test_banning_flips_existing_backlog_status_to_banned(fresh_db):
-    """Per wave-O design (β): adding a domain to the ban list while it
-    already has a BacklogDomain row flips that row's status to 'banned'.
-    The flip applies to NEW ban actions only — existing entries on the
-    ban list are NOT retroactively pushed onto pre-existing backlog
-    rows (no startup backfill — see the conversation thread)."""
-    from app.models import BacklogDomain
+def test_banning_snapshots_and_deletes_backlog_row(fresh_db):
+    """Locked 2026-05-14 (supersedes wave-O β): adding a domain to the
+    ban list while it already has a BacklogDomain row captures a JSON
+    snapshot of the row onto the new DomainBan and deletes the
+    Backlog row. The user no longer sees the row in Backlog — and the
+    snapshot is what makes unban able to fully restore it."""
+    import json
+
+    from app.models import BacklogDomain, DomainBan
 
     fresh_db.add(BacklogDomain(
         domain="flip-me.kz",
         status="analyzed",
+        registrar="example-reg",
+        comments="keep me",
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     ))
@@ -401,18 +405,24 @@ def test_banning_flips_existing_backlog_status_to_banned(fresh_db):
     assert r.json()["added"] == 1
 
     fresh_db.expire_all()
-    row = fresh_db.query(BacklogDomain).filter(
+    assert fresh_db.query(BacklogDomain).filter(
         BacklogDomain.domain == "flip-me.kz",
+    ).count() == 0, "Backlog row should be deleted when banned"
+
+    ban = fresh_db.query(DomainBan).filter(
+        DomainBan.domain == "flip-me.kz",
     ).one()
-    assert row.status == "banned"
+    snapshot = json.loads(ban.backlog_snapshot_json)
+    assert snapshot["status"] == "analyzed"
+    assert snapshot["registrar"] == "example-reg"
+    assert snapshot["comments"] == "keep me"
 
 
 def test_banning_no_op_when_no_backlog_row(fresh_db):
     """If the banned domain has no BacklogDomain row, the ban succeeds
-    and no backlog row is created (banning is a pure pre-filter — it
-    does not auto-create backlog rows). Pinning this so the status
-    flip helper never accidentally inserts."""
-    from app.models import BacklogDomain
+    with an EMPTY snapshot and no backlog row is created. Unban of such
+    a row has nothing to restore (covered by the next test)."""
+    from app.models import BacklogDomain, DomainBan
 
     client = _client()
     r = client.post(
@@ -425,49 +435,108 @@ def test_banning_no_op_when_no_backlog_row(fresh_db):
     assert fresh_db.query(BacklogDomain).filter(
         BacklogDomain.domain == "no-row.kz",
     ).count() == 0
+    ban = fresh_db.query(DomainBan).filter(
+        DomainBan.domain == "no-row.kz",
+    ).one()
+    assert ban.backlog_snapshot_json == "", (
+        "no Backlog row existed at ban time — snapshot must stay empty so "
+        "unban knows not to fabricate a restore"
+    )
 
 
-def test_unbanning_leaves_backlog_status_alone(fresh_db):
-    """Per wave-O design call (β): unbanning leaves the BacklogDomain
-    status at 'banned' — the user re-statuses manually if they change
-    their mind. This test pins that we don't accidentally introduce
-    auto-revert later without re-discussing."""
+def test_unbanning_restores_backlog_row_from_snapshot(fresh_db):
+    """Locked 2026-05-14: unban is the symmetric inverse of ban for
+    the row's data (registrar / expiration / comments / prices), but
+    the restored row's status is forced to 'banned' so the user can
+    find it under Status=Banned and re-status manually if they want
+    it back in the active triage flow."""
+    from datetime import date
+
     from app.models import BacklogDomain
 
     fresh_db.add(BacklogDomain(
         domain="ping-pong.kz",
         status="discarded",
+        registrar="reg-x",
+        expiration_date=date(2027, 1, 15),
+        comments="original note",
+        desired_price=10.5,
+        max_price=20.0,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     ))
     fresh_db.commit()
 
     client = _client()
-    # Ban → status flips to 'banned'.
+    # Ban → Backlog row deleted.
     client.post(
         "/banlist",
         auth=("admin", "changeme"),
         json={"rows": [{"domain": "ping-pong.kz", "note": ""}]},
     )
     fresh_db.expire_all()
-    row = fresh_db.query(BacklogDomain).filter(
+    assert fresh_db.query(BacklogDomain).filter(
         BacklogDomain.domain == "ping-pong.kz",
-    ).one()
-    assert row.status == "banned"
+    ).count() == 0
 
-    # Unban → status stays at 'banned'.
+    # Unban → Backlog row restored with original DATA fields; status
+    # forced to 'banned'.
     r = client.delete(
         "/banlist/ping-pong.kz", auth=("admin", "changeme"),
     )
     assert r.status_code == 200
+    assert r.json().get("restored") is True
     fresh_db.expire_all()
     row = fresh_db.query(BacklogDomain).filter(
         BacklogDomain.domain == "ping-pong.kz",
     ).one()
-    assert row.status == "banned", (
-        "unbanning auto-reverted the backlog status — design call (β) "
-        "specifies it should stay at 'banned' until the user re-statuses"
+    assert row.status == "banned"
+    assert row.registrar == "reg-x"
+    assert row.expiration_date == date(2027, 1, 15)
+    assert row.comments == "original note"
+    assert row.desired_price == 10.5
+    assert row.max_price == 20.0
+
+
+def test_bulk_unbanning_restores_backlog_rows(fresh_db):
+    """Bulk-delete path mirrors the single-domain restore."""
+    from app.models import BacklogDomain
+
+    for d in ("a.kz", "b.kz"):
+        fresh_db.add(BacklogDomain(
+            domain=d,
+            status="analyzed",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        ))
+    fresh_db.commit()
+
+    client = _client()
+    client.post(
+        "/banlist",
+        auth=("admin", "changeme"),
+        json={"rows": [{"domain": "a.kz"}, {"domain": "b.kz"}]},
     )
+    fresh_db.expire_all()
+    assert fresh_db.query(BacklogDomain).filter(
+        BacklogDomain.domain.in_(["a.kz", "b.kz"]),
+    ).count() == 0
+
+    r = client.post(
+        "/banlist/bulk-delete",
+        auth=("admin", "changeme"),
+        json={"domains": ["a.kz", "b.kz"]},
+    )
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 2
+    fresh_db.expire_all()
+    rows = fresh_db.query(BacklogDomain).filter(
+        BacklogDomain.domain.in_(["a.kz", "b.kz"]),
+    ).all()
+    assert {r.domain for r in rows} == {"a.kz", "b.kz"}
+    # Restored rows are forced to status='banned' — see the single-
+    # domain test for rationale.
+    assert all(r.status == "banned" for r in rows)
 
 
 def test_backlog_import_surfaces_skipped_banned_count(fresh_db):

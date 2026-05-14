@@ -22,6 +22,7 @@ Notes remain domain-keyed (cross-run) and are unaffected by the pin.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import Counter, defaultdict
@@ -31,7 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ..db import get_db
+from ..db import SessionLocal, get_db
 from ..models import (
     CriterionResult,
     DomainNote,
@@ -99,7 +100,23 @@ class DomainRow(BaseModel):
     final_score: float | None = None
     final_confidence: float | None = None
     final_bucket: str = ""
+    # Legacy combined flag: failed-at-synth OR underweight. Kept for
+    # back-compat with readers that haven't migrated to the split. New
+    # code should branch on `final_failed` / `final_underweight` so
+    # the UI can render distinct badges (error vs subset).
     final_partial: bool = False
+    # 2026-05-14 split. `final_failed` mirrors the rd's
+    # final_assessment_json.partial — an enabled criterion failed at
+    # AI synth time (genuine error state). `final_underweight` is the
+    # subset-of-weighted-criteria state — weight>0 criterion isn't
+    # pinned, so the score is derived from fewer signals than the
+    # weights envision. Both can be true simultaneously.
+    final_failed: bool = False
+    final_underweight: bool = False
+    # Weighted criteria that are NOT in pinned_criteria. Populated only
+    # when final_underweight is true; lets the UI tooltip say
+    # "missing: D, A" instead of inverting "pinned: B, W".
+    missing_weighted_criteria: list[str] = Field(default_factory=list)
     # Sorted list of criterion names that have a pin contributing to this
     # row (added 2026-05-12). Empty when no criterion is pinned for this
     # domain. The UI uses it to render "Partial — based on W, B" alongside
@@ -277,7 +294,6 @@ def _bucket_for(
 
 # --- Endpoint ---------------------------------------------------------------
 
-@router.get("/domains", response_model=DomainListResponse)
 def list_domains(
     db: Session = Depends(get_db),
     offset: int = 0,
@@ -578,7 +594,8 @@ def list_domains(
         weights = sc.get("weights") or {}
         weighted_crits = {c for c, w in weights.items() if w > 0}
         pinned_set = set(pinned_criteria_list)
-        partial = bool(weighted_crits - pinned_set)
+        missing_weighted = sorted(weighted_crits - pinned_set)
+        underweight = bool(missing_weighted)
 
         contributing_rd_ids = {src[0].id for src in per_crit_sources.values()}
         single_source_full = (
@@ -653,12 +670,13 @@ def list_domains(
                 bucket = "mixed"
             else:
                 bucket = "low_quality"
-        # If the underlying rd flagged partial (AI noted some enabled
-        # criterion failed at synth time), respect that even if the
-        # weighted-set rule says complete — a failed criterion is still
-        # a real signal worth surfacing.
-        if underlying_partial:
-            partial = True
+        # `final_failed` mirrors the rd's recorded partial flag (an
+        # enabled criterion failed at AI synth time). Distinct from
+        # `final_underweight` (weight>0 criterion not pinned). The
+        # legacy `final_partial` is the OR of the two, kept so any
+        # un-migrated readers stay correct.
+        failed = bool(underlying_partial)
+        partial = underweight or failed
 
         verdict_provider = (
             isinstance(parsed, dict) and (parsed.get("provider") or "") or ""
@@ -801,6 +819,9 @@ def list_domains(
             final_confidence=confidence,
             final_bucket=bucket,
             final_partial=partial,
+            final_failed=failed,
+            final_underweight=underweight,
+            missing_weighted_criteria=missing_weighted,
             pinned_criteria=pinned_criteria_list,
             ai_provider=ai_provider,
             ai_model=ai_model,
@@ -862,6 +883,30 @@ def list_domains(
     )
 
 
+@router.get("/domains", response_model=DomainListResponse)
+async def _list_domains_route(
+    offset: int = 0,
+    limit: int | None = None,
+) -> DomainListResponse:
+    """Async wrapper for `list_domains`. The DB walk is the heaviest
+    read in the app (per-criterion source resolution, JSON parsing per
+    row, multi-source synth) — off-loading it to asyncio.to_thread
+    keeps the event loop responsive when 5+ users land on the Database
+    page during a busy analyze run. A fresh Session is opened inside
+    the executor so it never crosses thread boundaries."""
+    return await asyncio.to_thread(_run_list_domains, offset, limit)
+
+
+def _run_list_domains(
+    offset: int, limit: int | None,
+) -> DomainListResponse:
+    db = SessionLocal()
+    try:
+        return list_domains(db=db, offset=offset, limit=limit)
+    finally:
+        db.close()
+
+
 # --- Pin / unpin endpoints --------------------------------------------------
 
 class PinIn(BaseModel):
@@ -897,18 +942,9 @@ def pin_domain(
             f"run_domain {payload.run_domain_id} belongs to domain "
             f"'{rd.domain}', not '{domain}'",
         )
-    # Clear any other pins for this domain (legacy per-domain pin).
-    others = (
-        db.query(RunDomain)
-        .filter(RunDomain.domain == domain)
-        .filter(RunDomain.is_pinned == True)  # noqa: E712
-        .filter(RunDomain.id != rd.id)
-        .all()
-    )
-    for o in others:
-        o.is_pinned = False
-    rd.is_pinned = True
-    # Per-criterion expansion.
+    # Per-criterion pins only. Locked 2026-05-14: stopped writing the
+    # legacy RunDomain.is_pinned column to match the cleanup of the
+    # /run-domains/{id}/pin endpoint in routers/jobs.py.
     run = db.get(Run, rd.run_id)
     if run is not None:
         rd_crits = {
@@ -939,20 +975,39 @@ def pin_domain(
 
 @router.delete("/domains/{domain}/pin")
 def unpin_domain(domain: str, db: Session = Depends(get_db)) -> dict:
-    """Clear the pin for a domain. Idempotent — no-op when no rd is pinned."""
+    """Clear every JobCriterionPin where the pinned run contains an rd
+    for this domain. Locked 2026-05-14: stopped touching the legacy
+    RunDomain.is_pinned column. Idempotent."""
     domain = domain.strip()
     if not domain:
         raise HTTPException(400, "domain required")
-    rds = (
-        db.query(RunDomain)
+    # Find all (job, run) pairs that have an rd for this domain, then
+    # delete every pin whose (job_id, run_id) is in that set. Two
+    # queries; cheap at any realistic scale.
+    pairs = (
+        db.query(Run.job_id, Run.id)
+        .join(RunDomain, RunDomain.run_id == Run.id)
         .filter(RunDomain.domain == domain)
-        .filter(RunDomain.is_pinned == True)  # noqa: E712
+        .distinct()
         .all()
     )
-    for rd in rds:
-        rd.is_pinned = False
+    if not pairs:
+        db.commit()
+        return {"unpinned": domain, "count": 0}
+    # SQLite doesn't support row-tuple IN clauses cleanly via SQLAlchemy.
+    # Build an OR-chain on (job_id, run_id) pairs.
+    from sqlalchemy import and_, or_
+    conds = [
+        and_(JobCriterionPin.job_id == jid, JobCriterionPin.run_id == rid)
+        for (jid, rid) in pairs
+    ]
+    n = (
+        db.query(JobCriterionPin)
+        .filter(or_(*conds))
+        .delete(synchronize_session=False)
+    )
     db.commit()
-    return {"unpinned": domain, "count": len(rds)}
+    return {"unpinned": domain, "count": int(n)}
 
 
 # --- Domain bulk delete (unchanged behavior) -------------------------------
@@ -1187,6 +1242,7 @@ def bulk_ban_domains(
     added = 0
     already = 0
     rows_added: list[str] = []
+    new_bans_by_domain: dict[str, DomainBan] = {}
     now = datetime.utcnow()
     note = (payload.note or "").strip()
     for d in normalized:
@@ -1196,14 +1252,16 @@ def bulk_ban_domains(
                 existing_row.note = note
             already += 1
             continue
-        db.add(DomainBan(domain=d, note=note, created_at=now))
+        ban = DomainBan(domain=d, note=note, created_at=now)
+        db.add(ban)
         rows_added.append(d)
+        new_bans_by_domain[d] = ban
         added += 1
-    # Status propagation (added 2026-05-14 wave O): flip any existing
-    # BacklogDomain rows for the newly-added domains to status='banned'.
-    # See routers/banlist._flip_backlog_status_to_banned for rationale.
-    from .banlist import _flip_backlog_status_to_banned
-    _flip_backlog_status_to_banned(db, rows_added)
+    # Snapshot + delete the matching Backlog rows (locked 2026-05-14,
+    # supersedes wave-O β). See routers/banlist._snapshot_and_delete_backlog
+    # for rationale.
+    from .banlist import _snapshot_and_delete_backlog
+    _snapshot_and_delete_backlog(db, new_bans_by_domain)
     db.commit()
     return BulkBanOut(added=added, already_banned=already, invalid=invalid)
 

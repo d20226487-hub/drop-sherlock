@@ -472,3 +472,32 @@ def set_availability_setting_route(payload: AvailabilitySettingIn):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"updated": payload.key}
+
+
+# --- DB maintenance (VACUUM) ----------------------------------------------
+
+
+class VacuumToggleIn(BaseModel):
+    enabled: bool
+
+
+@router.get("/db-maintenance")
+def get_db_maintenance_settings():
+    from ..app_settings import get_vacuum_enabled
+    return {"vacuum_enabled": get_vacuum_enabled()}
+
+
+@router.put("/db-maintenance/vacuum-enabled")
+def set_vacuum_enabled_route(payload: VacuumToggleIn):
+    from ..app_settings import set_vacuum_enabled
+    return {"vacuum_enabled": set_vacuum_enabled(payload.enabled)}
+
+
+@router.post("/db-maintenance/vacuum-now")
+def run_vacuum_now():
+    """Manual one-shot VACUUM trigger. Honors the same disk + lock
+    guards as the scheduled cron — won't run if a backup is in flight
+    or disk is tight. Returns the result dict so the UI can surface
+    bytes reclaimed / skip reason."""
+    from ..db_maintenance import try_vacuum
+    return try_vacuum()

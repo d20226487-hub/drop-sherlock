@@ -3,7 +3,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { use, useEffect, useState } from "react";
 import { useT } from "@/lib/i18n";
-import { api, JobDetail, RunSummary } from "@/lib/api";
+import { api, type JobDetail, type RunSummary } from "@/lib/api";
 import { StatusPill } from "@/components/status-pill";
 import { bucketPillTone, FinalBucket } from "@/lib/score";
 import { usePaginatedSearch } from "@/lib/use-paginated-search";
@@ -323,6 +323,8 @@ export default function JobDetailPage({
         )}
       </section>
 
+      <JobPinsPanel jobId={jobId} />
+
       <RunsSection
         runs={job.runs}
         jobId={jobId}
@@ -334,6 +336,143 @@ export default function JobDetailPage({
         onTogglePin={togglePinRun}
       />
     </div>
+  );
+}
+
+// Read-only Job-level pin view (added 2026-05-14). Read-only by design:
+// pin management still happens on the Run page's Per-criterion pins
+// panel. This widget is the missing surface that says, at a glance,
+// "for THIS Job: which Run feeds which criterion?". Empty state when
+// no pins have been set yet.
+function JobPinsPanel({ jobId }: { jobId: number }) {
+  const { t } = useT();
+  const ts = t.pages.jobs.detail;
+
+  const CRITERIA_ORDER = [
+    "backlinks",
+    "refdomains",
+    "anchors",
+    "keywords",
+    "wayback",
+    "wayback_classify",
+  ] as const;
+  const LETTERS: Record<string, string> = {
+    backlinks: "B",
+    refdomains: "D",
+    anchors: "A",
+    keywords: "K",
+    wayback: "W",
+    wayback_classify: "C",
+  };
+
+  const [pins, setPins] = useState<
+    {
+      criterion: string;
+      run_id: number;
+      run_name: string;
+      run_finished_at: string | null;
+    }[]
+  >([]);
+  const [open, setOpen] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .listJobCriterionPins(jobId)
+      .then((r) => {
+        if (!cancelled) {
+          setPins(r.pins);
+          setLoaded(true);
+        }
+      })
+      .catch(() => {
+        // Non-fatal — empty state covers it.
+        if (!cancelled) setLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId]);
+
+  // Build a (criterion → pin) lookup so we can render the canonical
+  // criterion order, gaps included. Gaps = "not pinned" (read from
+  // most-recent Run by default on the Database page).
+  const byCriterion = new Map(pins.map((p) => [p.criterion, p]));
+  const pinnedCount = pins.length;
+
+  return (
+    <section className="rounded-md border border-neutral-200 dark:border-neutral-800 p-3 space-y-2 bg-neutral-50/50 dark:bg-neutral-900/30">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="w-full flex flex-wrap items-center gap-2 justify-between text-left cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 rounded-md"
+      >
+        <div className="flex items-start gap-2">
+          <span
+            className="text-xs text-neutral-500 dark:text-neutral-400 mt-0.5 select-none"
+            aria-hidden
+          >
+            {open ? "▾" : "▸"}
+          </span>
+          <div>
+            <div className="text-sm font-medium">{ts.pinsHeading}</div>
+            {open && (
+              <div className="text-xs text-neutral-600 dark:text-neutral-400 max-w-2xl">
+                {ts.pinsHint}
+              </div>
+            )}
+          </div>
+        </div>
+        <span className="text-xs px-2 py-0.5 rounded-md border border-neutral-300 bg-white text-neutral-600 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300">
+          {ts.pinsBadge(pinnedCount, CRITERIA_ORDER.length)}
+        </span>
+      </button>
+      {open && (
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+          {CRITERIA_ORDER.map((c) => {
+            const p = byCriterion.get(c);
+            return (
+              <div
+                key={c}
+                className={
+                  "flex flex-col gap-1 rounded-md border p-2 text-xs " +
+                  (p
+                    ? "border-emerald-300 bg-emerald-50 dark:border-emerald-900/60 dark:bg-emerald-950/30"
+                    : "border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900")
+                }
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-medium">
+                    <span className="inline-block w-5 text-center rounded bg-neutral-200 dark:bg-neutral-800 mr-1">
+                      {LETTERS[c] ?? c[0]?.toUpperCase()}
+                    </span>
+                    {c}
+                  </span>
+                </div>
+                {p ? (
+                  <Link
+                    href={`/jobs/${jobId}/runs/${p.run_id}`}
+                    className="text-blue-600 dark:text-blue-400 hover:underline"
+                  >
+                    Run #{p.run_id}
+                    {p.run_name ? ` · ${p.run_name}` : ""}
+                  </Link>
+                ) : (
+                  <span className="text-neutral-500 dark:text-neutral-400">
+                    {ts.pinsUnpinned}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+          {!loaded && pins.length === 0 && (
+            <div className="col-span-full text-xs text-neutral-500">…</div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 

@@ -514,6 +514,33 @@ export default function BacklogPage() {
     }
   }
 
+  // Delete every row matching the current filters, regardless of
+  // pagination or selection. Confirms first — the user can't see the
+  // full affected set on screen.
+  async function handleBulkDeleteAllFiltered() {
+    if (!data) return;
+    const n = data.filtered_total;
+    if (n === 0) return;
+    if (!window.confirm(ts.confirmBulkDeleteFiltered(n))) return;
+    setBulkBusy(true);
+    setBulkError(null);
+    try {
+      await api.bulkBacklogDeleteFiltered({
+        search: search.trim() || undefined,
+        status: statusFilter.length ? statusFilter : undefined,
+        registrar: registrarFilter.length ? registrarFilter : undefined,
+        expiry_from: expiryFrom || undefined,
+        expiry_to: expiryTo || undefined,
+      });
+      setSelected(new Set());
+      reload({ silent: true, refreshOptions: true });
+    } catch (e) {
+      setBulkError((e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   // --- Render -------------------------------------------------------------
 
   const statusOptions = BACKLOG_STATUSES.map((s) => ({
@@ -725,6 +752,26 @@ export default function BacklogPage() {
             className="text-xs px-3 py-1 rounded-md border border-blue-300 dark:border-blue-900/60 text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-950/40 disabled:opacity-50"
           >
             {ts.sendAllFilteredToAnalyze(data.filtered_total)}
+          </button>
+          <button
+            type="button"
+            onClick={handleBulkDeleteAllFiltered}
+            // Disabled when no filter is active — protects against
+            // a careless "Delete all 358 filtered" click on a fresh
+            // page where the filtered set IS the whole backlog. The
+            // selection-toolbar's per-row delete still works; the user
+            // has to actually narrow the set to wipe in bulk.
+            disabled={bulkBusy || !filtersActive}
+            title={
+              !filtersActive
+                ? ts.bulkDeleteAllFilteredNoFilterHint
+                : undefined
+            }
+            className="text-xs px-3 py-1 rounded-md border border-red-300 dark:border-red-900/60 text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {bulkBusy
+              ? ts.bulkDeleting
+              : ts.bulkDeleteAllFiltered(data.filtered_total)}
           </button>
         </div>
       )}

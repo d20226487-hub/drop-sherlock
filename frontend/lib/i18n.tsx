@@ -52,6 +52,7 @@ const messagesEn = {
       label: "Database",
       analyzeList: "Analyze List",
       banList: "Ban List",
+      toggleAria: "Open Database menu",
     },
   },
   pages: {
@@ -97,6 +98,8 @@ const messagesEn = {
         keywords: "Organic keywords",
         wayback: "Wayback history",
         wayback_classify: "Language + theme + category",
+        waybackDiscoverHint:
+          "Disabled cards are collapsed — click the chevron on a card to expand and enable it. Wayback adds a history signal; Wayback Classify auto-detects language, theme, and category.",
       },
       fields: {
         limit: "Limit",
@@ -284,6 +287,18 @@ const messagesEn = {
           noDomains: "Add at least one domain.",
           noCriteria: "Enable at least one criterion.",
         },
+        errors: {
+          allBanned: (count: number, sample: string[], truncated: boolean) => {
+            const head =
+              count === 1
+                ? "The submitted domain is on the Ban List"
+                : `All ${count} submitted domains are on the Ban List`;
+            if (sample.length === 0) return `${head}.`;
+            const list = sample.join(", ");
+            const tail = truncated ? `, … (${count} total)` : "";
+            return `${head}: ${list}${tail}.`;
+          },
+        },
         progress: (done: number, total: number) =>
           `${done} / ${total} domains complete`,
         progressFailed: (n: number) => `· ${n} failed`,
@@ -377,6 +392,12 @@ const messagesEn = {
         notesEmpty: "(no notes)",
         runsHeading: "Runs",
         noRuns: "No runs yet.",
+        pinsHeading: "Per-criterion pins",
+        pinsHint:
+          "Which Run feeds each criterion for this Job's Database rollup. Read-only here — pin/unpin from the Per-criterion pins panel on a Run page. Gaps fall through to the most recent Run that has data for that criterion.",
+        pinsBadge: (pinned: number, total: number) =>
+          `${pinned}/${total} pinned`,
+        pinsUnpinned: "not pinned",
         runLabel: (id: number, name: string = "") =>
           name?.trim() || `Run #${id}`,
         renameRun: "Rename",
@@ -550,6 +571,8 @@ const messagesEn = {
         scoreWeightsPreview: "Preview",
         scoreWeightsApply: "Apply to this run",
         scoreWeightsReset: "Reset to global",
+        scoreWeightsResetDisabledHint:
+          "No per-run override is active — nothing to reset.",
         scoreWeightsResetConfirm:
           "Clear the per-run override and recompute scores using the current global Settings weights?",
         scoreWeightsApplyConfirm:
@@ -881,6 +904,15 @@ const messagesEn = {
       // stitched across multiple pinned Runs.
       partialFromCriteria: (crits: string) =>
         `Partial — based on ${crits}. Pin remaining criteria from their Runs to get a full verdict.`,
+      // 2026-05-14: partial → split into failed vs underweight.
+      failedBadge: "failed",
+      failedTooltip:
+        "Failed — an enabled criterion errored at AI synth time. Open the domain page and Reanalyze to retry.",
+      underweightBadge: "subset",
+      underweightTooltip:
+        "Subset — the score is derived from fewer signals than the scoring weights envision. Pin the missing criteria from their Runs.",
+      underweightMissing: (crits: string) =>
+        `Subset — missing ${crits}. Pin those criteria from their Runs to get a full-weight score.`,
       noProvider: "no AI",
       criteriaCell: (parts: string[]) =>
         parts.length === 0 ? "—" : parts.join(", "),
@@ -1334,6 +1366,13 @@ const messagesEn = {
       settingsCacheHeading: "Cache TTL (hours)",
       settingsCacheHint:
         "Reuse cached availability results within this window. Drop-hunters near close-to-drop dates may want 1h instead of the 24h default.",
+      settingsRetentionHeading: "Recent-checks retention",
+      settingsRetentionHint:
+        "Bounds the availability_checks history table. Daily prune + one-shot on every container restart. Defaults: 30 days, 20 rows per domain. Set either field to 0 to disable that cap.",
+      settingsRetentionDaysLabel: "Retention (days):",
+      settingsRetentionDaysHint: "0 = keep forever by age.",
+      settingsPerDomainKeepLabel: "Keep per domain:",
+      settingsPerDomainKeepHint: "0 = unlimited (within the age window).",
       settingsApiKeyHeading: "Domainr API key (RapidAPI)",
       settingsApiKeyHint:
         "Free Basic tier on RapidAPI gives 10,000 lookups/month. Encrypted at rest.",
@@ -1442,8 +1481,13 @@ const messagesEn = {
       openAnalyzed: "Open the analyzed domain page",
       bulkDelete: (n: number) => `Delete ${n}`,
       bulkDeleting: "Deleting…",
+      bulkDeleteAllFiltered: (n: number) => `Delete all ${n} filtered`,
+      bulkDeleteAllFilteredNoFilterHint:
+        "Apply at least one filter first — this action would wipe the entire backlog otherwise.",
       confirmBulkDelete: (n: number) =>
         `Permanently delete ${n} backlog row${n === 1 ? "" : "s"}? This cannot be undone.`,
+      confirmBulkDeleteFiltered: (n: number) =>
+        `Permanently delete all ${n} backlog row${n === 1 ? "" : "s"} matching the current filters? This cannot be undone.`,
       totalHint: (filtered: number, total: number) =>
         filtered === total
           ? `${total} domain${total === 1 ? "" : "s"}`
@@ -1564,6 +1608,7 @@ const messagesRu: Messages = {
       label: "База",
       analyzeList: "Список для анализа",
       banList: "Бан-лист",
+      toggleAria: "Открыть меню Базы",
     },
   },
   pages: {
@@ -1617,6 +1662,8 @@ const messagesRu: Messages = {
         keywords: "Органические ключи",
         wayback: "История Wayback",
         wayback_classify: "Язык + тематика + категория",
+        waybackDiscoverHint:
+          "Выключенные карточки свёрнуты — кликните по шевр-стрелке на карточке, чтобы развернуть и включить её. Wayback добавляет сигнал по истории сайта; Wayback Classify автоопределяет язык, тематику и категорию.",
       },
       fields: {
         limit: "Лимит",
@@ -1814,6 +1861,25 @@ const messagesRu: Messages = {
           noDomains: "Добавьте хотя бы один домен.",
           noCriteria: "Включите хотя бы один критерий.",
         },
+        errors: {
+          allBanned: (count, sample, truncated) => {
+            const last2 = count % 100;
+            const last1 = count % 10;
+            let word = "доменов";
+            if (last2 < 11 || last2 > 14) {
+              if (last1 === 1) word = "домен";
+              else if (last1 >= 2 && last1 <= 4) word = "домена";
+            }
+            const head =
+              count === 1
+                ? "Отправленный домен находится в бан-листе"
+                : `Все ${count} отправленных ${word} находятся в бан-листе`;
+            if (sample.length === 0) return `${head}.`;
+            const list = sample.join(", ");
+            const tail = truncated ? `, … (всего ${count})` : "";
+            return `${head}: ${list}${tail}.`;
+          },
+        },
         progress: (done, total) => `${done} / ${total} доменов готово`,
         progressFailed: (n) => `· ${n} с ошибкой`,
         statusPending: "В очереди",
@@ -1909,6 +1975,11 @@ const messagesRu: Messages = {
         notesEmpty: "(нет заметок)",
         runsHeading: "Запуски",
         noRuns: "Запусков пока нет.",
+        pinsHeading: "Пины по критериям",
+        pinsHint:
+          "Какой Run даёт данные по каждому критерию для свёрнутого вида этой Задачи на странице Базы. Только для чтения — пин/анпин делается на странице Run, в панели «Пины по критериям». Пропуски берутся из самого свежего Run, где этот критерий есть.",
+        pinsBadge: (pinned, total) => `${pinned}/${total} зафиксировано`,
+        pinsUnpinned: "не зафиксирован",
         runLabel: (id, name = "") => name?.trim() || `Запуск #${id}`,
         renameRun: "Переименовать",
         renameRunPrompt: (id) =>
@@ -2071,6 +2142,8 @@ const messagesRu: Messages = {
         scoreWeightsPreview: "Предпросмотр",
         scoreWeightsApply: "Применить к запуску",
         scoreWeightsReset: "Сбросить к глобальным",
+        scoreWeightsResetDisabledHint:
+          "Override для этого Run не задан — сбрасывать нечего.",
         scoreWeightsResetConfirm:
           "Снять переопределение и пересчитать баллы по текущим глобальным весам?",
         scoreWeightsApplyConfirm:
@@ -2433,6 +2506,15 @@ const messagesRu: Messages = {
         "Частичный результат — хотя бы один критерий упал. Балл не вычислен. Откройте страницу домена и нажмите «Переоценить», чтобы повторить.",
       partialFromCriteria: (crits: string) =>
         `Частично — на основе ${crits}. Зафиксируйте остальные критерии из их запусков, чтобы получить полный вердикт.`,
+      // 2026-05-14: partial → split into failed vs underweight.
+      failedBadge: "ошибка",
+      failedTooltip:
+        "Ошибка — один из включённых критериев упал на этапе AI-синтеза. Откройте страницу домена и нажмите «Переоценить», чтобы повторить.",
+      underweightBadge: "подмножество",
+      underweightTooltip:
+        "Подмножество — балл рассчитан по меньшему числу сигналов, чем предполагают веса. Зафиксируйте недостающие критерии из их запусков.",
+      underweightMissing: (crits) =>
+        `Подмножество — не хватает ${crits}. Зафиксируйте эти критерии из их запусков, чтобы получить балл с полным весом.`,
       noProvider: "без ИИ",
       criteriaCell: (parts) => (parts.length === 0 ? "—" : parts.join(", ")),
       criterionRowCount: (key, rows) => `${key} (${rows})`,
@@ -2943,6 +3025,13 @@ const messagesRu: Messages = {
       settingsCacheHeading: "TTL кэша (часов)",
       settingsCacheHint:
         "Использовать кэшированный результат проверки в этом окне. Охотникам за дропами с близкими датами выпадения может понадобиться 1 час вместо 24.",
+      settingsRetentionHeading: "Хранение недавних проверок",
+      settingsRetentionHint:
+        "Ограничивает рост таблицы availability_checks. Ежедневная очистка + одноразовый проход при перезапуске контейнера. По умолчанию: 30 дней, 20 строк на домен. Поставьте 0 в любом поле, чтобы отключить этот лимит.",
+      settingsRetentionDaysLabel: "Хранить (дней):",
+      settingsRetentionDaysHint: "0 = по возрасту не чистить.",
+      settingsPerDomainKeepLabel: "На домен оставлять:",
+      settingsPerDomainKeepHint: "0 = без лимита (в пределах окна по возрасту).",
       settingsApiKeyHeading: "API-ключ Domainr (RapidAPI)",
       settingsApiKeyHint:
         "Бесплатный Basic-тариф на RapidAPI даёт 10 000 запросов/мес. Шифруется в БД.",
@@ -3058,8 +3147,13 @@ const messagesRu: Messages = {
       openAnalyzed: "Открыть страницу проанализированного домена",
       bulkDelete: (n) => `Удалить ${n}`,
       bulkDeleting: "Удаление…",
+      bulkDeleteAllFiltered: (n) => `Удалить все ${n} отфильтрованных`,
+      bulkDeleteAllFilteredNoFilterHint:
+        "Сначала примените хотя бы один фильтр — иначе это действие сотрёт всю очередь.",
       confirmBulkDelete: (n) =>
         `Окончательно удалить ${n} строк(и) очереди? Действие необратимо.`,
+      confirmBulkDeleteFiltered: (n) =>
+        `Окончательно удалить все ${n} строк очереди, подходящих под текущие фильтры? Действие необратимо.`,
       totalHint: (filtered, total) => {
         const last2 = total % 100;
         const last1 = total % 10;

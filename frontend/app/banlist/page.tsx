@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, BanRow } from "@/lib/api";
 import { useT } from "@/lib/i18n";
 
+const PER_PAGE_OPTIONS = [20, 50, 100];
+
 // Ban List page (added 2026-05-13 wave L). Permanent "never analyze /
 // backlog this domain again" filter. Distinct from the Backlog
 // `discarded` status — a ban is hard, recurring, applied at every
@@ -13,16 +15,40 @@ export default function BanListPage() {
   const { t } = useT();
   const ts = t.pages.banlist;
 
+  // Server-paginated since 2026-05-14. `rows` is the current page's
+  // slice (already filtered by `search` server-side); `total` and
+  // `filteredTotal` come from the response and drive the totalLine
+  // footer + pagination math.
   const [rows, setRows] = useState<BanRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [filteredTotal, setFilteredTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   // Bulk-select state — same shape as the Database page so the user
-  // recognizes the pattern.
+  // recognizes the pattern. With server-side pagination, selections
+  // only span the rows currently visible. Reloads clear them.
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
-  // Search box: case-insensitive substring match on domain + note.
+  // Search + pagination state. Debounce search so every keystroke
+  // doesn't fire a request.
+  const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = useState(50);
+
+  // Debounce: commit searchInput → search after 250ms of no typing.
+  useEffect(() => {
+    const id = window.setTimeout(() => setSearch(searchInput.trim()), 250);
+    return () => window.clearTimeout(id);
+  }, [searchInput]);
+
+  // Reset to page 1 whenever the filter or per-page changes so a
+  // narrowed result set doesn't strand the user on an empty later
+  // page.
+  useEffect(() => {
+    setPage(1);
+  }, [search, perPage]);
 
   // CSV import panel state. Accept both `domain` and `domain,note`
   // shapes — per design call #4 (domain required, note optional).
@@ -39,33 +65,36 @@ export default function BanListPage() {
     setLoading(true);
     setError(null);
     try {
-      const resp = await api.listBans();
+      const resp = await api.listBans({
+        page,
+        per_page: perPage,
+        search: search || undefined,
+      });
       setRows(resp.rows);
+      setTotal(resp.total);
+      setFilteredTotal(resp.filtered_total);
       setSelected(new Set());
     } catch (e) {
       setError(e instanceof Error ? e.message : "load failed");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [page, perPage, search]);
 
   useEffect(() => {
     void reload();
   }, [reload]);
 
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter(
-      (r) =>
-        r.domain.toLowerCase().includes(q) ||
-        r.note.toLowerCase().includes(q),
-    );
-  }, [rows, search]);
+  const totalPages = Math.max(1, Math.ceil(filteredTotal / perPage));
+  const pageSafe = Math.min(page, totalPages);
 
-  const allFilteredSelected = useMemo(
-    () => filtered.length > 0 && filtered.every((r) => selected.has(r.domain)),
-    [filtered, selected],
+  // "Select all visible" scopes to the current page (the only rows
+  // the user can see). Bulk unban operates on the full `selected`
+  // set — but with server-side pagination, that set only contains
+  // the rows you actively checked on visible pages.
+  const allPageSelected = useMemo(
+    () => rows.length > 0 && rows.every((r) => selected.has(r.domain)),
+    [rows, selected],
   );
 
   const handleToggleRow = useCallback((domain: string) => {
@@ -79,16 +108,16 @@ export default function BanListPage() {
 
   const handleToggleAll = useCallback(() => {
     setSelected((prev) => {
-      if (allFilteredSelected) {
+      if (allPageSelected) {
         const next = new Set(prev);
-        for (const r of filtered) next.delete(r.domain);
+        for (const r of rows) next.delete(r.domain);
         return next;
       }
       const next = new Set(prev);
-      for (const r of filtered) next.add(r.domain);
+      for (const r of rows) next.add(r.domain);
       return next;
     });
-  }, [allFilteredSelected, filtered]);
+  }, [allPageSelected, rows]);
 
   const handleBulkUnban = useCallback(async () => {
     if (selected.size === 0) return;
@@ -171,8 +200,8 @@ export default function BanListPage() {
         <input
           type="search"
           placeholder={ts.searchPlaceholder}
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
           className="px-3 py-1.5 text-sm rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 w-full sm:w-80"
         />
         <div className="flex items-center gap-2">
@@ -250,7 +279,7 @@ export default function BanListPage() {
               <th className="w-8 px-3 py-2">
                 <input
                   type="checkbox"
-                  checked={allFilteredSelected}
+                  checked={allPageSelected}
                   onChange={handleToggleAll}
                   aria-label={ts.selectAll}
                 />
@@ -270,14 +299,18 @@ export default function BanListPage() {
                   {ts.loading}
                 </td>
               </tr>
-            ) : filtered.length === 0 ? (
+            ) : rows.length === 0 ? (
               <tr>
                 <td colSpan={5} className="px-3 py-4 text-neutral-500">
-                  {rows.length === 0 ? ts.emptyAll : ts.emptyFiltered}
+                  {total === 0
+                    ? ts.emptyAll
+                    : filteredTotal === 0
+                      ? ts.emptyFiltered
+                      : ts.emptyFiltered}
                 </td>
               </tr>
             ) : (
-              filtered.map((r) => (
+              rows.map((r) => (
                 <tr
                   key={r.domain}
                   className="border-t border-neutral-100 dark:border-neutral-800/60 hover:bg-neutral-50/50 dark:hover:bg-neutral-900/50"
@@ -315,9 +348,46 @@ export default function BanListPage() {
         </table>
       </div>
 
-      <p className="text-xs text-neutral-500">
-        {ts.totalLine(rows.length, filtered.length, selected.size)}
-      </p>
+      <div className="flex items-center justify-between gap-3 text-xs text-neutral-600 dark:text-neutral-400 flex-wrap">
+        <span>{ts.totalLine(total, filteredTotal, selected.size)}</span>
+        <div className="flex items-center gap-3 flex-wrap">
+          <label className="flex items-center gap-2">
+            <span className="text-neutral-500 dark:text-neutral-400">
+              {t.pagination.perPage}
+            </span>
+            <select
+              value={perPage}
+              onChange={(e) => setPerPage(parseInt(e.target.value, 10))}
+              className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1"
+            >
+              {PER_PAGE_OPTIONS.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
+          <span>{t.pagination.page(pageSafe, totalPages)}</span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={pageSafe <= 1}
+              className="px-2 py-1 rounded-md border dark:border-neutral-700 disabled:opacity-50"
+            >
+              {t.pagination.prev}
+            </button>
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={pageSafe >= totalPages}
+              className="px-2 py-1 rounded-md border dark:border-neutral-700 disabled:opacity-50"
+            >
+              {t.pagination.next}
+            </button>
+          </div>
+        </div>
+      </div>
     </main>
   );
 }

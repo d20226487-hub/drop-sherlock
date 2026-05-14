@@ -446,8 +446,28 @@ function AnalyzePageInner() {
       // it duplicated the Run page with fewer controls.
       router.push(`/jobs/${r.job_id}/runs/${r.run_id}`);
     } catch (e) {
-      const errObj = e as Error;
-      setSubmit({ kind: "error", message: errObj.message || "submit failed" });
+      const errObj = e as Error & { body?: string };
+      // The request helper stashes the raw response body on the error.
+      // FastAPI surfaces structured errors under `detail`; check for the
+      // `all_banned` code and localize it via i18n. Anything else falls
+      // back to the raw message — keeps unknown errors visible verbatim.
+      let message = errObj.message || "submit failed";
+      try {
+        const parsed = JSON.parse(errObj.body || "");
+        const d = parsed?.detail;
+        if (d && typeof d === "object" && d.code === "all_banned") {
+          message = ts.submit.errors.allBanned(
+            Number(d.count ?? 0),
+            Array.isArray(d.sample) ? d.sample : [],
+            Boolean(d.truncated),
+          );
+        } else if (typeof d === "string") {
+          message = d;
+        }
+      } catch {
+        // Body isn't JSON — leave message as the raw text.
+      }
+      setSubmit({ kind: "error", message });
     }
   }
 
@@ -636,6 +656,17 @@ function AnalyzePageInner() {
             waybackSamplingEnabled={criteria.wayback.sample_pages}
           />
         </div>
+        {/* Discoverability nudge for collapsed disabled cards (W/C
+            start collapsed when disabled — wave M). Without this hint,
+            new users have no signal that those criteria exist when
+            their cards render as one-line collapsed strips. Renders
+            only while at least one of W / C is disabled (= the state
+            where their card body is hidden). */}
+        {(!criteria.wayback.enabled || !criteria.wayback_classify.enabled) && (
+          <p className="text-xs text-neutral-500 dark:text-neutral-400">
+            {ts.criteria.waybackDiscoverHint}
+          </p>
+        )}
       </section>
 
       <AISelector value={ai} onChange={setAi} />

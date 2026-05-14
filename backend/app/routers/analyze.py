@@ -125,10 +125,20 @@ async def submit_job(
             if not (norm and norm in banned_normalized)
         ]
         if not cleaned_domains:
+            # Structured detail so the frontend can localize and we can
+            # cap the listed sample. Raw list could be hundreds of items
+            # long otherwise (locked: never include a comma-separated
+            # dump of every banned domain).
+            sample = sorted(banned_normalized)
+            SAMPLE_CAP = 10
             raise HTTPException(
                 400,
-                f"all submitted domains are banned: "
-                f"{', '.join(sorted(banned_normalized))}",
+                detail={
+                    "code": "all_banned",
+                    "count": len(sample),
+                    "sample": sample[:SAMPLE_CAP],
+                    "truncated": len(sample) > SAMPLE_CAP,
+                },
             )
     else:
         skipped_banned = []

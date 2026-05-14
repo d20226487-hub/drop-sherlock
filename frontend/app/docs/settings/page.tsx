@@ -7,9 +7,13 @@ export default function SettingsDoc() {
     <div className="docs-content">
       <h1>Настройки</h1>
       <p>
-        Страница <code>/settings</code> разделена на четыре вкладки. Здесь
-        вы храните ключи провайдеров, тюните «мозг» (промпты + scoring),
-        настраиваете Wayback-классификацию и админите хранение / backups.
+        Страница <code>/settings</code> разделена на пять вкладок:{" "}
+        <strong>API</strong>, <strong>Brain</strong>,{" "}
+        <strong>Wayback</strong>, <strong>Domain availability</strong>{" "}
+        и <strong>Other</strong>. Здесь вы храните ключи провайдеров,
+        тюните «мозг» (промпты + scoring), настраиваете
+        Wayback-классификацию, конфигурируете каскад проверки
+        доступности доменов и админите хранение / backups.
       </p>
 
       <h2>Вкладка «API»</h2>
@@ -94,6 +98,63 @@ export default function SettingsDoc() {
         Classify»</Link>.
       </p>
 
+      <h2>Вкладка «Domain availability»</h2>
+      <p>
+        Конфигурация каскада проверки доступности доменов (опт-ин с
+        формы <Link href="/docs/analyze">Анализа</Link>). Управляет:
+      </p>
+      <ul>
+        <li>
+          <strong>Providers</strong> — список включённых провайдеров
+          каскада: DNS / RDAP / Domainr / WHOIS. Каждый можно
+          отдельно отключить.
+        </li>
+        <li>
+          <strong>Cascade order</strong> — drag-reorderable порядок,
+          в котором провайдеры опрашиваются. Каскад останавливается на
+          первом терминальном ответе (available / registered).
+        </li>
+        <li>
+          <strong>Rate limits</strong> — RPS и max-concurrent на
+          провайдера. Жёсткий потолок 10 req/sec независимо от
+          введённого значения (clamps на запись).
+        </li>
+        <li>
+          <strong>Domainr API key</strong> — ключ RapidAPI для платной
+          подстраховки (free Basic tier даёт 10k lookups/мес).
+          Хранится зашифрованным.
+        </li>
+        <li>
+          <strong>Cache TTL</strong> — окно, в течение которого
+          terminal-результат переиспользуется без повторных запросов
+          (по умолчанию 24 ч).
+        </li>
+        <li>
+          <strong>Skip-registered policy</strong> — горизонт «не
+          трогать зарегистрированные домены, истекающие позже чем
+          через N дней». Экономит юниты на больших списках, где много
+          явно «живых» доменов.
+        </li>
+        <li>
+          <strong>Recent-checks retention</strong> — добавлено
+          2026-05-14. Два совмещающихся лимита для таблицы{" "}
+          <code>availability_checks</code> (журнал каждого ответа
+          провайдера): «retention days» (удалять старее N дней,
+          по умолчанию 30, 0 = не чистить по возрасту) и «keep per
+          domain» (после возрастной зачистки оставить M свежих
+          записей на домен, по умолчанию 20, 0 = без лимита).
+          Запускается ежедневно APScheduler и один раз при старте
+          контейнера. Подробнее — в{" "}
+          <Link href="/docs/backups">«Резервные копии»</Link>.
+        </li>
+        <li>
+          <strong>Monthly usage</strong> + <strong>Recent log</strong>{" "}
+          — таблицы для аудита: сколько проверок было в этом месяце
+          по провайдерам, и последние 50 ответов с латентностью и
+          ошибками.
+        </li>
+      </ul>
+
       <h2>Вкладка «Other»</h2>
       <p>Админские опции:</p>
       <ul>
@@ -113,6 +174,36 @@ export default function SettingsDoc() {
           <Link href="/docs/backups">отдельной статье</Link>.
         </li>
       </ul>
+
+      <h3>VACUUM (API-only)</h3>
+      <p>
+        Добавлено 2026-05-14. Ежемесячный <code>VACUUM</code> для
+        возврата пустых страниц на диск (после ретенций / bulk-delete).
+        UI на странице Настроек пока нет — управление через
+        endpoint-ы:
+      </p>
+      <ul>
+        <li>
+          <code>GET /settings/db-maintenance</code> — текущее
+          состояние тумблера.
+        </li>
+        <li>
+          <code>PUT /settings/db-maintenance/vacuum-enabled</code>{" "}
+          с телом <code>{`{"enabled": true|false}`}</code> —
+          включить / выключить ежемесячный cron (1-е число месяца,
+          03:30 UTC). По умолчанию ВКЛ.
+        </li>
+        <li>
+          <code>POST /settings/db-maintenance/vacuum-now</code> —
+          ручной триггер с теми же защитными проверками (≥ 2×
+          DB-size свободного места + shared maintenance lock с
+          бэкапом).
+        </li>
+      </ul>
+      <p>
+        Полное описание режима + защитные проверки — в{" "}
+        <Link href="/docs/backups">«Резервные копии»</Link>.
+      </p>
 
       <h2>Где что менять — короткая шпаргалка</h2>
       <table>
@@ -144,8 +235,23 @@ export default function SettingsDoc() {
             <td>Settings → Wayback → Categories</td>
           </tr>
           <tr>
+            <td>Включить проверку доступности в каскаде</td>
+            <td>Settings → Domain availability → Providers</td>
+          </tr>
+          <tr>
+            <td>Изменить, сколько хранить «недавние проверки»</td>
+            <td>Settings → Domain availability → Recent-checks retention</td>
+          </tr>
+          <tr>
             <td>Включить выгрузку backups на S3</td>
             <td>Settings → Other → Backups</td>
+          </tr>
+          <tr>
+            <td>Запустить VACUUM сейчас</td>
+            <td>
+              POST <code>/settings/db-maintenance/vacuum-now</code>{" "}
+              (UI пока нет)
+            </td>
           </tr>
         </tbody>
       </table>

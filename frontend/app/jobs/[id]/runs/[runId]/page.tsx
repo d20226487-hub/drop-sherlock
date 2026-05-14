@@ -104,6 +104,18 @@ function formatDate(iso: string | null): string {
   }
 }
 
+// Used by the slim-progress merge to decide if a per-criterion status
+// dict actually changed — lets React skip a row's reconcile when the
+// slim payload's contents are identical to what's already on screen.
+function shallowEqualStringMap(
+  a: Record<string, string>, b: Record<string, string>,
+): boolean {
+  const ak = Object.keys(a);
+  if (ak.length !== Object.keys(b).length) return false;
+  for (const k of ak) if (a[k] !== b[k]) return false;
+  return true;
+}
+
 // Per-run scoring-weights override panel (added 2026-05-13 wave J).
 // Recomputes finals against custom weights without touching per-criterion
 // AI verdicts. See `tasks.recompute_run_finals` for the backend contract.
@@ -429,18 +441,29 @@ function ScoreWeightsPanel({
                   ? ts.scoreWeightsBusyApply
                   : ts.scoreWeightsApply}
               </button>
-              {overrideActive && (
-                <button
-                  type="button"
-                  onClick={handleReset}
-                  disabled={busy !== ""}
-                  className="text-xs px-2 py-1 rounded-md border border-neutral-300 bg-white text-neutral-700 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
-                >
-                  {busy === "reset"
+              {/* Always rendered (was overrideActive-only). Disabled
+                  when no override is active so the button surface stays
+                  consistent — and so a stale "override active" snapshot
+                  in this tab can still self-correct on click (the
+                  endpoint is idempotent, the follow-up reload pulls
+                  fresh `currentOverride`). The visibility-refresh
+                  effect above keeps cross-tab state honest in the
+                  common case. */}
+              <button
+                type="button"
+                onClick={handleReset}
+                disabled={busy !== "" || !overrideActive}
+                title={
+                  !overrideActive
+                    ? ts.scoreWeightsResetDisabledHint
+                    : undefined
+                }
+                className="text-xs px-2 py-1 rounded-md border border-neutral-300 bg-white text-neutral-700 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {busy === "reset"
                     ? ts.scoreWeightsBusyReset
                     : ts.scoreWeightsReset}
-                </button>
-              )}
+              </button>
             </div>
           </div>
 
@@ -709,6 +732,90 @@ export default function RunDetailPage({
       if (s) setStatus(s);
       if (c) setCost(c);
       setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  // Slim per-tick reload (added 2026-05-14). Pulls the cheap
+  // /runs/{id}/progress payload — per-domain status + criteria/ai
+  // status + reanalyzing + last_analyzed_at — and overlays it onto
+  // the existing `run` snapshot. The expensive columns (language /
+  // theme / category / final score) stay at whatever the last full
+  // reload showed. When the slim payload reveals a transition
+  // (domain reached a terminal state or last_analyzed_at advanced),
+  // we queue a full reload so those columns refresh. Plus `status`
+  // + `cost` still come from their own slim endpoints.
+  async function reloadProgress() {
+    try {
+      const [p, s, c] = await Promise.all([
+        api.getRunProgress(runId),
+        api.getRunStatus(runId).catch(() => null),
+        api.getRunCost(runId).catch(() => null),
+      ]);
+      if (s) setStatus(s);
+      if (c) setCost(c);
+      setError(null);
+
+      // Merge slim into the existing snapshot. We compute transition
+      // detection BEFORE mutating state so the trigger sees the
+      // pre-merge view of last_analyzed_at / status. New domains in
+      // the slim payload but not the snapshot (shouldn't happen
+      // mid-run) force a full reload too.
+      let needsFullReload = false;
+      setRun((prev) => {
+        if (prev == null) {
+          // Snapshot not yet loaded — defer to the mount-time full
+          // reload effect; ignore this slim tick.
+          return prev;
+        }
+        const TERMINAL = new Set(["done", "failed", "canceled"]);
+        const bySlim = new Map(p.domains.map((d) => [d.id, d]));
+        let mutated = false;
+        const nextDomains = prev.domains.map((d) => {
+          const slim = bySlim.get(d.id);
+          if (!slim) return d;
+          // Transition detection — set the flag, don't reassign d.
+          if (
+            d.last_analyzed_at !== slim.last_analyzed_at ||
+            (!TERMINAL.has(d.status) && TERMINAL.has(slim.status))
+          ) {
+            needsFullReload = true;
+          }
+          // Cheap shallow compare: if every slim field already matches,
+          // return the existing reference so React skips that row's
+          // reconcile.
+          if (
+            d.status === slim.status &&
+            d.reanalyzing === slim.reanalyzing &&
+            d.last_analyzed_at === slim.last_analyzed_at &&
+            shallowEqualStringMap(d.criteria, slim.criteria) &&
+            shallowEqualStringMap(d.ai_status, slim.ai_status)
+          ) {
+            return d;
+          }
+          mutated = true;
+          return {
+            ...d,
+            status: slim.status,
+            criteria: slim.criteria,
+            ai_status: slim.ai_status,
+            reanalyzing: slim.reanalyzing,
+            last_analyzed_at: slim.last_analyzed_at,
+          };
+        });
+        // If the new domains array is structurally identical (every
+        // entry reference reused), don't replace state at all —
+        // avoids an unnecessary reconcile.
+        if (!mutated) return prev;
+        return { ...prev, status: p.status, domains: nextDomains };
+      });
+      if (needsFullReload) {
+        // Fire-and-forget — the full /runs/{id} fetch refreshes
+        // the expensive columns. Failures fall back to "stay stale";
+        // the next tick re-detects.
+        void reload();
+      }
     } catch (e) {
       setError((e as Error).message);
     }
@@ -994,6 +1101,26 @@ export default function RunDetailPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
 
+  // Refresh when the tab regains focus. Catches state changes the user
+  // made in another tab — particularly scoring_override toggled on/off
+  // via Apply/Reset, which the ScoreWeightsPanel reads from run.* and
+  // would otherwise stay stale until the next manual reload. Cheap:
+  // /runs/{id} is eager-loaded (3 queries) and adaptive polling has
+  // already stopped on terminal runs, so this is the ONLY refresh
+  // source after a run finishes.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") reload();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId]);
+
   // Adaptive polling. The naive 2s interval pegged the API at 75% CPU
   // when ≥2 tabs sat on a run page (regression observed 2026-05-12 with
   // a 352-domain Wayback run): /runs/{id} walks every RunDomain on
@@ -1018,8 +1145,13 @@ export default function RunDetailPage({
     }
     const intervalMs =
       run.status === "paused" && !reanalyzing ? 10_000 : 2_000;
+    // Use the slim progress poll (added 2026-05-14) — the heavy
+    // /runs/{id} fires inside reloadProgress() ONLY when it detects
+    // a per-domain transition (terminal status or last_analyzed_at
+    // change). Drops per-tick server CPU + wire bytes by ~30–40% at
+    // 1k+ domains while keeping the expensive columns fresh.
     const id = window.setInterval(() => {
-      reload();
+      reloadProgress();
     }, intervalMs);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1198,14 +1330,28 @@ export default function RunDetailPage({
             {lifecycleError}
           </p>
         )}
-        {run.status === "done" && (
+        {/* Score Weights panel: visible on every non-failed/non-canceled
+            run. Pre-`done` it lets the user preview-only against the
+            partial set of CRs available; recompute-final on the backend
+            already skips partial rds, so an Apply on a paused/pending
+            run only rewrites the rds that have settled. Useful for
+            staging the weights before a run finishes. */}
+        {run.status !== "failed" && run.status !== "canceled" && (
           <ScoreWeightsPanel
             runId={runId}
             currentOverride={run.scoring_override ?? null}
             onApplied={reload}
           />
         )}
-        {run.status === "done" && criteriaInRun.length > 0 && (
+        {/* Per-criterion pins panel: visible on every non-failed/non-
+            canceled run, given there's at least one criterion in the
+            run's spec. Pre-`done` you can already see which Run the
+            Job has pinned for each criterion (could be this run or
+            another), and pin/unpin as criteria settle — no need to
+            wait for the whole run to finish. */}
+        {run.status !== "failed" &&
+          run.status !== "canceled" &&
+          criteriaInRun.length > 0 && (
           <div className="rounded-md border border-neutral-200 dark:border-neutral-800 p-3 space-y-2 bg-neutral-50/50 dark:bg-neutral-900/30">
             <button
               type="button"

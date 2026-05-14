@@ -24,6 +24,7 @@ const SECTIONS: { title: string; items: { slug: string; title: string }[] }[] = 
       { slug: "run", title: "Страница запуска" },
       { slug: "domain", title: "Страница домена" },
       { slug: "database", title: "База" },
+      { slug: "banlist", title: "Ban List" },
       { slug: "errors", title: "Ошибки" },
       { slug: "settings", title: "Настройки" },
     ],

@@ -117,6 +117,10 @@ export type AvailabilitySettings = {
   availability__cache_ttl_hours: string;
   availability__skip_registered: string;
   availability__skip_horizon_days: string;
+  // Retention prune (added 2026-05-14). Strings to match the rest of
+  // the settings shape; 0 in either field disables that cap.
+  availability__retention_days: string;
+  availability__per_domain_keep: string;
 };
 
 export type IntegrationStatus = {
@@ -476,6 +480,37 @@ export type RunStatus = {
   reanalyzing: boolean;
 };
 
+// Slim per-tick poll companion to RunDetail (added 2026-05-14). Carries
+// only the live fields — status pills, criteria/ai_status enums,
+// reanalyzing flag, last_analyzed_at. The Run page overlays this onto
+// the last full snapshot and auto-fires a full reload whenever a status
+// transition is detected so the expensive columns (language / theme /
+// category / final score) stay current without per-tick recomputation.
+export type RunDomainProgressSlim = {
+  id: number;
+  status: string;
+  criteria: Record<string, string>;
+  ai_status: Record<string, string>;
+  reanalyzing: boolean;
+  last_analyzed_at: string | null;
+};
+
+export type RunProgress = {
+  run_id: number;
+  status: "pending" | "running" | "done" | "failed" | "canceled" | "paused";
+  started_at: string | null;
+  finished_at: string | null;
+  error: string;
+  counts: {
+    total: number;
+    done: number;
+    failed: number;
+    running: number;
+    pending: number;
+  };
+  domains: RunDomainProgressSlim[];
+};
+
 export type JobsListItem = {
   id: number;
   name: string;
@@ -823,6 +858,16 @@ export type DatabaseDomainRow = {
   final_confidence: number | null;
   final_bucket: string;
   final_partial: boolean;
+  // 2026-05-14 split. `final_failed` = an enabled criterion failed at
+  // AI synth time (red badge). `final_underweight` = weight>0 criterion
+  // is missing from the pinned set (amber subset badge). `final_partial`
+  // remains as the OR for back-compat. Server-side default is false on
+  // both so a missing field reads as "not failed/underweight".
+  final_failed?: boolean;
+  final_underweight?: boolean;
+  // Weighted criteria NOT in pinned_criteria — populated when
+  // final_underweight is true so the UI tooltip can say "missing: D, A".
+  missing_weighted_criteria?: string[];
   // Sorted list of criterion names contributing to this row's view
   // (added 2026-05-12). Empty when no criterion is pinned. The UI
   // surfaces it as a "Partial — based on W, B" hint on the FinalBanner.
@@ -881,7 +926,13 @@ export type BanRow = {
 };
 
 export type BanListResponse = {
+  // Server-paginated since 2026-05-14. `total` = unfiltered ban count;
+  // `filtered_total` = count after `search` is applied. `page`/
+  // `per_page` echo the inputs.
   total: number;
+  filtered_total: number;
+  page: number;
+  per_page: number;
   rows: BanRow[];
 };
 
@@ -1151,6 +1202,16 @@ export const api = {
   getRunStatus: (runId: number) =>
     request<RunStatus>(`/runs/${runId}/status`),
 
+  // Slim per-tick poll companion to getRun (added 2026-05-14). Returns
+  // only the live fields — status pills, criteria/ai_status enums,
+  // reanalyzing flag, last_analyzed_at. The expensive parsed columns
+  // (language / theme / category / final score) still come from the
+  // full /runs/{id} payload; the polling loop overlays slim updates
+  // on top of the last full snapshot and auto-fires a full reload
+  // whenever a status transition is detected.
+  getRunProgress: (runId: number) =>
+    request<RunProgress>(`/runs/${runId}/progress`),
+
   // SSE URL for live run status — frontend can subscribe via:
   //   const es = new EventSource(api.runEventsUrl(123));
   //   es.onmessage = (e) => setStatus(JSON.parse(e.data));
@@ -1254,7 +1315,14 @@ export const api = {
   // `/banlist` prefix; the bulk-ban-from-Database action lives under
   // `/database/domains/bulk-ban` because that endpoint composes pin
   // resolution from the Database side.
-  listBans: () => request<BanListResponse>(`/banlist`),
+  listBans: (params?: { page?: number; per_page?: number; search?: string }) => {
+    const q = new URLSearchParams();
+    if (params?.page) q.set("page", String(params.page));
+    if (params?.per_page) q.set("per_page", String(params.per_page));
+    if (params?.search) q.set("search", params.search);
+    const qs = q.toString();
+    return request<BanListResponse>(`/banlist${qs ? `?${qs}` : ""}`);
+  },
 
   addBans: (rows: { domain: string; note?: string }[]) =>
     request<BanAddBulkResult>(`/banlist`, {
@@ -1648,6 +1716,30 @@ export const api = {
     request<{ deleted: number }>(`/backlog/bulk-delete`, {
       method: "POST",
       body: JSON.stringify({ ids }),
+    }),
+
+  // Delete every row matching the given filters (no pagination — works
+  // across the entire filtered set). Mirrors bulkBacklogStatusFiltered.
+  bulkBacklogDeleteFiltered: (filters: {
+    search?: string;
+    status?: BacklogStatus[];
+    registrar?: string[];
+    expiry_from?: string;
+    expiry_to?: string;
+  }) =>
+    request<{ deleted: number }>(`/backlog/bulk-delete-filtered`, {
+      method: "POST",
+      body: JSON.stringify({
+        search: filters.search || "",
+        status_filter: filters.status?.length
+          ? filters.status.join(",")
+          : null,
+        registrar: filters.registrar?.length
+          ? filters.registrar.join(",")
+          : null,
+        expiry_from: filters.expiry_from || null,
+        expiry_to: filters.expiry_to || null,
+      }),
     }),
 
   // Backlog rows whose domain has been analyzed elsewhere but the

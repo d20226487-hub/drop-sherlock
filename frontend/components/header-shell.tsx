@@ -5,20 +5,18 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { LanguageToggle } from "@/components/language-toggle";
 import { useT } from "@/lib/i18n";
 
-// Database nav hover-menu (added 2026-05-13 wave L; switched from
-// click-dropdown to hover 2026-05-14 wave N because the button-based
-// trigger was perturbing the flex-row baseline and shifting siblings
-// upward). Trigger is now a plain <Link> to /database so default
-// click-through behavior is preserved (matches every other nav item
-// in shape and height); the menu opens on hover.
+// Database nav menu. History: started as click-dropdown (wave L), moved
+// to hover (wave N — button trigger was shifting the flex baseline),
+// now hybrid (2026-05-14): plain <Link> trigger for navigation +
+// adjacent chevron BUTTON that toggles the menu on click. Hover still
+// opens it for mouse users; the chevron makes touch + keyboard work.
+// Outside-click closes.
 function DatabaseDropdown() {
   const { t } = useT();
   const ts = t.nav.databaseDropdown;
   const [open, setOpen] = useState(false);
-  // Tiny close-delay so the cursor can travel from trigger to menu
-  // without the menu vanishing. 120ms is short enough to feel
-  // responsive and long enough to cover the gap.
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
 
   const openNow = () => {
     if (closeTimer.current) {
@@ -27,6 +25,15 @@ function DatabaseDropdown() {
     }
     setOpen(true);
   };
+  const closeNow = () => {
+    if (closeTimer.current) {
+      clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+    setOpen(false);
+  };
+  // 120ms hover-leave grace so the cursor can travel from trigger to
+  // menu without the menu vanishing.
   const closeLater = () => {
     if (closeTimer.current) clearTimeout(closeTimer.current);
     closeTimer.current = setTimeout(() => {
@@ -35,18 +42,25 @@ function DatabaseDropdown() {
     }, 120);
   };
 
-  // Keyboard fallback: Escape closes immediately (otherwise a hover
-  // user who tab-navigated here has no escape hatch).
+  // Escape closes immediately; outside-click closes too (click outside
+  // is the universal "dismiss" expectation for click-opened menus).
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
     };
+    const onClick = (e: MouseEvent) => {
+      if (!wrapperRef.current) return;
+      if (!wrapperRef.current.contains(e.target as Node)) setOpen(false);
+    };
     document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onClick);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onClick);
+    };
   }, [open]);
 
-  // Cleanup the timer if the component unmounts mid-delay.
   useEffect(() => {
     return () => {
       if (closeTimer.current) clearTimeout(closeTimer.current);
@@ -55,20 +69,27 @@ function DatabaseDropdown() {
 
   return (
     <div
-      className="relative"
+      ref={wrapperRef}
+      className="relative inline-flex items-center gap-0.5"
       onMouseEnter={openNow}
       onMouseLeave={closeLater}
-      onFocus={openNow}
-      onBlur={closeLater}
     >
       <Link
         href="/database"
         className="hover:text-neutral-900 dark:hover:text-neutral-100"
-        aria-haspopup="menu"
-        aria-expanded={open}
       >
         {ts.label}
       </Link>
+      <button
+        type="button"
+        onClick={() => (open ? closeNow() : openNow())}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={ts.toggleAria}
+        className="leading-none px-0.5 -my-1 text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 rounded"
+      >
+        <span aria-hidden className="text-[0.7em] select-none">▾</span>
+      </button>
       {open && (
         <div
           className="absolute left-0 top-full pt-1 min-w-[12rem] z-20"
@@ -77,6 +98,7 @@ function DatabaseDropdown() {
           <div className="rounded-md border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 shadow-lg">
             <Link
               href="/database"
+              onClick={closeNow}
               className="block px-3 py-2 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800 first:rounded-t-md"
               role="menuitem"
             >
@@ -84,6 +106,7 @@ function DatabaseDropdown() {
             </Link>
             <Link
               href="/banlist"
+              onClick={closeNow}
               className="block px-3 py-2 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800 last:rounded-b-md border-t border-neutral-200 dark:border-neutral-800"
               role="menuitem"
             >

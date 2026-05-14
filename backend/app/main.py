@@ -100,6 +100,10 @@ def _migrate_sqlite_columns() -> None:
         # translated `key_findings` + `red_flags` arrays. Same
         # endpoint populates both.
         ("criterion_results", "ai_verdict_ru_json", "TEXT DEFAULT ''"),
+        # Backlog snapshot captured at ban time (added 2026-05-14).
+        # JSON dict of the BacklogDomain fields, or "" when the banned
+        # domain had no Backlog row. Used to restore the row on unban.
+        ("domain_bans", "backlog_snapshot_json", "TEXT DEFAULT ''"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding
@@ -504,6 +508,65 @@ async def lifespan(_: FastAPI):
         replace_existing=True,
     )
 
+    # Retention prune for `availability_checks` (added 2026-05-14). The
+    # cascade writes 1+ row per check; without retention the table grows
+    # forever and DB backups balloon. Two compounding caps configurable
+    # via Settings → Domain Availability. The job runs once at boot
+    # (catches up any drift from a long-stopped instance) and then on
+    # the same 24h cadence as the error prune. Idempotent.
+    from .app_settings import (
+        get_availability_per_domain_keep,
+        get_availability_retention_days,
+    )
+    from .availability.retention import prune_availability_checks
+
+    def _scheduled_availability_prune() -> None:
+        days = get_availability_retention_days()
+        per_dom = get_availability_per_domain_keep()
+        if days == 0 and per_dom == 0:
+            return  # both caps disabled → no-op
+        db = SessionLocal()
+        try:
+            result = prune_availability_checks(
+                db, retention_days=days, per_domain_keep=per_dom,
+            )
+            if (
+                result["deleted_by_age"] > 0
+                or result["deleted_by_per_domain"] > 0
+            ):
+                # Single commit per run; the helper doesn't commit.
+                db.commit()
+            else:
+                db.rollback()
+        except Exception:
+            db.rollback()
+            import logging
+            logging.getLogger(__name__).exception(
+                "scheduled availability_checks prune failed"
+            )
+        finally:
+            db.close()
+
+    # One-shot at boot — covers the case where the container was down
+    # past the daily cadence (e.g., a host reboot) or this is the first
+    # boot after the retention feature shipped (catches up the historical
+    # accumulation in one pass).
+    try:
+        _scheduled_availability_prune()
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "boot availability_checks prune failed"
+        )
+
+    sched.add_job(
+        _scheduled_availability_prune,
+        "interval",
+        hours=24,
+        id="prune_availability_checks",
+        replace_existing=True,
+    )
+
     # Prompt audit: flag customized prompts that still reference Ahrefs
     # columns we've since dropped from AI_FIELD_TRIM. Non-fatal — emits
     # WARNING per stale reference for the operator to act on.
@@ -523,6 +586,43 @@ async def lifespan(_: FastAPI):
             "interval",
             hours=_backups.BACKUP_INTERVAL_HOURS,
             id="db_backup",
+            replace_existing=True,
+        )
+
+        # Monthly VACUUM (added 2026-05-14). Reclaims free pages that
+        # the various delete paths leave behind. Runs at 03:30 UTC on
+        # the 1st of each month — after midnight UTC so the nightly
+        # backup (default 00:00 UTC on a 24h interval) has comfortably
+        # finished, but still in the low-traffic window. Skips when:
+        #   - the per-call Settings toggle says off, OR
+        #   - filesystem free < 2x DB size (disk guard), OR
+        #   - the maintenance lock is held by another job.
+        # All gates are inside try_vacuum() so this wrapper just dispatches.
+        from .app_settings import get_vacuum_enabled
+        from .db_maintenance import try_vacuum
+
+        def _scheduled_vacuum() -> None:
+            if not get_vacuum_enabled():
+                import logging
+                logging.getLogger(__name__).info(
+                    "monthly VACUUM skipped: disabled in Settings"
+                )
+                return
+            try:
+                try_vacuum()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "scheduled VACUUM dispatcher failed"
+                )
+
+        sched.add_job(
+            _scheduled_vacuum,
+            "cron",
+            day=1,
+            hour=3,
+            minute=30,
+            id="db_vacuum",
             replace_existing=True,
         )
 

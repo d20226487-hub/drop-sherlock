@@ -11,6 +11,7 @@ redirect, and the passive 'were-analyzed' hint come in later phases.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 from datetime import date, datetime
@@ -28,8 +29,14 @@ from ..app_settings import (
     get_import_max_rows,
     set_import_max_rows,
 )
-from ..db import get_db
-from ..models import BACKLOG_STATUSES, BacklogDomain, Run, RunDomain
+from ..db import SessionLocal, get_db
+from ..models import (
+    BACKLOG_STATUSES,
+    BacklogDomain,
+    JobCriterionPin,
+    Run,
+    RunDomain,
+)
 
 router = APIRouter(prefix="/backlog", tags=["backlog"])
 
@@ -190,13 +197,21 @@ SORTABLE = {
 def _resolve_analyzed_links(
     db: Session, domains: list[str],
 ) -> dict[str, tuple[int, int, int]]:
-    """For each domain in `domains` with a manually-pinned definitive
-    RunDomain, return (run_domain_id, run_id, job_id). Domains with done
-    RunDomains but no pin get NO link — matches the Database page's
-    "pin = canonical, unpinned = blank" semantics (locked 2026-05-08).
+    """For each backlog domain, return the (run_domain_id, run_id, job_id)
+    we should deep-link to from the Backlog row's domain cell. Migrated
+    2026-05-14 to read from JobCriterionPin instead of the legacy
+    RunDomain.is_pinned column (which the pin endpoints no longer
+    write). Strategy:
 
-    At-most-one pin per domain is enforced at the pin endpoints, so a
-    plain JOIN on is_pinned=True returns one row per analyzed domain."""
+      1. Find every JobCriterionPin whose pinned Run contains a
+         RunDomain for one of these domains.
+      2. Among those, pick the pin with the largest `updated_at` per
+         domain — that's "the most recently asserted truth."
+      3. Resolve the corresponding RunDomain id for the deep-link.
+
+    Domains with no JobCriterionPin pointing at any of their runs
+    receive no link (matches the old "unpinned = blank" semantic).
+    """
     if not domains:
         return {}
     rows = (
@@ -205,13 +220,25 @@ def _resolve_analyzed_links(
             RunDomain.id,
             RunDomain.run_id,
             Run.job_id,
+            JobCriterionPin.updated_at,
         )
         .join(Run, Run.id == RunDomain.run_id)
-        .filter(RunDomain.is_pinned == True)  # noqa: E712
+        .join(
+            JobCriterionPin,
+            (JobCriterionPin.run_id == Run.id)
+            & (JobCriterionPin.job_id == Run.job_id),
+        )
         .filter(RunDomain.domain.in_(domains))
         .all()
     )
-    return {dom: (rd_id, run_id, job_id) for dom, rd_id, run_id, job_id in rows}
+    # Pick the most-recently-updated pin per domain. Sort then dict-build
+    # (small enough to be cheap; max ~hundreds of rows per page).
+    rows.sort(key=lambda r: (r[0], r[4] or 0), reverse=True)
+    out: dict[str, tuple[int, int, int]] = {}
+    for dom, rd_id, run_id, job_id, _ in rows:
+        if dom not in out:
+            out[dom] = (rd_id, run_id, job_id)
+    return out
 
 
 def _apply_sort(q, sort: str | None, direction: str | None):
@@ -238,7 +265,6 @@ def _apply_sort(q, sort: str | None, direction: str | None):
 
 # --- Endpoints --------------------------------------------------------------
 
-@router.get("", response_model=BacklogListResponse)
 def list_backlog(
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=500),
@@ -258,7 +284,10 @@ def list_backlog(
     db: Session = Depends(get_db),
 ) -> BacklogListResponse:
     """Server-paginated list. Filters compose with AND across kinds; OR
-    inside each multi-select kind."""
+    inside each multi-select kind.
+
+    Sync impl. The async route (`_list_backlog_route`) wraps this in
+    asyncio.to_thread."""
     statuses = _parse_status_csv(status)
     registrars_filter = _parse_registrar_csv(registrar)
 
@@ -322,6 +351,69 @@ def list_backlog(
         registrars=registrar_options,
         statuses=list(BACKLOG_STATUSES),
     )
+
+
+@router.get("", response_model=BacklogListResponse)
+async def _list_backlog_route(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=500),
+    search: str = "",
+    status: str | None = None,
+    registrar: str | None = None,
+    expiry_from: date | None = None,
+    expiry_to: date | None = None,
+    sort: str | None = None,
+    direction: str | None = None,
+    include_options: bool = Query(True),
+) -> BacklogListResponse:
+    """Async wrapper for `list_backlog`. The DB-bound work (filter
+    counts, paged read, registrar DISTINCT, analyzed-links lookup)
+    runs in an executor thread so the event loop stays responsive
+    even when /backlog is hit concurrently."""
+    return await asyncio.to_thread(
+        _run_list_backlog,
+        page,
+        per_page,
+        search,
+        status,
+        registrar,
+        expiry_from,
+        expiry_to,
+        sort,
+        direction,
+        include_options,
+    )
+
+
+def _run_list_backlog(
+    page: int,
+    per_page: int,
+    search: str,
+    status: str | None,
+    registrar: str | None,
+    expiry_from: date | None,
+    expiry_to: date | None,
+    sort: str | None,
+    direction: str | None,
+    include_options: bool,
+) -> BacklogListResponse:
+    db = SessionLocal()
+    try:
+        return list_backlog(
+            page=page,
+            per_page=per_page,
+            search=search,
+            status=status,
+            registrar=registrar,
+            expiry_from=expiry_from,
+            expiry_to=expiry_to,
+            sort=sort,
+            direction=direction,
+            include_options=include_options,
+            db=db,
+        )
+    finally:
+        db.close()
 
 
 class UpdateRowIn(BaseModel):
@@ -476,10 +568,18 @@ def analyzed_pending(db: Session = Depends(get_db)) -> dict:
     domain only "counts as analyzed" once the user has pinned a
     definitive run for it). Done-but-unpinned domains don't fire the
     hint. Returns the row ids so the frontend can hand them straight to
-    bulk-status without re-querying."""
+    bulk-status without re-querying.
+
+    Migrated 2026-05-14: reads pin-state from JobCriterionPin instead of
+    the legacy RunDomain.is_pinned column."""
     pinned_domains_subq = (
         db.query(distinct(RunDomain.domain))
-        .filter(RunDomain.is_pinned == True)  # noqa: E712
+        .join(Run, Run.id == RunDomain.run_id)
+        .join(
+            JobCriterionPin,
+            (JobCriterionPin.run_id == Run.id)
+            & (JobCriterionPin.job_id == Run.job_id),
+        )
         .subquery()
     )
     rows = (
@@ -616,6 +716,34 @@ def bulk_delete(payload: BulkDeleteIn, db: Session = Depends(get_db)) -> dict:
     )
     db.commit()
     return {"deleted": n}
+
+
+class BulkDeleteFilteredIn(BaseModel):
+    """Bulk delete scoped by the same filters as the list endpoint. Lets
+    the user say "delete every row matching this registrar+status filter"
+    without first selecting page-by-page. Mirrors BulkStatusFilteredIn."""
+    search: str = ""
+    status_filter: str | None = None
+    registrar: str | None = None
+    expiry_from: date | None = None
+    expiry_to: date | None = None
+
+
+@router.post("/bulk-delete-filtered")
+def bulk_delete_filtered(
+    payload: BulkDeleteFilteredIn, db: Session = Depends(get_db),
+) -> dict:
+    q = _apply_backlog_filters(
+        db.query(BacklogDomain),
+        search=payload.search,
+        statuses=_parse_status_csv(payload.status_filter),
+        registrars_filter=_parse_registrar_csv(payload.registrar),
+        expiry_from=payload.expiry_from,
+        expiry_to=payload.expiry_to,
+    )
+    n = q.delete(synchronize_session=False)
+    db.commit()
+    return {"deleted": int(n)}
 
 
 def _normalize_domain(raw: str) -> str:

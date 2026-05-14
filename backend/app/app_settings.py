@@ -920,6 +920,34 @@ AVAILABILITY_DEFAULTS: dict[str, str] = {
     # Registered-but-soon-expiring domains still flow through analysis.
     "availability__skip_registered":      "false",
     "availability__skip_horizon_days":    "90",
+    # Retention prune for the `availability_checks` history table
+    # (added 2026-05-14). Two compounding caps applied daily by an
+    # APScheduler job + once at boot:
+    #   - retention_days: delete rows older than N days. 0 = never
+    #     prune by age. Reads as int, "never" sentinel persisted as 0.
+    #   - per_domain_keep: after the age sweep, for each domain that
+    #     still has > M rows, drop the oldest until M remain. 0 =
+    #     no per-domain cap (keep everything within retention window).
+    # Defaults: 30d / 20 rows per domain — bounds the most-recent
+    # check column on the Settings page while leaving a useful audit
+    # trail for "why did the cascade pick provider X for this domain
+    # last week?" questions.
+    "availability__retention_days":       "30",
+    "availability__per_domain_keep":      "20",
+}
+
+# Maintenance toggles (separate namespace from availability__*; these
+# are DB-wide concerns, not provider-specific). Surfaced in Settings
+# alongside the backup config.
+DB_MAINTENANCE_DEFAULTS: dict[str, str] = {
+    # Monthly VACUUM cron (added 2026-05-14). Reclaims free pages left
+    # behind by the various delete paths (retention prunes, bulk
+    # delete-filtered, ban snapshots overwriting Backlog rows). VACUUM
+    # is safe — transactional, no data loss — but takes an exclusive
+    # lock while it runs. The job has its own disk-free guard
+    # (skips if free < 2x DB size) and the shared MAINTENANCE_LOCK
+    # so it never overlaps with a backup. Default ON.
+    "db_maintenance__vacuum_enabled": "true",
 }
 
 # Hardcoded ceiling so a runaway Settings edit can't accidentally hammer
@@ -1061,6 +1089,54 @@ def get_skip_registered_policy() -> dict:
     }
 
 
+# --- Retention prune for availability_checks ------------------------------
+# Both reads clamp to non-negative and apply sane upper bounds — a
+# misconfigured value (left over from a past wider range, or a hostile
+# input that slipped past validation) can't break the prune job.
+AVAILABILITY_RETENTION_DAYS_MAX = 3650  # 10 years — basically "never" without sentinel
+AVAILABILITY_PER_DOMAIN_KEEP_MAX = 10_000
+
+
+def get_availability_retention_days() -> int:
+    """0 = never prune by age. Otherwise N days back from now."""
+    v = _availability_int(
+        "availability__retention_days",
+        int(AVAILABILITY_DEFAULTS["availability__retention_days"]),
+    )
+    return max(0, min(v, AVAILABILITY_RETENTION_DAYS_MAX))
+
+
+def get_availability_per_domain_keep() -> int:
+    """0 = no per-domain cap. Otherwise keep most-recent M rows."""
+    v = _availability_int(
+        "availability__per_domain_keep",
+        int(AVAILABILITY_DEFAULTS["availability__per_domain_keep"]),
+    )
+    return max(0, min(v, AVAILABILITY_PER_DOMAIN_KEEP_MAX))
+
+
+def get_vacuum_enabled() -> bool:
+    """Monthly VACUUM toggle. Default ON. The scheduler reads this on
+    every cron fire so the user can turn it off without a restart."""
+    db = SessionLocal()
+    try:
+        raw = (_get(db, "db_maintenance__vacuum_enabled") or "").strip().lower()
+    finally:
+        db.close()
+    if raw == "":
+        return DB_MAINTENANCE_DEFAULTS["db_maintenance__vacuum_enabled"] == "true"
+    return raw in ("true", "1", "yes", "on")
+
+
+def set_vacuum_enabled(enabled: bool) -> bool:
+    db = SessionLocal()
+    try:
+        _set(db, "db_maintenance__vacuum_enabled", "true" if enabled else "false")
+    finally:
+        db.close()
+    return enabled
+
+
 def set_availability_setting(key: str, value: str) -> None:
     """Validated setter. Raises ValueError on unknown keys or invalid
     values; the route handler turns that into HTTP 400."""
@@ -1098,6 +1174,16 @@ def set_availability_setting(key: str, value: str) -> None:
         if not cleaned:
             raise ValueError("cascade order needs at least one provider")
         value = ",".join(cleaned)
+    elif key == "availability__per_domain_keep":
+        try:
+            n = int(value)
+        except ValueError as e:
+            raise ValueError(f"{key} must be an integer") from e
+        if n < 0:
+            raise ValueError(f"{key} must be ≥ 0 (0 = unlimited)")
+        if n > AVAILABILITY_PER_DOMAIN_KEEP_MAX:
+            n = AVAILABILITY_PER_DOMAIN_KEEP_MAX
+        value = str(n)
     db = SessionLocal()
     try:
         _set(db, key, value)
