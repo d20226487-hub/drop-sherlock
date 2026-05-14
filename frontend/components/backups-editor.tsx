@@ -143,10 +143,193 @@ export function BackupsEditor() {
         onSaved={() => void load()}
       />
 
+      <UploadRestoreSection
+        supported={status.supported}
+        onImported={() => void load()}
+      />
+
       <SnapshotsTable
         snapshots={status.snapshots}
         onRestored={() => void load()}
       />
+    </div>
+  );
+}
+
+// --- Upload an external .db.gz and restore from it ----------------------
+
+function UploadRestoreSection({
+  supported,
+  onImported,
+}: {
+  supported: boolean;
+  onImported: () => void;
+}) {
+  const { t } = useT();
+  const ts = t.pages.settings.backups.upload;
+  const [file, setFile] = useState<File | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [result, setResult] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
+
+  return (
+    <div className="space-y-2 rounded border border-neutral-200 dark:border-neutral-700 p-3">
+      <h3 className="text-sm font-semibold">{ts.heading}</h3>
+      <p className="text-xs text-neutral-600 dark:text-neutral-400">
+        {ts.intro}
+      </p>
+      {result && (
+        <div
+          className={`text-xs px-2 py-1 rounded border ${
+            result.ok
+              ? "border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300"
+              : "border-rose-300 dark:border-rose-700 bg-rose-50 dark:bg-rose-950/40 text-rose-800 dark:text-rose-300"
+          }`}
+        >
+          {result.message}
+        </div>
+      )}
+      <div className="flex items-center gap-2 flex-wrap">
+        <input
+          type="file"
+          accept=".gz,application/gzip,application/x-gzip"
+          disabled={!supported}
+          onChange={(e) => {
+            setResult(null);
+            setFile(e.target.files?.[0] ?? null);
+          }}
+          className="text-xs file:mr-2 file:px-2 file:py-1 file:rounded file:border file:border-neutral-300 dark:file:border-neutral-600 file:bg-white dark:file:bg-neutral-800 file:text-xs"
+        />
+        <button
+          type="button"
+          onClick={() => {
+            setResult(null);
+            setConfirming(true);
+          }}
+          disabled={!file || !supported}
+          className="px-3 py-1.5 text-xs rounded border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/40 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {ts.uploadAndRestore}
+        </button>
+        {file && (
+          <span className="text-[11px] text-neutral-500 dark:text-neutral-400">
+            {file.name} ({formatBytes(file.size)})
+          </span>
+        )}
+      </div>
+      {confirming && file && (
+        <UploadRestoreConfirmModal
+          file={file}
+          onCancel={() => setConfirming(false)}
+          onDone={(r) => {
+            setConfirming(false);
+            setResult(r);
+            if (r.ok) {
+              setFile(null);
+              onImported();
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function UploadRestoreConfirmModal({
+  file,
+  onCancel,
+  onDone,
+}: {
+  file: File;
+  onCancel: () => void;
+  onDone: (result: { ok: boolean; message: string }) => void;
+}) {
+  const { t } = useT();
+  const ts = t.pages.settings.backups.upload;
+  const tr = t.pages.settings.backups.restore;
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function confirm() {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await api.uploadAndRestoreBackup(file);
+      onDone({
+        ok: true,
+        message: ts.successBanner(
+          r.imported_filename,
+          r.prerestore_snapshot,
+        ),
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !busy) onCancel();
+      }}
+    >
+      <div className="max-w-md w-full mx-4 rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 shadow-xl p-4 space-y-3">
+        <h3 className="text-sm font-semibold text-amber-700 dark:text-amber-400">
+          {ts.modalTitle}
+        </h3>
+        <div className="text-xs text-neutral-700 dark:text-neutral-300 space-y-1">
+          <div>
+            <span className="text-neutral-500">{tr.fileLabel}:</span>{" "}
+            <code className="font-mono break-all">{file.name}</code>
+          </div>
+          <div>
+            <span className="text-neutral-500">{tr.sizeLabel}:</span>{" "}
+            {formatBytes(file.size)}
+          </div>
+        </div>
+        <div className="text-xs text-neutral-600 dark:text-neutral-300 leading-snug border-l-4 border-amber-400 pl-2 py-1 bg-amber-50/40 dark:bg-amber-950/20">
+          {ts.warning}
+        </div>
+        <label className="flex items-start gap-2 text-xs text-neutral-700 dark:text-neutral-300 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={acknowledged}
+            onChange={(e) => setAcknowledged(e.target.checked)}
+            disabled={busy}
+            className="mt-0.5"
+          />
+          <span>{tr.ackLabel}</span>
+        </label>
+        {error && (
+          <div className="text-xs text-rose-600 dark:text-rose-400 break-words">
+            {ts.failPrefix}: {error}
+          </div>
+        )}
+        <div className="flex items-center justify-end gap-2 pt-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            className="text-xs px-3 py-1.5 rounded border border-neutral-300 dark:border-neutral-600 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+          >
+            {t.common.cancel}
+          </button>
+          <button
+            type="button"
+            onClick={confirm}
+            disabled={!acknowledged || busy}
+            className="text-xs px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {busy ? ts.uploading : ts.uploadAndRestore}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

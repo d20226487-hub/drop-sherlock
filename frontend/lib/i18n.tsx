@@ -1056,6 +1056,19 @@ const messagesEn = {
           prerestoreHint:
             "Safety snapshot taken automatically right before a restore. Exempt from auto-rotation.",
         },
+        upload: {
+          heading: "Import backup from file",
+          intro:
+            "Upload a .db.gz snapshot from your computer and restore the live database from it. The uploaded file is saved into the snapshots directory (so it shows up in the list below and can be re-restored later) and counts toward the rotation retention. A pre-restore safety snapshot of the current database is still taken automatically — the action is recoverable.",
+          uploadAndRestore: "Upload & restore",
+          uploading: "Uploading…",
+          modalTitle: "Restore database from uploaded file",
+          warning:
+            "This replaces the entire current database with the uploaded snapshot's contents. The action is recoverable — a safety snapshot of the current state is taken automatically right before the restore. Restore is refused while any run is in flight (pause or cancel running runs first).",
+          successBanner: (imported: string, prerestore: string) =>
+            `Restored from uploaded file (saved as ${imported}). A pre-restore safety snapshot was saved as ${prerestore} — restore that one to undo.`,
+          failPrefix: "Upload-restore failed",
+        },
         remote: {
           heading: "Remote upload (S3-compatible)",
           intro:
@@ -2693,6 +2706,19 @@ const messagesRu: Messages = {
           prerestoreBadge: "страховочный",
           prerestoreHint:
             "Страховочный снимок, созданный автоматически перед восстановлением. Не подлежит автоудалению.",
+        },
+        upload: {
+          heading: "Импорт бэкапа из файла",
+          intro:
+            "Загрузите снимок .db.gz с вашего компьютера и восстановите рабочую базу из него. Загруженный файл сохраняется в каталог снимков (появится в списке ниже и сможет быть восстановлен повторно), учитывается ротацией. Страховочный снимок текущей базы создаётся автоматически — операция обратима.",
+          uploadAndRestore: "Загрузить и восстановить",
+          uploading: "Загрузка…",
+          modalTitle: "Восстановление базы из загруженного файла",
+          warning:
+            "Это полностью заменит текущую базу содержимым загруженного снимка. Операция обратима — прямо перед восстановлением создаётся страховочный снимок текущего состояния. Восстановление отклоняется, пока есть незавершённые запуски (сначала поставьте на паузу или отмените их).",
+          successBanner: (imported, prerestore) =>
+            `Восстановлено из загруженного файла (сохранён как ${imported}). Страховочный снимок текущего состояния сохранён как ${prerestore} — восстановите его, чтобы откатить.`,
+          failPrefix: "Импорт/восстановление не удалось",
         },
         remote: {
           heading: "Удалённая загрузка (S3-совместимо)",

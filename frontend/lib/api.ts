@@ -1913,6 +1913,32 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ filename }),
     }),
+
+  // Upload a local .db.gz and immediately restore from it. Bypasses
+  // the JSON `request()` wrapper because file uploads need multipart
+  // and the browser must set the Content-Type with the boundary.
+  uploadAndRestoreBackup: async (file: File): Promise<{
+    imported_filename: string;
+    imported_size_bytes: number;
+    restored_from: string;
+    prerestore_snapshot: string;
+    prerestore_size_bytes: number;
+  }> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch(`${BASE}/backups/upload-restore`, {
+      method: "POST",
+      body: fd,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw Object.assign(new Error(body || `HTTP ${res.status}`), {
+        status: res.status,
+        body,
+      });
+    }
+    return res.json();
+  },
 };
 
 export type BackupSnapshot = {

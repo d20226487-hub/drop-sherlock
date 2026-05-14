@@ -29,6 +29,7 @@ import shutil
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from io import BytesIO as io_BytesIO
 from pathlib import Path
 
 from .config import settings
@@ -283,6 +284,105 @@ def scheduled_backup() -> None:
 #
 # Always takes a `prerestore` snapshot of the CURRENT state first, so
 # restoring the wrong file is recoverable in one more click.
+
+def import_uploaded_snapshot(file_bytes: bytes) -> dict:
+    """Validate an uploaded .db.gz blob, save it under BACKUP_DIR with a
+    fresh timestamp-based filename, and return the snapshot metadata.
+
+    Validation:
+      * gzip magic bytes (0x1f 0x8b) on the raw blob
+      * after gunzip, the first 16 bytes are SQLite's header
+        ("SQLite format 3\\0"). We decompress to a temp file first so a
+        malformed/huge gzip bomb is caught before it touches the live
+        snapshots dir.
+
+    The caller is expected to follow up with `restore_from_snapshot()` on
+    the returned filename. We keep the saved file (counts toward rotation
+    retention like any other snapshot) so the user can see the imported
+    archive in the snapshots list and re-restore later if needed.
+    """
+    if len(file_bytes) < 2 or file_bytes[:2] != b"\x1f\x8b":
+        raise RuntimeError(
+            "uploaded file is not a gzip archive (expected .db.gz). "
+            "Header bytes did not match the gzip magic (1f 8b)."
+        )
+
+    _ensure_dir()
+    import tempfile
+    fd, tmp_name = tempfile.mkstemp(
+        prefix="upload-", suffix=".db", dir=str(BACKUP_DIR)
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        try:
+            with gzip.open(io_BytesIO(file_bytes), "rb") as fin, open(tmp_path, "wb") as fout:
+                shutil.copyfileobj(fin, fout, length=1024 * 1024)
+        except (OSError, EOFError) as e:
+            raise RuntimeError(f"failed to decompress upload: {e}") from e
+
+        # SQLite file header check — first 16 bytes are the literal
+        # string "SQLite format 3" followed by a null byte. A correctly
+        # gzipped backup written by run_backup() satisfies this; anything
+        # else (random gzipped file, encrypted DB, page-corrupted file
+        # cut off before the header) does not.
+        with open(tmp_path, "rb") as f:
+            header = f.read(16)
+        if header != b"SQLite format 3\x00":
+            raise RuntimeError(
+                "decompressed file is not a SQLite database "
+                "(header did not match 'SQLite format 3\\0'). "
+                "Make sure you are uploading a snapshot produced by Drop "
+                "Sherlock's backup feature (drop_sherlock-*.db.gz)."
+            )
+
+        # Generate a fresh snapshot filename. We intentionally do NOT
+        # preserve the original filename's timestamp — using "now" keeps
+        # the rotation order intuitive (newly-imported file is newest)
+        # and avoids collisions if the user re-imports the same file.
+        # On the rare same-second collision, advance the timestamp by 1s
+        # until free so the filename keeps matching _FILENAME_RE (a `-N`
+        # suffix would make list_snapshots ignore the file).
+        from datetime import timedelta
+        when = datetime.now(timezone.utc)
+        out_name = _snapshot_filename(when)
+        out_path = BACKUP_DIR / out_name
+        bumps = 0
+        while out_path.exists() and bumps < 60:
+            when = when + timedelta(seconds=1)
+            out_name = _snapshot_filename(when)
+            out_path = BACKUP_DIR / out_name
+            bumps += 1
+        if out_path.exists():
+            raise RuntimeError(
+                "could not pick a unique snapshot filename — too many "
+                "imports in the same minute"
+            )
+
+        # Write the gzipped bytes verbatim — the upload IS already a
+        # valid .db.gz (we just validated it), so re-gzipping would only
+        # waste CPU and change the file digest.
+        with open(out_path, "wb") as f:
+            f.write(file_bytes)
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+    size_bytes = out_path.stat().st_size
+    pruned = _prune(BACKUP_KEEP)
+    log.info(
+        "imported uploaded snapshot: %s (%d bytes); pruned %d old snapshot(s)",
+        out_path, size_bytes, pruned,
+    )
+    return {
+        "filename": out_name,
+        "size_bytes": size_bytes,
+        "created_at": when.isoformat(),
+        "pruned": pruned,
+    }
+
 
 def restore_from_snapshot(filename: str) -> dict:
     """Replace the live DB with the contents of `filename` (which must
