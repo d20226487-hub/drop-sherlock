@@ -268,6 +268,18 @@ function CriterionShell({
 }) {
   const { t } = useT();
   const ts = t.pages.analyze;
+  // Disabled cards collapse to header-only by default (added 2026-05-14
+  // wave M). When the user toggles a card on, it auto-expands; toggling
+  // off auto-collapses. The chevron lets the user manually peek inside
+  // a disabled card without flipping the on/off — useful when cloning a
+  // job spec and verifying knobs before enabling. The useEffect below
+  // is the auto-sync; setOpen inside the chevron handler short-circuits
+  // it for the manual-peek case.
+  const [open, setOpen] = useState(enabled);
+  useEffect(() => {
+    setOpen(enabled);
+  }, [enabled]);
+
   return (
     <section
       className={`rounded-lg border dark:border-neutral-800 p-5 space-y-4 transition-opacity ${
@@ -277,7 +289,20 @@ function CriterionShell({
       }`}
     >
       <header className="flex items-center justify-between gap-3">
-        <h3 className="font-semibold">{title}</h3>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="flex items-center gap-2 text-left flex-1 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 rounded-sm"
+        >
+          <span
+            className="text-xs text-neutral-500 dark:text-neutral-400 select-none"
+            aria-hidden
+          >
+            {open ? "▾" : "▸"}
+          </span>
+          <h3 className="font-semibold">{title}</h3>
+        </button>
         <label className="inline-flex items-center gap-2 cursor-pointer select-none">
           <input
             type="checkbox"
@@ -291,25 +316,29 @@ function CriterionShell({
         </label>
       </header>
 
-      <div className="grid grid-cols-[auto,1fr] items-center gap-x-3 gap-y-2 text-sm">
-        <label className="text-neutral-600 dark:text-neutral-400">
-          {ts.fields.limit}
-        </label>
-        <input
-          type="number"
-          min={1}
-          max={limitMax}
-          value={limit}
-          onChange={(e) => {
-            const n = parseInt(e.target.value, 10);
-            if (!Number.isNaN(n)) onLimitChange(n);
-          }}
-          disabled={!enabled}
-          className="w-28 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-blue-500/40 disabled:opacity-50"
-        />
-      </div>
+      {open && (
+        <>
+          <div className="grid grid-cols-[auto,1fr] items-center gap-x-3 gap-y-2 text-sm">
+            <label className="text-neutral-600 dark:text-neutral-400">
+              {ts.fields.limit}
+            </label>
+            <input
+              type="number"
+              min={1}
+              max={limitMax}
+              value={limit}
+              onChange={(e) => {
+                const n = parseInt(e.target.value, 10);
+                if (!Number.isNaN(n)) onLimitChange(n);
+              }}
+              disabled={!enabled}
+              className="w-28 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-blue-500/40 disabled:opacity-50"
+            />
+          </div>
 
-      {enabled && children}
+          {enabled && children}
+        </>
+      )}
     </section>
   );
 }
@@ -1112,9 +1141,27 @@ export function WaybackClassifyCard({
   const ts = t.pages.analyze.waybackClassify;
   const willAutoEnable =
     cfg.enabled && (!waybackEnabled || !waybackSamplingEnabled);
+  // Same collapse-when-disabled treatment as `CriterionShell` (added
+  // 2026-05-14 wave M). Default state mirrors `cfg.enabled`; auto-syncs
+  // when the user toggles, but the chevron lets them peek inside a
+  // disabled card without flipping the on/off.
+  const [open, setOpen] = useState(cfg.enabled);
+  useEffect(() => {
+    setOpen(cfg.enabled);
+  }, [cfg.enabled]);
+
   return (
     <div className="rounded-md border dark:border-neutral-700 p-4 bg-white dark:bg-neutral-900/60 space-y-3">
       <div className="flex items-center gap-2 flex-wrap">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="flex items-center gap-1 text-xs text-neutral-500 dark:text-neutral-400 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 rounded-sm select-none"
+          aria-label={open ? "collapse" : "expand"}
+        >
+          {open ? "▾" : "▸"}
+        </button>
         <label className="flex items-center gap-2 text-sm font-medium">
           <input
             type="checkbox"
@@ -1127,6 +1174,8 @@ export function WaybackClassifyCard({
           {ts.aiOnlyBadge}
         </span>
       </div>
+      {open && (
+        <>
       <p className="text-xs text-neutral-500 dark:text-neutral-400">
         {ts.intro}
       </p>
@@ -1160,6 +1209,8 @@ export function WaybackClassifyCard({
               {ts.autoEnableNote}
             </div>
           )}
+        </>
+      )}
         </>
       )}
     </div>
