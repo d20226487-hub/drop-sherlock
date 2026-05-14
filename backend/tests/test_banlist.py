@@ -330,6 +330,51 @@ def test_analyze_submit_400_when_every_domain_banned(fresh_db):
 # --- Database row exposure -------------------------------------------------
 
 
+def test_backlog_delete_does_not_remove_ban(fresh_db):
+    """The two tables are independent (no FK, no cascade). Deleting a
+    BacklogDomain row must NEVER touch the corresponding DomainBan row.
+    Pinned by this test so a future "convenience cascade" refactor
+    can't quietly break the invariant."""
+    from app.models import BacklogDomain, DomainBan
+
+    # Set up: one domain that's both in the backlog AND on the ban list.
+    fresh_db.add(BacklogDomain(
+        domain="dual.kz",
+        status="discarded",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    ))
+    _ban(fresh_db, "dual.kz", note="permanent")
+    fresh_db.commit()
+    backlog_id = (
+        fresh_db.query(BacklogDomain)
+        .filter(BacklogDomain.domain == "dual.kz")
+        .one()
+        .id
+    )
+
+    # Delete via the bulk-delete endpoint (the only delete path).
+    client = _client()
+    r = client.post(
+        "/backlog/bulk-delete",
+        auth=("admin", "changeme"),
+        json={"ids": [backlog_id]},
+    )
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 1
+
+    # Backlog row gone — ban survives.
+    fresh_db.expire_all()
+    assert fresh_db.query(BacklogDomain).filter(
+        BacklogDomain.domain == "dual.kz",
+    ).count() == 0
+    ban = fresh_db.query(DomainBan).filter(
+        DomainBan.domain == "dual.kz",
+    ).one_or_none()
+    assert ban is not None, "DomainBan was removed when BacklogDomain was deleted"
+    assert ban.note == "permanent"  # the original note survives unchanged
+
+
 def test_database_domains_exposes_is_banned(fresh_db):
     """A row whose domain is on the ban list should come back from
     /database/domains with is_banned=True (drives the row badge)."""
