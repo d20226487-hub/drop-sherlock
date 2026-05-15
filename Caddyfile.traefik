@@ -14,6 +14,10 @@
 # Basicauth + security headers are KEPT — defense in depth on top of
 # Traefik's IP-whitelist middleware. Anyone who somehow reaches Caddy
 # from inside the VPN still needs the basicauth credential.
+#
+# Public view-only share routes (/share/* + /api/public/*) bypass
+# basicauth here too, mirroring the standalone Caddyfile. The actual
+# access control happens inside the backend share-token handler.
 
 {
   auto_https off
@@ -23,14 +27,6 @@
   tls /certs/selfsigned.crt /certs/selfsigned.key
 
   encode zstd gzip
-
-  # HTTP basic auth — shared credential for the LAN crew. The browser
-  # caches it after the first prompt; subsequent fetch() calls from the
-  # frontend reach the API transparently. Hash is bcrypt; generated with
-  # `caddy hash-password`; see .env.example.
-  basicauth {
-    {$BASIC_AUTH_USERNAME} {$BASIC_AUTH_PASSWORD_HASH}
-  }
 
   # Defense-in-depth headers — same set as the standalone Caddyfile.
   # HSTS only meaningful on the public-facing TLS (which Traefik owns),
@@ -43,9 +39,79 @@
     Strict-Transport-Security "max-age=31536000"
   }
 
-  handle_path /api/* {
+  # Public share routes — no basicauth.
+  handle /share/* {
+    reverse_proxy web:3000
+  }
+  # Next.js static assets (hashed bundles, no operator data) and a
+  # few root-level static files — must be reachable without basicauth
+  # so the share page can hydrate in an incognito tab. See the
+  # standalone Caddyfile for the rationale.
+  handle /_next/* {
+    reverse_proxy web:3000
+  }
+  # Browser auto-discovery paths — same list as the standalone
+  # Caddyfile. These MUST be reachable without basicauth or the
+  # browser pops the credential dialog the share is supposed to
+  # avoid. Targets go through to Next.js which returns 404 for any
+  # asset that doesn't exist — no auth challenge along the way.
+  handle /favicon.ico {
+    reverse_proxy web:3000
+  }
+  handle /favicon.svg {
+    reverse_proxy web:3000
+  }
+  handle /icon.svg {
+    reverse_proxy web:3000
+  }
+  handle /icon.png {
+    reverse_proxy web:3000
+  }
+  handle /icon-*.png {
+    reverse_proxy web:3000
+  }
+  handle /apple-icon.png {
+    reverse_proxy web:3000
+  }
+  handle /apple-touch-icon.png {
+    reverse_proxy web:3000
+  }
+  handle /apple-touch-icon-precomposed.png {
+    reverse_proxy web:3000
+  }
+  handle /apple-touch-icon-*.png {
+    reverse_proxy web:3000
+  }
+  handle /manifest.json {
+    reverse_proxy web:3000
+  }
+  handle /manifest.webmanifest {
+    reverse_proxy web:3000
+  }
+  handle /robots.txt {
+    reverse_proxy web:3000
+  }
+  handle /sitemap.xml {
+    reverse_proxy web:3000
+  }
+  handle /api/public/* {
+    # Strip `/api` so the backend's FastAPI router (mounted at
+    # `/public`) sees `/public/share/<token>`. Mirrors the
+    # `handle_path /api/*` strip in the catch-all block below.
+    uri strip_prefix /api
     reverse_proxy api:8000
   }
 
-  reverse_proxy web:3000
+  # Everything else: basicauth + normal routing.
+  handle {
+    basicauth {
+      {$BASIC_AUTH_USERNAME} {$BASIC_AUTH_PASSWORD_HASH}
+    }
+
+    handle_path /api/* {
+      reverse_proxy api:8000
+    }
+
+    reverse_proxy web:3000
+  }
 }

@@ -1,5 +1,6 @@
 "use client";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useState, useRef, useEffect } from "react";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { LanguageToggle } from "@/components/language-toggle";
@@ -121,6 +122,14 @@ function DatabaseDropdown() {
 
 export function HeaderShell() {
   const { t } = useT();
+  // Public share pages render their own minimal header (no operator
+  // nav). Detect by path prefix so the basic-auth-free pages don't
+  // leak the operator surface area to recipients — even though clicking
+  // those links would prompt for basicauth, the mere presence of
+  // "Settings" / "Errors" / etc. would be confusing on a "view this
+  // analysis" page meant for a client.
+  const pathname = usePathname() || "";
+  if (pathname.startsWith("/share/")) return null;
   return (
     <header className="border-b dark:border-neutral-800 bg-white/70 dark:bg-neutral-900/70 backdrop-blur sticky top-0 z-10">
       {/* 3-column grid: brand left, nav centered, controls right.
@@ -137,6 +146,7 @@ export function HeaderShell() {
           <Link href="/analyze">{t.nav.analyze}</Link>
           <Link href="/jobs">{t.nav.jobs}</Link>
           <DatabaseDropdown />
+          <Link href="/shares">{t.nav.shares}</Link>
           <Link href="/errors">{t.nav.errors}</Link>
           <Link href="/settings">{t.nav.settings}</Link>
           <Link href="/docs">Документация</Link>

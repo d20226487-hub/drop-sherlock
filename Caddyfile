@@ -1,19 +1,11 @@
 {$SITE_HOST} {
 	encode zstd gzip
 
-	# HTTP basic auth — single shared credential for the LAN crew. Caddy
-	# enforces it on every request (HTML pages + the /api proxy below);
-	# the browser caches the credential after the first prompt so the
-	# frontend's fetch() calls reach the API transparently. The bcrypt
-	# hash is generated with `caddy hash-password`; see .env.example.
-	basicauth {
-		{$BASIC_AUTH_USERNAME} {$BASIC_AUTH_PASSWORD_HASH}
-	}
-
-	# Defense-in-depth headers. LAN deploy with no public exposure means
-	# the threat surface is small, but these are essentially free and
-	# protect against accidental future-you mistakes (e.g. embedding the
-	# app in an iframe on an internal wiki).
+	# Defense-in-depth headers. Applied globally — the auth-bypassed
+	# share routes get them too. LAN deploy with no public exposure
+	# means the threat surface is small, but these are essentially free
+	# and protect against accidental future-you mistakes (e.g. embedding
+	# the app in an iframe on an internal wiki).
 	header {
 		# Block clickjacking — the app isn't designed to be iframed.
 		X-Frame-Options "DENY"
@@ -31,9 +23,119 @@
 		Strict-Transport-Security "max-age=31536000"
 	}
 
-	handle_path /api/* {
+	# Public view-only share links — no basic-auth. The access control
+	# happens INSIDE the backend handler via the share-token table +
+	# per-IP rate limit (see routers/public_shares.py). Caddy's job
+	# here is just to skip basicauth for these path prefixes:
+	#
+	#   /share/*        → Next.js page rendering the shared analysis
+	#   /api/public/*   → Backend endpoints serving the share data
+	#
+	# Each `handle` block matches first; the catch-all `handle` block
+	# below carries the basicauth and only fires for everything else.
+
+	handle /share/* {
+		reverse_proxy web:3000
+	}
+
+	# Next.js static assets MUST be reachable without basicauth too —
+	# otherwise the share page HTML loads but the browser 401s on every
+	# JS chunk and font, triggering the auth prompt the share is
+	# supposed to avoid. These paths are hashed-bundle URLs (no
+	# operator data inside) so exposing them is safe:
+	#   /_next/static/* → JS / CSS / font / image bundles
+	#   /_next/image    → image-optimizer (we don't use it but harmless)
+	#   /_next/data/*   → would carry SSR data IF we used it; our app
+	#                     is fully client-rendered so this is empty
+	# The same handle also covers any future `/share/*` pages added
+	# under app/share/ without further Caddy work.
+	handle /_next/* {
+		reverse_proxy web:3000
+	}
+
+	# Root-level browser auto-discovery paths. The browser fetches
+	# these regardless of whether the HTML references them (favicon,
+	# touch-icons for Add-to-Home-Screen, PWA manifest, etc.) — and
+	# the share page recipient may be in incognito with no cached
+	# credentials. If these requests hit basicauth they 401 with a
+	# `WWW-Authenticate: Basic` header, which makes the browser pop
+	# the credential dialog — exactly what the share-link feature is
+	# supposed to avoid.
+	#
+	# Each path is enumerated (vs a `/*` wildcard) so we don't widen
+	# the bypass to any future top-level operator endpoint. Empty
+	# wildcards inside enumerated names (e.g. `apple-touch-icon-*`)
+	# cover the iOS sized variants browsers may probe. The targets
+	# go through to Next.js (web:3000); when a file isn't there
+	# Next.js naturally returns 404 — without the auth challenge,
+	# so no dialog.
+	handle /favicon.ico {
+		reverse_proxy web:3000
+	}
+	handle /favicon.svg {
+		reverse_proxy web:3000
+	}
+	handle /icon.svg {
+		reverse_proxy web:3000
+	}
+	handle /icon.png {
+		reverse_proxy web:3000
+	}
+	handle /icon-*.png {
+		reverse_proxy web:3000
+	}
+	handle /apple-icon.png {
+		reverse_proxy web:3000
+	}
+	handle /apple-touch-icon.png {
+		reverse_proxy web:3000
+	}
+	handle /apple-touch-icon-precomposed.png {
+		reverse_proxy web:3000
+	}
+	handle /apple-touch-icon-*.png {
+		reverse_proxy web:3000
+	}
+	handle /manifest.json {
+		reverse_proxy web:3000
+	}
+	handle /manifest.webmanifest {
+		reverse_proxy web:3000
+	}
+	handle /robots.txt {
+		reverse_proxy web:3000
+	}
+	handle /sitemap.xml {
+		reverse_proxy web:3000
+	}
+
+	handle /api/public/* {
+		# Strip the `/api` prefix before forwarding so the backend
+		# sees `/public/share/<token>` — that's where the FastAPI
+		# router is mounted. Mirrors the `handle_path /api/*` strip
+		# in the operator block below; we use `uri strip_prefix`
+		# here because `handle_path` would strip the whole matched
+		# prefix (`/api/public/`), which isn't what we want.
+		uri strip_prefix /api
 		reverse_proxy api:8000
 	}
 
-	reverse_proxy web:3000
+	# Catch-all: everything that isn't a public share path goes through
+	# basicauth.
+	handle {
+		# HTTP basic auth — single shared credential for the LAN crew.
+		# The browser caches it after the first prompt; subsequent
+		# fetch() calls from the frontend reach the API transparently.
+		# Hash is bcrypt; generated with `caddy hash-password`; see
+		# .env.example.
+		basicauth {
+			{$BASIC_AUTH_USERNAME} {$BASIC_AUTH_PASSWORD_HASH}
+		}
+
+		handle_path /api/* {
+			reverse_proxy api:8000
+		}
+
+		reverse_proxy web:3000
+	}
 }

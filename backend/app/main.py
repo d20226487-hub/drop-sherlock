@@ -15,7 +15,9 @@ from .routers import (
     database as database_router,
     errors as errors_router,
     jobs as jobs_router,
+    public_shares as public_shares_router,
     settings as settings_router,
+    shares as shares_router,
 )
 from .scheduler import get_scheduler
 from .tasks import mark_orphaned_runs_paused
@@ -667,6 +669,11 @@ app.include_router(backlog_router.router)
 app.include_router(backups_router.router)
 app.include_router(availability_router.router)
 app.include_router(banlist_router.router)
+app.include_router(shares_router.router)
+# Public router — Caddy bypasses basic-auth for `/api/public/*`. The
+# endpoints inside do their OWN access control via share tokens; no other
+# auth layer is in front of them, so each handler MUST validate.
+app.include_router(public_shares_router.router)
 
 
 @app.get("/health")

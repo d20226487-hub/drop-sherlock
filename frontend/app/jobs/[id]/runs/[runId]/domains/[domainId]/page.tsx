@@ -8,6 +8,7 @@ import { CriterionTable } from "@/components/criterion-table";
 import { VerdictBox } from "@/components/verdict-box";
 import { ReanalyzeBar } from "@/components/reanalyze-bar";
 import { NotesEditor } from "@/components/notes-editor";
+import { ShareButton } from "@/components/share-button";
 import { AiPreviewPanel } from "@/components/ai-preview-panel";
 import {
   WaybackSamplesTimeline,
@@ -236,6 +237,7 @@ export default function DomainDetailPage({
             )}
           </div>
           <div className="flex items-center gap-2 flex-wrap justify-end">
+            <ShareButton runDomainId={domainId} domain={data.domain} />
             <button
               type="button"
               onClick={handlePinToggle}

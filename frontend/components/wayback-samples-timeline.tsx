@@ -1,4 +1,5 @@
 "use client";
+import { useMemo, useState } from "react";
 import { useT } from "@/lib/i18n";
 
 export type WaybackSample = {
@@ -37,6 +38,26 @@ export function WaybackSamplesTimeline({
 }) {
   const { t } = useT();
   const ts = t.pages.jobs.domain.waybackTimeline;
+  // Client-side sort. Default is newest-first — what the user wants to
+  // see first when scanning a domain's history is recent activity.
+  // Timestamps are CDX-style YYYYMMDDHHMMSS strings, which lex-sort
+  // correctly as plain strings — no Date parsing required. Samples
+  // without a timestamp sink to the bottom under either direction so
+  // they don't poison the order.
+  const [sortDir, setSortDir] = useState<"desc" | "asc">("desc");
+  const sortedSamples = useMemo(() => {
+    const arr = [...samples];
+    arr.sort((a, b) => {
+      const at = a.timestamp ?? "";
+      const bt = b.timestamp ?? "";
+      if (!at && !bt) return 0;
+      if (!at) return 1;
+      if (!bt) return -1;
+      if (at === bt) return 0;
+      return sortDir === "desc" ? (at < bt ? 1 : -1) : at < bt ? -1 : 1;
+    });
+    return arr;
+  }, [samples, sortDir]);
   if (!samples || samples.length === 0) return null;
   const okCount = samples.filter(
     (s) => s.http_status === 200 && (s.title || (s.h1s && s.h1s.length > 0)),
@@ -55,15 +76,51 @@ export function WaybackSamplesTimeline({
             </span>
           )}
         </div>
-        <span className="text-xs text-neutral-500 dark:text-neutral-400">
-          {ts.coverage(okCount, samples.length)}
-        </span>
+        <div className="flex items-center gap-3">
+          <div
+            role="group"
+            aria-label={ts.sortLabel}
+            className="inline-flex items-center rounded-md border dark:border-neutral-700 overflow-hidden text-xs"
+          >
+            <button
+              type="button"
+              onClick={() => setSortDir("desc")}
+              aria-pressed={sortDir === "desc"}
+              title={ts.sortNewestHint}
+              className={
+                "px-2 py-0.5 " +
+                (sortDir === "desc"
+                  ? "bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100"
+                  : "text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800")
+              }
+            >
+              {ts.sortNewest}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSortDir("asc")}
+              aria-pressed={sortDir === "asc"}
+              title={ts.sortOldestHint}
+              className={
+                "px-2 py-0.5 border-l dark:border-neutral-700 " +
+                (sortDir === "asc"
+                  ? "bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100"
+                  : "text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800")
+              }
+            >
+              {ts.sortOldest}
+            </button>
+          </div>
+          <span className="text-xs text-neutral-500 dark:text-neutral-400">
+            {ts.coverage(okCount, samples.length)}
+          </span>
+        </div>
       </header>
       <p className="text-xs text-neutral-500 dark:text-neutral-400">
         {ts.intro}
       </p>
       <ol className="space-y-3">
-        {samples.map((s, i) => {
+        {sortedSamples.map((s, i) => {
           const failed = !!s.error || (s.http_status && s.http_status !== 200);
           const dateLabel = fmtTs(s.timestamp);
           return (

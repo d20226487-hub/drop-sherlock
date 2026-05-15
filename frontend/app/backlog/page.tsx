@@ -16,6 +16,7 @@ import { isoToDisplay } from "@/lib/dates";
 import { BACKLOG_HANDOFF_KEY } from "@/lib/backlog-handoff";
 import { BacklogImport } from "@/components/backlog-import";
 import {
+  EditableDateCell,
   EditablePriceCell,
   EditableTextCell,
 } from "@/components/editable-cell";
@@ -486,7 +487,12 @@ export default function BacklogPage() {
   // edit mode for retry.
   async function patchRow(
     id: number,
-    patch: { comments?: string; desired_price?: number | null; max_price?: number | null },
+    patch: {
+      comments?: string;
+      desired_price?: number | null;
+      max_price?: number | null;
+      expiration_date?: string | null;
+    },
   ): Promise<void> {
     const updated = await api.updateBacklogRow(id, patch);
     setData((prev) => {
@@ -983,7 +989,15 @@ export default function BacklogPage() {
                       </td>
                       <td className="px-3 py-2 align-top">{r.registrar || "—"}</td>
                       <td className="px-3 py-2 align-top whitespace-nowrap">
-                        {isoToDisplay(r.expiration_date) || "—"}
+                        <EditableDateCell
+                          value={r.expiration_date}
+                          display={isoToDisplay(r.expiration_date)}
+                          onSave={(v) =>
+                            patchRow(r.id, {
+                              expiration_date: (v as string | null) ?? null,
+                            })
+                          }
+                        />
                       </td>
                       <td className="px-3 py-2 align-top text-right">
                         <EditablePriceCell

@@ -246,8 +246,27 @@ const SORT_FIELDS_KEYWORDS: SortField[] = [
 
 // --- Generic shell -----------------------------------------------------------
 
+// Single-letter chip shown next to the criterion title so the Analyze
+// page uses the same shorthand the user sees on Jobs / Run / Database
+// pages — B/D/A/K/W/C. Keeps shape parity with `CRITERION_ABBREVIATIONS`
+// in app/jobs/[id]/runs/[runId]/page.tsx (kept here as a local literal
+// instead of an import to avoid a cross-file dep on a page module).
+// Green tone is intentional: on the Jobs Criteria column "done" is green
+// — surfacing the same color on Analyze ties the two visually.
+function CriterionLetterChip({ letter }: { letter: string }) {
+  return (
+    <span
+      aria-hidden
+      className="inline-flex items-center justify-center text-xs font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
+    >
+      {letter}
+    </span>
+  );
+}
+
 function CriterionShell({
   title,
+  letter,
   enabled,
   onEnabledChange,
   limit,
@@ -256,6 +275,9 @@ function CriterionShell({
   children,
 }: {
   title: string;
+  // Single-letter abbreviation (B/D/A/K/W). Required so every Analyze
+  // card carries the same nav-shortcut letter the user sees elsewhere.
+  letter: string;
   enabled: boolean;
   onEnabledChange: (v: boolean) => void;
   limit: number;
@@ -301,6 +323,7 @@ function CriterionShell({
           >
             {open ? "▾" : "▸"}
           </span>
+          <CriterionLetterChip letter={letter} />
           <h3 className="font-semibold">{title}</h3>
         </button>
         <label className="inline-flex items-center gap-2 cursor-pointer select-none">
@@ -560,6 +583,7 @@ export function BacklinksCard({
   return (
     <CriterionShell
       title={t.pages.analyze.criteria.backlinks}
+      letter="B"
       enabled={cfg.enabled}
       onEnabledChange={(v) => onChange({ ...cfg, enabled: v })}
       limit={cfg.limit}
@@ -796,6 +820,7 @@ export function RefdomainsCard({
   return (
     <CriterionShell
       title={t.pages.analyze.criteria.refdomains}
+      letter="D"
       enabled={cfg.enabled}
       onEnabledChange={(v) => onChange({ ...cfg, enabled: v })}
       limit={cfg.limit}
@@ -865,6 +890,7 @@ export function AnchorsCard({
   return (
     <CriterionShell
       title={t.pages.analyze.criteria.anchors}
+      letter="A"
       enabled={cfg.enabled}
       onEnabledChange={(v) => onChange({ ...cfg, enabled: v })}
       limit={cfg.limit}
@@ -903,6 +929,7 @@ export function KeywordsCard({
   return (
     <CriterionShell
       title={t.pages.analyze.criteria.keywords}
+      letter="K"
       enabled={cfg.enabled}
       onEnabledChange={(v) => onChange({ ...cfg, enabled: v })}
       limit={cfg.limit}
@@ -934,6 +961,7 @@ export function WaybackCard({
   return (
     <CriterionShell
       title={t.pages.analyze.criteria.wayback}
+      letter="W"
       enabled={cfg.enabled}
       onEnabledChange={(v) => onChange({ ...cfg, enabled: v })}
       limit={cfg.limit}
@@ -1162,6 +1190,7 @@ export function WaybackClassifyCard({
         >
           {open ? "▾" : "▸"}
         </button>
+        <CriterionLetterChip letter="C" />
         <label className="flex items-center gap-2 text-sm font-medium">
           <input
             type="checkbox"

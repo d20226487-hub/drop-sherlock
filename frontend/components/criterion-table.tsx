@@ -178,9 +178,17 @@ function Row({ row, columns }: { row: Record<string, unknown>; columns: string[]
 export function CriterionTable({
   criterion,
   detail,
+  // When true, suppress operator-only widgets above the table:
+  // request-URL toggle, "data from cache · Run #N" badge, and the
+  // Ahrefs units pill. Used by the public share page (/share/[token])
+  // where the recipient shouldn't see internal IDs / Ahrefs spend.
+  // Defaults to false so every existing call site keeps its current
+  // behavior; only the share-page caller passes `true`.
+  viewOnly = false,
 }: {
   criterion: string;
   detail: CriterionDetail | undefined;
+  viewOnly?: boolean;
 }) {
   const { t } = useT();
   const ts = t.pages.jobs.domain;
@@ -200,15 +208,28 @@ export function CriterionTable({
           {ts.criterionFailed}
           {detail.error && <>: {detail.error}</>}
         </p>
-        <RequestUrlBlock
-          showUrl={showUrl}
-          onToggle={() => setShowUrl((s) => !s)}
-          url={detail.request_url}
-        />
+        {/* Request-URL toggle is operator-only debugging output —
+            suppress on the public share page (viewOnly=true). */}
+        {!viewOnly && (
+          <RequestUrlBlock
+            showUrl={showUrl}
+            onToggle={() => setShowUrl((s) => !s)}
+            url={detail.request_url}
+          />
+        )}
       </div>
     );
   }
   if (!detail.rows || detail.rows.length === 0) {
+    // In viewOnly: render nothing. wayback_classify has no rows by
+    // design (it's a derived verdict, not a fetched dataset), and
+    // empty Ahrefs criteria (e.g. zero organic keywords on a
+    // low-volume domain) are operator-internal scaffolding too. The
+    // VerdictBox rendered ABOVE this table already conveys what the
+    // AI judged. Showing "No rows returned." + "View request URL" on
+    // a public share page is confusing for the recipient and leaks
+    // operator UX wording.
+    if (viewOnly) return null;
     return (
       <div className="space-y-2">
         <p className="text-sm text-neutral-500 dark:text-neutral-400">
@@ -246,6 +267,7 @@ export function CriterionTable({
       unitsCostActual={detail.units_cost_actual}
       showUrl={showUrl}
       onToggleUrl={() => setShowUrl((s) => !s)}
+      viewOnly={viewOnly}
     />
   );
 }
@@ -262,6 +284,7 @@ function SortableTable({
   unitsCostActual,
   showUrl,
   onToggleUrl,
+  viewOnly,
 }: {
   rows: Record<string, unknown>[];
   columns: string[];
@@ -274,6 +297,7 @@ function SortableTable({
   unitsCostActual: number | null;
   showUrl: boolean;
   onToggleUrl: () => void;
+  viewOnly: boolean;
 }) {
   const { t } = useT();
   const [sort, setSort] = useState<SortState>(null);
@@ -301,7 +325,15 @@ function SortableTable({
           <p className="text-sm text-neutral-600 dark:text-neutral-400">
             {rowCountLabel}
           </p>
-          {cachedFromRunId !== null && (
+          {/* Cache provenance + Ahrefs unit accounting + the request
+              URL toggle are operator-only — suppress in viewOnly so the
+              public share page doesn't leak internal run IDs, spend
+              numbers, or the raw Ahrefs request signature. The
+              `cachedFromRunId != null` guard (loose !=) also catches
+              the `undefined` we get from the sanitized public payload —
+              tighter than the previous `!== null` which let undefined
+              through and rendered "Run #undefined". */}
+          {!viewOnly && cachedFromRunId != null && (
             <span
               className="text-xs px-2 py-0.5 rounded-full bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300"
               title="Reused from a prior run with matching criteria"
@@ -309,18 +341,22 @@ function SortableTable({
               {t.pages.jobs.domain.dataCachedFromRun(cachedFromRunId)}
             </span>
           )}
-          <UnitsChip
-            cachedFromRunId={cachedFromRunId}
-            costRow={unitsCostRow}
-            costTotal={unitsCostTotal}
-            costActual={unitsCostActual}
-          />
+          {!viewOnly && (
+            <UnitsChip
+              cachedFromRunId={cachedFromRunId}
+              costRow={unitsCostRow}
+              costTotal={unitsCostTotal}
+              costActual={unitsCostActual}
+            />
+          )}
         </div>
-        <RequestUrlBlock
-          showUrl={showUrl}
-          onToggle={onToggleUrl}
-          url={requestUrl}
-        />
+        {!viewOnly && (
+          <RequestUrlBlock
+            showUrl={showUrl}
+            onToggle={onToggleUrl}
+            url={requestUrl}
+          />
+        )}
       </div>
       <div className="overflow-x-auto rounded-md border dark:border-neutral-800">
         <table className="w-full text-sm">

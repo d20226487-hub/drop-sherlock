@@ -528,3 +528,52 @@ class DomainBan(Base):
     # (locked 2026-05-14, supersedes the wave-O β "leave-status-alone"
     # design after the user hit the discoverability problem).
     backlog_snapshot_json: Mapped[str] = mapped_column(Text, default="")
+
+
+# --- Public view-only share links (added 2026-05-15) ----------------------
+#
+# Lets the operator generate an unguessable URL that anyone can open to
+# view a single RunDomain's analysis page WITHOUT the basic-auth
+# credential. Targets a specific (job, run, domain) so the view is
+# frozen — re-pins or re-judges on other runs don't change what the
+# recipient sees. Caddy bypasses basicauth for `/share/*` (frontend)
+# and `/api/public/*` (backend). The backend route checks the token
+# here on every hit and 404s on revoked/expired tokens.
+#
+# Token is 32 chars urlsafe (~190 bits of entropy — well past
+# unguessable). Distinct from a Fernet payload — there's no need to
+# encode anything inside it; the lookup keys this table.
+
+class DomainShare(Base):
+    """One row per share link. PK on the token so lookups are index-served
+    and the public endpoint never has to scan."""
+    __tablename__ = "domain_shares"
+
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # Target run-domain. We do NOT cascade-delete on RunDomain deletion
+    # at the DB layer — RunDomain deletes are exceedingly rare in this
+    # app, and a dangling share simply 404s in the public handler
+    # (resolved row is None). Keeping the share row preserves an audit
+    # trail (who created it, when, how many views) even after the
+    # underlying analysis is purged.
+    run_domain_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # Creator's free-text label (e.g. "demo for ClientCorp", "internal
+    # SEO team"). Surfaced in the management table for searchability.
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, index=True,
+    )
+    # Optional expiry. NULL = never expires; public handler 404s past
+    # the date. Stored in UTC like every other datetime in the app.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Revocation tombstone. NULL = active; non-NULL = the moment the
+    # operator clicked revoke. We do NOT hard-delete revoked rows so
+    # the view_count + last_viewed_at audit trail survives — useful
+    # for "was this link being used when I revoked it?" forensics.
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    view_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_viewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Source IP of the creator (best-effort; behind Caddy this is the
+    # X-Forwarded-For first hop). Audit-only — never surfaced to the
+    # recipient.
+    created_ip: Mapped[str] = mapped_column(String(64), default="")

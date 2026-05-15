@@ -426,6 +426,11 @@ class UpdateRowIn(BaseModel):
     comments: str | None = None
     desired_price: float | None = None
     max_price: float | None = None
+    # Expiration is editable inline (added 2026-05-15). The cascade /
+    # availability path also writes here when RDAP returns expires_on;
+    # manual edits take precedence and aren't clobbered by a subsequent
+    # cascade run (RDAP only writes when the column is null or older).
+    expiration_date: date | None = None
 
 
 @router.patch("/{row_id}", response_model=BacklogRow)
@@ -444,6 +449,11 @@ def update_row(row_id: int, payload: UpdateRowIn, db: Session = Depends(get_db))
             if v is not None and v < 0:
                 raise HTTPException(400, f"{k} must be non-negative")
             setattr(row, k, v)
+    if "expiration_date" in data:
+        # Nullable Date column — accepts an explicit null to clear.
+        # Pydantic already parsed an ISO `YYYY-MM-DD` string into a
+        # `date`; bad input lands as a 422 before we get here.
+        row.expiration_date = data["expiration_date"]
     row.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(row)

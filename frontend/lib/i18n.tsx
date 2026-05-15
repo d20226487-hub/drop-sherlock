@@ -46,6 +46,7 @@ const messagesEn = {
     analyze: "Analyze",
     jobs: "Jobs",
     database: "Database",
+    shares: "Shares",
     errors: "Errors",
     settings: "Settings",
     databaseDropdown: {
@@ -650,6 +651,32 @@ const messagesEn = {
         replacePinHint:
           "A different run is currently pinned for this domain. Click to switch the pin to this run.",
         pinFailed: "Pin failed",
+        share: {
+          button: "Share",
+          buttonHint:
+            "Create an unguessable view-only link to this domain page. Anyone with the link can view it without basic-auth — revoke from the Shares page.",
+          modalTitle: "Create view-only link",
+          expiryLabel: "Expires",
+          expiryPresets: {
+            never: "Never",
+            d7: "In 7 days",
+            d30: "In 30 days",
+            d90: "In 90 days",
+          },
+          noteLabel: "Note (optional)",
+          notePlaceholder: "e.g. demo for ClientCorp",
+          warning:
+            "Anyone with the link can view this analysis without entering your basic-auth password. Cost, AI provider, and internal IDs are stripped — but raw Ahrefs rows + AI verdicts are visible.",
+          createButton: "Create link",
+          creating: "Creating…",
+          successHint: "Link created. Copy and share:",
+          copyButton: "Copy link",
+          copied: "Copied!",
+          manageAll: "Manage all shares",
+          expiresHint: "Expires:",
+          done: "Done",
+          failPrefix: "Couldn't create the share",
+        },
         verdictsHeading: "AI verdicts per criterion",
         rawDataHeading: "Raw data",
         tabs: {
@@ -749,6 +776,11 @@ const messagesEn = {
           moreItems: (n: number) => `+${n} more`,
           errorPrefix: "Sample error",
           redirectTo: "Redirect →",
+          sortLabel: "Sort by date",
+          sortNewest: "Newest first",
+          sortOldest: "Oldest first",
+          sortNewestHint: "Most recent snapshots at the top.",
+          sortOldestHint: "Earliest snapshots at the top.",
         },
         notes: {
           heading: "Notes",
@@ -1431,6 +1463,78 @@ const messagesEn = {
       totalLine: (total: number, visible: number, selectedCount: number) =>
         `${total} banned · ${visible} visible · ${selectedCount} selected`,
     },
+    shares: {
+      title: "Share links",
+      intro:
+        "View-only links you've generated for specific domain analyses. Anyone with a link can view the page without basic-auth — revoke a link here to cut access immediately.",
+      statusLabel: "Status",
+      statusOptions: {
+        all: "All",
+        active: "Active",
+        revoked: "Revoked",
+        expired: "Expired",
+      },
+      searchLabel: "Search",
+      searchPlaceholder: "domain or note…",
+      perPageLabel: "Per page",
+      refresh: "Refresh",
+      bulkRevoke: "Revoke selected",
+      revokingPlural: "Revoking…",
+      clearSelection: "Clear selection",
+      revokeAll: "Revoke all active",
+      revokeAllHint:
+        "Nuclear button — revokes EVERY currently-active share link in one click. Use if you suspect a leak.",
+      revokeAllConfirm:
+        "Revoke ALL currently-active share links? Recipients lose access immediately. This cannot be undone — they'd need new tokens.",
+      bulkRevokeConfirm: (n: number) =>
+        `Revoke ${n} selected share${n === 1 ? "" : "s"}? Recipients lose access immediately.`,
+      bulkRevokeDone: (revoked: number, requested: number) =>
+        `Revoked ${revoked} of ${requested} share${requested === 1 ? "" : "s"}.`,
+      bulkRevokeFailed: "Bulk revoke failed",
+      revokeAllDone: (n: number) =>
+        `Revoked ${n} active share${n === 1 ? "" : "s"}.`,
+      revokeOneConfirm:
+        "Revoke this share? The recipient loses access immediately.",
+      copied: "Copied to clipboard.",
+      selectedCount: (n: number) => `${n} selected`,
+      selectAllAria: "Select all visible",
+      selectAria: (domain: string) => `Select share for ${domain}`,
+      pageInfo: (start: number, end: number, total: number) =>
+        `Showing ${start}–${end} of ${total}`,
+      prev: "Previous",
+      next: "Next",
+      empty: "No share links yet. Open any domain page and click 'Share'.",
+      never: "Never",
+      cols: {
+        domain: "Domain",
+        status: "Status",
+        note: "Note",
+        job: "Job",
+        created: "Created",
+        expires: "Expires",
+        views: "Views",
+        actions: "Actions",
+      },
+      copy: "Copy link",
+      open: "Open",
+      revoke: "Revoke",
+    },
+    share: {
+      // Recipient-facing labels (public /share/[token] page).
+      viewOnlyBadge: "Drop Sherlock — shared analysis (view-only)",
+      sharedOn: "Shared",
+      expiresOn: "expires",
+      finalAssessment: "Final assessment",
+      verdictLabel: "Verdict",
+      confidenceLabel: "Confidence",
+      recommendationLabel: "Recommendation",
+      notesHeading: "Notes",
+      footer:
+        "This is a view-only snapshot of one domain analysis. Powered by Drop Sherlock.",
+      notFoundTitle: "Share not found",
+      notFound:
+        "This link is no longer valid. It may have been revoked, expired, or never existed.",
+    },
     backlog: {
       title: "Backlog",
       intro:
@@ -1615,6 +1719,7 @@ const messagesRu: Messages = {
     analyze: "Анализ",
     jobs: "Задачи",
     database: "База",
+    shares: "Ссылки",
     errors: "Ошибки",
     settings: "Настройки",
     databaseDropdown: {
@@ -2234,6 +2339,32 @@ const messagesRu: Messages = {
         replacePinHint:
           "Сейчас для этого домена зафиксирован другой запуск. Кликните, чтобы переключить пин на этот запуск.",
         pinFailed: "Фиксация не удалась",
+        share: {
+          button: "Поделиться",
+          buttonHint:
+            "Создать неугадываемую ссылку «только просмотр» на эту страницу домена. Любой по ссылке откроет её без basic-auth — отозвать можно на странице «Ссылки».",
+          modalTitle: "Создание ссылки «только просмотр»",
+          expiryLabel: "Срок действия",
+          expiryPresets: {
+            never: "Бессрочно",
+            d7: "7 дней",
+            d30: "30 дней",
+            d90: "90 дней",
+          },
+          noteLabel: "Заметка (необязательно)",
+          notePlaceholder: "например, демо для КлиентКорп",
+          warning:
+            "Любой по ссылке увидит этот анализ без ввода пароля basic-auth. Стоимость, AI-провайдер и внутренние ID скрыты — но сырые строки Ahrefs и вердикты ИИ видны.",
+          createButton: "Создать ссылку",
+          creating: "Создание…",
+          successHint: "Ссылка создана. Скопируйте и поделитесь:",
+          copyButton: "Скопировать",
+          copied: "Скопировано!",
+          manageAll: "Управление ссылками",
+          expiresHint: "Истекает:",
+          done: "Готово",
+          failPrefix: "Не удалось создать ссылку",
+        },
         verdictsHeading: "Вердикты ИИ по критериям",
         rawDataHeading: "Сырые данные",
         tabs: {
@@ -2359,6 +2490,11 @@ const messagesRu: Messages = {
           moreItems: (n) => `+${n} ещё`,
           errorPrefix: "Ошибка сэмпла",
           redirectTo: "Редирект →",
+          sortLabel: "Сортировка по дате",
+          sortNewest: "Сначала новые",
+          sortOldest: "Сначала старые",
+          sortNewestHint: "Самые свежие снимки сверху.",
+          sortOldestHint: "Самые ранние снимки сверху.",
         },
         notes: {
           heading: "Заметки",
@@ -3101,6 +3237,77 @@ const messagesRu: Messages = {
       selectAll: "Выбрать все видимые",
       totalLine: (total, visible, selectedCount) =>
         `${total} забанено · ${visible} видно · ${selectedCount} выбрано`,
+    },
+    shares: {
+      title: "Ссылки для просмотра",
+      intro:
+        "Ссылки «только просмотр», которые вы создали для отдельных анализов доменов. Любой по ссылке откроет страницу без basic-auth — отзовите ссылку здесь, чтобы немедленно закрыть доступ.",
+      statusLabel: "Статус",
+      statusOptions: {
+        all: "Все",
+        active: "Активные",
+        revoked: "Отозванные",
+        expired: "Истёкшие",
+      },
+      searchLabel: "Поиск",
+      searchPlaceholder: "домен или заметка…",
+      perPageLabel: "На страницу",
+      refresh: "Обновить",
+      bulkRevoke: "Отозвать выбранные",
+      revokingPlural: "Отзыв…",
+      clearSelection: "Снять выбор",
+      revokeAll: "Отозвать все активные",
+      revokeAllHint:
+        "Аварийная кнопка — отзывает ВСЕ активные ссылки одним кликом. Используйте при подозрении на утечку.",
+      revokeAllConfirm:
+        "Отозвать ВСЕ активные ссылки? Получатели потеряют доступ немедленно. Действие необратимо — нужны будут новые токены.",
+      bulkRevokeConfirm: (n) =>
+        `Отозвать ${n} выбранных ссылок? Получатели потеряют доступ немедленно.`,
+      bulkRevokeDone: (revoked, requested) =>
+        `Отозвано ${revoked} из ${requested}.`,
+      bulkRevokeFailed: "Массовый отзыв не удался",
+      revokeAllDone: (n) => `Отозвано активных ссылок: ${n}.`,
+      revokeOneConfirm:
+        "Отозвать эту ссылку? Получатель потеряет доступ немедленно.",
+      copied: "Скопировано в буфер обмена.",
+      selectedCount: (n) => `Выбрано: ${n}`,
+      selectAllAria: "Выбрать все видимые",
+      selectAria: (domain) => `Выбрать ссылку для ${domain}`,
+      pageInfo: (start, end, total) =>
+        `Показано ${start}–${end} из ${total}`,
+      prev: "Назад",
+      next: "Вперёд",
+      empty:
+        "Ссылок пока нет. Откройте любую страницу домена и нажмите «Поделиться».",
+      never: "Бессрочно",
+      cols: {
+        domain: "Домен",
+        status: "Статус",
+        note: "Заметка",
+        job: "Задача",
+        created: "Создано",
+        expires: "Истекает",
+        views: "Просмотры",
+        actions: "Действия",
+      },
+      copy: "Скопировать",
+      open: "Открыть",
+      revoke: "Отозвать",
+    },
+    share: {
+      viewOnlyBadge: "Drop Sherlock — общий анализ (только просмотр)",
+      sharedOn: "Создано",
+      expiresOn: "истекает",
+      finalAssessment: "Итоговая оценка",
+      verdictLabel: "Вердикт",
+      confidenceLabel: "Уверенность",
+      recommendationLabel: "Рекомендация",
+      notesHeading: "Заметки",
+      footer:
+        "Это снимок анализа одного домена «только для просмотра». Сделано в Drop Sherlock.",
+      notFoundTitle: "Ссылка не найдена",
+      notFound:
+        "Эта ссылка больше недействительна. Возможно, она отозвана, истекла или никогда не существовала.",
     },
     backlog: {
       title: "Очередь",

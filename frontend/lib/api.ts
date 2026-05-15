@@ -1939,6 +1939,109 @@ export const api = {
     }
     return res.json();
   },
+
+  // --- View-only share links (added 2026-05-15) ---
+  createShare: (payload: {
+    run_domain_id: number;
+    note?: string;
+    expires_in_days?: number | null;
+  }) =>
+    request<ShareRecord>("/shares", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  listShares: (params: {
+    page?: number;
+    per_page?: number;
+    status?: "all" | "active" | "revoked" | "expired";
+    search?: string;
+  } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.page != null) qs.set("page", String(params.page));
+    if (params.per_page != null) qs.set("per_page", String(params.per_page));
+    if (params.status) qs.set("status", params.status);
+    if (params.search) qs.set("search", params.search);
+    const q = qs.toString();
+    return request<{
+      total: number;
+      page: number;
+      per_page: number;
+      items: ShareRecord[];
+    }>(`/shares${q ? `?${q}` : ""}`);
+  },
+  updateShare: (
+    token: string,
+    patch: { note?: string; expires_at?: string | "clear" | null },
+  ) =>
+    request<ShareRecord>(`/shares/${encodeURIComponent(token)}`, {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
+  revokeShare: (token: string) =>
+    request<ShareRecord>(`/shares/${encodeURIComponent(token)}`, {
+      method: "DELETE",
+    }),
+  bulkRevokeShares: (tokens: string[]) =>
+    request<{ revoked: number; requested: number }>("/shares/bulk-revoke", {
+      method: "POST",
+      body: JSON.stringify({ tokens }),
+    }),
+  revokeAllActiveShares: () =>
+    request<{ revoked: number }>("/shares", { method: "DELETE" }),
+
+  // Public-view fetch — used by the /share/[token] page. Bypasses the
+  // basic-auth gate because Caddy whitelists /api/public/* for the
+  // token-only access path. We still go through the standard `request`
+  // wrapper because the auth shape is identical (browser uses its
+  // cached basic-auth credentials for `/api/*` even on the share page,
+  // but the Caddy bypass means a viewer who DOESN'T have them will
+  // still get through).
+  getPublicShare: (token: string) =>
+    request<PublicShareDetail>(
+      `/public/share/${encodeURIComponent(token)}`,
+    ),
+};
+
+// --- Share-link types (added 2026-05-15) ---
+
+export type ShareRecord = {
+  token: string;
+  run_domain_id: number;
+  domain: string;
+  job_id: number | null;
+  job_name: string;
+  run_id: number | null;
+  note: string;
+  created_at: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  view_count: number;
+  last_viewed_at: string | null;
+  is_active: boolean;
+};
+
+// Same shape as RunDomainDetail minus operator-only fields. We type it
+// as a loose dict here rather than a sister of RunDomainDetail because
+// the public page only reads a fixed subset (domain, criteria, final).
+export type PublicShareDetail = {
+  id: number;
+  domain: string;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  last_analyzed_at: string | null;
+  error: string;
+  criteria: Record<string, Record<string, unknown>>;
+  final_assessment: Record<string, unknown> | null;
+  final_summary: string;
+  note: string;
+  note_updated_at: string | null;
+  share: {
+    token: string;
+    shared_at: string;
+    expires_at: string | null;
+    note: string;
+  };
 };
 
 export type BackupSnapshot = {
@@ -2009,6 +2112,11 @@ export type BacklogRowPatch = {
   comments?: string;
   desired_price?: number | null;
   max_price?: number | null;
+  // ISO date `YYYY-MM-DD` (or null to clear). Backend's `UpdateRowIn`
+  // accepts a Pydantic `date` field; sending the ISO string keeps the
+  // wire format identical to what `BacklogRow.expiration_date` looks
+  // like on the way back.
+  expiration_date?: string | null;
 };
 
 export type BacklogImportRow = {
