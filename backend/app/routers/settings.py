@@ -546,3 +546,113 @@ def set_whois_history_api_key_route(payload: WhoisHistoryApiKeyIn):
     from ..app_settings import set_whois_history_api_key
     set_whois_history_api_key(payload.api_key)
     return {"ok": True, "api_key_set": bool(payload.api_key)}
+
+
+class WhoisHistoryRateLimitsIn(BaseModel):
+    """Both fields optional — patch semantics. The frontend usually
+    sends both at once but a single-field write works the same way."""
+    rpm: int | None = None
+    max_concurrent: int | None = None
+
+
+@router.put("/whois-history/rate-limits")
+def set_whois_history_rate_limits_route(payload: WhoisHistoryRateLimitsIn):
+    """Update RPM + max_concurrent for the currently-configured
+    WHOIS provider. Stored under `<provider>__rpm` /
+    `<provider>__max_concurrent` keys; the limits middleware picks the
+    new values up on the next acquire (no restart needed thanks to the
+    cache invalidation in `limits.get_limiter`)."""
+    from ..app_settings import get_whois_history_provider, set_rate_limits
+    values: dict[str, int] = {}
+    if payload.rpm is not None:
+        values["rpm"] = payload.rpm
+    if payload.max_concurrent is not None:
+        values["max_concurrent"] = payload.max_concurrent
+    if not values:
+        raise HTTPException(400, "no rate-limit fields provided")
+    try:
+        set_rate_limits(get_whois_history_provider(), values)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"updated": list(values.keys())}
+
+
+class WhoisHistoryTestIn(BaseModel):
+    # Domain to probe with. Defaults to a well-known long-lived one
+    # so a sane test still works when the operator just clicks Test
+    # with no domain in mind. `example.com` is reserved by IANA, has
+    # decades of WHOIS history, and won't burn meaningful quota on
+    # any reasonable provider.
+    domain: str = "example.com"
+
+
+@router.post("/whois-history/test")
+async def test_whois_history_route(
+    payload: WhoisHistoryTestIn | None = None,
+):
+    """Live probe — fetch a single domain's history through the
+    configured provider + API key, return a tiny diagnostic envelope.
+    Costs the operator 1 provider request (a few cents on WhoisFreaks).
+
+    Designed so the UI can render three outcomes:
+      • ok=true, records_found > 0 → green: "working, found N records"
+      • ok=true, records_found = 0 → amber: "auth fine, no history
+        for this domain — try a different one"
+      • ok=false              → rose:  error message verbatim
+
+    We don't write anything to the DB on test — no CriterionResult,
+    no Run, no availability_checks row. Pure read-through to surface
+    config issues before the operator burns credits on a real job."""
+    domain = (
+        (payload.domain if payload else "example.com") or "example.com"
+    ).strip().lower()
+    if not domain or "." not in domain:
+        raise HTTPException(400, "domain must include a TLD (e.g. example.com)")
+
+    # Imports inside the handler — the whois_history module pulls in
+    # httpx which is already loaded, but keep the import lazy so the
+    # base settings router doesn't tug on an extra subtree at import
+    # time. Also defends against circulars during boot ordering tweaks.
+    from ..whois_history.base import WhoisProviderError
+    from ..whois_history.fetcher import fetch_history
+
+    try:
+        result = await fetch_history(domain)
+    except WhoisProviderError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "domain": domain,
+        }
+    except Exception as e:  # noqa: BLE001
+        # Anything else (timeout, JSON parse, etc.) — surface the
+        # class name so the operator can grep logs if needed, but
+        # don't 500 the test endpoint itself.
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "domain": domain,
+        }
+
+    return {
+        "ok": True,
+        "domain": domain,
+        "provider": result.provider,
+        "records_found": result.snapshot_count,
+        # Tiny sample so the UI can show "yes, this is real data" —
+        # pick the latest record's most-useful fields. Skip raw_text
+        # / extras to keep the response tiny.
+        "latest_record_preview": (
+            {
+                "query_time": result.records[-1].get("query_time"),
+                "creation_date": result.records[-1].get("creation_date"),
+                "expiry_date": result.records[-1].get("expiry_date"),
+                "registrar_name": result.records[-1].get("registrar_name"),
+                "registrant_country": (
+                    result.records[-1].get("registrant_country")
+                ),
+                "domain_status": result.records[-1].get("domain_status"),
+            }
+            if result.records else None
+        ),
+    }

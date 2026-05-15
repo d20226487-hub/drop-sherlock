@@ -125,15 +125,29 @@ export type AvailabilitySettings = {
 
 export type IntegrationStatus = {
   provider: string;
-  configured: ProviderStatus;
+  // `configured` is optional now (Wave 2b, 2026-05-15) — backend
+  // attaches it for providers in PROVIDER_FIELDS but skips for
+  // WhoisFreaks (which encodes config state via the `state` field
+  // directly). Frontend checks before reading.
+  configured?: ProviderStatus;
 } & (
-  | { state: "ok"; elapsed_ms: number; details: Record<string, unknown> }
+  | {
+      state: "ok";
+      // `elapsed_ms` is optional — the config-only mode + WhoisFreaks
+      // probe omit it because no IO happened.
+      elapsed_ms?: number;
+      details: Record<string, unknown>;
+    }
   | { state: "unconfigured"; error: string }
   | { state: "error"; error: string }
 );
 
 export type DashboardStatus = {
   checked_at: string;
+  // `mode` (Wave 2b) — "config" or "live". UI uses this to label
+  // whether the user is looking at a passive check or a fresh
+  // upstream probe.
+  mode?: "config" | "live";
   integrations: IntegrationStatus[];
 };
 
@@ -743,6 +757,10 @@ export type RunDomainDetail = {
   run_id: number;
   job_id: number;
   job_name: string;
+  // Pillar discriminator (Wave 2b, 2026-05-15). Drives the per-domain
+  // page's view selection. Always populated; empty fallback maps to
+  // 'quality' on the renderer side.
+  job_kind?: JobKind;
   domain: string;
   status: string;
   started_at: string | null;
@@ -1196,7 +1214,10 @@ export const api = {
       }),
     }),
 
-  getDashboardStatus: () => request<DashboardStatus>("/dashboard/status"),
+  getDashboardStatus: (opts?: { live?: boolean }) =>
+    request<DashboardStatus>(
+      `/dashboard/status${opts?.live ? "?live=true" : ""}`,
+    ),
 
   previewAnalyze: (spec: AnalyzeSpec) =>
     request<PreviewResponse>("/analyze/preview", {
@@ -2020,6 +2041,91 @@ export const api = {
     request<PublicShareDetail>(
       `/public/share/${encodeURIComponent(token)}`,
     ),
+
+  // --- Whois History pillar (Wave 2, 2026-05-15) ---
+  getWhoisHistorySettings: () =>
+    request<WhoisHistorySettings>("/settings/whois-history"),
+  setWhoisHistorySetting: (key: string, value: string) =>
+    request<{ updated: string }>("/settings/whois-history", {
+      method: "PUT",
+      body: JSON.stringify({ key, value }),
+    }),
+  setWhoisHistoryApiKey: (apiKey: string) =>
+    request<{ ok: boolean; api_key_set: boolean }>(
+      "/settings/whois-history/api-key",
+      {
+        method: "PUT",
+        body: JSON.stringify({ api_key: apiKey }),
+      },
+    ),
+  testWhoisHistory: (domain?: string) =>
+    request<WhoisHistoryTestResult>("/settings/whois-history/test", {
+      method: "POST",
+      body: JSON.stringify(
+        domain && domain.trim() ? { domain: domain.trim() } : {},
+      ),
+    }),
+  setWhoisHistoryRateLimits: (values: {
+    rpm?: number;
+    max_concurrent?: number;
+  }) =>
+    request<{ updated: string[] }>("/settings/whois-history/rate-limits", {
+      method: "PUT",
+      body: JSON.stringify(values),
+    }),
+  submitWhoisHistoryJob: (payload: {
+    domains: string[];
+    ai_provider: string;
+    ai_model?: string;
+    name?: string;
+    notes?: string;
+    lang?: string;
+  }) =>
+    request<{
+      job_id: number;
+      run_id: number;
+      skipped_banned: string[];
+    }>("/analyze/whois-history", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+};
+
+export type WhoisHistoryTestResult =
+  | {
+      ok: true;
+      domain: string;
+      provider: string;
+      records_found: number;
+      latest_record_preview: {
+        query_time: string | null;
+        creation_date: string | null;
+        expiry_date: string | null;
+        registrar_name: string;
+        registrant_country: string;
+        domain_status: string[];
+      } | null;
+    }
+  | {
+      ok: false;
+      domain: string;
+      error: string;
+    };
+
+// --- Whois History types (added Wave 2, 2026-05-15) ---
+export type WhoisHistorySettings = {
+  provider: string;
+  // Backend never round-trips the API key; this flag is "do we have
+  // one stored?" so the UI can show set/unset state without leaking
+  // the secret. Pair with setWhoisHistoryApiKey to write.
+  api_key_set: boolean;
+  max_records: number;
+  coverage_gap_threshold_days: number;
+  drop_confidence_threshold: number;
+  // Rate limits applied to the configured provider (Wave 2b,
+  // 2026-05-15). Storing per-provider means a future provider swap
+  // doesn't inherit WhoisFreaks's tuning.
+  rate_limits: { rpm: number; max_concurrent: number };
 };
 
 // --- Share-link types (added 2026-05-15) ---

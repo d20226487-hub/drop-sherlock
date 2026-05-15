@@ -13,14 +13,25 @@ import { RetentionEditor } from "@/components/retention-editor";
 import { BackupsEditor } from "@/components/backups-editor";
 import { ImportLimitEditor } from "@/components/import-limit-editor";
 import { AvailabilityEditor } from "@/components/availability-editor";
+import { WhoisHistoryEditor } from "@/components/whois-history-editor";
 
-type SettingsTab = "api" | "brain" | "wayback" | "availability" | "others";
+type SettingsTab =
+  | "api"
+  | "brain"
+  | "wayback"
+  | "availability"
+  | "whoisHistory"
+  | "others";
 
 const TABS: SettingsTab[] = [
   "api",
   "brain",
   "wayback",
   "availability",
+  // Wave 2b (2026-05-15): pillar-specific tab for the WHOIS history
+  // pillar. Lives between Availability and Others so the order matches
+  // the pipeline pillars on the nav (Availability → Whois → Quality).
+  "whoisHistory",
   "others",
 ];
 
@@ -195,6 +206,12 @@ export default function SettingsPage() {
           {tab === "availability" && (
             <div className="space-y-8">
               <AvailabilityEditor />
+            </div>
+          )}
+
+          {tab === "whoisHistory" && (
+            <div className="space-y-8">
+              <WhoisHistoryEditor />
             </div>
           )}
 

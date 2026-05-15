@@ -86,7 +86,10 @@ const messagesEn = {
         gemini: "Google Gemini",
         github_models: "GitHub Models",
         openrouter: "OpenRouter",
+        whoisfreaks: "WhoisFreaks",
       },
+      whoisfreaksConfiguredHint:
+        "API key configured. The Dashboard does NOT probe live (every WhoisFreaks request costs money). Use Settings → Whois History → Test to verify live (1 request per click).",
       states: {
         ok: "Working",
         unconfigured: "Not configured",
@@ -96,6 +99,21 @@ const messagesEn = {
       noKeyYet: "No credentials saved yet. Open Settings to add one.",
       openSettings: "Open Settings",
       elapsed: (ms: number) => `${ms} ms`,
+      // Wave 2b (2026-05-15): default Dashboard load is now passive
+      // (zero upstream calls). These strings cover the new two-button
+      // UX + the mode banner explaining which view the user is on.
+      refreshHint:
+        "Re-read configured-state from the DB. No upstream requests — instant.",
+      liveChecks: "Run live checks",
+      liveChecksRunning: "Running…",
+      liveChecksHint:
+        "Probe every AI provider, Ahrefs, and Wayback for current liveness. Uses each provider's FREE test endpoint, so it costs you nothing. WhoisFreaks stays config-only (every request costs money — use Settings → Whois History → Test for a single explicit probe).",
+      liveCheckedAt: (when: string) => `Live-checked ${when}`,
+      lastLiveAt: (when: string) => `Last live check: ${when}`,
+      modeBannerConfig:
+        "Showing CONFIGURED state (no upstream requests). Click \"Run live checks\" to verify providers are responding right now.",
+      modeBannerLive:
+        "Showing LIVE state — providers were probed just now. Refresh re-reads configured-state without re-probing.",
     },
     analyze: {
       title: "Analyze",
@@ -1030,7 +1048,54 @@ const messagesEn = {
         brain: "Brain",
         wayback: "Wayback classification",
         availability: "Domain availability",
+        whoisHistory: "Whois History",
         others: "Others",
+      },
+      whoisHistory: {
+        heading: "Whois History (drop detection)",
+        intro:
+          "Historical-WHOIS lookups via the configured provider. The AI judge reads the structured diff (creation_date changes, EPP drop-pipeline status codes, coverage gaps, owner/email/org changes) and emits a 'dropped vs transferred' confidence. Run this BEFORE the Quality pillar — domains with high drop confidence can skip Wayback + Ahrefs spend.",
+        providerLabel: "Provider",
+        providerHint: "Only WhoisFreaks is wired today; more in a future wave.",
+        apiKeyLabel: "API key",
+        apiKeyHint:
+          "Encrypted at rest. Stored value is never returned — leave the field empty to keep the existing key, type a new value to replace, type nothing and click Clear to remove.",
+        apiKeyStored: "(stored — leave blank to keep)",
+        apiKeyMissing: "(not set yet)",
+        saveApiKey: "Save key",
+        clearApiKey: "Clear key",
+        maxRecordsLabel: "Max history records",
+        maxRecordsHint:
+          "Cap on how many historical snapshots to keep per domain. The most-recent N are kept (drop-signal density is highest near the present). Range: 1–500.",
+        coverageGapLabel: "Coverage-gap threshold (days)",
+        coverageGapHint:
+          "Days of \"no snapshots\" between consecutive records that the diff computer flags as a hard drop signal. Below this, normal polling-cadence variance dominates. Range: 1–365.",
+        dropThresholdLabel: "Drop confidence threshold",
+        dropThresholdHint:
+          "AI verdicts whose dropped_confidence ≥ this value get the green \"high confidence: dropped\" chip in the UI and are eligible for the bulk \"send passers to Quality\" filter. Range: 0–1.",
+        testLabel: "Test connection",
+        testHint:
+          "Live probe — fetches one domain's history through the configured provider and shows the result inline. Costs 1 provider request (a few cents).",
+        testButton: "Test",
+        testing: "Testing…",
+        testTooltip: "Probe the provider with this domain",
+        testNeedsKey: "Save an API key first.",
+        testOk: (count: number, domain: string) =>
+          `OK — found ${count} historical record${count === 1 ? "" : "s"} for ${domain}.`,
+        testOkHint: (provider: string) =>
+          `via ${provider}. Latest snapshot preview below.`,
+        testNoRecords: (domain: string) =>
+          `Auth fine, but no history available for ${domain}.`,
+        testNoRecordsHint:
+          "The provider responded successfully with zero records. Try a longer-lived domain (e.g. google.com) to verify the integration works end-to-end.",
+        testFailed: "Test failed",
+        testFailedHint:
+          "Most common causes: invalid API key, exhausted plan quota, network issue. Check the error verbatim above.",
+        rateLimitsHeading: "Rate limits",
+        rateLimitsHint:
+          "Caps applied to every WhoisFreaks call (Test button, runner, dashboard probes). Set these BELOW your plan's ceiling — bursts above the cap surface as HTTP 429. Defaults work for the free tier; raise once you've confirmed your plan's actual limit.",
+        rpmLabel: "Requests per minute",
+        maxConcurrentLabel: "Max concurrent",
       },
       othersEmpty: "No settings here yet.",
       importLimit: {
@@ -1568,9 +1633,28 @@ const messagesEn = {
       useQuality: "Use the Quality pillar instead",
     },
     checkWhoisHistory: {
-      title: "Whois History",
+      title: "Check — Whois History",
       subtitle:
-        "Historical WHOIS drop-detection. Compares snapshots over time, flags owner changes / re-registrations / drop-pipeline status codes.",
+        "Historical WHOIS drop-detection. Each domain gets one provider call (records fetched, diff computed) and one AI verdict (dropped vs transferred, with confidence and key signals). Use BEFORE the Quality pillar to skip Wayback + Ahrefs spend on domains the AI says clearly didn't drop.",
+      pipelineHint:
+        "Configure the provider key + rate limits in Settings → Whois History before submitting big jobs.",
+      labelHeading: "Job label",
+      labelHint:
+        "Optional — defaults to `<first-domain> +N more · <yyyy-mm-dd HH:MM>` when blank.",
+      nameLabel: "Name",
+      namePlaceholder: "e.g. drop-watch batch 2026-05",
+      notesLabel: "Notes",
+      notesPlaceholder: "Why are we checking these?",
+      submit: "Run Whois history check",
+      submitting: "Submitting…",
+      settingsLink: "Open Whois settings",
+      summary: (n: number) => `${n} domain${n === 1 ? "" : "s"} ready`,
+      skippedBanned: (n: number) =>
+        `Skipped ${n} banned domain${n === 1 ? "" : "s"} from the input.`,
+      allBannedError: (count: number, sample: string, truncated: boolean) =>
+        `All submitted domains are on the ban list (${count} total): ${sample}${
+          truncated ? "…" : ""
+        }`,
     },
     checkAvailability: {
       title: "Availability",
@@ -1586,6 +1670,72 @@ const messagesEn = {
       title: "Availability — Jobs",
       subtitle:
         "Past + ongoing availability-cascade jobs.",
+    },
+    // Wave 2b (2026-05-15) — per-domain page for whois_history-kind
+    // runs (rendered via WhoisHistoryDomainView when job_kind matches).
+    whoisDomain: {
+      pending: "Whois History fetch / AI judge still pending for this domain.",
+      errorHeading: "Whois History fetch failed",
+      verdict: {
+        heading: "AI verdict",
+        dropConfidence: "dropped",
+        transferredConfidence: "transferred",
+        keySignals: "Key signals",
+        recommendation: "Recommendation",
+      },
+      diff: {
+        heading: "Diff signals",
+        coverage: (count: number, first: string | null, last: string | null) =>
+          first && last
+            ? `${count} snapshots · ${first.slice(0, 10)} → ${last.slice(0, 10)}`
+            : `${count} snapshots`,
+        hardSignals: "Hard signals",
+        softSignals: "Soft signals",
+        noHardSignals:
+          "No hard signals (no creation-date change, no drop-pipeline status, no coverage gaps).",
+        signals: {
+          creation_date_changes: "Creation date changed (HARD — re-registered)",
+          drop_pipeline_status_events:
+            "Drop-pipeline status codes in history (HARD)",
+          coverage_gaps_days: "Coverage gaps ≥ threshold (HARD)",
+          owner_changes: "Registrant name changed",
+          email_changes: "Registrant email changed",
+          org_changes: "Registrant org / company changed",
+          country_changes: "Registrant country changed",
+          city_changes: "Registrant city changed",
+          registrar_changes: "Registrar changed (weak — transfers happen)",
+          ns_changes: "Nameserver family changed (weak — hosting moves)",
+          dnssec_toggles: "DNSSEC toggled (weak)",
+        },
+      },
+      currentState: {
+        heading: "Current state (latest snapshot)",
+        registrar: "Registrar",
+        owner: "Owner",
+        org: "Organization",
+        country: "Country",
+        creationDate: "Creation date",
+        status: "Status codes",
+        nameServers: "Nameservers",
+        dnssec: "DNSSEC",
+        dnssecOn: "enabled",
+        dnssecOff: "disabled",
+        inDropPipeline:
+          "Latest snapshot shows this domain in the registry's drop pipeline.",
+      },
+      rawRecords: {
+        toggle: (n: number) =>
+          `Raw historical records (${n} snapshot${n === 1 ? "" : "s"})`,
+        cols: {
+          queryTime: "As of",
+          creationDate: "Created",
+          expiryDate: "Expires",
+          registrar: "Registrar",
+          registrant: "Registrant",
+          country: "Country",
+          status: "Status",
+        },
+      },
     },
     backlog: {
       title: "Backlog",
@@ -1805,7 +1955,22 @@ const messagesRu: Messages = {
         gemini: "Google Gemini",
         github_models: "GitHub Models",
         openrouter: "OpenRouter",
+        whoisfreaks: "WhoisFreaks",
       },
+      whoisfreaksConfiguredHint:
+        "API-ключ настроен. Панель не делает живой запрос (каждый запрос к WhoisFreaks стоит денег). Чтобы проверить вживую — Настройки → История Whois → Проверить (1 запрос на клик).",
+      refreshHint:
+        "Перечитать состояние из БД. Без запросов к провайдерам — мгновенно.",
+      liveChecks: "Живая проверка",
+      liveChecksRunning: "Проверка…",
+      liveChecksHint:
+        "Опросить все AI-провайдеры, Ahrefs и Wayback на актуальную живость. Использует бесплатные test-эндпоинты — стоит вам ничего. WhoisFreaks остаётся в режиме config-only (каждый запрос стоит денег — используйте Настройки → История Whois → Проверить для отдельного запроса).",
+      liveCheckedAt: (when) => `Живая проверка: ${when}`,
+      lastLiveAt: (when) => `Последняя живая проверка: ${when}`,
+      modeBannerConfig:
+        "Показано НАСТРОЕННОЕ состояние (без запросов к провайдерам). Нажмите «Живая проверка», чтобы убедиться, что провайдеры отвечают прямо сейчас.",
+      modeBannerLive:
+        "Показано ЖИВОЕ состояние — провайдеры опрошены только что. «Обновить» перечитает настройки без повторного опроса.",
       states: {
         ok: "Работает",
         unconfigured: "Не настроено",
@@ -2824,7 +2989,54 @@ const messagesRu: Messages = {
         brain: "Мозг",
         wayback: "Классификация Wayback",
         availability: "Доступность домена",
+        whoisHistory: "История Whois",
         others: "Прочее",
+      },
+      whoisHistory: {
+        heading: "История Whois (выявление дропов)",
+        intro:
+          "Запросы исторических WHOIS через выбранный провайдер. ИИ-судья читает структурированный diff (изменения creation_date, EPP-статусы из drop-pipeline, пробелы покрытия, смену владельца/email/организации) и выдаёт уверенность «дроп vs трансфер». Запускайте ПЕРЕД пиллар «Качество» — домены с высокой уверенностью дропа могут пропустить Wayback + Ahrefs.",
+        providerLabel: "Провайдер",
+        providerHint: "Сегодня поддерживается только WhoisFreaks; больше — позже.",
+        apiKeyLabel: "API-ключ",
+        apiKeyHint:
+          "Шифруется на хранении. Сохранённое значение никогда не возвращается — оставьте поле пустым, чтобы сохранить текущий ключ, введите новое значение, чтобы заменить, или ничего не вводите и нажмите «Очистить», чтобы удалить.",
+        apiKeyStored: "(сохранён — оставьте пустым, чтобы оставить)",
+        apiKeyMissing: "(пока не задан)",
+        saveApiKey: "Сохранить ключ",
+        clearApiKey: "Очистить ключ",
+        maxRecordsLabel: "Максимум исторических записей",
+        maxRecordsHint:
+          "Ограничение на число снимков, хранимых для одного домена. Оставляются N последних (плотность drop-сигналов выше у недавних). Диапазон: 1–500.",
+        coverageGapLabel: "Порог пробела покрытия (дни)",
+        coverageGapHint:
+          "Дни «без снимков» между последовательными записями, которые diff-вычислитель считает жёстким drop-сигналом. Ниже этого значения преобладает обычная вариация частоты опроса. Диапазон: 1–365.",
+        dropThresholdLabel: "Порог уверенности «дроп»",
+        dropThresholdHint:
+          "Вердикты ИИ с dropped_confidence ≥ этого значения получают зелёный чип «высокая уверенность: дроп» в интерфейсе и попадают в фильтр массового действия «отправить прошедших в Качество». Диапазон: 0–1.",
+        testLabel: "Проверка соединения",
+        testHint:
+          "Живой запрос — получает историю одного домена через выбранного провайдера и показывает результат тут же. Стоит 1 запрос (несколько центов).",
+        testButton: "Проверить",
+        testing: "Проверка…",
+        testTooltip: "Запросить провайдера с этим доменом",
+        testNeedsKey: "Сначала сохраните API-ключ.",
+        testOk: (count, domain) =>
+          `OK — найдено ${count} историческ${count === 1 ? "ая запись" : "их записей"} для ${domain}.`,
+        testOkHint: (provider) =>
+          `через ${provider}. Предпросмотр последнего снимка ниже.`,
+        testNoRecords: (domain) =>
+          `Авторизация прошла, но истории для ${domain} нет.`,
+        testNoRecordsHint:
+          "Провайдер ответил успешно, но без записей. Попробуйте более долгоживущий домен (например, google.com), чтобы убедиться, что интеграция работает end-to-end.",
+        testFailed: "Проверка не удалась",
+        testFailedHint:
+          "Самые частые причины: неверный API-ключ, исчерпана квота плана, проблема с сетью. Текст ошибки указан выше дословно.",
+        rateLimitsHeading: "Ограничения частоты",
+        rateLimitsHint:
+          "Лимиты применяются к каждому запросу WhoisFreaks (кнопка «Проверить», runner, проверки в панели). Ставьте НИЖЕ потолка вашего плана — всплески выше лимита приводят к HTTP 429. По умолчанию настроено под бесплатный тариф; поднимайте, когда подтвердите реальный лимит плана.",
+        rpmLabel: "Запросов в минуту",
+        maxConcurrentLabel: "Максимум одновременно",
       },
       othersEmpty: "Пока здесь нет настроек.",
       importLimit: {
@@ -3385,9 +3597,28 @@ const messagesRu: Messages = {
       useQuality: "Перейти в раздел Качество",
     },
     checkWhoisHistory: {
-      title: "История Whois",
+      title: "Проверка — История Whois",
       subtitle:
-        "Анализ исторических записей WHOIS для выявления дропов. Сравнивает срезы во времени, отмечает смену владельцев, перерегистрацию, drop-pipeline статусы.",
+        "Анализ исторических WHOIS-записей для выявления дропов. Каждый домен — один запрос к провайдеру (получение записей, вычисление diff) и один вердикт ИИ (дроп vs трансфер, с уверенностью и ключевыми сигналами). Запускайте ПЕРЕД пиллар «Качество», чтобы пропустить Wayback и Ahrefs для доменов, которые точно не дропались.",
+      pipelineHint:
+        "Перед большими задачами настройте ключ провайдера и лимиты частоты в Настройки → История Whois.",
+      labelHeading: "Метка задачи",
+      labelHint:
+        "Необязательно — по умолчанию `<первый-домен> +N ещё · <yyyy-mm-dd HH:MM>`.",
+      nameLabel: "Название",
+      namePlaceholder: "напр. drop-watch партия 2026-05",
+      notesLabel: "Заметки",
+      notesPlaceholder: "Зачем проверяем?",
+      submit: "Запустить проверку Whois history",
+      submitting: "Отправка…",
+      settingsLink: "Открыть настройки Whois",
+      summary: (n) => `${n} домен${n === 1 ? "" : ""} готов${n === 1 ? "" : "ы"} к запуску`,
+      skippedBanned: (n) =>
+        `Пропущено забаненных доменов: ${n}.`,
+      allBannedError: (count, sample, truncated) =>
+        `Все указанные домены в бан-листе (${count} всего): ${sample}${
+          truncated ? "…" : ""
+        }`,
     },
     checkAvailability: {
       title: "Доступность",
@@ -3403,6 +3634,72 @@ const messagesRu: Messages = {
       title: "Доступность — Задачи",
       subtitle:
         "Прошлые и текущие задачи каскада доступности.",
+    },
+    whoisDomain: {
+      pending: "Запрос Whois и/или вердикт ИИ для этого домена ещё в работе.",
+      errorHeading: "Получение Whois history не удалось",
+      verdict: {
+        heading: "Вердикт ИИ",
+        dropConfidence: "дроп",
+        transferredConfidence: "трансфер",
+        keySignals: "Ключевые сигналы",
+        recommendation: "Рекомендация",
+      },
+      diff: {
+        heading: "Сигналы из diff",
+        coverage: (count, first, last) =>
+          first && last
+            ? `${count} снимков · ${first.slice(0, 10)} → ${last.slice(0, 10)}`
+            : `${count} снимков`,
+        hardSignals: "Жёсткие сигналы",
+        softSignals: "Мягкие сигналы",
+        noHardSignals:
+          "Жёстких сигналов нет (нет изменения creation_date, drop-pipeline статусов, провалов покрытия).",
+        signals: {
+          creation_date_changes:
+            "Изменилась дата создания (ЖЁСТКИЙ — перерегистрация)",
+          drop_pipeline_status_events:
+            "Drop-pipeline статусы в истории (ЖЁСТКИЙ)",
+          coverage_gaps_days: "Провалы покрытия ≥ порога (ЖЁСТКИЙ)",
+          owner_changes: "Изменилось имя владельца",
+          email_changes: "Изменился email владельца",
+          org_changes: "Изменилась организация/компания",
+          country_changes: "Изменилась страна владельца",
+          city_changes: "Изменился город владельца",
+          registrar_changes:
+            "Изменился регистратор (слабый — трансферы бывают)",
+          ns_changes:
+            "Изменилось семейство нэймсерверов (слабый — переезд хостинга)",
+          dnssec_toggles: "DNSSEC включён/выключен (слабый)",
+        },
+      },
+      currentState: {
+        heading: "Текущее состояние (последний снимок)",
+        registrar: "Регистратор",
+        owner: "Владелец",
+        org: "Организация",
+        country: "Страна",
+        creationDate: "Дата создания",
+        status: "Статусы",
+        nameServers: "Нэймсерверы",
+        dnssec: "DNSSEC",
+        dnssecOn: "включён",
+        dnssecOff: "выключен",
+        inDropPipeline:
+          "Последний снимок показывает, что домен в drop-pipeline реестра.",
+      },
+      rawRecords: {
+        toggle: (n) => `Сырые исторические записи (${n} снимков)`,
+        cols: {
+          queryTime: "На дату",
+          creationDate: "Создан",
+          expiryDate: "Истекает",
+          registrar: "Регистратор",
+          registrant: "Владелец",
+          country: "Страна",
+          status: "Статус",
+        },
+      },
     },
     backlog: {
       title: "Очередь",

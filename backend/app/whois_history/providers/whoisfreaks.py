@@ -53,6 +53,7 @@ from typing import Any
 
 import httpx
 
+from ...limits import limit
 from ..base import WhoisProvider, WhoisProviderError, WhoisRecord
 
 log = logging.getLogger(__name__)
@@ -291,8 +292,17 @@ class WhoisFreaksProvider(WhoisProvider):
         last_err: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    resp = await client.get(_API_BASE, params=params)
+                # Gate every HTTP request through the per-provider
+                # rate limiter (token bucket + concurrency semaphore).
+                # User-configurable in Settings → Whois History → Rate
+                # limits — see `_RATE_LIMIT_DEFAULTS["whoisfreaks"]`
+                # for the defaults. Wrapping the request (not the
+                # whole retry loop) ensures retries also pay the rate
+                # cost, preventing a retry burst from re-triggering
+                # the 429 we just bounced off of.
+                async with limit("whoisfreaks"):
+                    async with httpx.AsyncClient(timeout=self._timeout) as client:
+                        resp = await client.get(_API_BASE, params=params)
                 # WhoisFreaks puts auth errors in HTTP 200 + status:false
                 # AND uses 401/403 for the same thing depending on
                 # endpoint version. Map both to WhoisProviderError.

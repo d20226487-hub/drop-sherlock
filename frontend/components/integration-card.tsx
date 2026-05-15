@@ -14,7 +14,13 @@ const STATE_DOT: Record<IntegrationStatus["state"], string> = {
   error: "bg-red-500",
 };
 
-function summary(it: IntegrationStatus): string | null {
+function summary(
+  it: IntegrationStatus,
+  // i18n bundle for provider-specific copy. Passed in (rather than
+  // calling useT here) so this stays a pure function — easier to
+  // test, and the integration card already has the bundle in scope.
+  whoisfreaksConfiguredHint: string,
+): string | null {
   if (it.state !== "ok") return null;
   const d = it.details;
   switch (it.provider) {
@@ -59,6 +65,15 @@ function summary(it: IntegrationStatus): string | null {
         parts.push(`${used.toLocaleString()} / ${limit.toLocaleString()} units used`);
       return parts.join(" · ") || null;
     }
+    case "whoisfreaks": {
+      // Dashboard probe is configuration-only (no API call) because
+      // every WhoisFreaks request costs money — see backend
+      // _probe_whoisfreaks docstring. Surface a clear hint that the
+      // "ok" state here means "key is set", not "live verified".
+      // For actual liveness use Settings → Whois History → Test.
+      if (d.live_check_required) return whoisfreaksConfiguredHint;
+      return null;
+    }
     default:
       return null;
   }
@@ -71,7 +86,7 @@ export function IntegrationCard({ status }: { status: IntegrationStatus }) {
     ts.providerNames[status.provider as keyof typeof ts.providerNames] ||
     status.provider;
   const stateLabel = ts.states[status.state] || status.state;
-  const oneLiner = summary(status);
+  const oneLiner = summary(status, ts.whoisfreaksConfiguredHint);
 
   return (
     <section className="rounded-lg border dark:border-neutral-800 bg-white dark:bg-neutral-900 p-5 space-y-3">

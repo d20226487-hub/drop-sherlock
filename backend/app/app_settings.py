@@ -307,15 +307,42 @@ _RATE_LIMIT_DEFAULTS: dict[str, dict[str, int]] = {
     # batches now drain steadily. User can bump in Settings if their
     # workload tolerates it.
     "wayback": {"rpm": 30, "max_concurrent": 1, "retry_max": 3},
+    # WhoisFreaks (added Wave 2b, 2026-05-15). The first user-side
+    # 429 happened during the Settings → Test button — their free tier
+    # limit is ~30/min and bursts hit it. Conservative defaults:
+    #   - rpm=30: 1 request every 2s averages well under the free
+    #     tier's published ceiling
+    #   - max_concurrent=2: small bursts allowed (the runner's per-
+    #     domain fan-out wants > 1), but never piles up.
+    #   - retry_max=2: WhoisFreaks 5xxs occasionally; one retry is
+    #     enough. 429 is NOT retried by the provider client (that'd
+    #     loop into more 429s) — the rate limiter prevents it instead.
+    # User can tune both up in Settings → Whois History → Rate limits
+    # once they confirm their plan's actual ceiling.
+    "whoisfreaks": {"rpm": 30, "max_concurrent": 2, "retry_max": 2},
 }
+
+# Providers that have configurable rate limits but are NOT exposed in
+# the main `/settings` provider-cards section (their credentials live
+# in dedicated pillar tabs). Used by the rate-limit getter/setter to
+# validate "this is a known provider" without forcing the card UI to
+# render it.
+_RATE_LIMIT_EXTRAS: set[str] = {"whoisfreaks"}
 
 
 def _rate_key(provider: str, field: str) -> str:
     return f"rate_limit__{provider}__{field}"
 
 
+def _rate_limit_provider_allowed(provider: str) -> bool:
+    """A provider can have rate limits if it's either a main API
+    provider (`PROVIDER_FIELDS`) OR a pillar-specific extra. Centralized
+    so both getter + setter agree on the check."""
+    return provider in PROVIDER_FIELDS or provider in _RATE_LIMIT_EXTRAS
+
+
 def get_rate_limits(provider: str) -> dict[str, int]:
-    if provider not in PROVIDER_FIELDS:
+    if not _rate_limit_provider_allowed(provider):
         raise ValueError(f"unknown provider: {provider}")
     out = dict(_RATE_LIMIT_DEFAULTS[provider])
     db = SessionLocal()
@@ -334,7 +361,7 @@ def get_rate_limits(provider: str) -> dict[str, int]:
 
 
 def set_rate_limits(provider: str, values: dict[str, int]) -> None:
-    if provider not in PROVIDER_FIELDS:
+    if not _rate_limit_provider_allowed(provider):
         raise ValueError(f"unknown provider: {provider}")
     db = SessionLocal()
     try:
@@ -1467,6 +1494,11 @@ def get_whois_history_drop_threshold() -> float:
 def get_whois_history_config() -> dict:
     """Bundle of all whois_history settings for the Settings UI to
     render in one shot. Mirrors `get_availability_config()` shape."""
+    # Rate limits are stored against the *concrete* provider name so
+    # a future provider swap (DomainTools / WhoisXMLAPI) lands its own
+    # row rather than inheriting WhoisFreaks's tuning. Today only
+    # WhoisFreaks is wired so this always reads from there.
+    rl = get_rate_limits(get_whois_history_provider())
     return {
         "provider": get_whois_history_provider(),
         "api_key_set": bool(get_whois_history_api_key()),
@@ -1475,6 +1507,10 @@ def get_whois_history_config() -> dict:
             get_whois_history_coverage_gap_threshold()
         ),
         "drop_confidence_threshold": get_whois_history_drop_threshold(),
+        "rate_limits": {
+            "rpm": rl["rpm"],
+            "max_concurrent": rl["max_concurrent"],
+        },
     }
 
 

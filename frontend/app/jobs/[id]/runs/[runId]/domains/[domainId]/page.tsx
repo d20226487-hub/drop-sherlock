@@ -9,6 +9,7 @@ import { VerdictBox } from "@/components/verdict-box";
 import { ReanalyzeBar } from "@/components/reanalyze-bar";
 import { NotesEditor } from "@/components/notes-editor";
 import { ShareButton } from "@/components/share-button";
+import { WhoisHistoryDomainView } from "@/components/whois-history-domain-view";
 import { AiPreviewPanel } from "@/components/ai-preview-panel";
 import {
   WaybackSamplesTimeline,
@@ -209,6 +210,48 @@ export default function DomainDetailPage({
 
   if (data === null) {
     return <div className="text-sm text-neutral-500">{t.common.loading}</div>;
+  }
+
+  // Wave 2b (2026-05-15): whois_history-kind runs render a dedicated
+  // single-criterion view instead of the Quality criterion tabs. The
+  // header (back link, domain, status, notes editor) is shared so
+  // the look stays consistent across pillars.
+  if (data.job_kind === "whois_history") {
+    return (
+      <div className="space-y-10">
+        <Link
+          href={`/jobs/${jobId}/runs/${runId}`}
+          className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+        >
+          {ts.backToRun(runId)}
+        </Link>
+        <header className="space-y-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <h1 className="text-2xl font-semibold font-mono">
+              {ts.title(data.domain)}
+            </h1>
+            <StatusPill status={data.status} />
+          </div>
+        </header>
+        <WhoisHistoryDomainView data={data} />
+        {/* Notes are domain-keyed (cross-job survival) — render the
+            same editor as the Quality view so an operator can attach
+            judgment notes to a domain regardless of which pillar
+            surfaced it. */}
+        <section className="pt-6 border-t dark:border-neutral-800">
+          <NotesEditor
+            domain={data.domain}
+            initialNote={data.note}
+            initialUpdatedAt={data.note_updated_at}
+            onSaved={(note, updatedAt) => {
+              setData((prev) =>
+                prev ? { ...prev, note, note_updated_at: updatedAt } : prev,
+              );
+            }}
+          />
+        </section>
+      </div>
+    );
   }
 
   const detail = data.criteria[tab];

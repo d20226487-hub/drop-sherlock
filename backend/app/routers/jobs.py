@@ -1191,6 +1191,11 @@ def get_run_domain_detail(
         "error": rd.error,
         "job_id": rd.run.job_id,
         "job_name": rd.run.job.name,
+        # Pillar discriminator (Wave 2b, 2026-05-15) — drives the
+        # per-domain page's choice of view (Quality criterion tabs vs
+        # WhoisHistoryDomainView). Always populated post-Wave-1
+        # backfill; empty fallback maps to 'quality' on the frontend.
+        "job_kind": (rd.run.job.kind or "quality"),
         "criteria": criteria,
         "final_assessment": final_assessment,
         "final_summary": rd.final_summary,
