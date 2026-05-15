@@ -106,6 +106,14 @@ def _migrate_sqlite_columns() -> None:
         # JSON dict of the BacklogDomain fields, or "" when the banned
         # domain had no Backlog row. Used to restore the row on unban.
         ("domain_bans", "backlog_snapshot_json", "TEXT DEFAULT ''"),
+        # Pillar discriminator (added 2026-05-15, Wave 1 of the
+        # 3-pillar restructure). Every pre-wave row backfills to
+        # 'quality' via the dedicated step below; the additive
+        # migration here just makes the column exist. New jobs are
+        # tagged by the create endpoint (analyze sets 'quality',
+        # availability sets 'availability', whois_history sets
+        # 'whois_history').
+        ("jobs", "kind", "VARCHAR(32) DEFAULT 'quality'"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding
@@ -134,6 +142,9 @@ def _migrate_sqlite_columns() -> None:
         ("ix_availability_checks_domain", "availability_checks", "domain"),
         ("ix_availability_checks_checked_at", "availability_checks", "checked_at"),
         ("ix_availability_checks_run_id", "availability_checks", "run_id"),
+        # Added Wave 1 — drives the kind-filtered list endpoint
+        # for the /jobs/{quality,whois_history,availability} pages.
+        ("ix_jobs_kind", "jobs", "kind"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in additions:
@@ -360,6 +371,37 @@ def _encrypt_legacy_secret_settings() -> None:
         db.close()
 
 
+def _backfill_job_kind() -> None:
+    """Wave 1 (2026-05-15): every existing Job row dates from before the
+    3-pillar restructure → tag them all `'quality'`. The additive ALTER
+    in `_migrate_sqlite_columns` sets a column-level default of 'quality'
+    so new INSERTs are fine; this one-shot covers the (rare) case where
+    a row was inserted with `kind=NULL` or `kind=''` before the column
+    default kicked in for that particular client.
+
+    Idempotent — only touches rows whose `kind` is null/empty.
+    """
+    import logging
+    from sqlalchemy import text
+
+    log = logging.getLogger(__name__)
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "UPDATE jobs SET kind = 'quality' "
+                    "WHERE kind IS NULL OR kind = ''"
+                )
+            )
+            if result.rowcount:
+                log.info(
+                    "Wave-1 backfill: tagged %s pre-existing Job row(s) as kind='quality'",
+                    result.rowcount,
+                )
+    except Exception:  # noqa: BLE001
+        log.exception("job kind backfill failed")
+
+
 def _migrate_legacy_pins_to_criterion_pins() -> None:
     """One-shot: expand legacy Run.is_pinned + RunDomain.is_pinned rows into
     the per-(job, criterion) `job_criterion_pins` table introduced
@@ -466,6 +508,7 @@ async def lifespan(_: FastAPI):
     _migrate_wayback_concurrency_default()
     _reconcile_stale_failed_statuses()
     _encrypt_legacy_secret_settings()
+    _backfill_job_kind()
     _migrate_legacy_pins_to_criterion_pins()
     # Phase 2 — start capturing every error from any logger into error_log.
     # Idempotent so reload-on-edit dev scenarios don't double-attach.

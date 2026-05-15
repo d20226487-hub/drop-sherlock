@@ -412,7 +412,11 @@ export default function BacklogPage() {
         BACKLOG_HANDOFF_KEY,
         JSON.stringify({ domains: r.domains }),
       );
-      router.push("/analyze?from_backlog=1");
+      // Wave 1 (2026-05-15): /analyze moved to /check/quality. The old
+      // path still works (it redirects) but pointing at the canonical
+      // path avoids the round-trip and lets the redirect file get
+      // deleted later without breaking this flow.
+      router.push("/check/quality?from_backlog=1");
     } catch (e) {
       setBulkError((e as Error).message);
     } finally {
@@ -442,7 +446,11 @@ export default function BacklogPage() {
         BACKLOG_HANDOFF_KEY,
         JSON.stringify({ domains: r.domains }),
       );
-      router.push("/analyze?from_backlog=1");
+      // Wave 1 (2026-05-15): /analyze moved to /check/quality. The old
+      // path still works (it redirects) but pointing at the canonical
+      // path avoids the round-trip and lets the redirect file get
+      // deleted later without breaking this flow.
+      router.push("/check/quality?from_backlog=1");
     } catch (e) {
       setBulkError((e as Error).message);
     } finally {

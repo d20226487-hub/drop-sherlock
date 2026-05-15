@@ -124,6 +124,17 @@ class Job(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
+    # Pillar this Job belongs to (added 2026-05-15, Wave 1 of the
+    # 3-pillar restructure). Values:
+    #   quality        — Wayback + Ahrefs analysis (the original/legacy
+    #                    pipeline; every pre-wave row backfills here)
+    #   availability   — Domain availability cascade (RDAP / Domainr /
+    #                    WHOIS-43); Wave 3
+    #   whois_history  — Historical WHOIS / drop-detection via
+    #                    WhoisFreaks-style provider + AI judge; Wave 2
+    # Free-string column (not Enum) so migrations stay painless on
+    # SQLite — the application layer enforces allowed values.
+    kind: Mapped[str] = mapped_column(String(32), default="quality", index=True)
     # Soft-archive marker. NULL = active; non-NULL = archived at that time.
     # Active queries default to filtering archived jobs out; the Jobs UI has
     # an explicit Archived tab to bring them back into view.

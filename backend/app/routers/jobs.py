@@ -51,6 +51,11 @@ class JobDetail(BaseModel):
     id: int
     name: str
     notes: str
+    # Pillar discriminator (added Wave 1, 2026-05-15). Drives which
+    # /jobs/<pillar> page the JobDetail will be rendered on; null/empty
+    # is treated as 'quality' on the frontend for pre-wave rows that
+    # somehow slipped past the backfill.
+    kind: str
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None
@@ -234,6 +239,7 @@ def _summarize_run(run: Run) -> RunSummary:
 @router.get("/")
 def list_jobs(
     archived: str = "active",
+    kind: str = "quality",
     db: Session = Depends(get_db),
 ) -> dict:
     """List jobs.
@@ -242,6 +248,13 @@ def list_jobs(
     - "active" (default): only jobs with archived_at IS NULL
     - "archived": only archived jobs
     - "all": both
+
+    `kind` filter (added Wave 1, 2026-05-15):
+    - "quality" (default): Wayback+Ahrefs analysis jobs — the legacy
+      pillar; default so pre-wave callers keep their behavior.
+    - "availability": domain-availability cascade jobs (Wave 3)
+    - "whois_history": historical-WHOIS drop-detection jobs (Wave 2)
+    - "all": ignore the kind filter (admin / debug)
     """
     q = db.query(Job)
     if archived == "active":
@@ -250,6 +263,13 @@ def list_jobs(
         q = q.filter(Job.archived_at.is_not(None))
     elif archived != "all":
         raise HTTPException(400, "archived must be one of: active, archived, all")
+    if kind not in ("quality", "availability", "whois_history", "all"):
+        raise HTTPException(
+            400,
+            "kind must be one of: quality, availability, whois_history, all",
+        )
+    if kind != "all":
+        q = q.filter(Job.kind == kind)
     rows = q.order_by(Job.id.desc()).limit(500).all()
     return {
         "jobs": [
@@ -257,6 +277,7 @@ def list_jobs(
                 "id": j.id,
                 "name": j.name,
                 "notes": j.notes,
+                "kind": j.kind,
                 "created_at": j.created_at.isoformat(),
                 "updated_at": j.updated_at.isoformat(),
                 "archived_at": j.archived_at.isoformat() if j.archived_at else None,
@@ -311,6 +332,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)) -> JobDetail:
         id=job.id,
         name=job.name,
         notes=job.notes,
+        kind=job.kind or "quality",
         created_at=job.created_at,
         updated_at=job.updated_at,
         archived_at=job.archived_at,

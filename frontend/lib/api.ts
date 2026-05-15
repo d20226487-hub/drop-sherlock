@@ -515,6 +515,10 @@ export type JobsListItem = {
   id: number;
   name: string;
   notes: string;
+  // Pillar discriminator (added Wave 1, 2026-05-15). Backend always
+  // emits one of 'quality'|'availability'|'whois_history'; pre-wave
+  // rows backfilled to 'quality'.
+  kind: JobKind;
   created_at: string;
   updated_at: string;
   archived_at: string | null;
@@ -522,6 +526,11 @@ export type JobsListItem = {
 };
 
 export type JobsArchivedFilter = "active" | "archived" | "all";
+
+// Pillar discriminator (added Wave 1, 2026-05-15). Backfilled to
+// 'quality' on every pre-wave row. Drives /check/<pillar> and
+// /jobs/<pillar> route segmentation.
+export type JobKind = "quality" | "availability" | "whois_history";
 
 export type RunSummary = {
   id: number;
@@ -543,6 +552,8 @@ export type JobDetail = {
   id: number;
   name: string;
   notes: string;
+  // Pillar discriminator (added Wave 1, 2026-05-15).
+  kind: JobKind;
   created_at: string;
   updated_at: string;
   archived_at: string | null;
@@ -1221,8 +1232,17 @@ export const api = {
   // additive, not a replacement.
   runEventsUrl: (runId: number) => `${BASE}/runs/${runId}/events`,
 
-  listJobs: (archived: JobsArchivedFilter = "active") =>
-    request<{ jobs: JobsListItem[] }>(`/jobs/?archived=${archived}`),
+  // `kind` filter added Wave 1 (2026-05-15) for the 3-pillar restructure.
+  // Defaults to "quality" so the legacy /jobs list page (and any older
+  // callers) behave the same. New /jobs/whois-history and /jobs/availability
+  // pages pass their own kind.
+  listJobs: (
+    archived: JobsArchivedFilter = "active",
+    kind: JobKind = "quality",
+  ) =>
+    request<{ jobs: JobsListItem[] }>(
+      `/jobs/?archived=${archived}&kind=${kind}`,
+    ),
 
   getJob: (jobId: number) => request<JobDetail>(`/jobs/${jobId}`),
 

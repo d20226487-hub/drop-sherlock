@@ -179,7 +179,11 @@ async def submit_job(
     name = (payload.name or "").strip() or _autoname(cleaned_domains)
     notes = (payload.notes or "").strip()
 
-    job = Job(name=name, notes=notes, spec_json=spec_json)
+    # The analyze submit creates a Quality-pillar Job. The `kind`
+    # column defaults to 'quality' so this is redundant, but making it
+    # explicit defends against a future schema change that drops the
+    # default.
+    job = Job(name=name, notes=notes, spec_json=spec_json, kind="quality")
     db.add(job)
     db.flush()  # assign job.id
 

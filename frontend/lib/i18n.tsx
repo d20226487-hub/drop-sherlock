@@ -43,7 +43,11 @@ const messagesEn = {
   nav: {
     dashboard: "Dashboard",
     backlog: "Backlog",
+    // `analyze` is the legacy nav label; kept for any pre-Wave-1
+    // references in the codebase. Use `check` for the new pillar
+    // dropdown trigger.
     analyze: "Analyze",
+    check: "Check",
     jobs: "Jobs",
     database: "Database",
     shares: "Shares",
@@ -54,6 +58,21 @@ const messagesEn = {
       analyzeList: "Analyze List",
       banList: "Ban List",
       toggleAria: "Open Database menu",
+    },
+    // Wave 1 (2026-05-15) — Check / Jobs split into 3-pillar dropdowns.
+    // Quality = current Wayback+Ahrefs pipeline; Whois History +
+    // Availability ship in waves 2/3.
+    checkDropdown: {
+      quality: "Quality (Wayback + Ahrefs)",
+      whoisHistory: "Whois History",
+      availability: "Availability",
+      toggleAria: "Open Check menu",
+    },
+    jobsDropdown: {
+      quality: "Quality",
+      whoisHistory: "Whois History",
+      availability: "Availability",
+      toggleAria: "Open Jobs menu",
     },
   },
   pages: {
@@ -1535,6 +1554,39 @@ const messagesEn = {
       notFound:
         "This link is no longer valid. It may have been revoked, expired, or never existed.",
     },
+    // Wave 1 (2026-05-15) — placeholder strings for the four pillar
+    // stubs (Check/Jobs × Whois History/Availability). Replaced by
+    // real page copy as each wave ships.
+    pillarStub: {
+      comingSoon: "Coming soon — this pillar isn't shipped yet.",
+      wave2:
+        "Planned for Wave 2: integrate WhoisFreaks Historical WHOIS API + AI judge for drop detection.",
+      wave3:
+        "Planned for Wave 3: promote the existing availability cascade (RDAP / Domainr / WHOIS:43) to a first-class Job kind so you can run availability checks as standalone jobs (today it's a sub-check of Quality runs and a button on Backlog rows).",
+      architectureNote:
+        "The Job → Run → Domain tree, cache, pagination, archive, notes, pin, export, and search infrastructure is already in place — each pillar just needs its kind-specific runner + UI added on top.",
+      useQuality: "Use the Quality pillar instead",
+    },
+    checkWhoisHistory: {
+      title: "Whois History",
+      subtitle:
+        "Historical WHOIS drop-detection. Compares snapshots over time, flags owner changes / re-registrations / drop-pipeline status codes.",
+    },
+    checkAvailability: {
+      title: "Availability",
+      subtitle:
+        "Standalone domain-availability cascade (RDAP → Domainr → WHOIS:43). Today's cascade is embedded in Quality runs + Backlog row buttons.",
+    },
+    jobsWhoisHistory: {
+      title: "Whois History — Jobs",
+      subtitle:
+        "Past + ongoing WHOIS-history jobs. Same Job → Run → Domain tree as Quality, scoped to this pillar.",
+    },
+    jobsAvailability: {
+      title: "Availability — Jobs",
+      subtitle:
+        "Past + ongoing availability-cascade jobs.",
+    },
     backlog: {
       title: "Backlog",
       intro:
@@ -1717,6 +1769,7 @@ const messagesRu: Messages = {
     dashboard: "Панель",
     backlog: "Очередь",
     analyze: "Анализ",
+    check: "Проверка",
     jobs: "Задачи",
     database: "База",
     shares: "Ссылки",
@@ -1727,6 +1780,18 @@ const messagesRu: Messages = {
       analyzeList: "Список для анализа",
       banList: "Бан-лист",
       toggleAria: "Открыть меню Базы",
+    },
+    checkDropdown: {
+      quality: "Качество (Wayback + Ahrefs)",
+      whoisHistory: "История Whois",
+      availability: "Доступность",
+      toggleAria: "Открыть меню Проверки",
+    },
+    jobsDropdown: {
+      quality: "Качество",
+      whoisHistory: "История Whois",
+      availability: "Доступность",
+      toggleAria: "Открыть меню Задач",
     },
   },
   pages: {
@@ -3308,6 +3373,36 @@ const messagesRu: Messages = {
       notFoundTitle: "Ссылка не найдена",
       notFound:
         "Эта ссылка больше недействительна. Возможно, она отозвана, истекла или никогда не существовала.",
+    },
+    pillarStub: {
+      comingSoon: "Скоро — этот раздел пока не запущен.",
+      wave2:
+        "Запланировано во Волне 2: интеграция WhoisFreaks Historical WHOIS API + ИИ-судья для выявления дропов.",
+      wave3:
+        "Запланировано во Волне 3: вывести существующий каскад доступности (RDAP / Domainr / WHOIS:43) в отдельный тип Job, чтобы можно было запускать проверки доступности как самостоятельные задачи (сейчас это под-шаг в Quality-запусках и кнопка на строке Очереди).",
+      architectureNote:
+        "Дерево Job → Run → Domain, кеш, пагинация, архив, заметки, пин, экспорт и поиск уже на месте — каждому разделу остаётся только добавить kind-специфичный runner и UI.",
+      useQuality: "Перейти в раздел Качество",
+    },
+    checkWhoisHistory: {
+      title: "История Whois",
+      subtitle:
+        "Анализ исторических записей WHOIS для выявления дропов. Сравнивает срезы во времени, отмечает смену владельцев, перерегистрацию, drop-pipeline статусы.",
+    },
+    checkAvailability: {
+      title: "Доступность",
+      subtitle:
+        "Самостоятельный каскад проверки доступности доменов (RDAP → Domainr → WHOIS:43). Сегодня каскад встроен в Quality-запуски и кнопки на строках Очереди.",
+    },
+    jobsWhoisHistory: {
+      title: "История Whois — Задачи",
+      subtitle:
+        "Прошлые и текущие задачи по истории WHOIS. То же дерево Job → Run → Domain, что и в Quality, отфильтровано по этому разделу.",
+    },
+    jobsAvailability: {
+      title: "Доступность — Задачи",
+      subtitle:
+        "Прошлые и текущие задачи каскада доступности.",
     },
     backlog: {
       title: "Очередь",

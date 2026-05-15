@@ -187,8 +187,11 @@ export default function JobDetailPage({
   if (error) {
     return (
       <div className="space-y-4">
+        {/* Error branch: job didn't load, so we don't know its kind.
+            Fall back to /jobs/quality (the default pillar) — the old
+            /jobs path redirects there anyway. */}
         <Link
-          href="/jobs"
+          href="/jobs/quality"
           className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
         >
           {ts.backLink}
@@ -204,10 +207,15 @@ export default function JobDetailPage({
     return <div className="text-sm text-neutral-500">{t.common.loading}</div>;
   }
 
+  // Per-pillar back link (Wave 1, 2026-05-15) — point the user back at
+  // the list page that matches THIS job's kind, not the legacy /jobs
+  // path. Fallback to 'quality' for any row whose kind didn't backfill.
+  const backHref = `/jobs/${job.kind || "quality"}`;
+
   return (
     <div className="space-y-6">
       <Link
-        href="/jobs"
+        href={backHref}
         className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
       >
         {ts.backLink}
