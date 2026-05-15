@@ -19,7 +19,19 @@ const QUICK_LINKS: { slug: string; title: string; description: string }[] = [
     slug: "analyze",
     title: "Анализ",
     description:
-      "Форма запуска: какие критерии включать, какую модель брать, как работают флаги кэша.",
+      "Quality-форма запуска: какие критерии включать, какую модель брать, как работают флаги кэша.",
+  },
+  {
+    slug: "whois-history",
+    title: "Whois History",
+    description:
+      "Детектор истории дропа: drop-confidence, цветовые бэнды, юниты WhoisFreaks, отдельный per-domain view.",
+  },
+  {
+    slug: "availability",
+    title: "Availability",
+    description:
+      "Каскад RDAP → Domainr → WHOIS → DNS как первоклассный Job kind. Без AI; use_cache=False per Job.",
   },
   {
     slug: "database",

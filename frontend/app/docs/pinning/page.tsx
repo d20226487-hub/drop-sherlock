@@ -57,11 +57,42 @@ export default function PinningDoc() {
         критерий{" "}
         (<code>backlinks</code> / <code>refdomains</code> /{" "}
         <code>anchors</code> / <code>keywords</code> /{" "}
-        <code>wayback</code> / <code>wayback_classify</code>) может
+        <code>wayback</code> / <code>wayback_classify</code> /{" "}
+        <code>whois_history</code> / <code>availability</code>) может
         указывать на свой собственный Run. Страница Базы для каждого
         домена аккуратно сшивает по-критериально пинённые данные в одну
-        строку — например, B/D/A/K от одного запуска, W/C от другого.
+        строку — например, B/D/A/K от одного Quality-запуска, W/C от
+        другого Quality-запуска, H от запуска Whois History, V от
+        запуска Availability.
       </p>
+      <p>
+        Буквенные обозначения, которые видны в виджете пинов на
+        Run/Job-страницах:
+      </p>
+      <ul>
+        <li>
+          <code>B</code> / <code>D</code> / <code>A</code> /{" "}
+          <code>K</code> — Quality (Ahrefs): Backlinks / refDomains /
+          Anchors / Keywords.
+        </li>
+        <li>
+          <code>W</code> — Quality: Wayback (история архива).
+        </li>
+        <li>
+          <code>C</code> — Quality: wayback_<strong>C</strong>lassify
+          (язык / тема / категория).
+        </li>
+        <li>
+          <code>H</code> — w<strong>H</strong>ois history (Wave 2,
+          2026-05-15). См.{" "}
+          <Link href="/docs/whois-history">«Whois History»</Link>.
+        </li>
+        <li>
+          <code>V</code> — a<strong>V</strong>ailability (Wave 3,
+          2026-05-15). См.{" "}
+          <Link href="/docs/availability">«Availability»</Link>.
+        </li>
+      </ul>
 
       <p>Инварианты:</p>
       <ul>

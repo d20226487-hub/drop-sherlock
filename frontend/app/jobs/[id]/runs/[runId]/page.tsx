@@ -981,6 +981,10 @@ export default function RunDetailPage({
   // backend's check via `d.criteria[c]` reflecting CR.status).
   const criteriaInRun = useMemo<string[]>(() => {
     if (!run) return [];
+    // ALL is the universe of criteria the pin panel may render. The
+    // panel auto-filters to ones with data on this run, so Quality
+    // jobs naturally hide whois_history (no data) and Whois jobs
+    // naturally hide B/D/A/K/W/C — no per-job-kind branching needed.
     const ALL = [
       "backlinks",
       "refdomains",
@@ -988,6 +992,8 @@ export default function RunDetailPage({
       "keywords",
       "wayback",
       "wayback_classify",
+      "whois_history",
+      "availability",
     ];
     const out: string[] = [];
     for (const c of ALL) {
@@ -1011,7 +1017,7 @@ export default function RunDetailPage({
     if (!run) return { criteria: 0, domains: 0 };
     const ALL = [
       "backlinks", "refdomains", "anchors", "keywords",
-      "wayback", "wayback_classify",
+      "wayback", "wayback_classify", "whois_history", "availability",
     ];
     let criteria = 0;
     let domains = 0;
@@ -1461,6 +1467,8 @@ export default function RunDetailPage({
                     keywords: "K",
                     wayback: "W",
                     wayback_classify: "C",
+                    whois_history: "H",
+                    availability: "V",
                   } as Record<string, string>
                 )[c];
                 const tone = pinnedHere
@@ -2023,6 +2031,17 @@ function DomainsSection({
                 </button>
               </div>
             )}
+          {/* Quality-only columns are hidden on Whois + Availability
+              run pages (Wave 3 follow-up). For those pillars the
+              AI-Wayback / AI-Ahrefs / lang / theme / category cells
+              are always empty since their cascades don't produce
+              that data — hiding the columns avoids 5× "—" per row
+              and keeps the table narrow. The pin-letter `Criteria`
+              column stays because it shows H / V (the data-driven
+              pin filter naturally limits to the pillar's criteria). */}
+          {(() => {
+            const isQuality = jobKind === "quality";
+            return (
           <div className="overflow-x-auto rounded-md border dark:border-neutral-800">
             <table className="w-full text-sm">
               <thead className="bg-neutral-100 dark:bg-neutral-900 text-left">
@@ -2038,12 +2057,16 @@ function DomainsSection({
                   </th>
                   <th className="px-3 py-2 font-medium">{ts.cols.domain}</th>
                   <th className="px-3 py-2 font-medium">{ts.cols.status}</th>
-                  <th className="px-3 py-2 font-medium">{ts.cols.criteria}</th>
-                  <th className="px-3 py-2 font-medium">{ts.cols.aiWayback}</th>
-                  <th className="px-3 py-2 font-medium">{ts.cols.aiAhrefs}</th>
-                  <th className="px-3 py-2 font-medium">{ts.cols.language}</th>
-                  <th className="px-3 py-2 font-medium">{ts.cols.theme}</th>
-                  <th className="px-3 py-2 font-medium">{ts.cols.category}</th>
+                  {isQuality && (
+                    <>
+                      <th className="px-3 py-2 font-medium">{ts.cols.criteria}</th>
+                      <th className="px-3 py-2 font-medium">{ts.cols.aiWayback}</th>
+                      <th className="px-3 py-2 font-medium">{ts.cols.aiAhrefs}</th>
+                      <th className="px-3 py-2 font-medium">{ts.cols.language}</th>
+                      <th className="px-3 py-2 font-medium">{ts.cols.theme}</th>
+                      <th className="px-3 py-2 font-medium">{ts.cols.category}</th>
+                    </>
+                  )}
                   <th className="px-3 py-2 font-medium">{ts.cols.finished}</th>
                   <th className="px-3 py-2 w-1" />
                 </tr>
@@ -2101,6 +2124,8 @@ function DomainsSection({
                           )}
                         </div>
                       </td>
+                      {isQuality && (
+                        <>
                       <td className="px-3 py-2">
                         <CriteriaPills criteria={d.criteria} />
                       </td>
@@ -2262,6 +2287,8 @@ function DomainsSection({
                           </span>
                         )}
                       </td>
+                        </>
+                      )}
                       <td className="px-3 py-2 text-xs text-neutral-600 dark:text-neutral-300 whitespace-nowrap">
                         {formatDate(d.finished_at)}
                       </td>
@@ -2279,6 +2306,8 @@ function DomainsSection({
               </tbody>
             </table>
           </div>
+            );
+          })()}
           {search.filteredTotal === 0 && (
             <p className="text-sm text-neutral-500">
               {t.pagination.none}

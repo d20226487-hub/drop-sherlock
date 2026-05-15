@@ -953,6 +953,14 @@ export type DatabaseDomainRow = {
   category_confidence: number | null;
   // Historical category — only populated when classify_drift_detected.
   category_was: string;
+  // Whois-history verdict (added 2026-05-15) — surfaced separately like
+  // wayback. `whois_dropped_confidence` is 0..1; `whois_band` is the
+  // server-computed bucket (one of "dropped"/"mixed"/"insufficient"/
+  // "stable"/""). Empty when no whois_history pin exists for this domain.
+  whois_dropped_confidence: number | null;
+  whois_transferred_confidence: number | null;
+  whois_summary: string;
+  whois_band: string;
   total_runs: number;
   any_cached: boolean;
   // User-authored note attached to this domain. Empty string when no note.
@@ -974,10 +982,24 @@ export type DatabaseDomainRow = {
   is_banned?: boolean;
 };
 
+// Cross-link to a per-domain analysis page from a ban row. Lets the
+// Ban List surface "Ahrefs / Wayback / Whois" buttons so operators can
+// review the analysis that led them to ban without leaving the page.
+// All three are null when the banned domain has no rd of that type.
+export type BanAnalysisLink = {
+  kind: "ahrefs" | "wayback" | "whois";
+  job_id: number;
+  run_id: number;
+  run_domain_id: number;
+};
+
 export type BanRow = {
   domain: string;
   note: string;
   created_at: string;
+  ahrefs_link: BanAnalysisLink | null;
+  wayback_link: BanAnalysisLink | null;
+  whois_link: BanAnalysisLink | null;
 };
 
 export type BanListResponse = {
@@ -1019,6 +1041,10 @@ export type DatabaseDomainList = {
     // names actually assigned by the AI.
     languages: string[];
     categories: string[];
+    // Whois drop-confidence bands seen across pinned rds (added
+    // 2026-05-15). Subset of {dropped, mixed, insufficient, stable}.
+    // Drives the Whois filter dropdown's enabled state.
+    whois_bands: string[];
   };
   // Total domain count across the full set (regardless of pagination).
   // Equal to rows.length when no offset/limit was passed.
@@ -1762,6 +1788,8 @@ export const api = {
       params.set("registrar", opts.registrar.join(","));
     if (opts.expiry_from) params.set("expiry_from", opts.expiry_from);
     if (opts.expiry_to) params.set("expiry_to", opts.expiry_to);
+    if (opts.availability && opts.availability.length)
+      params.set("availability", opts.availability.join(","));
     if (opts.sort) {
       params.set("sort", opts.sort);
       if (opts.direction) params.set("direction", opts.direction);
@@ -1793,6 +1821,7 @@ export const api = {
     registrar?: string[];
     expiry_from?: string;
     expiry_to?: string;
+    availability?: string[];
   }) =>
     request<{ deleted: number }>(`/backlog/bulk-delete-filtered`, {
       method: "POST",
@@ -1806,6 +1835,9 @@ export const api = {
           : null,
         expiry_from: filters.expiry_from || null,
         expiry_to: filters.expiry_to || null,
+        availability: filters.availability?.length
+          ? filters.availability.join(",")
+          : null,
       }),
     }),
 
@@ -1829,6 +1861,7 @@ export const api = {
           registrar?: string[];
           expiry_from?: string;
           expiry_to?: string;
+          availability?: string[];
         },
   ) => {
     if (payload.scope === "ids") {
@@ -1858,6 +1891,9 @@ export const api = {
           : null,
         expiry_from: payload.expiry_from || null,
         expiry_to: payload.expiry_to || null,
+        availability: payload.availability?.length
+          ? payload.availability.join(",")
+          : null,
       }),
     });
   },
@@ -1872,6 +1908,7 @@ export const api = {
       registrar?: string[];
       expiry_from?: string;
       expiry_to?: string;
+      availability?: string[];
     },
   ) =>
     request<{ updated: number }>(`/backlog/bulk-status-filtered`, {
@@ -1888,6 +1925,9 @@ export const api = {
           : null,
         expiry_from: filters.expiry_from || null,
         expiry_to: filters.expiry_to || null,
+        availability: filters.availability?.length
+          ? filters.availability.join(",")
+          : null,
       }),
     }),
 
@@ -2112,6 +2152,23 @@ export const api = {
       run_id: number;
       skipped_banned: string[];
     }>("/analyze/whois-history", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  // Availability pillar submit (Wave 3, 2026-05-15). No AI fields —
+  // the cascade gives a deterministic verdict. Forces fresh state per
+  // Job server-side (use_cache=False on the canonical spec).
+  submitAvailabilityJob: (payload: {
+    domains: string[];
+    name?: string;
+    notes?: string;
+    lang?: string;
+  }) =>
+    request<{
+      job_id: number;
+      run_id: number;
+      skipped_banned: string[];
+    }>("/analyze/availability", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -2366,6 +2423,10 @@ export type BacklogListOpts = {
   // ISO YYYY-MM-DD; inclusive on both ends.
   expiry_from?: string;
   expiry_to?: string;
+  // Availability filter (added 2026-05-15). CSV of
+  // "available"/"registered"/"unknown"/"error" plus the "__none__"
+  // sentinel for "domain has never been checked". Empty = no filter.
+  availability?: string[];
   sort?: BacklogSortColumn;
   direction?: BacklogSortDirection;
   // Pass false on page navigation to skip the heavy total/registrars

@@ -54,6 +54,16 @@ export default function DatabaseDoc() {
           <strong>Confidence</strong> — уверенность ИИ.
         </li>
         <li>
+          <strong>Whois</strong> — процент уверенности судьи WHOIS-истории
+          в том, что домен дропался (см.{" "}
+          <Link href="/docs/whois-history">«Whois History»</Link>).
+          Низкий процент = стабильный домен (зелёный), высокий = повторные
+          дропы (красный — осторожно). Бэнды: <code>&lt;30%</code> stable,{" "}
+          <code>30–50%</code> insufficient, <code>&gt;50%</code> mixed,{" "}
+          <code>&gt;80%</code> dropped. Колонка появляется только когда
+          для домена был запущен Job kind=whois_history.
+        </li>
+        <li>
           <strong>Wayback</strong> — отдельный вердикт по истории
           (high_quality / mixed / low_quality). Часто важнее общего балла:
           если Wayback показал тематический дрифт на казино, домен не
@@ -65,9 +75,6 @@ export default function DatabaseDoc() {
           статью</Link>).
         </li>
         <li>
-          <strong>Provider</strong> — провайдер/модель, выдавшие финал.
-        </li>
-        <li>
           <strong>Note</strong> — ваш кроссранный комментарий по домену.
         </li>
         <li>
@@ -75,10 +82,10 @@ export default function DatabaseDoc() {
           Order / Discard.
         </li>
         <li>
-          <strong>Criteria</strong> — зелёные пилюли{" "}
-          <code>B&nbsp;D&nbsp;A&nbsp;K</code> по тем критериям, по которым
-          собраны данные (на наведении — полное имя и кол-во строк).
-          Что означает каждая буква:
+          <strong>Criteria</strong> — зелёные пилюли по тем критериям,
+          по которым собраны данные (на наведении — полное имя,
+          кол-во строк и ссылка на исходный Run). Что означает каждая
+          буква:
           <ul>
             <li>
               <code>B</code> — <strong>Backlinks</strong> (входящие ссылки)
@@ -94,11 +101,24 @@ export default function DatabaseDoc() {
               <code>K</code> — <strong>Keywords</strong> (органические
               ключи)
             </li>
+            <li>
+              <code>W</code> — <strong>Wayback</strong> (фетч CDX
+              истории — отдельная колонка показывает AI-вердикт).
+            </li>
+            <li>
+              <code>C</code> — wayback_<strong>C</strong>lassify
+              (язык/тема/категория собраны — отдельные колонки
+              показывают сами значения).
+            </li>
+            <li>
+              <code>H</code> — w<strong>H</strong>ois history
+              (детектор истории дропа — отдельная колонка показывает
+              dropped_confidence %).
+            </li>
           </ul>
-          Wayback и Wayback Classify живут в отдельных колонках{" "}
-          (<em>Wayback</em>, <em>Language</em>, <em>Theme</em>,{" "}
-          <em>Category</em>), поэтому в столбце Criteria их буквы
-          (<code>W</code>, <code>C</code>) не дублируются. Глубокий
+          Доступность вынесена в отдельную колонку{" "}
+          <em>Availability</em> с собственным фильтром и не дублируется
+          здесь. Глубокий
           разбор четырёх Ahrefs-критериев — в статье{" "}
           <Link href="/docs/ahrefs-criteria">«Ahrefs-критерии»</Link>.
         </li>
@@ -143,6 +163,22 @@ export default function DatabaseDoc() {
           Wayback-оценки.
         </li>
         <li>
+          <strong>Whois verdict</strong> — фильтр по бэнду drop-confidence
+          судьи WHOIS-истории. Четыре опции (stable / insufficient / mixed
+          / dropped) + «нет вердикта». Самый частый сценарий: stable +
+          insufficient после whois_history-прогона списка кандидатов, чтобы
+          отсечь повторно дропавшиеся домены.
+        </li>
+        <li>
+          <strong>Availability</strong> — отдельный фильтр по последнему
+          результату каскада доступности. Пять опций (available / registered
+          / unknown / error / never-checked). Семантика «последнего ответа»
+          совпадает с тем, что показано в колонке Availability — каскад
+          предпочитает терминальные ответы (available/registered) более
+          поздним inconclusive (unknown/error), чтобы один временный
+          таймаут RDAP не затмевал хороший ответ DNS.
+        </li>
+        <li>
           <strong>Language</strong> — ISO 639-1 коды.
         </li>
         <li>
@@ -153,11 +189,17 @@ export default function DatabaseDoc() {
         <li>
           <strong>Provider / Model</strong> — отрезать вердикты от моделей,
           которым вы больше не доверяете, или наоборот оставить только
-          одну.
+          одну. Колонка с провайдером в таблице удалена 2026-05-15 (та же
+          информация доступна на странице домена и в CSV-экспорте);
+          фильтр-дропдаун оставлен.
         </li>
         <li>
           <strong>Criteria (any of)</strong> — оставить домены, у которых
           собран минимум один из выбранных критериев и хотя бы N строк.
+          С 2026-05-15 список включает не только B/D/A/K/W, но и{" "}
+          <code>wayback_classify</code> (C) и <code>whois_history</code>{" "}
+          (H). Доступность вынесена в отдельный фильтр (см. выше) — она
+          не является CR-критерием.
         </li>
         <li>
           <strong>Cache</strong> — фильтр по тому, прилетели ли данные из
@@ -218,6 +260,16 @@ export default function DatabaseDoc() {
         Backlog удаляются. При снятии бана (unban) строки восстанавливаются
         в Backlog со статусом <code>banned</code> — оригинальные данные
         (регистратор, дата истечения, комментарии, цены) сохраняются.
+      </p>
+      <p>
+        <strong>С 2026-05-15 забаненные домены скрываются из этой
+        страницы</strong> (раньше оставались видимыми с бейджем
+        «banned»). Базовые данные (RunDomain, CriterionResult) при бане
+        не удаляются — разбан возвращает строку на /database. Аудит
+        прошлых анализов забаненных доменов теперь живёт на странице{" "}
+        <Link href="/docs/banlist">Ban List</Link>: для каждой строки
+        там доступны кнопки-ссылки Ahrefs / Wayback / Whois, ведущие
+        к самому свежему RunDomain соответствующего типа.
       </p>
 
       <h2>Экспорт</h2>

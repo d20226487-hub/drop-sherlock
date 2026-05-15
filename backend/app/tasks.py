@@ -436,12 +436,12 @@ def dispatch_run(run_id: int) -> asyncio.Task:
     Returns the Task handle so callers can keep a reference (asyncio
     GC's task objects that aren't referenced anywhere).
 
-    Kind dispatch (Wave 1+2, 2026-05-15):
+    Kind dispatch (Wave 1+2+3, 2026-05-15):
       • quality       → tasks.process_run (Wayback + Ahrefs pipeline)
       • whois_history → whois_history.runner.process_whois_history_run
-      • availability  → not yet wired (Wave 3) — falls through to
-                        Quality runner for backward-compat, since no
-                        UI creates that kind yet.
+      • availability  → availability_runner.process_availability_run
+                        (Wave 3) — runs the existing cascade with
+                        use_cache=False and writes one CR per domain.
 
     Cheap DB peek (one PK lookup) to read the kind. Done synchronously
     here because the runner functions don't take spec via argument —
@@ -457,6 +457,9 @@ def dispatch_run(run_id: int) -> asyncio.Task:
     if kind == "whois_history":
         from .whois_history.runner import process_whois_history_run
         return asyncio.create_task(process_whois_history_run(run_id))
+    if kind == "availability":
+        from .availability_runner import process_availability_run
+        return asyncio.create_task(process_availability_run(run_id))
     return asyncio.create_task(process_run(run_id))
 
 

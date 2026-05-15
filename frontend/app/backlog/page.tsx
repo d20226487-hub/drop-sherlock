@@ -33,6 +33,11 @@ export default function BacklogPage() {
   const [registrarFilter, setRegistrarFilter] = useState<string[]>([]);
   const [expiryFrom, setExpiryFrom] = useState<string>("");
   const [expiryTo, setExpiryTo] = useState<string>("");
+  // Availability filter (added 2026-05-15) — selected statuses from
+  // {"available","registered","unknown","error","__none__"} where
+  // "__none__" matches domains that have never had an availability
+  // check. Server-side resolved via the `availability` query param.
+  const [availabilityFilter, setAvailabilityFilter] = useState<string[]>([]);
   const [search, setSearch] = useState<string>("");
 
   // --- Pagination state ---------------------------------------------------
@@ -160,6 +165,8 @@ export default function BacklogPage() {
         params.set("registrar", registrarFilter.join(","));
       if (expiryFrom) params.set("expiry_from", expiryFrom);
       if (expiryTo) params.set("expiry_to", expiryTo);
+      if (availabilityFilter.length)
+        params.set("availability", availabilityFilter.join(","));
     }
     if (sortCol) {
       params.set("sort", sortCol);
@@ -199,6 +206,7 @@ export default function BacklogPage() {
     registrarFilter,
     expiryFrom,
     expiryTo,
+    availabilityFilter,
     search,
     perPage,
     sortCol,
@@ -238,6 +246,9 @@ export default function BacklogPage() {
         registrar: registrarFilter.length ? registrarFilter : undefined,
         expiry_from: expiryFrom || undefined,
         expiry_to: expiryTo || undefined,
+        availability: availabilityFilter.length
+          ? availabilityFilter
+          : undefined,
         sort: sortCol || undefined,
         direction: sortCol ? sortDir : undefined,
         include_options: includeOptions,
@@ -297,6 +308,7 @@ export default function BacklogPage() {
       registrarFilter,
       expiryFrom,
       expiryTo,
+      availabilityFilter,
       search,
       sortCol,
       sortDir,
@@ -320,6 +332,7 @@ export default function BacklogPage() {
     registrarFilter,
     expiryFrom,
     expiryTo,
+    availabilityFilter,
     search,
     sortCol,
     sortDir,
@@ -330,6 +343,7 @@ export default function BacklogPage() {
     setRegistrarFilter([]);
     setExpiryFrom("");
     setExpiryTo("");
+    setAvailabilityFilter([]);
     setSearch("");
   }
 
@@ -338,6 +352,7 @@ export default function BacklogPage() {
     registrarFilter.length > 0 ||
     !!expiryFrom ||
     !!expiryTo ||
+    availabilityFilter.length > 0 ||
     search.trim().length > 0;
 
   // --- Selection helpers --------------------------------------------------
@@ -395,62 +410,62 @@ export default function BacklogPage() {
     }
   }
 
-  // Hand domains off to the Analyze page via sessionStorage (URLs would
-  // blow past length limits at thousands of rows). The backend also
-  // flips the affected rows' status to in_progress as a side effect.
-  async function handleSendSelectedToAnalyze() {
-    if (selected.size === 0) return;
-    setBulkBusy(true);
-    setBulkError(null);
-    try {
-      const r = await api.sendBacklogToAnalyze({
-        scope: "ids",
-        ids: Array.from(selected),
-      });
-      if (r.count === 0) return;
-      sessionStorage.setItem(
-        BACKLOG_HANDOFF_KEY,
-        JSON.stringify({ domains: r.domains }),
-      );
-      // Wave 1 (2026-05-15): /analyze moved to /check/quality. The old
-      // path still works (it redirects) but pointing at the canonical
-      // path avoids the round-trip and lets the redirect file get
-      // deleted later without breaking this flow.
-      router.push("/check/quality?from_backlog=1");
-    } catch (e) {
-      setBulkError((e as Error).message);
-    } finally {
-      setBulkBusy(false);
-    }
-  }
+  // Resolve which /check page each pillar lands on. Quality + Whois
+  // have functional forms; Availability accepts the same handoff key
+  // even though its check page is currently a stub — operators can
+  // still kick off availability runs from this menu.
+  type Pillar = "quality" | "whois" | "availability";
+  const PILLAR_ROUTES: Record<Pillar, string> = {
+    quality: "/check/quality?from_backlog=1",
+    whois: "/check/whois-history?from_backlog=1",
+    availability: "/check/availability?from_backlog=1",
+  };
 
-  async function handleSendAllFilteredToAnalyze() {
-    if (!data || data.filtered_total === 0) return;
+  // Unified handoff for "send these domains to <pillar>". Replaces the
+  // pre-Wave-3 separate handlers per scope; the pillar choice is
+  // surfaced via a 3-button picker in the selection + all-filtered
+  // toolbars. The backend's `/send-to-analyze` endpoint still flips
+  // affected rows' status to `in_progress` regardless of pillar — that
+  // status reflects "operator-decided-to-act," not pillar-specific
+  // pipeline state.
+  async function handleSendTo(
+    pillar: Pillar,
+    scope: "ids" | "filtered",
+  ): Promise<void> {
+    if (scope === "ids" && selected.size === 0) return;
+    if (scope === "filtered" && (!data || data.filtered_total === 0)) return;
     if (
-      !window.confirm(ts.confirmSendAllFiltered(data.filtered_total))
-    )
+      scope === "filtered" &&
+      !window.confirm(ts.confirmSendAllFiltered(data!.filtered_total))
+    ) {
       return;
+    }
     setBulkBusy(true);
     setBulkError(null);
     try {
-      const r = await api.sendBacklogToAnalyze({
-        scope: "filtered",
-        search: search.trim() || undefined,
-        status: statusFilter.length ? statusFilter : undefined,
-        registrar: registrarFilter.length ? registrarFilter : undefined,
-        expiry_from: expiryFrom || undefined,
-        expiry_to: expiryTo || undefined,
-      });
+      const r =
+        scope === "ids"
+          ? await api.sendBacklogToAnalyze({
+              scope: "ids",
+              ids: Array.from(selected),
+            })
+          : await api.sendBacklogToAnalyze({
+              scope: "filtered",
+              search: search.trim() || undefined,
+              status: statusFilter.length ? statusFilter : undefined,
+              registrar: registrarFilter.length ? registrarFilter : undefined,
+              expiry_from: expiryFrom || undefined,
+              expiry_to: expiryTo || undefined,
+              availability: availabilityFilter.length
+                ? availabilityFilter
+                : undefined,
+            });
       if (r.count === 0) return;
       sessionStorage.setItem(
         BACKLOG_HANDOFF_KEY,
         JSON.stringify({ domains: r.domains }),
       );
-      // Wave 1 (2026-05-15): /analyze moved to /check/quality. The old
-      // path still works (it redirects) but pointing at the canonical
-      // path avoids the round-trip and lets the redirect file get
-      // deleted later without breaking this flow.
-      router.push("/check/quality?from_backlog=1");
+      router.push(PILLAR_ROUTES[pillar]);
     } catch (e) {
       setBulkError((e as Error).message);
     } finally {
@@ -480,6 +495,9 @@ export default function BacklogPage() {
         registrar: registrarFilter.length ? registrarFilter : undefined,
         expiry_from: expiryFrom || undefined,
         expiry_to: expiryTo || undefined,
+        availability: availabilityFilter.length
+          ? availabilityFilter
+          : undefined,
       });
       setSelected(new Set());
       reload({ silent: true, refreshOptions: true });
@@ -545,6 +563,9 @@ export default function BacklogPage() {
         registrar: registrarFilter.length ? registrarFilter : undefined,
         expiry_from: expiryFrom || undefined,
         expiry_to: expiryTo || undefined,
+        availability: availabilityFilter.length
+          ? availabilityFilter
+          : undefined,
       });
       setSelected(new Set());
       reload({ silent: true, refreshOptions: true });
@@ -678,6 +699,36 @@ export default function BacklogPage() {
             searchable
             searchPlaceholder={ts.filters.registrarSearchPlaceholder}
           />
+          <MultiSelectFilter
+            label={ts.filters.availabilityLabel}
+            anyLabel={ts.filters.availabilityAny}
+            value={availabilityFilter}
+            onChange={setAvailabilityFilter}
+            title={ts.filters.availabilityHint}
+            options={[
+              {
+                value: "available",
+                label: ts.filters.availabilityAvailable,
+              },
+              {
+                value: "registered",
+                label: ts.filters.availabilityRegistered,
+              },
+              {
+                value: "unknown",
+                label: ts.filters.availabilityUnknown,
+              },
+              {
+                value: "error",
+                label: ts.filters.availabilityError,
+              },
+              {
+                value: "__none__",
+                label: ts.filters.availabilityNeverChecked,
+                group: "tail" as const,
+              },
+            ]}
+          />
           <label className="flex items-center gap-2 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5">
             <span className="text-xs text-neutral-500 dark:text-neutral-400 shrink-0">
               {ts.filters.expiryFrom}
@@ -759,13 +810,35 @@ export default function BacklogPage() {
               </option>
             ))}
           </select>
+          <span className="text-xs text-neutral-500 dark:text-neutral-400 self-center">
+            {ts.sendToPicker.allFilteredLabel(data.filtered_total)}
+          </span>
           <button
             type="button"
-            onClick={handleSendAllFilteredToAnalyze}
+            onClick={() => handleSendTo("quality", "filtered")}
             disabled={bulkBusy}
             className="text-xs px-3 py-1 rounded-md border border-blue-300 dark:border-blue-900/60 text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-950/40 disabled:opacity-50"
+            title={ts.sendToPicker.qualityHint}
           >
-            {ts.sendAllFilteredToAnalyze(data.filtered_total)}
+            {ts.sendToPicker.quality}
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSendTo("whois", "filtered")}
+            disabled={bulkBusy}
+            className="text-xs px-3 py-1 rounded-md border border-indigo-300 dark:border-indigo-900/60 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 disabled:opacity-50"
+            title={ts.sendToPicker.whoisHint}
+          >
+            {ts.sendToPicker.whois}
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSendTo("availability", "filtered")}
+            disabled={bulkBusy}
+            className="text-xs px-3 py-1 rounded-md border border-sky-300 dark:border-sky-900/60 text-sky-700 dark:text-sky-300 hover:bg-sky-50 dark:hover:bg-sky-950/40 disabled:opacity-50"
+            title={ts.sendToPicker.availabilityHint}
+          >
+            {ts.sendToPicker.availability}
           </button>
           <button
             type="button"
@@ -822,13 +895,35 @@ export default function BacklogPage() {
                 </option>
               ))}
             </select>
+            <span className="text-xs text-neutral-500 dark:text-neutral-400 self-center">
+              {ts.sendToPicker.label(selected.size)}
+            </span>
             <button
               type="button"
-              onClick={handleSendSelectedToAnalyze}
+              onClick={() => handleSendTo("quality", "ids")}
               disabled={bulkBusy}
               className="text-xs px-3 py-1 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+              title={ts.sendToPicker.qualityHint}
             >
-              {ts.sendToAnalyze(selected.size)}
+              {ts.sendToPicker.quality}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSendTo("whois", "ids")}
+              disabled={bulkBusy}
+              className="text-xs px-3 py-1 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+              title={ts.sendToPicker.whoisHint}
+            >
+              {ts.sendToPicker.whois}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSendTo("availability", "ids")}
+              disabled={bulkBusy}
+              className="text-xs px-3 py-1 rounded-md bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-50"
+              title={ts.sendToPicker.availabilityHint}
+            >
+              {ts.sendToPicker.availability}
             </button>
             <button
               type="button"

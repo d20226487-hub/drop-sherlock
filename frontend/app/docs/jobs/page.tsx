@@ -8,15 +8,51 @@ export default function JobsDoc() {
       <h1>Задачи</h1>
       <p>
         <strong>Задача</strong> (Job) — это контейнер для одного или
-        нескольких запусков (Runs). Один сабмит из формы Анализа создаёт
-        Job + первый Run. Дальше внутри Job можно делать reruns с другими
-        настройками и сравнивать их между собой.
+        нескольких запусков (Runs). Один сабмит из формы Check
+        создаёт Job + первый Run. Дальше внутри Job можно делать reruns
+        с другими настройками и сравнивать их между собой.
+      </p>
+
+      <h2>Job kind (пилары)</h2>
+      <p>
+        С 2026-05-15 у каждой Задачи есть поле <code>kind</code> —
+        пилар, к которому она принадлежит. Три значения:
+      </p>
+      <ul>
+        <li>
+          <code>quality</code> — Ahrefs + Wayback + AI-судьи (то, что
+          раньше было просто «Анализ»). Создаётся через{" "}
+          <code>/check/quality</code>. Список — <code>/jobs/quality</code>.
+        </li>
+        <li>
+          <code>whois_history</code> — детектор истории дропа (см.{" "}
+          <Link href="/docs/whois-history">«Whois History»</Link>).
+          Создаётся через <code>/check/whois-history</code>. Список —{" "}
+          <code>/jobs/whois-history</code>.
+        </li>
+        <li>
+          <code>availability</code> — каскад проверки доступности (см.{" "}
+          <Link href="/docs/availability">«Availability»</Link>).
+          Создаётся через <code>/check/availability</code>. Список —{" "}
+          <code>/jobs/availability</code>.
+        </li>
+      </ul>
+      <p>
+        Job kind определяет, какой runner запустится (диспатч в{" "}
+        <code>tasks.dispatch_run</code> по полю <code>kind</code>),
+        какой <code>CriterionResult</code> запишется и какой
+        per-domain view отрендерится. На странице Задачи / Run / Domain
+        вид зависит от пилара — некоторые секции (например, Score
+        Weights, Wayback CDX-фильтр) появляются только на Quality.
       </p>
 
       <h2>Список задач</h2>
       <p>
-        Страница <code>/jobs</code> — список всех Job. Каждый ряд: имя,
-        дата, число запусков, статусные плашки. Внизу — пагинация.
+        Страницы <code>/jobs/quality</code>, <code>/jobs/whois-history</code>{" "}
+        и <code>/jobs/availability</code> — список Job соответствующего
+        пилара. Каждый ряд: имя, дата, число запусков, статусные плашки.
+        Внизу — пагинация. Старый <code>/jobs</code> делает редирект на{" "}
+        <code>/jobs/quality</code>.
       </p>
       <p>
         Архивированные задачи скрыты по умолчанию. Переключатель{" "}
@@ -66,13 +102,15 @@ export default function JobsDoc() {
       <h3>Per-criterion pins (read-only виджет)</h3>
       <p>
         Под заметками и над списком запусков — свёрнутая по умолчанию
-        панель с шестью карточками{" "}
-        (<code>B&nbsp;D&nbsp;A&nbsp;K&nbsp;W&nbsp;C</code>). Каждая
-        карточка показывает, какой Run внутри этой Задачи закреплён
-        как источник для соответствующего критерия в Базе. Зелёная
-        рамка + ссылка «Run #N» — критерий закреплён; серая «not
-        pinned» — Drop Sherlock возьмёт самый свежий Run, у которого
-        есть данные по этому критерию.
+        панель с карточками-критериями{" "}
+        (<code>B&nbsp;D&nbsp;A&nbsp;K&nbsp;W&nbsp;C</code> для Quality,{" "}
+        <code>H</code> для Whois History, <code>V</code> для
+        Availability — рендерятся только те, у которых на каком-то
+        Run этой Задачи есть данные). Каждая карточка показывает,
+        какой Run внутри этой Задачи закреплён как источник для
+        соответствующего критерия в Базе. Зелёная рамка + ссылка «Run #N» —
+        критерий закреплён; серая «not pinned» — Drop Sherlock возьмёт
+        самый свежий Run, у которого есть данные по этому критерию.
       </p>
       <p>
         Виджет — только для чтения. Изменение пинов идёт с{" "}

@@ -249,6 +249,19 @@ class WhoisHistoryConfig(BaseModel):
     enabled: bool = False
 
 
+class AvailabilityConfig(BaseModel):
+    """Availability criterion config (added Wave 3, 2026-05-15).
+
+    Mirrors WhoisHistoryConfig — single `enabled` toggle. All
+    cascade-level knobs (provider order, RPS/concurrency, per-provider
+    enabled flags, cache TTL) live in Settings since they apply
+    globally regardless of which Job invokes the cascade. The runner
+    forces use_cache=False per the Wave 3 decision (a Job is an
+    explicit ask — fresh data per Job)."""
+
+    enabled: bool = False
+
+
 class CriteriaSpec(BaseModel):
     backlinks: BacklinksConfig = Field(default_factory=BacklinksConfig)
     refdomains: RefdomainsConfig = Field(default_factory=RefdomainsConfig)
@@ -260,6 +273,9 @@ class CriteriaSpec(BaseModel):
     )
     whois_history: WhoisHistoryConfig = Field(
         default_factory=WhoisHistoryConfig
+    )
+    availability: AvailabilityConfig = Field(
+        default_factory=AvailabilityConfig
     )
 
 

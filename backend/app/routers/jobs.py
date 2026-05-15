@@ -334,7 +334,43 @@ def get_job(job_id: int, db: Session = Depends(get_db)) -> JobDetail:
         # Domains with no AI verdict at all (failed fetch, no key,
         # provider 429) → no_verdict.
         is_whois_job = (job.kind or "quality") == "whois_history"
+        # Wave 3 (2026-05-15): availability jobs have no AI verdict
+        # and no final_assessment_json either. Their result lives in
+        # the availability CR's `data_json.verdict.status` — one of
+        # available / registered / unknown / error. Map to the same
+        # bucket keys so existing pill colors apply:
+        #   status='available'              → good        (green — actionable)
+        #   status='registered'             → mixed       (amber — owned, may still be worth waiting on)
+        #   status='unknown' | 'error'      → no_verdict  (grey)
+        # `partial` and `low_quality` are not used by this pillar.
+        is_availability_job = (
+            (job.kind or "quality") == "availability"
+        )
         for d in source_run.domains:
+            if is_availability_job:
+                cr = next(
+                    (c for c in d.results if c.criterion == "availability"),
+                    None,
+                )
+                payload: dict | None = None
+                if cr is not None and cr.data_json:
+                    try:
+                        payload = json.loads(cr.data_json)
+                    except json.JSONDecodeError:
+                        payload = None
+                status = None
+                if isinstance(payload, dict):
+                    verdict = payload.get("verdict")
+                    if isinstance(verdict, dict):
+                        status = verdict.get("status")
+                if status == "available":
+                    key = "good"
+                elif status == "registered":
+                    key = "mixed"
+                else:
+                    key = "no_verdict"
+                counts[key] = counts.get(key, 0) + 1
+                continue
             if is_whois_job:
                 cr = next(
                     (c for c in d.results if c.criterion == "whois_history"),
@@ -989,6 +1025,11 @@ def get_run_domain_detail(
         # WhoisHistoryDomainView reads criteria.whois_history.ai_verdict
         # + .raw, so the criterion MUST appear in this loop's output.
         "whois_history",
+        # Availability pillar (Wave 3, 2026-05-15) — same shape. CR
+        # has data_json (cascade trace + verdict) only; no
+        # ai_verdict_json since no AI is involved. Frontend's
+        # AvailabilityDomainView reads criteria.availability.raw.
+        "availability",
     ):
         picked_cr: CriterionResult | None = own_crs.get(criterion_name)
         picked_rd: RunDomain | None = rd if picked_cr is not None else None
@@ -2205,6 +2246,16 @@ CRITERIA_NAMES = (
     "keywords",
     "wayback",
     "wayback_classify",
+    # whois_history (added 2026-05-15 Wave 2 follow-up). Lets the
+    # Whois job's run page expose the same per-criterion pin UI as
+    # Quality jobs — the panel auto-filters by which criteria have
+    # data on the run, so Quality runs still show B/D/A/K/W/C only
+    # and whois runs show just H.
+    "whois_history",
+    # availability (added 2026-05-15 Wave 3). Same data-driven
+    # filter handles the rest — Availability runs surface just V on
+    # the pin panel; Quality / Whois runs don't show it.
+    "availability",
 )
 
 

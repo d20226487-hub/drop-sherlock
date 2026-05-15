@@ -1,246 +1,274 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState, useRef, useEffect } from "react";
+import {
+  KeyboardEvent as ReactKeyboardEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { LanguageToggle } from "@/components/language-toggle";
 import { useT } from "@/lib/i18n";
 
-// Database nav menu. History: started as click-dropdown (wave L), moved
-// to hover (wave N — button trigger was shifting the flex baseline),
-// now hybrid (2026-05-14): plain <Link> trigger for navigation +
-// adjacent chevron BUTTON that toggles the menu on click. Hover still
-// opens it for mouse users; the chevron makes touch + keyboard work.
-// Outside-click closes.
-function DatabaseDropdown() {
-  const { t } = useT();
-  const ts = t.nav.databaseDropdown;
-  const [open, setOpen] = useState(false);
-  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const wrapperRef = useRef<HTMLDivElement | null>(null);
+// One nav-dropdown component for all three uses (Check / Jobs /
+// Database). Wave-15 rewrite (2026-05-15): replaces the prior two
+// near-identical components (DatabaseDropdown + NavDropdown) with
+// one reusable surface that ALSO upgrades the interaction:
+//
+//   • Active highlight on both the trigger and the currently-active
+//     item when the URL matches one of the items.
+//   • Real keyboard navigation: Down/Up walks items, Enter activates,
+//     Home/End jumps, Esc closes + restores focus to the trigger.
+//   • SVG chevron that rotates on open (vs the prior Unicode glyph
+//     with `-my-1` layout hacks).
+//   • Single trigger affordance (chevron baked into the trigger), no
+//     more "two clickable spots" awkwardness.
+//   • Click trigger → primary destination (e.g. /jobs/quality). Hover
+//     OR focus → open menu. Chevron click toggles. Same gestures all
+//     mouse + touch + keyboard.
+//   • Items deduped: if `triggerHref` matches an item.href, the
+//     menu drops that item (no more "Database / Database" repeat).
+//   • 120ms hover-out grace so the cursor can travel from trigger to
+//     menu without the menu vanishing.
 
-  const openNow = () => {
-    if (closeTimer.current) {
-      clearTimeout(closeTimer.current);
-      closeTimer.current = null;
-    }
-    setOpen(true);
-  };
-  const closeNow = () => {
-    if (closeTimer.current) {
-      clearTimeout(closeTimer.current);
-      closeTimer.current = null;
-    }
-    setOpen(false);
-  };
-  // 120ms hover-leave grace so the cursor can travel from trigger to
-  // menu without the menu vanishing.
-  const closeLater = () => {
-    if (closeTimer.current) clearTimeout(closeTimer.current);
-    closeTimer.current = setTimeout(() => {
-      setOpen(false);
-      closeTimer.current = null;
-    }, 120);
-  };
+type NavDropdownItem = { href: string; label: string };
 
-  // Escape closes immediately; outside-click closes too (click outside
-  // is the universal "dismiss" expectation for click-opened menus).
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    const onClick = (e: MouseEvent) => {
-      if (!wrapperRef.current) return;
-      if (!wrapperRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("keydown", onKey);
-    document.addEventListener("mousedown", onClick);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.removeEventListener("mousedown", onClick);
-    };
-  }, [open]);
-
-  useEffect(() => {
-    return () => {
-      if (closeTimer.current) clearTimeout(closeTimer.current);
-    };
-  }, []);
-
+function ChevronIcon({ open }: { open: boolean }) {
   return (
-    <div
-      ref={wrapperRef}
-      className="relative inline-flex items-center gap-0.5"
-      onMouseEnter={openNow}
-      onMouseLeave={closeLater}
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 12 12"
+      aria-hidden
+      className={
+        "transition-transform duration-100 ease-out " +
+        (open ? "rotate-180" : "")
+      }
     >
-      <Link
-        href="/database"
-        className="hover:text-neutral-900 dark:hover:text-neutral-100"
-      >
-        {ts.label}
-      </Link>
-      <button
-        type="button"
-        onClick={() => (open ? closeNow() : openNow())}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        aria-label={ts.toggleAria}
-        className="leading-none px-0.5 -my-1 text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 rounded"
-      >
-        <span aria-hidden className="text-[0.7em] select-none">▾</span>
-      </button>
-      {open && (
-        <div
-          className="absolute left-0 top-full pt-1 min-w-[12rem] z-20"
-          role="menu"
-        >
-          <div className="rounded-md border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 shadow-lg">
-            <Link
-              href="/database"
-              onClick={closeNow}
-              className="block px-3 py-2 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800 first:rounded-t-md"
-              role="menuitem"
-            >
-              {ts.analyzeList}
-            </Link>
-            <Link
-              href="/banlist"
-              onClick={closeNow}
-              className="block px-3 py-2 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800 last:rounded-b-md border-t border-neutral-200 dark:border-neutral-800"
-              role="menuitem"
-            >
-              {ts.banList}
-            </Link>
-          </div>
-        </div>
-      )}
-    </div>
+      <path
+        d="M3 4.5L6 7.5L9 4.5"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    </svg>
   );
 }
 
-// Generic pillar dropdown for the Check + Jobs nav entries (Wave 1,
-// 2026-05-15). Same hover-with-grace + click-toggle + outside-click
-// behavior as DatabaseDropdown above. The trigger is a Link to the
-// `quality` route (the default pillar) so a plain click on the label
-// keeps the legacy /analyze + /jobs UX; the chevron button opens the
-// menu for users who want to switch pillars.
-//
-// Kept separate from DatabaseDropdown rather than refactored into one
-// shared component — the Database one has a slightly different item
-// shape (Database vs Ban List, no pillar discriminator) and merging the
-// two would just bury the simple shape behind a config blob.
 function NavDropdown({
-  triggerHref,
   triggerLabel,
   toggleAria,
   items,
 }: {
-  triggerHref: string;
   triggerLabel: string;
   toggleAria: string;
-  // Each item gets its own line in the dropdown body. Order matters —
-  // Quality first (the default/most-used), then the two newer pillars.
-  items: { href: string; label: string }[];
+  items: NavDropdownItem[];
 }) {
+  const pathname = usePathname() || "";
   const [open, setOpen] = useState(false);
-  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const itemRefs = useRef<(HTMLAnchorElement | null)[]>([]);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const openNow = () => {
+  // The trigger is a menu button — clicking it just opens the menu so
+  // the user always picks from all N items (no implicit default
+  // route, no item duplicating the trigger). Pre-2026-05-15 the
+  // trigger was also a navigable Link to the most-common item; we
+  // removed that because it confused the gesture ("did I want to go
+  // there, or just open the menu?") and forced a dedupe of the
+  // matching item.
+  const visibleItems = items;
+
+  // Per-item + per-trigger active match. Active when the current path
+  // equals the href OR starts with `${href}/` so deep pages light up
+  // their pillar (e.g. /jobs/whois-history/42 lights up the "Whois
+  // history" item AND tints the Jobs trigger).
+  const matches = useCallback(
+    (href: string) =>
+      pathname === href || pathname.startsWith(`${href}/`),
+    [pathname],
+  );
+  const triggerActive = items.some((it) => matches(it.href));
+
+  const openNow = useCallback(() => {
     if (closeTimer.current) {
       clearTimeout(closeTimer.current);
       closeTimer.current = null;
     }
     setOpen(true);
-  };
-  const closeNow = () => {
+  }, []);
+  const closeNow = useCallback(() => {
     if (closeTimer.current) {
       clearTimeout(closeTimer.current);
       closeTimer.current = null;
     }
     setOpen(false);
-  };
-  const closeLater = () => {
+  }, []);
+  const closeLater = useCallback(() => {
     if (closeTimer.current) clearTimeout(closeTimer.current);
     closeTimer.current = setTimeout(() => {
       setOpen(false);
       closeTimer.current = null;
     }, 120);
-  };
+  }, []);
 
+  // Outside-click + Escape both dismiss. Escape also restores focus
+  // back to the trigger so keyboard users don't lose their place.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
     };
-    const onClick = (e: MouseEvent) => {
+    const onPointer = (e: MouseEvent) => {
       if (!wrapperRef.current) return;
       if (!wrapperRef.current.contains(e.target as Node)) setOpen(false);
     };
     document.addEventListener("keydown", onKey);
-    document.addEventListener("mousedown", onClick);
+    document.addEventListener("mousedown", onPointer);
     return () => {
       document.removeEventListener("keydown", onKey);
-      document.removeEventListener("mousedown", onClick);
+      document.removeEventListener("mousedown", onPointer);
     };
   }, [open]);
 
-  useEffect(() => {
-    return () => {
+  useEffect(
+    () => () => {
       if (closeTimer.current) clearTimeout(closeTimer.current);
-    };
-  }, []);
+    },
+    [],
+  );
+
+  // Keyboard nav within the open menu. Down/Up walk items, Home/End
+  // jump to the edges, Tab closes (let focus exit naturally).
+  const handleItemKey = (
+    e: ReactKeyboardEvent<HTMLAnchorElement>,
+    index: number,
+  ) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      const next = (index + 1) % visibleItems.length;
+      itemRefs.current[next]?.focus();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      const prev = (index - 1 + visibleItems.length) % visibleItems.length;
+      itemRefs.current[prev]?.focus();
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      itemRefs.current[0]?.focus();
+    } else if (e.key === "End") {
+      e.preventDefault();
+      itemRefs.current[visibleItems.length - 1]?.focus();
+    } else if (e.key === "Tab") {
+      // Let Tab move focus out naturally and close the menu so it
+      // doesn't linger over content the user has tabbed past.
+      setOpen(false);
+    }
+  };
+
+  // Trigger key handler: Down arrow opens the menu and focuses item 0;
+  // Up arrow opens and focuses the last item. Enter/Space toggle is
+  // handled by the native button.
+  const handleTriggerKey = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setOpen(true);
+      requestAnimationFrame(() => itemRefs.current[0]?.focus());
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setOpen(true);
+      requestAnimationFrame(() => {
+        const last = itemRefs.current[visibleItems.length - 1];
+        last?.focus();
+      });
+    }
+  };
 
   return (
     <div
       ref={wrapperRef}
-      className="relative inline-flex items-center gap-0.5"
+      className="relative"
       onMouseEnter={openNow}
       onMouseLeave={closeLater}
     >
-      <Link
-        href={triggerHref}
-        className="hover:text-neutral-900 dark:hover:text-neutral-100"
-      >
-        {triggerLabel}
-      </Link>
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => (open ? closeNow() : openNow())}
+        onFocus={openNow}
+        onKeyDown={handleTriggerKey}
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label={toggleAria}
-        className="leading-none px-0.5 -my-1 text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 rounded"
+        aria-current={triggerActive ? "page" : undefined}
+        className={
+          "inline-flex items-center gap-1 px-1 py-0.5 rounded-md transition-colors " +
+          "focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 " +
+          "cursor-pointer bg-transparent border-0 text-sm font-[inherit] " +
+          (triggerActive
+            ? "text-neutral-900 dark:text-neutral-100 font-medium"
+            : "text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-neutral-100")
+        }
       >
-        <span aria-hidden className="text-[0.7em] select-none">▾</span>
+        <span>{triggerLabel}</span>
+        {/* Chevron rotates 180° on open so the trigger always tells
+            you whether the menu is showing. */}
+        <ChevronIcon open={open} />
+        <span className="sr-only">{toggleAria}</span>
       </button>
+      {/* Invisible bridge between trigger and menu so the cursor can
+          travel without leaving the wrapper's hover area. `pt-1.5`
+          renders as space the menu rounded-rect doesn't occupy. */}
       {open && (
         <div
-          className="absolute left-0 top-full pt-1 min-w-[12rem] z-20"
+          className="absolute left-0 top-full pt-1.5 min-w-[12rem] z-20"
           role="menu"
         >
-          <div className="rounded-md border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 shadow-lg">
-            {items.map((it, i) => (
-              <Link
-                key={it.href}
-                href={it.href}
-                onClick={closeNow}
-                className={
-                  "block px-3 py-2 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800 " +
-                  (i === 0 ? "first:rounded-t-md " : "") +
-                  (i === items.length - 1
-                    ? "last:rounded-b-md border-t border-neutral-200 dark:border-neutral-800 "
-                    : i > 0
-                      ? "border-t border-neutral-200 dark:border-neutral-800 "
-                      : "")
-                }
-                role="menuitem"
-              >
-                {it.label}
-              </Link>
-            ))}
+          <div
+            className={
+              "rounded-lg border border-neutral-200 dark:border-neutral-800 " +
+              "bg-white dark:bg-neutral-900 shadow-lg shadow-black/5 dark:shadow-black/20 " +
+              "py-1 divide-y divide-neutral-100 dark:divide-neutral-800/60"
+            }
+          >
+            {visibleItems.map((it, i) => {
+              const isActive = matches(it.href);
+              return (
+                <Link
+                  key={it.href}
+                  href={it.href}
+                  ref={(el) => {
+                    itemRefs.current[i] = el;
+                  }}
+                  onClick={closeNow}
+                  onKeyDown={(e) => handleItemKey(e, i)}
+                  role="menuitem"
+                  aria-current={isActive ? "page" : undefined}
+                  className={
+                    "flex items-center justify-between px-3 py-2 text-sm transition-colors " +
+                    (isActive
+                      ? "text-blue-700 dark:text-blue-300 font-medium bg-blue-50/60 dark:bg-blue-950/30"
+                      : "text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800/70")
+                  }
+                >
+                  <span>{it.label}</span>
+                  {isActive && (
+                    <span
+                      aria-hidden
+                      className="ml-3 text-[0.7em] text-blue-700/80 dark:text-blue-300/80"
+                    >
+                      ●
+                    </span>
+                  )}
+                </Link>
+              );
+            })}
           </div>
         </div>
       )}
@@ -252,33 +280,47 @@ export function HeaderShell() {
   const { t } = useT();
   // Public share pages render their own minimal header (no operator
   // nav). Detect by path prefix so the basic-auth-free pages don't
-  // leak the operator surface area to recipients — even though clicking
-  // those links would prompt for basicauth, the mere presence of
-  // "Settings" / "Errors" / etc. would be confusing on a "view this
-  // analysis" page meant for a client.
+  // leak the operator surface area to recipients.
   const pathname = usePathname() || "";
   if (pathname.startsWith("/share/")) return null;
+
+  // Highlight non-dropdown nav links when the current path matches
+  // them (or is nested under them). Same active-state semantic as
+  // the dropdowns so everything in the nav looks consistent.
+  const isActiveLink = (href: string) =>
+    pathname === href || pathname.startsWith(`${href}/`);
+  const linkClass = (href: string) =>
+    "px-1 py-0.5 rounded-md transition-colors " +
+    (isActiveLink(href)
+      ? "text-neutral-900 dark:text-neutral-100 font-medium"
+      : "text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-neutral-100");
+
   return (
     <header className="border-b dark:border-neutral-800 bg-white/70 dark:bg-neutral-900/70 backdrop-blur sticky top-0 z-10">
       {/* 3-column grid: brand left, nav centered, controls right.
           Using grid (vs flex+ml-auto) so the nav is truly centered in
-          the viewport and doesn't drift left/right as the brand or
-          controls change width. */}
+          the viewport and doesn't drift as the brand or controls
+          change width. */}
       <div className="max-w-screen-2xl mx-auto px-6 py-3 grid grid-cols-3 items-center gap-6">
-        <Link href="/" className="font-semibold justify-self-start">
+        <Link
+          href="/"
+          className={
+            "font-semibold justify-self-start transition-colors " +
+            (pathname === "/"
+              ? "text-neutral-900 dark:text-neutral-100"
+              : "hover:text-neutral-900 dark:hover:text-neutral-100")
+          }
+        >
           {t.appName}
         </Link>
-        <nav className="text-sm flex gap-4 text-neutral-600 dark:text-neutral-300 justify-self-center">
-          <Link href="/">{t.nav.dashboard}</Link>
-          <Link href="/backlog">{t.nav.backlog}</Link>
-          {/* Wave 1 (2026-05-15): single Analyze + Jobs links are now
-              dropdowns that switch between the three pillars (Quality
-              today; Whois History + Availability ship in waves 2/3).
-              Trigger label clicks go to /check/quality and
-              /jobs/quality respectively, preserving the most-common
-              path the user already hits. */}
+        <nav className="text-sm flex items-center gap-3 justify-self-center">
+          <Link href="/" className={linkClass("/")}>
+            {t.nav.dashboard}
+          </Link>
+          <Link href="/backlog" className={linkClass("/backlog")}>
+            {t.nav.backlog}
+          </Link>
           <NavDropdown
-            triggerHref="/check/quality"
             triggerLabel={t.nav.check}
             toggleAria={t.nav.checkDropdown.toggleAria}
             items={[
@@ -294,7 +336,6 @@ export function HeaderShell() {
             ]}
           />
           <NavDropdown
-            triggerHref="/jobs/quality"
             triggerLabel={t.nav.jobs}
             toggleAria={t.nav.jobsDropdown.toggleAria}
             items={[
@@ -309,11 +350,29 @@ export function HeaderShell() {
               },
             ]}
           />
-          <DatabaseDropdown />
-          <Link href="/shares">{t.nav.shares}</Link>
-          <Link href="/errors">{t.nav.errors}</Link>
-          <Link href="/settings">{t.nav.settings}</Link>
-          <Link href="/docs">Документация</Link>
+          <NavDropdown
+            triggerLabel={t.nav.databaseDropdown.label}
+            toggleAria={t.nav.databaseDropdown.toggleAria}
+            items={[
+              {
+                href: "/database",
+                label: t.nav.databaseDropdown.analyzeList,
+              },
+              { href: "/banlist", label: t.nav.databaseDropdown.banList },
+            ]}
+          />
+          <Link href="/shares" className={linkClass("/shares")}>
+            {t.nav.shares}
+          </Link>
+          <Link href="/errors" className={linkClass("/errors")}>
+            {t.nav.errors}
+          </Link>
+          <Link href="/settings" className={linkClass("/settings")}>
+            {t.nav.settings}
+          </Link>
+          <Link href="/docs" className={linkClass("/docs")}>
+            Документация
+          </Link>
         </nav>
         <div className="flex items-center gap-2 justify-self-end">
           <LanguageToggle />

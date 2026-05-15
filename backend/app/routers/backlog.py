@@ -158,6 +158,28 @@ def _parse_registrar_csv(raw: str | None) -> list[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+# Valid AvailabilityCheck.status values. Mirrors models.AvailabilityCheck
+# docstring. The "__none__" sentinel here means "domain has never been
+# checked at all" (no row in `availability_checks`).
+_AVAILABILITY_STATUSES = {"available", "registered", "unknown", "error"}
+
+
+def _parse_availability_csv(raw: str | None) -> list[str]:
+    """Accept any of the 4 real statuses or the `__none__` never-checked
+    sentinel. Empty/missing → no filter."""
+    if not raw:
+        return []
+    out: list[str] = []
+    for piece in raw.split(","):
+        s = piece.strip()
+        if not s:
+            continue
+        if s != "__none__" and s not in _AVAILABILITY_STATUSES:
+            raise HTTPException(400, f"unknown availability status: {s}")
+        out.append(s)
+    return out
+
+
 def _apply_backlog_filters(
     q,
     *,
@@ -166,6 +188,7 @@ def _apply_backlog_filters(
     registrars_filter: list[str] | None = None,
     expiry_from: date | None = None,
     expiry_to: date | None = None,
+    availability_statuses: list[str] | None = None,
 ):
     """Compose the standard set of filters onto a BacklogDomain query.
     Used by every endpoint that scopes by user-chosen filters (list,
@@ -182,6 +205,125 @@ def _apply_backlog_filters(
         q = q.filter(BacklogDomain.expiration_date >= expiry_from)
     if expiry_to is not None:
         q = q.filter(BacklogDomain.expiration_date <= expiry_to)
+    if availability_statuses:
+        # Availability filter (added 2026-05-15; semantic revised after
+        # bug report — original MAX(id) was wrong because the cascade
+        # writes one row PER PROVIDER per check and a later inconclusive
+        # answer must NOT supersede an earlier definitive one).
+        #
+        # We mirror `routers/availability.latest_for_domains` exactly:
+        #
+        #   • A domain's "displayed status" is the most-recent row
+        #     among those with status ∈ (available, registered) — call
+        #     this the "definitive" answer.
+        #   • If no definitive row exists, the displayed status is the
+        #     most-recent row's status overall (unknown / error).
+        #   • If no row at all, the column reads "never checked".
+        #
+        # The filter joins both subqueries and the conditions OR-compose
+        # so selecting "available + never-checked" matches both buckets.
+        from sqlalchemy import and_, or_, select, func
+        from ..models import AvailabilityCheck
+
+        real_statuses = [
+            s for s in availability_statuses if s != "__none__"
+        ]
+        include_never = "__none__" in availability_statuses
+        definitive_wanted = [
+            s for s in real_statuses if s in ("available", "registered")
+        ]
+        inconclusive_wanted = [
+            s for s in real_statuses if s in ("unknown", "error")
+        ]
+
+        latest_def_row = None
+        latest_any_row = None
+
+        if definitive_wanted or inconclusive_wanted:
+            # Latest definitive (available/registered) check per
+            # domain. MAX(checked_at) — matches latest_for_domains'
+            # use of MAX(checked_at) rather than MAX(id) so behavior
+            # is identical to the UI's column hydrator.
+            latest_def_t = (
+                select(
+                    AvailabilityCheck.domain.label("def_dom"),
+                    func.max(AvailabilityCheck.checked_at).label("def_t"),
+                )
+                .where(
+                    AvailabilityCheck.status.in_(
+                        ("available", "registered")
+                    )
+                )
+                .group_by(AvailabilityCheck.domain)
+                .subquery()
+            )
+            latest_def_row = (
+                select(
+                    AvailabilityCheck.domain.label("def_dom"),
+                    AvailabilityCheck.status.label("def_status"),
+                )
+                .join(
+                    latest_def_t,
+                    (AvailabilityCheck.domain == latest_def_t.c.def_dom)
+                    & (
+                        AvailabilityCheck.checked_at
+                        == latest_def_t.c.def_t
+                    ),
+                )
+                .subquery()
+            )
+            q = q.outerjoin(
+                latest_def_row,
+                latest_def_row.c.def_dom == BacklogDomain.domain,
+            )
+
+        if inconclusive_wanted or include_never:
+            # Latest row of ANY status per domain. MAX(id) is fine here
+            # because we use it only to (a) detect "never checked"
+            # (NULL after outer join) and (b) read the latest status
+            # for domains with no definitive row.
+            latest_any_t = (
+                select(
+                    AvailabilityCheck.domain.label("any_dom"),
+                    func.max(AvailabilityCheck.id).label("any_id"),
+                )
+                .group_by(AvailabilityCheck.domain)
+                .subquery()
+            )
+            latest_any_row = (
+                select(
+                    AvailabilityCheck.domain.label("any_dom"),
+                    AvailabilityCheck.status.label("any_status"),
+                )
+                .join(
+                    latest_any_t,
+                    AvailabilityCheck.id == latest_any_t.c.any_id,
+                )
+                .subquery()
+            )
+            q = q.outerjoin(
+                latest_any_row,
+                latest_any_row.c.any_dom == BacklogDomain.domain,
+            )
+
+        conds = []
+        if definitive_wanted and latest_def_row is not None:
+            conds.append(
+                latest_def_row.c.def_status.in_(definitive_wanted)
+            )
+        if inconclusive_wanted and latest_any_row is not None:
+            # Inconclusive = no definitive answer ever AND latest-by-id
+            # row matches the requested status (unknown/error).
+            conds.append(
+                and_(
+                    latest_def_row.c.def_dom.is_(None),
+                    latest_any_row.c.any_status.in_(inconclusive_wanted),
+                )
+            )
+        if include_never and latest_any_row is not None:
+            conds.append(latest_any_row.c.any_dom.is_(None))
+        if conds:
+            q = q.filter(or_(*conds))
     return q
 
 
@@ -273,6 +415,7 @@ def list_backlog(
     registrar: str | None = None,
     expiry_from: date | None = None,
     expiry_to: date | None = None,
+    availability: str | None = None,
     sort: str | None = None,
     direction: str | None = None,
     # When false, the response skips `total` (full-table count) and
@@ -290,6 +433,7 @@ def list_backlog(
     asyncio.to_thread."""
     statuses = _parse_status_csv(status)
     registrars_filter = _parse_registrar_csv(registrar)
+    availability_statuses = _parse_availability_csv(availability)
 
     base = db.query(BacklogDomain)
     total = base.count() if include_options else 0
@@ -301,6 +445,7 @@ def list_backlog(
         registrars_filter=registrars_filter,
         expiry_from=expiry_from,
         expiry_to=expiry_to,
+        availability_statuses=availability_statuses,
     )
 
     filtered_total = q.count()
@@ -362,6 +507,7 @@ async def _list_backlog_route(
     registrar: str | None = None,
     expiry_from: date | None = None,
     expiry_to: date | None = None,
+    availability: str | None = None,
     sort: str | None = None,
     direction: str | None = None,
     include_options: bool = Query(True),
@@ -379,6 +525,7 @@ async def _list_backlog_route(
         registrar,
         expiry_from,
         expiry_to,
+        availability,
         sort,
         direction,
         include_options,
@@ -393,6 +540,7 @@ def _run_list_backlog(
     registrar: str | None,
     expiry_from: date | None,
     expiry_to: date | None,
+    availability: str | None,
     sort: str | None,
     direction: str | None,
     include_options: bool,
@@ -407,6 +555,7 @@ def _run_list_backlog(
             registrar=registrar,
             expiry_from=expiry_from,
             expiry_to=expiry_to,
+            availability=availability,
             sort=sort,
             direction=direction,
             include_options=include_options,
@@ -525,6 +674,7 @@ def export_csv(
     registrar: str | None = None,
     expiry_from: date | None = None,
     expiry_to: date | None = None,
+    availability: str | None = None,
     sort: str | None = None,
     direction: str | None = None,
     db: Session = Depends(get_db),
@@ -543,6 +693,7 @@ def export_csv(
             registrars_filter=_parse_registrar_csv(registrar),
             expiry_from=expiry_from,
             expiry_to=expiry_to,
+            availability_statuses=_parse_availability_csv(availability),
         )
     q = _apply_sort(q, sort, direction)
 
@@ -631,6 +782,7 @@ class BulkStatusFilteredIn(BaseModel):
     registrar: str | None = None
     expiry_from: date | None = None
     expiry_to: date | None = None
+    availability: str | None = None
 
 
 class SendToAnalyzeIn(BaseModel):
@@ -647,6 +799,7 @@ class SendToAnalyzeIn(BaseModel):
     registrar: str | None = None
     expiry_from: date | None = None
     expiry_to: date | None = None
+    availability: str | None = None
 
 
 @router.post("/send-to-analyze")
@@ -665,6 +818,7 @@ def send_to_analyze(
             registrars_filter=_parse_registrar_csv(payload.registrar),
             expiry_from=payload.expiry_from,
             expiry_to=payload.expiry_to,
+            availability_statuses=_parse_availability_csv(payload.availability),
         )
 
     # Pull just the domain strings + ids — no need for full rows.
@@ -704,6 +858,7 @@ def bulk_status_filtered(
         registrars_filter=_parse_registrar_csv(payload.registrar),
         expiry_from=payload.expiry_from,
         expiry_to=payload.expiry_to,
+        availability_statuses=_parse_availability_csv(payload.availability),
     )
 
     n = q.update(
@@ -737,6 +892,7 @@ class BulkDeleteFilteredIn(BaseModel):
     registrar: str | None = None
     expiry_from: date | None = None
     expiry_to: date | None = None
+    availability: str | None = None
 
 
 @router.post("/bulk-delete-filtered")
@@ -750,6 +906,7 @@ def bulk_delete_filtered(
         registrars_filter=_parse_registrar_csv(payload.registrar),
         expiry_from=payload.expiry_from,
         expiry_to=payload.expiry_to,
+        availability_statuses=_parse_availability_csv(payload.availability),
     )
     n = q.delete(synchronize_session=False)
     db.commit()

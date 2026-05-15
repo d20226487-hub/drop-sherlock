@@ -148,6 +148,19 @@ class DomainRow(BaseModel):
     category: str = ""
     category_confidence: float | None = None
     category_was: str = ""
+    # Whois-history verdict (added 2026-05-15 Wave 2 follow-up) — surfaced
+    # separately like wayback. `dropped_confidence` is the per-domain
+    # drop-evidence score from the WhoisFreaks judge (high = caution).
+    # `whois_band` is the server-computed bucket — one of "dropped" /
+    # "mixed" / "insufficient" / "stable" / "" — derived using the same
+    # thresholds as the per-domain Whois view's `dropTone()` (>0.80 →
+    # dropped, >0.50 → mixed, ≥0.30 → insufficient, <0.30 → stable).
+    # Drives both the column tone and the filter dropdown so the
+    # frontend doesn't have to keep the threshold constants in sync.
+    whois_dropped_confidence: float | None = None
+    whois_transferred_confidence: float | None = None
+    whois_summary: str = ""
+    whois_band: str = ""
     # Across-runs aggregates for the domain (independent of the pin).
     total_runs: int
     any_cached: bool = False
@@ -193,7 +206,35 @@ class DomainListResponse(BaseModel):
 CRITERIA = (
     "backlinks", "refdomains", "anchors", "keywords",
     "wayback", "wayback_classify",
+    # whois_history added 2026-05-15: lets the Database page surface
+    # whois-only domains (Quality-pillar pins not required) and the new
+    # Whois column. compute_final ignores it (no weight in the scoring
+    # config), and `CRITERIA_LETTERS` on the frontend doesn't render a
+    # pill for it, so the only visible effect is the dedicated whois
+    # column + the `pinned_criteria` list including "whois_history".
+    "whois_history",
+    # availability added 2026-05-15 Wave 3: same shape — lets
+    # availability-only domains appear on Database, and lets the
+    # existing Availability cell + filter source from the pinned
+    # availability CR row when one exists. compute_final ignores it
+    # (no weight in scoring config).
+    "availability",
 )
+
+
+def _whois_band(dropped: float | None) -> str:
+    """Bucket `dropped_confidence` into the same 4 bands the per-domain
+    Whois view uses (see `dropTone()` in whois-history-domain-view.tsx).
+    Empty string when no confidence is available."""
+    if dropped is None:
+        return ""
+    if dropped > 0.80:
+        return "dropped"
+    if dropped > 0.50:
+        return "mixed"
+    if dropped >= 0.30:
+        return "insufficient"
+    return "stable"
 
 
 def _row_count(data_json: str) -> int:
@@ -390,6 +431,33 @@ def list_domains(
     for cr in cr_rows:
         crs_by_rd[cr.run_domain_id][cr.criterion] = cr
 
+    # Whois-history fallback (added 2026-05-15): pinning isn't required
+    # to surface a whois verdict on Database — when no JobCriterionPin
+    # exists for whois_history, use the most-recent rd that has a
+    # whois_history CR across ALL of the domain's rds. Whois jobs are
+    # typically one-shot per domain, so requiring an extra "pin" click
+    # would defeat the whole "send good-whois domains to Analyze"
+    # workflow. Pre-load all whois_history CRs once so the per-domain
+    # loop doesn't issue N more queries.
+    whois_crs_by_rd_id: dict[int, CriterionResult] = {
+        cr.run_domain_id: cr
+        for cr in db.query(CriterionResult)
+        .filter(CriterionResult.criterion == "whois_history")
+        .filter(CriterionResult.ai_verdict_json != "")
+        .all()
+    }
+    # Availability fallback (Wave 3, 2026-05-15): same pattern as
+    # whois_history. Availability runs have no AI verdict so we key
+    # off data_json instead — a `done` cascade always writes the
+    # trace + verdict there.
+    availability_crs_by_rd_id: dict[int, CriterionResult] = {
+        cr.run_domain_id: cr
+        for cr in db.query(CriterionResult)
+        .filter(CriterionResult.criterion == "availability")
+        .filter(CriterionResult.data_json != "")
+        .all()
+    }
+
     # Notes: same IN-list pattern as backlog below. The notes table is
     # smaller in practice but the principle is identical — fetch only
     # the rows the page will actually display. (Index added 2026-05-10
@@ -421,9 +489,14 @@ def list_domains(
             .all()
         }
 
-    # Banned-domain lookup (added 2026-05-13 wave L). Single IN-list
-    # against `domain_bans` — same pattern as backlog_by_domain above.
-    # Drives the per-row `is_banned` flag for the badge.
+    # Banned-domain lookup. Originally (Wave L, 2026-05-13) drove a
+    # per-row "banned" badge but rows stayed visible. Revised
+    # 2026-05-15: banned rows are now HIDDEN from the Database listing
+    # entirely — operators view banned-domain analysis history via the
+    # Ban List page's per-row links instead. The underlying rds + CRs
+    # are NOT deleted (so unbanning restores the row to Database
+    # automatically). `is_banned` field on the response is retained for
+    # back-compat but will always be false on returned rows.
     from ..models import DomainBan
     banned_set: set[str] = set()
     if domain_keys:
@@ -447,8 +520,18 @@ def list_domains(
     # Filter universes for wayback_classify columns (added 2026-05-09).
     languages_seen: set[str] = set()
     categories_seen: set[str] = set()
+    # Whois-band universe for the new Whois filter dropdown (added
+    # 2026-05-15). Always a subset of {dropped, mixed, insufficient,
+    # stable} — the four bands `_whois_band` produces.
+    whois_bands_seen: set[str] = set()
 
     for domain, domain_rds in rds_by_domain.items():
+        # Banned domains are hidden from the Database listing entirely
+        # (revised 2026-05-15). The underlying rds + CRs stay in the DB
+        # so unbanning brings the row back; operators audit banned-
+        # domain analysis history via the Ban List page's links.
+        if domain in banned_set:
+            continue
         domain_rds_sorted = sorted(domain_rds, key=lambda r: r.id, reverse=True)
         # Build the pin-options dropdown for the UI. Always present so the
         # user can pick or change the pin.
@@ -473,6 +556,52 @@ def list_domains(
         per_crit_sources = sources_by_domain.get(domain, {})
         note_row = notes_by_domain.get(domain)
         backlog_row = backlog_by_domain.get(domain)
+
+        # Whois-history fallback: if no pin contributed a whois source
+        # for this domain, surface the most-recent rd that has a
+        # whois_history CR with a verdict. Synthesize a source entry so
+        # the row goes through the populated path (gets pinned_run_*
+        # fields, whois column populated). Whois-only domains thus
+        # appear on Database without requiring the user to manually pin
+        # the whois run.
+        if "whois_history" not in per_crit_sources:
+            for d in domain_rds_sorted:
+                if d.id not in whois_crs_by_rd_id:
+                    continue
+                d_run = runs.get(d.run_id)
+                if d_run is None:
+                    continue
+                d_job = jobs.get(d_run.job_id)
+                if d_job is None:
+                    continue
+                per_crit_sources["whois_history"] = (d, d_run, d_job)
+                # CR row is in whois_crs_by_rd_id but might not be in
+                # crs_by_rd (only rd_ids_needed were pulled into that
+                # dict). Splice it in so the existing whois extraction
+                # block reads it via the same crs_by_rd path.
+                crs_by_rd[d.id]["whois_history"] = whois_crs_by_rd_id[d.id]
+                break
+
+        # Availability fallback (Wave 3): same pattern as whois — when
+        # no pin contributes an availability source, fall back to the
+        # most-recent rd that has an availability CR. Lets per-row
+        # click-through reach the cascade trace page even before an
+        # operator manually pins the run.
+        if "availability" not in per_crit_sources:
+            for d in domain_rds_sorted:
+                if d.id not in availability_crs_by_rd_id:
+                    continue
+                d_run = runs.get(d.run_id)
+                if d_run is None:
+                    continue
+                d_job = jobs.get(d_run.job_id)
+                if d_job is None:
+                    continue
+                per_crit_sources["availability"] = (d, d_run, d_job)
+                crs_by_rd[d.id]["availability"] = (
+                    availability_crs_by_rd_id[d.id]
+                )
+                break
 
         if not per_crit_sources:
             # No criterion has a pin contributing to this domain. Emit an
@@ -595,7 +724,14 @@ def list_domains(
         weighted_crits = {c for c, w in weights.items() if w > 0}
         pinned_set = set(pinned_criteria_list)
         missing_weighted = sorted(weighted_crits - pinned_set)
-        underweight = bool(missing_weighted)
+        # `underweight` needs at least one weighted criterion to actually
+        # be pinned. Otherwise the row simply has "no Ahrefs verdict"
+        # (e.g. whois-only or wayback-only domains) and the "subset"
+        # badge would be misleading — there's no subset, there's no
+        # quality data at all. Same `final_bucket=""` state as a never-
+        # analyzed row.
+        has_any_weighted_pin = bool(weighted_crits & pinned_set)
+        underweight = bool(missing_weighted) and has_any_weighted_pin
 
         contributing_rd_ids = {src[0].id for src in per_crit_sources.values()}
         single_source_full = (
@@ -804,6 +940,40 @@ def list_domains(
                 if isinstance(cw, str):
                     category_was = cw
 
+        # Whois-history verdict (added 2026-05-15) — sourced from
+        # whichever rd supplies the `whois_history` criterion pin. Shape:
+        # {dropped_confidence, transferred_confidence, summary,
+        #  key_signals[], recommendation}.
+        whois_dropped_confidence: float | None = None
+        whois_transferred_confidence: float | None = None
+        whois_summary = ""
+        whois_band = ""
+        whois_src = per_crit_sources.get("whois_history")
+        whois_cr = (
+            crs_by_rd.get(whois_src[0].id, {}).get("whois_history")
+            if whois_src else None
+        )
+        if whois_cr is not None and whois_cr.ai_verdict_json:
+            try:
+                wh_parsed = json.loads(whois_cr.ai_verdict_json)
+            except json.JSONDecodeError:
+                wh_parsed = None
+            if isinstance(wh_parsed, dict):
+                dc = wh_parsed.get("dropped_confidence")
+                if isinstance(dc, (int, float)) and not isinstance(dc, bool):
+                    if 0.0 <= float(dc) <= 1.0:
+                        whois_dropped_confidence = float(dc)
+                tc = wh_parsed.get("transferred_confidence")
+                if isinstance(tc, (int, float)) and not isinstance(tc, bool):
+                    if 0.0 <= float(tc) <= 1.0:
+                        whois_transferred_confidence = float(tc)
+                s = wh_parsed.get("summary")
+                if isinstance(s, str):
+                    whois_summary = s
+        whois_band = _whois_band(whois_dropped_confidence)
+        if whois_band:
+            whois_bands_seen.add(whois_band)
+
         rows.append(DomainRow(
             domain=domain,
             is_pinned=True,
@@ -841,6 +1011,10 @@ def list_domains(
             category=category,
             category_confidence=category_confidence,
             category_was=category_was,
+            whois_dropped_confidence=whois_dropped_confidence,
+            whois_transferred_confidence=whois_transferred_confidence,
+            whois_summary=whois_summary,
+            whois_band=whois_band,
             total_runs=len(domain_rds),
             any_cached=any_cached,
             note=(note_row.note if note_row else ""),
@@ -878,6 +1052,10 @@ def list_domains(
             "wayback_verdicts": sorted(wayback_assessments),
             "languages": sorted(languages_seen),
             "categories": sorted(categories_seen),
+            # Subset of {dropped, mixed, insufficient, stable}. Frontend
+            # uses this to disable the Whois filter when empty (no whois
+            # job has run for any pinned rd yet).
+            "whois_bands": sorted(whois_bands_seen),
         },
         total=total,
     )

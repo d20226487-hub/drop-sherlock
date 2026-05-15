@@ -5,13 +5,45 @@ export const metadata = { title: "Анализ — Drop Sherlock" };
 export default function AnalyzeDoc() {
   return (
     <div className="docs-content">
-      <h1>Анализ</h1>
+      <h1>Анализ (пилары Quality / Whois / Availability)</h1>
+      <div className="callout callout-info docs-content">
+        <p>
+          <strong>С 2026-05-15 «Анализ» — это не одна страница, а три</strong>.
+          После того как WHOIS-история (Wave 2) и проверка доступности
+          (Wave 3) выделены в отдельные Job kind, у каждого пилара своя
+          форма:
+        </p>
+        <ul>
+          <li>
+            <code>/check/quality</code> — то, что раньше называлось
+            «Анализ»: Ahrefs (B/D/A/K) + Wayback + AI-судьи. Это и
+            есть страница, которую описывает остальная часть статьи.
+          </li>
+          <li>
+            <code>/check/whois-history</code> — детектор истории дропа
+            (см. <Link href="/docs/whois-history">«Whois History»</Link>).
+            Своя форма; без Ahrefs-критериев.
+          </li>
+          <li>
+            <code>/check/availability</code> — каскад проверки
+            доступности (см.{" "}
+            <Link href="/docs/availability">«Availability»</Link>).
+            Без AI-судьи — каскад сам выдаёт детерминированный вердикт.
+          </li>
+        </ul>
+        <p>
+          Старый URL <code>/analyze</code> делает 307-редирект на{" "}
+          <code>/check/quality</code> с сохранением searchParams —
+          ссылки извне не ломаются.
+        </p>
+      </div>
+      <h2>Quality-форма (то, что было «Анализом»)</h2>
       <p>
-        Страница «Анализ» — это форма запуска. Вы указываете список
-        доменов, набор критериев, ИИ-провайдера и нажимаете
-        «Запустить» — Drop Sherlock создаёт{" "}
-        <strong>Задачу</strong> (Job) с одним <strong>Запуском</strong>{" "}
-        (Run) и начинает сбор данных + ИИ-вердиктов.
+        Страница «Анализ» Quality-пилара — это форма запуска. Вы
+        указываете список доменов, набор критериев, ИИ-провайдера и
+        нажимаете «Запустить» — Drop Sherlock создаёт{" "}
+        <strong>Задачу</strong> (Job, <code>kind=&quot;quality&quot;</code>) с
+        одним <strong>Запуском</strong> (Run) и начинает сбор данных + ИИ-вердиктов.
       </p>
 
       <h2>Домены</h2>

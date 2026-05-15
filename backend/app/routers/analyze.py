@@ -357,3 +357,123 @@ async def submit_whois_history_job(
     return SubmitWhoisHistoryOut(
         job_id=job.id, run_id=run.id, skipped_banned=skipped_banned,
     )
+
+
+# --- Wave 3 (2026-05-15): Availability pillar submit ----------------------
+# Same shape as the Whois Wave 2 endpoint but without AI fields — the
+# cascade output is the verdict. Forces use_cache=False in the canonical
+# spec so the runner gets fresh state per Job (Wave 3 decision (b)).
+
+class SubmitAvailabilityIn(BaseModel):
+    domains: list[str]
+    # No AI fields — the cascade is deterministic, no judge needed
+    # (Wave 3 decision (a)). lang carries through for any future
+    # localization of result strings.
+    lang: str = "en"
+    name: str | None = None
+    notes: str | None = None
+
+
+class SubmitAvailabilityOut(BaseModel):
+    job_id: int
+    run_id: int
+    skipped_banned: list[str]
+
+
+@router.post("/availability", response_model=SubmitAvailabilityOut)
+async def submit_availability_job(
+    payload: SubmitAvailabilityIn, db: Session = Depends(get_db)
+) -> SubmitAvailabilityOut:
+    """Mint a Job(kind='availability') + first Run + per-domain
+    RunDomains, then dispatch. Mirrors `submit_whois_history_job` but
+    the spec enables only the `availability` criterion and carries no
+    AI provider."""
+    from .backlog import _normalize_domain
+    from ..ban_filter import filter_banned
+
+    cleaned_domains = [d.strip() for d in payload.domains if d.strip()]
+    if not cleaned_domains:
+        raise HTTPException(400, "at least one domain is required")
+
+    # Ban-list pre-filter — same shape + envelope as Quality / Whois
+    # submits so the frontend's `all_banned` handler matches.
+    normalized_for_check = [_normalize_domain(d) for d in cleaned_domains]
+    pairs = list(zip(cleaned_domains, normalized_for_check))
+    _, banned_normalized = filter_banned(
+        db, [n for n in normalized_for_check if n],
+    )
+    if banned_normalized:
+        skipped_banned = [
+            original for original, norm in pairs
+            if norm and norm in banned_normalized
+        ]
+        cleaned_domains = [
+            original for original, norm in pairs
+            if not (norm and norm in banned_normalized)
+        ]
+        if not cleaned_domains:
+            sample = sorted(banned_normalized)
+            SAMPLE_CAP = 10
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "all_banned",
+                    "count": len(sample),
+                    "sample": sample[:SAMPLE_CAP],
+                    "truncated": len(sample) > SAMPLE_CAP,
+                },
+            )
+    else:
+        skipped_banned = []
+
+    # Canonical spec with ONLY availability enabled. use_cache=False
+    # because a Job is an explicit "give me fresh state" ask (Wave 3
+    # decision (b)). The runner re-reads this and passes it to the
+    # cascade; we set it here for downstream visibility too.
+    spec_dict = {
+        "domains": cleaned_domains,
+        "criteria": {
+            "backlinks": {"enabled": False},
+            "refdomains": {"enabled": False},
+            "anchors": {"enabled": False},
+            "keywords": {"enabled": False},
+            "wayback": {"enabled": False},
+            "wayback_classify": {"enabled": False},
+            "whois_history": {"enabled": False},
+            "availability": {"enabled": True},
+        },
+        # No AI on this pillar. AISpec.provider is Optional[AIProvider]
+        # so None is the canonical "no AI" sentinel — the runner reads
+        # spec.ai.provider and is a no-op when missing. Don't pass
+        # provider:"" — the Literal validator rejects the empty string.
+        "ai": {"provider": None, "model": None},
+        "use_cache": False,
+        "cross_job_cache": False,
+        "lang": payload.lang or "en",
+    }
+    norm_spec = AnalyzeSpec.model_validate(spec_dict)
+    spec_json = norm_spec.model_dump_json()
+
+    name = (payload.name or "").strip() or _autoname(cleaned_domains)
+    notes = (payload.notes or "").strip()
+
+    job = Job(
+        name=name,
+        notes=notes,
+        spec_json=spec_json,
+        kind="availability",
+    )
+    db.add(job)
+    db.flush()
+
+    run = Run(job_id=job.id, status="pending", spec_json=spec_json)
+    db.add(run)
+    db.flush()
+    for d in cleaned_domains:
+        db.add(RunDomain(run_id=run.id, domain=d, status="pending"))
+    db.commit()
+
+    dispatch_run(run.id)
+    return SubmitAvailabilityOut(
+        job_id=job.id, run_id=run.id, skipped_banned=skipped_banned,
+    )

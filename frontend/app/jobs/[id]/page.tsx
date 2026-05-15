@@ -28,6 +28,16 @@ export default function JobDetailPage({
 }) {
   const { id } = use(params);
   const jobId = parseInt(id, 10);
+  // Next.js static segments (whois-history, quality, availability, etc.)
+  // sit at the same depth as this dynamic `[id]` route. When the user
+  // navigates back from /jobs/<numericId> to /jobs/<staticSlug>, the
+  // browser sometimes briefly re-renders this component with the new
+  // path's id value before the route swap completes — at that moment
+  // `id` is e.g. "whois-history" and `parseInt` yields NaN. Without a
+  // guard, the polling useEffect fires `api.getJob(NaN)` and the
+  // backend rejects with 422. Treat non-finite jobIds as "no job" —
+  // the static handler will take over a moment later anyway.
+  const jobIdValid = Number.isFinite(jobId);
   const { t } = useT();
   const ts = t.pages.jobs.detail;
   const router = useRouter();
@@ -39,6 +49,7 @@ export default function JobDetailPage({
   const [busy, setBusy] = useState<string | null>(null);
 
   async function reload() {
+    if (!jobIdValid) return;
     try {
       const d = await api.getJob(jobId);
       setJob(d);
@@ -49,6 +60,7 @@ export default function JobDetailPage({
   }
 
   useEffect(() => {
+    if (!jobIdValid) return;
     reload();
     // Poll while any run is non-terminal so the user sees live progress
     // without manual refresh. Polling the job-detail endpoint is cheap.
@@ -57,7 +69,7 @@ export default function JobDetailPage({
     }, 3000);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId]);
+  }, [jobId, jobIdValid]);
 
   async function rename() {
     if (!job) return;
@@ -363,6 +375,8 @@ function JobPinsPanel({ jobId }: { jobId: number }) {
     "keywords",
     "wayback",
     "wayback_classify",
+    "whois_history",
+    "availability",
   ] as const;
   const LETTERS: Record<string, string> = {
     backlinks: "B",
@@ -371,6 +385,8 @@ function JobPinsPanel({ jobId }: { jobId: number }) {
     keywords: "K",
     wayback: "W",
     wayback_classify: "C",
+    whois_history: "H",
+    availability: "V",
   };
 
   const [pins, setPins] = useState<

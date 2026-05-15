@@ -1,7 +1,8 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, BanRow } from "@/lib/api";
+import { api, BanAnalysisLink, BanRow } from "@/lib/api";
 import { useT } from "@/lib/i18n";
 
 const PER_PAGE_OPTIONS = [20, 50, 100];
@@ -286,6 +287,7 @@ export default function BanListPage() {
               </th>
               <th className="px-3 py-2 font-medium">{ts.colDomain}</th>
               <th className="px-3 py-2 font-medium">{ts.colNote}</th>
+              <th className="px-3 py-2 font-medium">{ts.colAnalyses}</th>
               <th className="px-3 py-2 font-medium">{ts.colCreatedAt}</th>
               <th className="w-20 px-3 py-2 font-medium text-right">
                 {ts.colActions}
@@ -295,13 +297,13 @@ export default function BanListPage() {
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={5} className="px-3 py-4 text-neutral-500">
+                <td colSpan={6} className="px-3 py-4 text-neutral-500">
                   {ts.loading}
                 </td>
               </tr>
             ) : rows.length === 0 ? (
               <tr>
-                <td colSpan={5} className="px-3 py-4 text-neutral-500">
+                <td colSpan={6} className="px-3 py-4 text-neutral-500">
                   {total === 0
                     ? ts.emptyAll
                     : filteredTotal === 0
@@ -328,6 +330,9 @@ export default function BanListPage() {
                     {r.note || (
                       <span className="text-neutral-400">—</span>
                     )}
+                  </td>
+                  <td className="px-3 py-2">
+                    <AnalysisLinks row={r} />
                   </td>
                   <td className="px-3 py-2 text-neutral-500 text-xs">
                     {new Date(r.created_at).toLocaleString()}
@@ -389,5 +394,51 @@ export default function BanListPage() {
         </div>
       </div>
     </main>
+  );
+}
+
+// Renders up to three pill-style links pointing at the most-recent rd
+// page that holds each analysis type for the banned domain. "—" when
+// none exist (banned without ever being analyzed). Per-kind tone keeps
+// scanning fast: emerald = Ahrefs, sky = Wayback, indigo = Whois —
+// matches the existing pillar accent colors used elsewhere in the app.
+function AnalysisLinks({ row }: { row: BanRow }) {
+  const { t } = useT();
+  const ts = t.pages.banlist.analyses;
+  const links: { l: BanAnalysisLink; label: string; tone: string }[] = [];
+  if (row.ahrefs_link)
+    links.push({
+      l: row.ahrefs_link,
+      label: ts.ahrefs,
+      tone: "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-200 hover:bg-emerald-100 dark:hover:bg-emerald-900/40",
+    });
+  if (row.wayback_link)
+    links.push({
+      l: row.wayback_link,
+      label: ts.wayback,
+      tone: "border-sky-300 bg-sky-50 text-sky-800 dark:border-sky-900/60 dark:bg-sky-950/40 dark:text-sky-200 hover:bg-sky-100 dark:hover:bg-sky-900/40",
+    });
+  if (row.whois_link)
+    links.push({
+      l: row.whois_link,
+      label: ts.whois,
+      tone: "border-indigo-300 bg-indigo-50 text-indigo-800 dark:border-indigo-900/60 dark:bg-indigo-950/40 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-900/40",
+    });
+  if (links.length === 0) {
+    return <span className="text-xs text-neutral-400">—</span>;
+  }
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {links.map(({ l, label, tone }) => (
+        <Link
+          key={l.kind}
+          href={`/jobs/${l.job_id}/runs/${l.run_id}/domains/${l.run_domain_id}`}
+          className={`text-xs px-2 py-0.5 rounded-full border ${tone}`}
+          title={ts.linkHint(label)}
+        >
+          {label}
+        </Link>
+      ))}
+    </div>
   );
 }

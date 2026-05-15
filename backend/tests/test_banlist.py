@@ -562,9 +562,13 @@ def test_backlog_import_surfaces_skipped_banned_count(fresh_db):
     assert body["inserted"] == 1
 
 
-def test_database_domains_exposes_is_banned(fresh_db):
-    """A row whose domain is on the ban list should come back from
-    /database/domains with is_banned=True (drives the row badge)."""
+def test_database_domains_hides_banned(fresh_db):
+    """Revised 2026-05-15: banned domains are HIDDEN from the
+    /database/domains listing (was: stay visible with is_banned=True).
+    The underlying rds + CRs are not deleted — unbanning restores the
+    row on the next reload. Audit links to prior analyses are surfaced
+    on the /banlist page instead.
+    """
     from app.models import Job, Run, RunDomain
     job = Job(name="t", spec_json="{}")
     fresh_db.add(job); fresh_db.flush()
@@ -579,5 +583,6 @@ def test_database_domains_exposes_is_banned(fresh_db):
     r = client.get("/database/domains", auth=("admin", "changeme"))
     assert r.status_code == 200
     by_domain = {row["domain"]: row for row in r.json()["rows"]}
-    assert by_domain["banned.kz"]["is_banned"] is True
-    assert by_domain["ok.kz"].get("is_banned", False) is False
+    # banned.kz is filtered out; ok.kz remains.
+    assert "banned.kz" not in by_domain
+    assert "ok.kz" in by_domain

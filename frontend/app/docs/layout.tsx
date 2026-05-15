@@ -30,6 +30,18 @@ const SECTIONS: { title: string; items: { slug: string; title: string }[] }[] = 
     ],
   },
   {
+    // Per-pillar deep-dives (Wave 2 + Wave 3, added 2026-05-15). Each
+    // page covers cost, data shape, settings, and per-domain view for
+    // its pillar. Quality is documented across multiple existing pages
+    // (run / domain / database / ahrefs-criteria), so it doesn't need
+    // a dedicated entry here.
+    title: "Пилары",
+    items: [
+      { slug: "whois-history", title: "Whois History" },
+      { slug: "availability", title: "Availability" },
+    ],
+  },
+  {
     title: "Концепции",
     items: [
       { slug: "ahrefs-criteria", title: "Ahrefs-критерии (B / D / A / K)" },

@@ -77,6 +77,16 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
         return hashlib.sha256(
             _stable_json({"c": criterion}).encode("utf-8")
         ).hexdigest()
+    # availability (Wave 3, 2026-05-15): same shape as whois_history.
+    # Only per-job knob is `enabled`; cascade order, RPS/concurrency,
+    # TTL all live in Settings. params_hash carries criterion name
+    # only. Note: the runner forces use_cache=False, so the AI/data
+    # cache layer never actually hits for availability runs — this
+    # hash exists for consistency + future-proofing.
+    if criterion == "availability":
+        return hashlib.sha256(
+            _stable_json({"c": criterion}).encode("utf-8")
+        ).hexdigest()
     payload: dict[str, Any] = {
         "c": criterion,
         "limit": cfg.limit,

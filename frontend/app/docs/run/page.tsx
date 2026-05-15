@@ -44,10 +44,11 @@ export default function RunDoc() {
           (pending / running / done / failed).
         </li>
         <li>
-          <strong>Criteria</strong> — пилюли{" "}
-          <code>B&nbsp;D&nbsp;A&nbsp;K&nbsp;W&nbsp;C</code>. Это статус{" "}
-          <em>сбора данных</em> по каждому критерию (зелёный = done, синий =
-          running, красный = failed). Что означает каждая буква:
+          <strong>Criteria</strong> — пилюли с буквенными обозначениями
+          критериев. Это статус <em>сбора данных</em> по каждому критерию
+          (зелёный = done, синий = running, красный = failed). Какие
+          буквы рендерятся зависит от пилара Задачи (Drop Sherlock
+          показывает только те, по которым у домена есть данные):
           <ul>
             <li>
               <code>B</code> — <strong>Backlinks</strong> (входящие ссылки)
@@ -70,8 +71,21 @@ export default function RunDoc() {
               <code>C</code> — wayback_<strong>C</strong>lassify (язык +
               тематика + категория)
             </li>
+            <li>
+              <code>H</code> — w<strong>H</strong>ois history (детектор
+              истории дропа, добавлено 2026-05-15). См.{" "}
+              <Link href="/docs/whois-history">«Whois History»</Link>.
+            </li>
+            <li>
+              <code>V</code> — a<strong>V</strong>ailability (каскад
+              проверки доступности как первоклассный Job kind,
+              добавлено 2026-05-15). См.{" "}
+              <Link href="/docs/availability">«Availability»</Link>.
+            </li>
           </ul>
-          Глубокий разбор первых четырёх — в статье{" "}
+          Quality-задача обычно показывает B/D/A/K/W/C; Whois-задача —
+          только H; Availability-задача — только V. Глубокий разбор
+          Ahrefs-четвёрки — в статье{" "}
           <Link href="/docs/ahrefs-criteria">«Ahrefs-критерии»</Link>; про
           C — в{" "}
           <Link href="/docs/wayback-classify">«Wayback Classify»</Link>.
@@ -118,6 +132,18 @@ export default function RunDoc() {
         </p>
       </div>
 
+      <div className="callout callout-info docs-content">
+        <p>
+          <strong>Pillar-aware колонки (2026-05-15):</strong> на
+          Whois-history и Availability запусках Drop Sherlock скрывает
+          пять Quality-only колонок (<em>AI Wayback</em>, <em>AI Ahrefs</em>,{" "}
+          <em>Language</em>, <em>Theme</em>, <em>Category</em>) — их
+          ячейки всегда были бы пустые. Колонка <em>Criteria</em>{" "}
+          остаётся: на Whois там видна одна <code>H</code>, на
+          Availability — одна <code>V</code>.
+        </p>
+      </div>
+
       <h2>Retry failed</h2>
       <p>
         Кнопка в шапке. Drop Sherlock пройдётся по всем доменам, у которых
@@ -148,9 +174,13 @@ export default function RunDoc() {
       <h2>Per-criterion pins (панель под таблицей)</h2>
       <p>
         Заменила удалённую кнопку «Pin entire run» в 2026-05-12.
-        Сворачиваемая панель с шестью карточками — по одной на каждый
-        критерий, по которому у этого запуска есть данные{" "}
-        (<code>B&nbsp;D&nbsp;A&nbsp;K&nbsp;W&nbsp;C</code>). Клик по
+        Сворачиваемая панель с карточками — по одной на каждый
+        критерий, по которому у этого запуска есть данные. Какие
+        буквы рендерятся, зависит от пилара Задачи:{" "}
+        <code>B&nbsp;D&nbsp;A&nbsp;K&nbsp;W&nbsp;C</code> для Quality,{" "}
+        <code>H</code> для Whois History, <code>V</code> для
+        Availability — фильтр по «у этого критерия есть CR с данными»
+        автоматически отсекает буквы, не относящиеся к пилару. Клик по
         карточке закрепляет критерий на этот Run в пределах Задачи
         (запись в таблицу <code>job_criterion_pins</code>); повторный
         клик — снимает пин.

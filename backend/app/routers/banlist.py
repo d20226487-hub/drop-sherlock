@@ -27,7 +27,13 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import BacklogDomain, DomainBan
+from ..models import (
+    BacklogDomain,
+    CriterionResult,
+    DomainBan,
+    Run,
+    RunDomain,
+)
 from .backlog import _normalize_domain
 
 
@@ -154,10 +160,33 @@ def _restore_backlog_from_snapshot(
 router = APIRouter(prefix="/banlist", tags=["banlist"])
 
 
+class AnalysisLink(BaseModel):
+    """Pointer to the most-recent RunDomain page that holds a specific
+    type of analysis for the banned domain. Lets the Ban List page link
+    directly to the per-domain analysis page so operators can review
+    why they banned. `kind` is informational ("ahrefs"/"wayback"/
+    "whois") — the URL builds to `/jobs/{job_id}/runs/{run_id}/
+    domains/{run_domain_id}` on the frontend regardless."""
+    kind: str
+    job_id: int
+    run_id: int
+    run_domain_id: int
+
+
 class BanRow(BaseModel):
     domain: str
     note: str
     created_at: datetime
+    # Analysis cross-links (added 2026-05-15) — null when the banned
+    # domain has no rd of that type. Backed by the most-recent rd
+    # whose CR for the respective criterion is `status='done'`. Ahrefs
+    # is keyed off the `backlinks` criterion, wayback off `wayback`,
+    # whois off `whois_history`. wayback_classify is intentionally NOT
+    # surfaced as a separate link — it lives on the same rd as
+    # `wayback` so the Wayback link already exposes it.
+    ahrefs_link: AnalysisLink | None = None
+    wayback_link: AnalysisLink | None = None
+    whois_link: AnalysisLink | None = None
 
 
 class BanListResponse(BaseModel):
@@ -227,13 +256,92 @@ def list_bans(
         .limit(per_page)
         .all()
     )
+
+    # Analysis cross-link resolution (added 2026-05-15). For each
+    # banned domain shown on this page, find the most-recent RunDomain
+    # that has each of: backlinks CR (→ Ahrefs link), wayback CR (→
+    # Wayback link), whois_history CR (→ Whois link). Three IN-list
+    # queries scoped to the visible domains keeps the per-page cost
+    # constant regardless of total ban count. CRITERION_TO_LINK_KIND
+    # is the only thing that decides which criteria surface — adding
+    # availability later means one more entry here.
+    CRITERION_TO_LINK_KIND = {
+        "backlinks": "ahrefs",
+        "wayback": "wayback",
+        "whois_history": "whois",
+    }
+    links_by_domain: dict[str, dict[str, AnalysisLink]] = {
+        r.domain: {} for r in rows
+    }
+    visible_domains = list(links_by_domain.keys())
+    if visible_domains:
+        # Pull all rds for the visible banned domains.
+        rds = (
+            db.query(RunDomain)
+            .filter(RunDomain.domain.in_(visible_domains))
+            .all()
+        )
+        rd_by_id: dict[int, RunDomain] = {rd.id: rd for rd in rds}
+        rd_ids = list(rd_by_id.keys())
+        run_ids = {rd.run_id for rd in rds}
+        runs_by_id: dict[int, Run] = (
+            {r.id: r for r in db.query(Run).filter(Run.id.in_(run_ids)).all()}
+            if run_ids else {}
+        )
+        # Pull only the CR criteria we care about — done status only,
+        # since "done" is what we want the user to be able to view.
+        crs = (
+            db.query(CriterionResult)
+            .filter(CriterionResult.run_domain_id.in_(rd_ids))
+            .filter(
+                CriterionResult.criterion.in_(
+                    list(CRITERION_TO_LINK_KIND.keys())
+                )
+            )
+            .filter(CriterionResult.status == "done")
+            .all()
+        ) if rd_ids else []
+        # Resolve per-(domain, criterion) latest rd. Most-recent =
+        # highest rd id (rds are created in order).
+        best: dict[tuple[str, str], int] = {}  # (domain, criterion) → rd_id
+        for cr in crs:
+            rd = rd_by_id.get(cr.run_domain_id)
+            if rd is None:
+                continue
+            key = (rd.domain, cr.criterion)
+            cur = best.get(key)
+            if cur is None or rd.id > cur:
+                best[key] = rd.id
+        # Build AnalysisLink objects.
+        for (domain, criterion), rd_id in best.items():
+            rd = rd_by_id.get(rd_id)
+            if rd is None:
+                continue
+            run = runs_by_id.get(rd.run_id)
+            if run is None:
+                continue
+            kind = CRITERION_TO_LINK_KIND[criterion]
+            links_by_domain[domain][kind] = AnalysisLink(
+                kind=kind,
+                job_id=run.job_id,
+                run_id=run.id,
+                run_domain_id=rd.id,
+            )
+
     return BanListResponse(
         total=total,
         filtered_total=filtered_total,
         page=page,
         per_page=per_page,
         rows=[
-            BanRow(domain=r.domain, note=r.note or "", created_at=r.created_at)
+            BanRow(
+                domain=r.domain,
+                note=r.note or "",
+                created_at=r.created_at,
+                ahrefs_link=links_by_domain.get(r.domain, {}).get("ahrefs"),
+                wayback_link=links_by_domain.get(r.domain, {}).get("wayback"),
+                whois_link=links_by_domain.get(r.domain, {}).get("whois"),
+            )
             for r in rows
         ],
     )

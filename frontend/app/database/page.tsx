@@ -50,12 +50,89 @@ function MaybeLink({
   );
 }
 
+// Confidence-threshold slider (added 2026-05-15 iteration). Replaces
+// the prior text/number input for Wayback/Ahrefs confidence filters.
+// Range [0, 1] with 0.05 step; 0 = filter off. The track + thumb gets
+// blue tint when active (>0), grey when off. The right-hand label
+// shows either the current % (when active) or the off-label.
+// Clicking the small × clears in one tap. Keyboard arrows move the
+// thumb in 5%-steps (native range input behavior).
+function ConfidenceSlider({
+  label,
+  title,
+  offLabel,
+  value,
+  onChange,
+}: {
+  label: string;
+  title: string;
+  offLabel: string;
+  value: number;
+  onChange: (n: number) => void;
+}) {
+  const active = value > 0;
+  return (
+    <label
+      className="flex items-center gap-2 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm cursor-pointer"
+      title={title}
+    >
+      <span className="text-xs text-neutral-500 dark:text-neutral-400 shrink-0">
+        {label}
+      </span>
+      <input
+        type="range"
+        min={0}
+        max={1}
+        step={0.05}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className={
+          "flex-1 min-w-[5rem] h-1.5 cursor-pointer accent-blue-600 " +
+          (active ? "" : "opacity-60")
+        }
+        aria-label={label}
+      />
+      <span
+        className={
+          "text-xs font-mono shrink-0 w-9 text-right " +
+          (active
+            ? "text-blue-700 dark:text-blue-300 font-medium"
+            : "text-neutral-400 dark:text-neutral-500")
+        }
+      >
+        {active ? `${Math.round(value * 100)}%` : offLabel}
+      </span>
+      {active && (
+        <button
+          type="button"
+          onClick={(e) => {
+            // Prevent the label click from re-firing onto the slider.
+            e.preventDefault();
+            e.stopPropagation();
+            onChange(0);
+          }}
+          aria-label={`Clear ${label}`}
+          className="text-xs text-neutral-400 hover:text-rose-600 dark:hover:text-rose-400 leading-none px-0.5"
+        >
+          ×
+        </button>
+      )}
+    </label>
+  );
+}
+
 const CRITERIA_KEYS = [
   "backlinks",
   "refdomains",
   "anchors",
   "keywords",
   "wayback",
+  // Added 2026-05-15: classify (wayback_classify) and Whois are
+  // selectable in the "Any criterion" multi-select so the user can
+  // narrow to rows that ran them. Availability is NOT here — it's not
+  // a CR-row criterion, so it gets its own filter dropdown below.
+  "wayback_classify",
+  "whois_history",
 ] as const;
 type CriterionKey = (typeof CRITERIA_KEYS)[number];
 
@@ -81,6 +158,13 @@ export default function DatabasePage() {
   // they filter to rows missing the respective field.
   const [verdicts, setVerdicts] = useState<string[]>([]);
   const [waybackVerdicts, setWaybackVerdicts] = useState<string[]>([]);
+  const [whoisBands, setWhoisBands] = useState<string[]>([]);
+  // Availability filter (added 2026-05-15) — separate from the
+  // criterion multi-select because availability isn't a CR-row
+  // criterion. Values: "available"/"registered"/"unknown"/"error"
+  // plus "__none__" for "never checked." Matches against the
+  // domain's entry in `availabilityByDomain` (hydrated post-fetch).
+  const [availabilityFilter, setAvailabilityFilter] = useState<string[]>([]);
   const [provider, setProvider] = useState<string>("");
   const [model, setModel] = useState<string>("");
   const [criteria, setCriteria] = useState<CriterionKey[]>([]);
@@ -91,10 +175,18 @@ export default function DatabasePage() {
   // wayback_classify filters (added 2026-05-09).
   const [languages, setLanguages] = useState<string[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
-  // Confidence thresholds (added 2026-05-13). Each is a value in 0..1
-  // OR 0 = "no filter". Rows with null confidence (no verdict, partial
-  // final stub, etc.) are excluded when the corresponding min is > 0
-  // — they can't meet a threshold by definition.
+  // Confidence thresholds (added 2026-05-13; iterated to slider UX
+  // 2026-05-15). 0 = "no filter". Rows with null confidence (no
+  // verdict, partial final stub, etc.) are excluded when the min is
+  // > 0 — they can't meet a threshold by definition.
+  //
+  // Slider over text/number input: a numeric input forced operators
+  // to think in absolute confidence percents and made decimals
+  // awkward (the prior `value={n||""}` text shape broke 0→"" round-
+  // trip when typing "0.7"). A slider makes the gesture "drag right
+  // for stricter, all the way left for off" obvious, keeps keyboard
+  // accessibility (arrows), and the live badge on the right shows
+  // the current threshold as a %.
   const [waybackConfMin, setWaybackConfMin] = useState<number>(0);
   const [ahrefsConfMin, setAhrefsConfMin] = useState<number>(0);
 
@@ -114,6 +206,11 @@ export default function DatabasePage() {
   // the file.
 
   const [verdictSort, setVerdictSort] = useState<"asc" | "desc" | null>(null);
+  // Whois sort cycles the OPPOSITE direction first (asc = stable on top,
+  // since low dropped_confidence is "good"). Mutually exclusive with
+  // verdictSort — clicking one clears the other so the table has a
+  // single active sort signal.
+  const [whoisSort, setWhoisSort] = useState<"asc" | "desc" | null>(null);
 
   const [reanalyzeOpen, setReanalyzeOpen] = useState(false);
   const [reanalyzeBusy, setReanalyzeBusy] = useState(false);
@@ -349,11 +446,28 @@ export default function DatabasePage() {
         return r.category === v;
       });
     }
+    function matchWhois(r: DatabaseDomainRow): boolean {
+      if (whoisBands.length === 0) return true;
+      return whoisBands.some((v) => {
+        if (v === "__none__") return !r.whois_band;
+        return r.whois_band === v;
+      });
+    }
+    function matchAvailability(r: DatabaseDomainRow): boolean {
+      if (availabilityFilter.length === 0) return true;
+      const avail = availabilityByDomain[r.domain];
+      return availabilityFilter.some((v) => {
+        if (v === "__none__") return !avail;
+        return !!avail && avail.status === v;
+      });
+    }
     return data.rows.filter((r) => {
       if (pinFilter === "pinned" && !r.is_pinned) return false;
       if (pinFilter === "unpinned" && r.is_pinned) return false;
       if (!matchVerdict(r)) return false;
       if (!matchWayback(r)) return false;
+      if (!matchWhois(r)) return false;
+      if (!matchAvailability(r)) return false;
       if (!matchLang(r)) return false;
       if (!matchCat(r)) return false;
       // Confidence thresholds (added 2026-05-13). null verdicts are
@@ -412,6 +526,9 @@ export default function DatabasePage() {
     pinFilter,
     verdicts,
     waybackVerdicts,
+    whoisBands,
+    availabilityFilter,
+    availabilityByDomain,
     languages,
     categories,
     provider,
@@ -425,29 +542,50 @@ export default function DatabasePage() {
   ]);
 
   const sorted = useMemo<DatabaseDomainRow[]>(() => {
-    if (!verdictSort) return filtered;
-    const dir = verdictSort === "asc" ? 1 : -1;
-    function rank(r: DatabaseDomainRow): number {
-      return r.final_score ?? Number.NEGATIVE_INFINITY;
-    }
-    function isScored(r: DatabaseDomainRow): boolean {
-      return !r.final_partial && r.final_score != null;
-    }
-    return [...filtered].sort((a, b) => {
-      const aScored = isScored(a);
-      const bScored = isScored(b);
-      if (aScored !== bScored) return aScored ? -1 : 1;
-      if (!aScored && !bScored) {
-        return (
-          (a.final_partial ? 0 : 1) - (b.final_partial ? 0 : 1)
-        );
+    if (verdictSort) {
+      const dir = verdictSort === "asc" ? 1 : -1;
+      function rank(r: DatabaseDomainRow): number {
+        return r.final_score ?? Number.NEGATIVE_INFINITY;
       }
-      const ra = rank(a);
-      const rb = rank(b);
-      if (ra === rb) return a.domain.localeCompare(b.domain);
-      return (ra - rb) * dir;
-    });
-  }, [filtered, verdictSort]);
+      function isScored(r: DatabaseDomainRow): boolean {
+        return !r.final_partial && r.final_score != null;
+      }
+      return [...filtered].sort((a, b) => {
+        const aScored = isScored(a);
+        const bScored = isScored(b);
+        if (aScored !== bScored) return aScored ? -1 : 1;
+        if (!aScored && !bScored) {
+          return (
+            (a.final_partial ? 0 : 1) - (b.final_partial ? 0 : 1)
+          );
+        }
+        const ra = rank(a);
+        const rb = rank(b);
+        if (ra === rb) return a.domain.localeCompare(b.domain);
+        return (ra - rb) * dir;
+      });
+    }
+    if (whoisSort) {
+      // Whois sort: rows WITH a Whois verdict on top, rest sink. Within
+      // the verdict set, ascending puts the lowest dropped_confidence
+      // (most stable) first — that's the "good first" direction.
+      const dir = whoisSort === "asc" ? 1 : -1;
+      function hasVerdict(r: DatabaseDomainRow): boolean {
+        return typeof r.whois_dropped_confidence === "number";
+      }
+      return [...filtered].sort((a, b) => {
+        const aHas = hasVerdict(a);
+        const bHas = hasVerdict(b);
+        if (aHas !== bHas) return aHas ? -1 : 1;
+        if (!aHas && !bHas) return a.domain.localeCompare(b.domain);
+        const ra = a.whois_dropped_confidence as number;
+        const rb = b.whois_dropped_confidence as number;
+        if (ra === rb) return a.domain.localeCompare(b.domain);
+        return (ra - rb) * dir;
+      });
+    }
+    return filtered;
+  }, [filtered, verdictSort, whoisSort]);
 
   const search = usePaginatedSearch<DatabaseDomainRow>(
     sorted,
@@ -593,6 +731,8 @@ export default function DatabasePage() {
   function clearFilters() {
     setVerdicts([]);
     setWaybackVerdicts([]);
+    setWhoisBands([]);
+    setAvailabilityFilter([]);
     setLanguages([]);
     setCategories([]);
     setProvider("");
@@ -624,6 +764,16 @@ export default function DatabasePage() {
       { header: "confidence", get: (r) => r.final_confidence ?? "" },
       { header: "ai_provider", get: (r) => r.ai_provider },
       { header: "ai_model", get: (r) => r.ai_model },
+      {
+        header: "whois_dropped_confidence",
+        get: (r) => r.whois_dropped_confidence ?? "",
+      },
+      {
+        header: "whois_transferred_confidence",
+        get: (r) => r.whois_transferred_confidence ?? "",
+      },
+      { header: "whois_band", get: (r) => r.whois_band || "" },
+      { header: "whois_summary", get: (r) => r.whois_summary || "" },
       {
         header: "wayback_verdict",
         get: (r) => r.wayback_assessment || "",
@@ -718,6 +868,8 @@ export default function DatabasePage() {
   const filtersActive =
     verdicts.length > 0 ||
     waybackVerdicts.length > 0 ||
+    whoisBands.length > 0 ||
+    availabilityFilter.length > 0 ||
     languages.length > 0 ||
     categories.length > 0 ||
     !!provider ||
@@ -871,6 +1023,71 @@ export default function DatabasePage() {
           />
 
           <MultiSelectFilter
+            label={ts.filters.verdictWhoisLabel}
+            anyLabel={ts.filters.verdictWhoisAny}
+            value={whoisBands}
+            onChange={setWhoisBands}
+            title={ts.filters.verdictWhoisHint}
+            disabled={(opts.whois_bands || []).length === 0}
+            options={[
+              // Always show the full stable → insufficient → mixed →
+              // dropped scale so the user sees the spectrum even when
+              // current data only covers a subset. The dropdown is
+              // disabled at the parent level when no bands exist at
+              // all; once any verdict lands, the user wants to see all
+              // four threshold ranges.
+              ...(["stable", "insufficient", "mixed", "dropped"] as const)
+                .map((b) => ({
+                  value: b,
+                  label:
+                    b === "stable"
+                      ? ts.filters.verdictWhoisStable
+                      : b === "insufficient"
+                        ? ts.filters.verdictWhoisInsufficient
+                        : b === "mixed"
+                          ? ts.filters.verdictWhoisMixed
+                          : ts.filters.verdictWhoisDropped,
+                })),
+              {
+                value: "__none__",
+                label: ts.filters.verdictWhoisNone,
+                group: "tail" as const,
+              },
+            ]}
+          />
+
+          <MultiSelectFilter
+            label={ts.filters.availabilityLabel}
+            anyLabel={ts.filters.availabilityAny}
+            value={availabilityFilter}
+            onChange={setAvailabilityFilter}
+            title={ts.filters.availabilityHint}
+            options={[
+              {
+                value: "available",
+                label: ts.filters.availabilityAvailable,
+              },
+              {
+                value: "registered",
+                label: ts.filters.availabilityRegistered,
+              },
+              {
+                value: "unknown",
+                label: ts.filters.availabilityUnknown,
+              },
+              {
+                value: "error",
+                label: ts.filters.availabilityError,
+              },
+              {
+                value: "__none__",
+                label: ts.filters.availabilityNeverChecked,
+                group: "tail" as const,
+              },
+            ]}
+          />
+
+          <MultiSelectFilter
             label={ts.filters.languageLabel}
             anyLabel={ts.filters.languageAny}
             value={languages}
@@ -977,40 +1194,40 @@ export default function DatabasePage() {
             className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none"
           />
 
-          <input
-            type="number"
-            min={0}
-            max={1}
-            step={0.05}
-            value={waybackConfMin || ""}
-            onChange={(e) => {
-              const v = parseFloat(e.target.value);
-              setWaybackConfMin(
-                Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0,
-              );
-            }}
-            placeholder={ts.filters.waybackConfMin}
+          <ConfidenceSlider
+            label={ts.filters.waybackConfMin}
             title={ts.filters.waybackConfMinHelp}
-            className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none w-28"
+            offLabel={ts.filters.confSliderOff}
+            value={waybackConfMin}
+            onChange={setWaybackConfMin}
           />
-
-          <input
-            type="number"
-            min={0}
-            max={1}
-            step={0.05}
-            value={ahrefsConfMin || ""}
-            onChange={(e) => {
-              const v = parseFloat(e.target.value);
-              setAhrefsConfMin(
-                Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0,
-              );
-            }}
-            placeholder={ts.filters.ahrefsConfMin}
+          <ConfidenceSlider
+            label={ts.filters.ahrefsConfMin}
             title={ts.filters.ahrefsConfMinHelp}
-            className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none w-28"
+            offLabel={ts.filters.confSliderOff}
+            value={ahrefsConfMin}
+            onChange={setAhrefsConfMin}
           />
         </div>
+        {/* Filtered count under the filter grid (added 2026-05-15).
+            Only renders when filters are active — when nothing is
+            filtered, "X of X" is just noise. Pagination footer still
+            shows the overall total. */}
+        {filtersActive && (
+          <div className="flex items-center gap-2 text-xs text-neutral-600 dark:text-neutral-400 pt-1">
+            <span>
+              {ts.filters.matchedCount(
+                filtered.length,
+                data?.rows.length ?? 0,
+              )}
+            </span>
+            {filtered.length === 0 && (
+              <span className="text-amber-600 dark:text-amber-400">
+                · {ts.filters.matchedCountEmpty}
+              </span>
+            )}
+          </div>
+        )}
       </section>
 
       <PaginationTopBar state={search} />
@@ -1324,11 +1541,12 @@ export default function DatabasePage() {
                 <th className="px-3 py-2 font-medium">
                   <button
                     type="button"
-                    onClick={() =>
+                    onClick={() => {
+                      setWhoisSort(null);
                       setVerdictSort((cur) =>
                         cur === "desc" ? "asc" : cur === "asc" ? null : "desc",
-                      )
-                    }
+                      );
+                    }}
                     className="inline-flex items-center gap-1 hover:text-blue-600 dark:hover:text-blue-400"
                     title={ts.cols.verdictSortHint}
                   >
@@ -1342,11 +1560,34 @@ export default function DatabasePage() {
                     </span>
                   </button>
                 </th>
+                <th className="px-3 py-2 font-medium">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVerdictSort(null);
+                      // Whois cycle starts with asc (stable on top — the
+                      // "good first" direction for drop-confidence).
+                      setWhoisSort((cur) =>
+                        cur === "asc" ? "desc" : cur === "desc" ? null : "asc",
+                      );
+                    }}
+                    className="inline-flex items-center gap-1 hover:text-blue-600 dark:hover:text-blue-400"
+                    title={ts.cols.whoisSortHint}
+                  >
+                    {ts.cols.whois}
+                    <span className="text-xs opacity-70 w-3 inline-block text-left">
+                      {whoisSort === "asc"
+                        ? "↑"
+                        : whoisSort === "desc"
+                          ? "↓"
+                          : ""}
+                    </span>
+                  </button>
+                </th>
                 <th className="px-3 py-2 font-medium">{ts.cols.wayback}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.language}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.theme}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.category}</th>
-                <th className="px-3 py-2 font-medium">{ts.cols.provider}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.note}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.backlog}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.criteria}</th>
@@ -1467,16 +1708,30 @@ function DomainListRow({
     : "";
 
   // Single-letter criteria pills for the Criteria column — matches the
-  // run-page abbreviations (B/D/A/K) so a B in either table refers to
-  // the same criterion. Tooltip carries the full criterion name + row
-  // count. Green tone signals "data fetched" (the Database page sources
-  // from the pinned rd, which is by definition `done` — there's no
-  // failed/pending state to render here, so a single tone is enough).
+  // run-page + pin-panel letter scheme so a `B` in either place refers
+  // to the same criterion. Tooltip carries the full criterion name +
+  // row count + source-run badge. Green tone signals "data fetched"
+  // (the Database page sources from a pinned/fallback rd, which is by
+  // definition `done` — there's no failed/pending state to render
+  // here, so a single tone is enough).
+  //
+  // Pre-2026-05-15 this list was just B/D/A/K because Wayback /
+  // Classify / Whois had dedicated columns. Now expanded to include
+  // W (Wayback fetched), C (wayback_classify ran), and H (Whois
+  // history collected) so the operator can see at a glance which
+  // pillars touched a row — even when the dedicated columns are
+  // empty for that row (e.g. a Whois-only row still gets H here).
+  // Availability lives in its own dedicated column + filter and isn't
+  // a CR-criterion to the operator's mental model, so it's NOT shown
+  // here.
   const CRITERIA_LETTERS = [
     ["backlinks", "B"],
     ["refdomains", "D"],
     ["anchors", "A"],
     ["keywords", "K"],
+    ["wayback", "W"],
+    ["wayback_classify", "C"],
+    ["whois_history", "H"],
   ] as const;
   const enabledCriteriaPills = CRITERIA_LETTERS.filter(
     ([k]) => row.criteria[k]?.enabled,
@@ -1554,6 +1809,8 @@ function DomainListRow({
               keywords: "K",
               wayback: "W",
               wayback_classify: "C",
+              whois_history: "H",
+              availability: "V",
             };
             const lettersFor = (xs?: string[]) =>
               (xs ?? []).map((c) => LETTERS[c] ?? c).join(", ");
@@ -1615,6 +1872,8 @@ function DomainListRow({
                     keywords: "K",
                     wayback: "W",
                     wayback_classify: "C",
+                    whois_history: "H",
+                    availability: "V",
                   };
                   const lettersFor = (xs?: string[]) =>
                     (xs ?? []).map((c) => LETTERS[c] ?? c).join(", ");
@@ -1704,6 +1963,59 @@ function DomainListRow({
             {ts.cachedTag}
           </span>
         )}
+      </td>
+      {/* Whois (AI verdict) column (added 2026-05-15) — shows
+          dropped_confidence as a percentage with band-based color tone
+          (stable=emerald, insufficient=neutral, mixed=amber, dropped=
+          rose). Mirrors the per-domain Whois view's `dropTone()` bands
+          so a row reading "12%" on Database matches the green-banded
+          verdict box on the per-domain page. */}
+      <td className="px-3 py-2 align-top">
+        {(() => {
+          const drop = row.whois_dropped_confidence;
+          if (typeof drop !== "number") {
+            return (
+              <span className="text-xs text-neutral-400 dark:text-neutral-500">
+                —
+              </span>
+            );
+          }
+          const band = row.whois_band;
+          const pillCls =
+            band === "dropped"
+              ? "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300"
+              : band === "mixed"
+                ? "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
+                : band === "stable"
+                  ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
+                  : "bg-neutral-100 text-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-300";
+          const pct = Math.round(drop * 100);
+          const whoisHref =
+            row.criteria.whois_history?.source_job_id != null &&
+            row.criteria.whois_history?.source_run_id != null &&
+            row.criteria.whois_history?.source_run_domain_id != null
+              ? `/jobs/${row.criteria.whois_history.source_job_id}/runs/${row.criteria.whois_history.source_run_id}/domains/${row.criteria.whois_history.source_run_domain_id}`
+              : null;
+          const xfer = row.whois_transferred_confidence;
+          const titleParts = [
+            `drop ${pct}%`,
+            band ? `band: ${band}` : "",
+            typeof xfer === "number"
+              ? `transferred ${Math.round(xfer * 100)}%`
+              : "",
+            row.whois_summary || "",
+          ].filter(Boolean);
+          return (
+            <MaybeLink href={whoisHref}>
+              <span
+                className={`text-xs px-2 py-0.5 rounded-full ${pillCls}`}
+                title={titleParts.join(" · ")}
+              >
+                {pct}%
+              </span>
+            </MaybeLink>
+          );
+        })()}
       </td>
       <td className="px-3 py-2 align-top">
         {!row.is_pinned ? (
@@ -1897,22 +2209,6 @@ function DomainListRow({
           </MaybeLink>
         ) : (
           <span className="text-xs text-neutral-400 dark:text-neutral-500">—</span>
-        )}
-      </td>
-      <td className="px-3 py-2 align-top">
-        {row.is_pinned && row.ai_provider ? (
-          <div className="text-xs">
-            <div className="font-medium">{row.ai_provider}</div>
-            {row.ai_model && (
-              <div className="text-neutral-500 dark:text-neutral-400 break-all">
-                {row.ai_model}
-              </div>
-            )}
-          </div>
-        ) : (
-          <span className="text-xs text-neutral-400 dark:text-neutral-500">
-            {row.is_pinned ? ts.noProvider : "—"}
-          </span>
         )}
       </td>
       <td className="px-3 py-2 align-top text-xs">

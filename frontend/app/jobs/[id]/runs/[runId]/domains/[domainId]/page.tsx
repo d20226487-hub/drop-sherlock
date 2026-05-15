@@ -10,6 +10,7 @@ import { ReanalyzeBar } from "@/components/reanalyze-bar";
 import { NotesEditor } from "@/components/notes-editor";
 import { ShareButton } from "@/components/share-button";
 import { WhoisHistoryDomainView } from "@/components/whois-history-domain-view";
+import { AvailabilityDomainView } from "@/components/availability-domain-view";
 import { AiPreviewPanel } from "@/components/ai-preview-panel";
 import {
   WaybackSamplesTimeline,
@@ -284,6 +285,43 @@ export default function DomainDetailPage({
             same editor as the Quality view so an operator can attach
             judgment notes to a domain regardless of which pillar
             surfaced it. */}
+        <section className="pt-6 border-t dark:border-neutral-800">
+          <NotesEditor
+            domain={data.domain}
+            initialNote={data.note}
+            initialUpdatedAt={data.note_updated_at}
+            onSaved={(note, updatedAt) => {
+              setData((prev) =>
+                prev ? { ...prev, note, note_updated_at: updatedAt } : prev,
+              );
+            }}
+          />
+        </section>
+      </div>
+    );
+  }
+
+  // Wave 3 (2026-05-15): availability-kind runs render a dedicated
+  // cascade-trace view. No AI cost on this pillar — only the data
+  // payload itself. Same header layout as Whois for visual consistency.
+  if (data.job_kind === "availability") {
+    return (
+      <div className="space-y-10">
+        <Link
+          href={`/jobs/${jobId}/runs/${runId}`}
+          className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+        >
+          {ts.backToRun(runId)}
+        </Link>
+        <header className="space-y-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <h1 className="text-2xl font-semibold font-mono">
+              {ts.title(data.domain)}
+            </h1>
+            <StatusPill status={data.status} />
+          </div>
+        </header>
+        <AvailabilityDomainView data={data} />
         <section className="pt-6 border-t dark:border-neutral-800">
           <NotesEditor
             domain={data.domain}

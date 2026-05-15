@@ -1,14 +1,10 @@
 "use client";
-import { PillarStubPage } from "@/components/pillar-stub-page";
-import { useT } from "@/lib/i18n";
+// Wave 3 (2026-05-15): real Jobs list for the availability pillar.
+// Replaces the "Coming soon" stub. Same JobsListByKind shared
+// component the Whois pillar uses — kind filter applied to
+// api.listJobs.
+import { JobsListByKind } from "@/components/jobs-list-by-kind";
 
-export default function JobsAvailabilityPage() {
-  const { t } = useT();
-  return (
-    <PillarStubPage
-      title={t.pages.jobsAvailability.title}
-      subtitle={t.pages.jobsAvailability.subtitle}
-      wave="wave_3"
-    />
-  );
+export default function JobsAvailabilityListPage() {
+  return <JobsListByKind kind="availability" />;
 }

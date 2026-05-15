@@ -136,6 +136,8 @@ const messagesEn = {
         keywords: "Organic keywords",
         wayback: "Wayback history",
         wayback_classify: "Language + theme + category",
+        whois_history: "Whois history",
+        availability: "Availability",
         waybackDiscoverHint:
           "Disabled cards are collapsed — click the chevron on a card to expand and enable it. Wayback adds a history signal; Wayback Classify auto-detects language, theme, and category.",
       },
@@ -844,6 +846,9 @@ const messagesEn = {
         verdict: "Ahrefs",
         verdictSortHint:
           "Click to sort by score. Cycles desc → asc → default. Partial / no-verdict rows always sink to the bottom.",
+        whois: "Whois",
+        whoisSortHint:
+          "Click to sort by Whois drop-confidence. Cycles asc (stable first) → desc → default. Rows without a Whois verdict always sink to the bottom.",
         wayback: "Wayback",
         language: "Lang",
         theme: "Theme",
@@ -884,7 +889,7 @@ const messagesEn = {
       bulkBanHint:
         "Permanently exclude these domains from future analysis and Backlog imports. Existing Backlog rows (if any) are not affected.",
       bulkBanConfirm: (n: number) =>
-        `Add ${n} domain${n === 1 ? "" : "s"} to the Ban List? They'll be silently rejected from future Analyze submissions, Backlog imports, and the availability-cascade auto-upsert. Existing Backlog rows stay as-is.`,
+        `Add ${n} domain${n === 1 ? "" : "s"} to the Ban List? They'll be silently rejected from future Analyze submissions, Backlog imports, and the availability-cascade auto-upsert. Banned rows are hidden from this list — review prior analyses via the Ban List page. Unbanning restores them.`,
       bulkBanResult: (added: number, already: number, invalid: number) =>
         `Banned ${added} · already banned ${already} · invalid ${invalid}.`,
       bulkBanFailed: "Bulk-ban failed",
@@ -918,6 +923,24 @@ const messagesEn = {
         verdictWaybackNone: "(no Wayback verdict)",
         verdictWaybackHint:
           "Filter by the Wayback judge's per-criterion assessment (separate from the aggregated final score).",
+        verdictWhoisAny: "Any Whois verdict",
+        verdictWhoisLabel: "Whois verdict",
+        verdictWhoisNone: "(no Whois verdict)",
+        verdictWhoisHint:
+          "Filter by the WHOIS-history judge's drop-confidence band. Stable = clean ownership; dropped = repeated drops (caution).",
+        verdictWhoisStable: "stable (<30%)",
+        verdictWhoisInsufficient: "insufficient (30–50%)",
+        verdictWhoisMixed: "mixed (>50%)",
+        verdictWhoisDropped: "dropped (>80%)",
+        availabilityLabel: "Availability",
+        availabilityAny: "Any availability",
+        availabilityHint:
+          "Filter by the latest availability-check result (RDAP / Domainr / WHOIS:43 cascade). Separate from the criterion filter — availability isn't a CR-row criterion.",
+        availabilityAvailable: "available",
+        availabilityRegistered: "registered",
+        availabilityUnknown: "unknown",
+        availabilityError: "error",
+        availabilityNeverChecked: "(never checked)",
         languageAny: "Any language",
         languageLabel: "Language",
         languageNone: "(no language)",
@@ -949,13 +972,17 @@ const messagesEn = {
         minRecords: "Min records",
         minRecordsHelp:
           "Minimum row count in the chosen criterion (latest run).",
-        waybackConfMin: "Wayback conf ≥",
+        waybackConfMin: "Wayback ≥",
         waybackConfMinHelp:
-          "Show only rows whose Wayback AI verdict confidence is at least this value (0..1). Rows without a Wayback verdict are hidden when this is > 0.",
-        ahrefsConfMin: "Ahrefs conf ≥",
+          "Slider: minimum Wayback-judge confidence. Drag to set the threshold; all the way left = off. Rows without a Wayback verdict are hidden once the threshold is above zero.",
+        ahrefsConfMin: "Ahrefs ≥",
         ahrefsConfMinHelp:
-          "Show only rows whose Ahrefs Final Assessment confidence is at least this value (0..1). Rows without a final (or with a partial) are hidden when this is > 0.",
+          "Slider: minimum Ahrefs Final Assessment confidence. Drag to set the threshold; all the way left = off. Rows without a final (or with a partial) are hidden once the threshold is above zero.",
+        confSliderOff: "off",
         clear: "Clear filters",
+        matchedCount: (filtered: number, total: number) =>
+          `Filtered: ${filtered} of ${total} domain${total === 1 ? "" : "s"}`,
+        matchedCountEmpty: "no rows match the current filters",
       },
       verdictSpread: (counts: Record<string, number>) => {
         const parts: string[] = [];
@@ -1542,8 +1569,16 @@ const messagesEn = {
       emptyFiltered: "No banned domains match the current search.",
       colDomain: "Domain",
       colNote: "Note",
+      colAnalyses: "Analyses",
       colCreatedAt: "Banned at",
       colActions: "",
+      analyses: {
+        ahrefs: "Ahrefs",
+        wayback: "Wayback",
+        whois: "Whois",
+        linkHint: (label: string) =>
+          `Open the ${label} analysis for this domain — review why you banned it.`,
+      },
       unbanOne: "Unban",
       unbanSelected: (n: number) => `Unban ${n} selected`,
       unbanSelectedConfirm: (n: number) =>
@@ -1664,7 +1699,26 @@ const messagesEn = {
     checkAvailability: {
       title: "Availability",
       subtitle:
-        "Standalone domain-availability cascade (RDAP → Domainr → WHOIS:43). Today's cascade is embedded in Quality runs + Backlog row buttons.",
+        "Run the domain-availability cascade (RDAP → Domainr → WHOIS:43) against a list of domains. Each domain produces one CriterionResult row holding the resolved status + the per-provider cascade trace.",
+      pipelineHint:
+        "No AI involved — the cascade gives a deterministic verdict. Cascade order, per-provider toggles, RPS/concurrency, and TTL live in Settings → Availability. This Job forces fresh state per run; per-row Recheck buttons on /database and /backlog stay on the cache-honoring path.",
+      labelHeading: "Job label",
+      labelHint:
+        "Optional. The name shows on /jobs/availability and on the job detail page; the note is for free-form context.",
+      nameLabel: "Name",
+      namePlaceholder: "Auto-generated from the first domain if blank",
+      notesLabel: "Notes",
+      notesPlaceholder: "Why are you checking these?",
+      submit: "Run availability",
+      submitting: "Dispatching…",
+      settingsLink: "Open Availability settings",
+      summary: (n: number) => `${n} domain${n === 1 ? "" : "s"} ready`,
+      skippedBanned: (n: number) =>
+        `Skipped ${n} banned domain${n === 1 ? "" : "s"} from the input.`,
+      allBannedError: (count: number, sample: string, truncated: boolean) =>
+        `All submitted domains are on the ban list (${count} total): ${sample}${
+          truncated ? "…" : ""
+        }`,
     },
     jobsWhoisHistory: {
       title: "Whois History — Jobs",
@@ -1707,6 +1761,28 @@ const messagesEn = {
     },
     // Wave 2b (2026-05-15) — per-domain page for whois_history-kind
     // runs (rendered via WhoisHistoryDomainView when job_kind matches).
+    availabilityDomain: {
+      verdictHeading: "Availability verdict",
+      resolvedBy: "Resolved by",
+      registrar: "Registrar",
+      expiresOn: "Expires on",
+      noVerdict:
+        "No cascade verdict yet — run pending, failed, or skipped.",
+      cascadeErrorPrefix: "Cascade error",
+      traceHeading: "Cascade trace",
+      traceHint:
+        "One row per provider that was attempted. Newest-first. The cascade walks providers in the order configured in Settings → Availability and stops on the first terminal answer (available / registered).",
+      traceEmpty: "No provider rows recorded for this run.",
+      cols: {
+        provider: "Provider",
+        status: "Status",
+        latency: "Latency",
+        registrar: "Registrar",
+        expires: "Expires",
+        error: "Error",
+        checkedAt: "Checked at",
+      },
+    },
     whoisDomain: {
       pending: "Whois History fetch / AI judge still pending for this domain.",
       errorHeading: "Whois History fetch failed",
@@ -1809,6 +1885,15 @@ const messagesEn = {
         registrarSearchPlaceholder: "Search registrars…",
         expiryFrom: "Expires from",
         expiryTo: "Expires to",
+        availabilityLabel: "Availability",
+        availabilityAny: "Any availability",
+        availabilityHint:
+          "Filter by the latest availability-check result (RDAP / Domainr / WHOIS:43 cascade).",
+        availabilityAvailable: "available",
+        availabilityRegistered: "registered",
+        availabilityUnknown: "unknown",
+        availabilityError: "error",
+        availabilityNeverChecked: "(never checked)",
       },
       selectedCount: (n: number) =>
         `${n} domain${n === 1 ? "" : "s"} selected`,
@@ -1826,6 +1911,19 @@ const messagesEn = {
         `Send all ${n} filtered to Analyze`,
       confirmSendAllFiltered: (n: number) =>
         `Send all ${n} filtered domain${n === 1 ? "" : "s"} to Analyze? They'll be marked "in progress" automatically.`,
+      sendToPicker: {
+        label: (n: number) => `Send ${n} to:`,
+        allFilteredLabel: (n: number) => `Send all ${n} filtered to:`,
+        quality: "Quality",
+        qualityHint:
+          "Run Ahrefs criteria (backlinks / refdomains / anchors / keywords) + Wayback. The original pre-3-pillar 'Analyze' path.",
+        whois: "Whois",
+        whoisHint:
+          "Run WHOIS history (drop-pipeline detection). Cheap per-domain — billed in WhoisFreaks units.",
+        availability: "Availability",
+        availabilityHint:
+          "Run the availability cascade (RDAP / Domainr / WHOIS:43) to confirm what's currently registered.",
+      },
       analyzedHint: (n: number) =>
         `${n} backlog domain${n === 1 ? " has" : "s have"} been analyzed but ${n === 1 ? "isn't" : "aren't"} marked yet.`,
       analyzedHintMark: (n: number) =>
@@ -2044,6 +2142,8 @@ const messagesRu: Messages = {
         keywords: "Органические ключи",
         wayback: "История Wayback",
         wayback_classify: "Язык + тематика + категория",
+        whois_history: "История Whois",
+        availability: "Доступность",
         waybackDiscoverHint:
           "Выключенные карточки свёрнуты — кликните по шевр-стрелке на карточке, чтобы развернуть и включить её. Wayback добавляет сигнал по истории сайта; Wayback Classify автоопределяет язык, тематику и категорию.",
       },
@@ -2785,6 +2885,9 @@ const messagesRu: Messages = {
         verdict: "Ahrefs",
         verdictSortHint:
           "Кликните для сортировки по баллу. Цикл: убыв → возр → по умолчанию. Частичные / без вердикта всегда уходят вниз.",
+        whois: "Whois",
+        whoisSortHint:
+          "Кликните для сортировки по уверенности дропа Whois. Цикл: возр (стабильные сверху) → убыв → по умолчанию. Строки без Whois-вердикта всегда уходят вниз.",
         wayback: "Wayback",
         language: "Язык",
         theme: "Тема",
@@ -2823,7 +2926,7 @@ const messagesRu: Messages = {
       bulkBanHint:
         "Навсегда исключить выбранные домены из будущих анализов и импортов в Очередь. Существующие записи в Очереди не меняются.",
       bulkBanConfirm: (n) =>
-        `Добавить ${n} доменов в бан-лист? Они будут молча отклоняться при отправке в Анализ, импорте в Очередь и в авто-апсерте через проверку доступности. Существующие записи в Очереди остаются без изменений.`,
+        `Добавить ${n} доменов в бан-лист? Они будут молча отклоняться при отправке в Анализ, импорте в Очередь и в авто-апсерте через проверку доступности. Забаненные строки скрываются из этого списка — историю анализов смотрите на странице Бан-лист. Разбан возвращает строки.`,
       bulkBanResult: (added, already, invalid) =>
         `Забанено ${added} · уже было ${already} · некорректных ${invalid}.`,
       bulkBanFailed: "Не удалось забанить",
@@ -2857,6 +2960,24 @@ const messagesRu: Messages = {
         verdictWaybackNone: "(без вердикта Wayback)",
         verdictWaybackHint:
           "Фильтр по покритериальной оценке судьи Wayback (отдельно от агрегированного итогового балла).",
+        verdictWhoisAny: "Любой вердикт Whois",
+        verdictWhoisLabel: "Вердикт Whois",
+        verdictWhoisNone: "(без вердикта Whois)",
+        verdictWhoisHint:
+          "Фильтр по диапазону уверенности дропа судьи WHOIS-истории. Stable = чистая история владения; dropped = повторные дропы (осторожно).",
+        verdictWhoisStable: "stable (<30%)",
+        verdictWhoisInsufficient: "insufficient (30–50%)",
+        verdictWhoisMixed: "mixed (>50%)",
+        verdictWhoisDropped: "dropped (>80%)",
+        availabilityLabel: "Доступность",
+        availabilityAny: "Любая доступность",
+        availabilityHint:
+          "Фильтр по последнему результату проверки доступности (каскад RDAP / Domainr / WHOIS:43). Отдельно от фильтра критериев — доступность не является CR-критерием.",
+        availabilityAvailable: "свободен",
+        availabilityRegistered: "занят",
+        availabilityUnknown: "неизвестно",
+        availabilityError: "ошибка",
+        availabilityNeverChecked: "(не проверялся)",
         languageAny: "Любой язык",
         languageLabel: "Язык",
         languageNone: "(без языка)",
@@ -2888,13 +3009,17 @@ const messagesRu: Messages = {
         minRecords: "Мин. записей",
         minRecordsHelp:
           "Минимальное число строк в выбранном критерии (последний запуск).",
-        waybackConfMin: "Wayback увер. ≥",
+        waybackConfMin: "Wayback ≥",
         waybackConfMinHelp:
-          "Показывать только строки, где уверенность AI-вердикта Wayback не меньше этого значения (0..1). Строки без Wayback-вердикта скрываются, когда значение > 0.",
-        ahrefsConfMin: "Ahrefs увер. ≥",
+          "Ползунок: минимальная уверенность судьи Wayback. Тащите вправо для более строгого порога; до упора влево — фильтр выключен. Строки без Wayback-вердикта скрываются, как только порог становится больше нуля.",
+        ahrefsConfMin: "Ahrefs ≥",
         ahrefsConfMinHelp:
-          "Показывать только строки, где уверенность Итоговой оценки Ahrefs не меньше этого значения (0..1). Строки без итоговой оценки (или с частичной) скрываются, когда значение > 0.",
+          "Ползунок: минимальная уверенность Итоговой оценки Ahrefs. Тащите вправо для более строгого порога; до упора влево — фильтр выключен. Строки без итоговой оценки (или с частичной) скрываются, как только порог становится больше нуля.",
+        confSliderOff: "выкл",
         clear: "Очистить фильтры",
+        matchedCount: (filtered, total) =>
+          `Отфильтровано: ${filtered} из ${total}`,
+        matchedCountEmpty: "ни одна строка не подходит под текущие фильтры",
       },
       verdictSpread: (counts) => {
         const parts: string[] = [];
@@ -3544,8 +3669,16 @@ const messagesRu: Messages = {
       emptyFiltered: "По текущему поиску забаненных доменов нет.",
       colDomain: "Домен",
       colNote: "Примечание",
+      colAnalyses: "Анализы",
       colCreatedAt: "Забанен",
       colActions: "",
+      analyses: {
+        ahrefs: "Ahrefs",
+        wayback: "Wayback",
+        whois: "Whois",
+        linkHint: (label) =>
+          `Открыть анализ ${label} для этого домена — посмотреть, почему он забанен.`,
+      },
       unbanOne: "Снять бан",
       unbanSelected: (n) => `Снять бан с ${n}`,
       unbanSelectedConfirm: (n) =>
@@ -3662,7 +3795,26 @@ const messagesRu: Messages = {
     checkAvailability: {
       title: "Доступность",
       subtitle:
-        "Самостоятельный каскад проверки доступности доменов (RDAP → Domainr → WHOIS:43). Сегодня каскад встроен в Quality-запуски и кнопки на строках Очереди.",
+        "Запустить каскад проверки доступности доменов (RDAP → Domainr → WHOIS:43) для списка доменов. На каждый домен создаётся одна CriterionResult-запись с итоговым статусом и трассой по провайдерам.",
+      pipelineHint:
+        "ИИ не используется — каскад выдаёт детерминированный вердикт. Порядок каскада, тумблеры провайдеров, RPS/конкуренция и TTL живут в Настройках → Доступность. Этот запуск всегда берёт свежее состояние; кнопки «Перепроверить» в /database и /backlog продолжают использовать кэш.",
+      labelHeading: "Метка задачи",
+      labelHint:
+        "Необязательно. Имя видно в /jobs/availability и на странице задачи; заметка — свободный контекст.",
+      nameLabel: "Название",
+      namePlaceholder: "Автогенерация по первому домену, если пусто",
+      notesLabel: "Заметки",
+      notesPlaceholder: "Зачем проверяем?",
+      submit: "Запустить проверку доступности",
+      submitting: "Отправка…",
+      settingsLink: "Открыть настройки Доступности",
+      summary: (n) => `${n} домен${n === 1 ? "" : ""} готов${n === 1 ? "" : "ы"} к запуску`,
+      skippedBanned: (n) =>
+        `Пропущено забаненных доменов: ${n}.`,
+      allBannedError: (count, sample, truncated) =>
+        `Все указанные домены в бан-листе (${count} всего): ${sample}${
+          truncated ? "…" : ""
+        }`,
     },
     jobsWhoisHistory: {
       title: "История Whois — Задачи",
@@ -3696,6 +3848,27 @@ const messagesRu: Messages = {
           "Отправленные задачи раздела Доступность (RDAP / Domainr / WHOIS-43 каскад).",
         empty: "Пока нет задач Доступности — отправка появится в Волне 3.",
         goCheck: "Открыть Проверка → Доступность",
+      },
+    },
+    availabilityDomain: {
+      verdictHeading: "Вердикт доступности",
+      resolvedBy: "Определил",
+      registrar: "Регистратор",
+      expiresOn: "Истекает",
+      noVerdict: "Вердикта каскада ещё нет — запуск в работе, упал или был пропущен.",
+      cascadeErrorPrefix: "Ошибка каскада",
+      traceHeading: "Трасса каскада",
+      traceHint:
+        "По одной строке на каждого попытанного провайдера, новые сверху. Каскад идёт по провайдерам в порядке, заданном в Настройках → Доступность, и останавливается на первом терминальном ответе (available / registered).",
+      traceEmpty: "Для этого запуска не записано ни одной строки провайдера.",
+      cols: {
+        provider: "Провайдер",
+        status: "Статус",
+        latency: "Задержка",
+        registrar: "Регистратор",
+        expires: "Истекает",
+        error: "Ошибка",
+        checkedAt: "Проверен",
       },
     },
     whoisDomain: {
@@ -3802,6 +3975,15 @@ const messagesRu: Messages = {
         registrarSearchPlaceholder: "Поиск регистраторов…",
         expiryFrom: "Истекает с",
         expiryTo: "Истекает по",
+        availabilityLabel: "Доступность",
+        availabilityAny: "Любая доступность",
+        availabilityHint:
+          "Фильтр по последнему результату проверки доступности (каскад RDAP / Domainr / WHOIS:43).",
+        availabilityAvailable: "свободен",
+        availabilityRegistered: "занят",
+        availabilityUnknown: "неизвестно",
+        availabilityError: "ошибка",
+        availabilityNeverChecked: "(не проверялся)",
       },
       selectedCount: (n) => {
         const last2 = n % 100;
@@ -3826,6 +4008,19 @@ const messagesRu: Messages = {
         `Отправить все ${n} отфильтрованных в Анализ`,
       confirmSendAllFiltered: (n) =>
         `Отправить все ${n} отфильтрованных доменов в Анализ? Им автоматически проставится статус «в работе».`,
+      sendToPicker: {
+        label: (n) => `Отправить ${n} в:`,
+        allFilteredLabel: (n) => `Отправить все ${n} отфильтрованных в:`,
+        quality: "Quality",
+        qualityHint:
+          "Запустить критерии Ahrefs (беклинки / реф.домены / анкоры / ключи) + Wayback. Прежний путь «Анализ» до разделения на пилары.",
+        whois: "Whois",
+        whoisHint:
+          "Запустить историю WHOIS (детектор пайплайна дропа). Дёшево по доменам — тарификация в юнитах WhoisFreaks.",
+        availability: "Availability",
+        availabilityHint:
+          "Запустить каскад доступности (RDAP / Domainr / WHOIS:43), чтобы подтвердить регистрацию.",
+      },
       analyzedHint: (n) =>
         n === 1
           ? `${n} домен из очереди уже проанализирован, но ещё не отмечен.`
