@@ -18,6 +18,11 @@ const KEYS = [
   "wayback_classify_combined",
   "wayback_classify_theme_only",
   "wayback_category",
+  // whois_history_judge (Wave 2b, 2026-05-15) — drives the AI verdict
+  // on the whois_history pillar (dropped vs transferred). Editable here
+  // so the operator can tweak the signal-hierarchy phrasing /
+  // confidence calibration without a redeploy.
+  "whois_history_judge",
   "final",
   // Output-language directive appended to every system prompt on RU
   // runs. Editing this here lets the user tighten/loosen the rule

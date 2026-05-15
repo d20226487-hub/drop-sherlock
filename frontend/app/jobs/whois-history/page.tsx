@@ -1,14 +1,10 @@
 "use client";
-import { PillarStubPage } from "@/components/pillar-stub-page";
-import { useT } from "@/lib/i18n";
+// Wave 2b (2026-05-15): real Jobs list for the whois_history pillar.
+// Replaces the "Coming soon" stub. Shares the JobsListByKind component
+// with /jobs/quality — same archive / bulk / search machinery, kind
+// filter applied to api.listJobs.
+import { JobsListByKind } from "@/components/jobs-list-by-kind";
 
-export default function JobsWhoisHistoryPage() {
-  const { t } = useT();
-  return (
-    <PillarStubPage
-      title={t.pages.jobsWhoisHistory.title}
-      subtitle={t.pages.jobsWhoisHistory.subtitle}
-      wave="wave_2"
-    />
-  );
+export default function JobsWhoisHistoryListPage() {
+  return <JobsListByKind kind="whois_history" />;
 }

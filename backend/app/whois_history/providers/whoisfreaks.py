@@ -1,8 +1,6 @@
 """WhoisFreaks Historical WHOIS API.
 
-Endpoint shape (as documented at https://whoisfreaks.com/products/whois-api.html
-under "Historical Whois Lookup", verified against their public sample
-responses):
+Endpoint shape (verified against live responses 2026-05-15):
 
     GET https://api.whoisfreaks.com/v1.0/whois
         ?apiKey={KEY}
@@ -12,37 +10,47 @@ responses):
 Response (HTTP 200):
     {
       "status": true,
-      "domain_name": "example.com",
-      "whois_records_count": 50,
-      "whois_records": [ ...record... ]
+      "whois": "historical",
+      "total_records": "15",                  # string, not int
+      "whois_domains_historical": [ ...record... ]
     }
 
-A "record" looks roughly like:
+A "record" (.kz / ccTLD shape — gTLDs add `create_date`, `update_date`,
+`expiry_date`, `domain_registrar`):
     {
-      "query_time": "2023-01-15",
-      "create_date": "1995-08-14",
-      "update_date": "2022-09-13",
-      "expiry_date": "2024-08-13",
-      "domain_registrar": {
-        "registrar_name": "MarkMonitor Inc.",
-        "iana_id": "292",
-        "whois_server": "whois.markmonitor.com",
-        ...
-      },
+      "num": 1,
+      "status": true,
+      "domain_name": "...",
+      "query_time": "2020-04-03 15:08:18",
       "registrant_contact": {
-        "name": "...", "company": "...", "country": "...",
-        "city": "...", "state": "...", "email_address": "...",
+        "name": "...", "company": "...", "city": "...",
+        "country_name": "Kazakhstan",
+        "country_code": "KZ"
       },
-      "administrative_contact": {...},
-      "technical_contact": {...},
-      "name_servers": ["NS1.X", "NS2.X"],
-      "domain_status": ["clientTransferProhibited", ...],
-      ...
+      "administrative_contact": {
+        "name": "...", "email_address": "...", "phone": "...", ...
+      },
+      "name_servers": ["ns1.ps.kz", "ns.ps.kz"],
+      "domain_status": ["clienttransferprohibited-"]
     }
 
-Errors come back as `{"status": false, "error": {...}}` with HTTP 200
-(WhoisFreaks's convention — annoying but we handle it). We surface the
-error message via WhoisProviderError so the fetcher can record it.
+The parser is intentionally TOLERANT of multiple schema variants:
+  • top-level array: `whois_domains_historical` (current) OR
+    `whois_records` (older / undocumented variant)
+  • country field on contacts: `country_name` (current) OR `country`
+  • registrar: flat `registrar_name` / `domain_registrar.registrar_name`
+  • dates: `create_date`/`update_date`/`expiry_date` OR
+    `created_date`/`updated_date`/`expires_date`
+
+Belt-and-braces parsing because WhoisFreaks's documentation lags
+their live shape; we'd rather quietly accept either than break on a
+silent schema flip.
+
+Errors come back two ways:
+  • HTTP 200 + `{"status": false, "error": ...}` (their legacy convention)
+  • HTTP 429 / 401 / 403 + a JSON envelope with `error` + `message`
+    (newer error shape — observed during free-tier rate-limit testing)
+Both surface as WhoisProviderError with the message text.
 """
 from __future__ import annotations
 
@@ -139,17 +147,39 @@ def _norm_status(codes: Any) -> list[str]:
 def _map_contact(contact: Any) -> dict[str, str]:
     """Pull a name/company/email/country/state/city set out of a
     WhoisFreaks contact block. Empty string for anything missing — the
-    diff computer's "no signal" branch handles those uniformly."""
+    diff computer's "no signal" branch handles those uniformly.
+
+    Schema tolerance: live responses use `country_name` (preferred);
+    older / undocumented variants used the bare `country`. Try the
+    preferred field first, fall back to the legacy spelling.
+    """
     if not isinstance(contact, dict):
         return {}
+    country = (
+        contact.get("country_name")
+        or contact.get("country")
+        or ""
+    ).strip()
     return {
         "name": (contact.get("name") or "").strip(),
         "company": (contact.get("company") or "").strip(),
-        "country": (contact.get("country") or "").strip(),
+        "country": country,
         "state": (contact.get("state") or "").strip(),
         "city": (contact.get("city") or "").strip(),
         "email": (contact.get("email_address") or "").strip(),
     }
+
+
+def _first_present(raw: dict[str, Any], *keys: str) -> Any:
+    """First non-empty value from `raw[k]` over the listed keys.
+    Used to absorb the multi-variant date field naming WhoisFreaks
+    uses across endpoint versions (`create_date` vs `created_date`,
+    `expiry_date` vs `expires_date`, etc.)."""
+    for k in keys:
+        v = raw.get(k)
+        if v not in (None, ""):
+            return v
+    return None
 
 
 def _record_from_json(raw: dict[str, Any]) -> WhoisRecord | None:
@@ -157,19 +187,38 @@ def _record_from_json(raw: dict[str, Any]) -> WhoisRecord | None:
     Returns None if the record is unusable (no query_time AND no
     creation_date — we can't place it on the timeline).
     """
-    query_time = _parse_date(raw.get("query_time"))
+    # Date fields — WhoisFreaks uses two naming conventions across
+    # endpoint versions; accept either spelling for each.
+    query_raw = _first_present(raw, "query_time", "queried_at")
+    create_raw = _first_present(raw, "create_date", "created_date", "creation_date")
+    update_raw = _first_present(raw, "update_date", "updated_date", "last_updated")
+    expiry_raw = _first_present(
+        raw, "expiry_date", "expires_date", "expiration_date",
+    )
+
+    query_time = _parse_date(query_raw)
     # Some older records lack query_time but have update_date — use
     # that as a poor-man's "as of" so we can still order them.
     if query_time is None:
-        query_time = _parse_date(raw.get("update_date"))
+        query_time = _parse_date(update_raw)
     if query_time is None:
         # Final fallback: creation_date. Snapshots with no time signal
         # at all are skipped (they'd pollute coverage-gap detection).
-        query_time = _parse_date(raw.get("create_date"))
+        query_time = _parse_date(create_raw)
     if query_time is None:
         return None
 
+    # Registrar can appear two ways:
+    #  • nested under `domain_registrar` (gTLD shape)
+    #  • flat `registrar_name` / `registrar` at the top level (some
+    #    ccTLD endpoints; observed on .kz which omits the nested block
+    #    entirely).
     registrar_block = raw.get("domain_registrar") or {}
+    flat_registrar = (
+        raw.get("registrar_name")
+        or raw.get("registrar")
+        or ""
+    )
     registrant = _map_contact(raw.get("registrant_contact"))
     admin = _map_contact(raw.get("administrative_contact"))
     tech = _map_contact(raw.get("technical_contact"))
@@ -194,21 +243,32 @@ def _record_from_json(raw: dict[str, Any]) -> WhoisRecord | None:
     # Stash everything we DIDN'T map into extras so the AI prompt's
     # raw-records section still sees provider-specific fields (raw text,
     # billing contacts, etc.) without us having to enumerate every
-    # column WhoisFreaks might add later.
+    # column WhoisFreaks might add later. Includes both date-name
+    # variants so a future schema flip doesn't double-emit.
     consumed_keys = {
-        "query_time", "create_date", "update_date", "expiry_date",
-        "domain_registrar", "registrant_contact",
+        "query_time", "queried_at",
+        "create_date", "created_date", "creation_date",
+        "update_date", "updated_date", "last_updated",
+        "expiry_date", "expires_date", "expiration_date",
+        "domain_registrar", "registrar_name", "registrar",
+        "registrant_contact",
         "administrative_contact", "technical_contact",
         "name_servers", "domain_status", "dnssec",
+        # `num` and per-record `status` are WhoisFreaks bookkeeping —
+        # not signal. Drop them from extras too.
+        "num", "status",
     }
     extras = {k: v for k, v in raw.items() if k not in consumed_keys}
 
     return WhoisRecord(
         query_time=query_time,
-        creation_date=_parse_date(raw.get("create_date")),
-        update_date=_parse_date(raw.get("update_date")),
-        expiry_date=_parse_date(raw.get("expiry_date")),
-        registrar_name=(registrar_block.get("registrar_name") or "").strip(),
+        creation_date=_parse_date(create_raw),
+        update_date=_parse_date(update_raw),
+        expiry_date=_parse_date(expiry_raw),
+        registrar_name=(
+            (registrar_block.get("registrar_name") or "").strip()
+            or str(flat_registrar).strip()
+        ),
         registrar_iana_id=str(registrar_block.get("iana_id") or "").strip(),
         whois_server=(registrar_block.get("whois_server") or "").strip(),
         registrant_name=registrant.get("name", ""),
@@ -228,15 +288,38 @@ def _record_from_json(raw: dict[str, Any]) -> WhoisRecord | None:
 
 def parse_response(body: dict[str, Any]) -> list[WhoisRecord]:
     """Public for tests + the fetcher's cache path. Maps a full
-    WhoisFreaks response into the chronologically-sorted record list."""
+    WhoisFreaks response into the chronologically-sorted record list.
+
+    Tolerates both array-key naming conventions:
+      • `whois_domains_historical` (live + documented)
+      • `whois_records` (older / undocumented variant kept as fallback)
+
+    Error envelopes are handled with the same tolerance — both legacy
+    (HTTP 200 + `status: false`) and modern (HTTP 4xx + `error` +
+    `message`) shapes raise WhoisProviderError with the human-readable
+    message text.
+    """
     if not isinstance(body, dict):
         raise WhoisProviderError("WhoisFreaks response is not a JSON object")
-    if body.get("status") is False:
-        err = body.get("error") or body.get("message") or "unknown error"
+    # Status flag — accept the modern "true"/"false" boolean AND the
+    # newer numeric envelope where `status` is an HTTP code (429 etc).
+    status_val = body.get("status")
+    if status_val is False or (
+        isinstance(status_val, int) and status_val >= 400
+    ):
+        err = (
+            body.get("message")
+            or body.get("error")
+            or "unknown error"
+        )
         if isinstance(err, dict):
             err = err.get("message") or str(err)
         raise WhoisProviderError(f"WhoisFreaks error: {err}")
-    records_raw = body.get("whois_records")
+    records_raw = (
+        body.get("whois_domains_historical")
+        or body.get("whois_records")
+        or []
+    )
     if not isinstance(records_raw, list):
         # No history available is a valid response — return empty.
         return []

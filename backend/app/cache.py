@@ -65,6 +65,18 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
                 "language_mode": getattr(cfg, "language_mode", "ai"),
             }).encode("utf-8")
         ).hexdigest()
+    # whois_history (Wave 2b, 2026-05-15): the only per-job knob is
+    # `enabled` — every other lever (max_records, coverage gap
+    # threshold, drop confidence threshold) lives in Settings, not the
+    # job spec. So the params_hash carries only the criterion name;
+    # any two whois_history runs against the same domain share the
+    # same hash. (`enabled` is intentionally excluded from the hash
+    # for all criteria — see top of function — so it's omitted here
+    # too even though it's literally the only field.)
+    if criterion == "whois_history":
+        return hashlib.sha256(
+            _stable_json({"c": criterion}).encode("utf-8")
+        ).hexdigest()
     payload: dict[str, Any] = {
         "c": criterion,
         "limit": cfg.limit,

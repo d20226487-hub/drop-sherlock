@@ -69,6 +69,36 @@ function DomainCostPill({ cost }: { cost: RunCost }) {
   );
 }
 
+// Per-domain WhoisFreaks units pill (Wave 2b, 2026-05-15 — revised
+// same-day to display units instead of raw request count). The number
+// shown is `whois_units_billed` from the cost payload; tooltip carries
+// the raw request count + plan-tier multiplier so the math is
+// auditable. Mirrors the run-page pill exactly.
+function DomainWhoisUnitsPill({ cost }: { cost: RunCost }) {
+  const tooltip = [
+    `Fresh WhoisFreaks requests: ${cost.whois_fresh_calls}`,
+    cost.whois_cached_calls > 0
+      ? `Cache hits: ${cost.whois_cached_calls} (zero WhoisFreaks cost)`
+      : null,
+    `Units per request: ${cost.whois_units_per_request} (plan tier)`,
+    `Units billed: ${cost.whois_units_billed.toLocaleString()}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return (
+    <span
+      className="px-2 py-0.5 rounded-md font-medium bg-indigo-100 text-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-200"
+      title={tooltip}
+    >
+      <span className="opacity-70 mr-1">Whois</span>
+      {cost.whois_units_billed.toLocaleString()}
+      <span className="ml-1 opacity-70">
+        unit{cost.whois_units_billed === 1 ? "" : "s"}
+      </span>
+    </span>
+  );
+}
+
 const TABS = [
   "backlinks",
   "refdomains",
@@ -232,6 +262,22 @@ export default function DomainDetailPage({
             </h1>
             <StatusPill status={data.status} />
           </div>
+          {/* Cost row for the whois_history pillar (Wave 2b). AI cost
+              from the judge call + WhoisFreaks request count. Mirrors
+              the Quality header's pill row. Each pill renders only
+              when its respective spend is non-zero so a no-AI-config
+              or zero-fetch domain stays clean. */}
+          {data.cost && (
+            <div className="flex items-center gap-2 flex-wrap text-xs">
+              {(data.cost.fresh_calls > 0 || data.cost.cache_hits > 0) && (
+                <DomainCostPill cost={data.cost} />
+              )}
+              {(data.cost.whois_fresh_calls > 0 ||
+                data.cost.whois_cached_calls > 0) && (
+                <DomainWhoisUnitsPill cost={data.cost} />
+              )}
+            </div>
+          )}
         </header>
         <WhoisHistoryDomainView data={data} />
         {/* Notes are domain-keyed (cross-job survival) — render the
@@ -353,6 +399,15 @@ export default function DomainDetailPage({
                 </span>
               )}
               {showCost && cost && <DomainCostPill cost={cost} />}
+              {/* Whois request pill on the Quality branch too — would
+                  only render on a hypothetical cross-pillar rd where a
+                  whois_history CR landed on a Quality run. Defensive +
+                  future-proof. */}
+              {cost &&
+                (cost.whois_fresh_calls > 0 ||
+                  cost.whois_cached_calls > 0) && (
+                  <DomainWhoisUnitsPill cost={cost} />
+                )}
             </div>
           );
         })()}

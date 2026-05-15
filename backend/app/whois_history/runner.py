@@ -32,6 +32,7 @@ from ..app_settings import (
     SessionLocal,
     get_ai_prompt,
     get_model_price,
+    get_provider_creds,
 )
 from ..models import CriterionResult, Run, RunDomain
 from ..providers.base import ProviderConfigError, ProviderError
@@ -65,23 +66,31 @@ def _verdict_skeleton(reason: str) -> dict[str, Any]:
     }
 
 
-def _build_user_message(domain: str, fetch_result: dict[str, Any]) -> str:
-    """Prompt body — structured diff first (easy reading for the
-    model), raw records second (so the model can cross-check).
+# Soft cap on raw records bundled into the AI prompt. Hard signals +
+# diff summary already encode "what changed"; raw records are for the
+# model to cross-check borderline cases. 30 keeps prompts bounded on
+# domains with hundreds of snapshots. Module-level constant so the
+# `build_ai_preview` route + this runner build IDENTICAL prompts.
+MAX_RECORDS_IN_PROMPT = 30
 
-    Records are truncated to a soft cap to keep token usage bounded
-    on domains with hundreds of historical snapshots — the diff
-    summary already encodes "what changed", the raw records are just
-    for verification of borderline cases."""
-    diff = fetch_result.get("diff", {}) or {}
-    records = fetch_result.get("records", []) or []
-    snapshot_count = fetch_result.get("snapshot_count", len(records))
-    # Show at most 30 raw records — newest first — to keep the prompt
-    # manageable. Hard signals + diff summary cover the rest.
+
+def build_user_message(
+    domain: str, records: list[dict[str, Any]], diff: dict[str, Any]
+) -> str:
+    """Prompt body — structured diff first (easy reading for the
+    model), raw records second. The runner + the AI-preview route
+    both call this so what the operator sees in the preview is
+    BYTE-IDENTICAL to what the runner sends.
+
+    Records are passed in newest-first up to MAX_RECORDS_IN_PROMPT.
+    Callers should pass the canonical record list (chronological,
+    oldest-first); we reverse here so the prompt always shows
+    newest-first which is what the model prioritizes."""
+    snapshot_count = len(records)
     raw_records_for_prompt = list(records)
     raw_records_for_prompt.reverse()
-    if len(raw_records_for_prompt) > 30:
-        raw_records_for_prompt = raw_records_for_prompt[:30]
+    if len(raw_records_for_prompt) > MAX_RECORDS_IN_PROMPT:
+        raw_records_for_prompt = raw_records_for_prompt[:MAX_RECORDS_IN_PROMPT]
     parts = [
         f"Domain: {domain}",
         f"Snapshot count: {snapshot_count}",
@@ -89,10 +98,42 @@ def _build_user_message(domain: str, fetch_result: dict[str, Any]) -> str:
         "Structured diff (signals classified by strength):",
         json.dumps(diff, indent=2, ensure_ascii=False),
         "",
-        "Raw historical records (newest first, up to 30 shown):",
+        f"Raw historical records (newest first, up to "
+        f"{MAX_RECORDS_IN_PROMPT} shown):",
         json.dumps(raw_records_for_prompt, indent=2, ensure_ascii=False),
     ]
     return "\n".join(parts)
+
+
+def _build_user_message(domain: str, fetch_result: dict[str, Any]) -> str:
+    """Internal alias used by `_process_whois_domain`. Kept thin so
+    the public `build_user_message` (above) stays the single source
+    of truth."""
+    return build_user_message(
+        domain,
+        fetch_result.get("records", []) or [],
+        fetch_result.get("diff", {}) or {},
+    )
+
+
+def _resolve_effective_model(provider: str, override: str | None) -> str:
+    """Resolve the concrete model name a `judge()` call will use:
+    explicit override wins, else the provider's `default_model` from
+    Settings. Returns "" if neither is set (judge will then error out
+    on its own; we stamp an empty model on the CR and the cost just
+    falls through to 0).
+
+    Distinct from `ai_judge._resolve_model` which RAISES on missing
+    default — we want a best-effort name for cost stamping, not a
+    hard failure inside the runner's "after the call succeeded" path.
+    """
+    if override and override.strip():
+        return override.strip()
+    try:
+        creds = get_provider_creds(provider)
+    except Exception:  # noqa: BLE001
+        return ""
+    return (creds.get("default_model") or "").strip()
 
 
 def _record_ai_cost(
@@ -101,7 +142,15 @@ def _record_ai_cost(
     """Stamp tokens + USD cost onto the CR. Same pattern as Quality
     judges — pricing comes from the model_pricing table, cost stays
     0 with a 'missing pricing' surface in the UI when a row is
-    missing for the model."""
+    missing for the model.
+
+    Caller MUST pass the resolved model name (use
+    `_resolve_effective_model` if the spec carries an empty override).
+    Passing "" here lands an empty model_name on the CR and pricing
+    lookup fails — making the Cost pill show $0 + ⚠ even when there
+    IS a pricing row for the model that actually ran. That bug bit
+    once already (run 85 of job 47 stamped ai_model="") — fix is in
+    the call site, not here."""
     cr.ai_input_tokens = int(usage.get("input_tokens") or 0)
     cr.ai_output_tokens = int(usage.get("output_tokens") or 0)
     cr.ai_provider = provider
@@ -224,7 +273,12 @@ async def _process_whois_domain(rd_id: int, run_id: int) -> None:
             db.commit()
             return
 
-        # Real AI judge call.
+        # Real AI judge call. Resolve the concrete model name here
+        # (vs inside `judge()`) so we have it for both the call AND
+        # the post-call cost stamping — empty override on the spec
+        # otherwise stamped ai_model="" on the CR and broke pricing
+        # lookup (run 85 of job 47, fixed 2026-05-15).
+        effective_model = _resolve_effective_model(ai_provider, ai_model)
         system_prompt = localize_prompt(
             get_ai_prompt("whois_history_judge"), lang,
         )
@@ -241,21 +295,13 @@ async def _process_whois_domain(rd_id: int, run_id: int) -> None:
                 provider=ai_provider,
                 system_prompt=system_prompt,
                 user_message=user_message,
-                model_override=ai_model,
+                model_override=effective_model or None,
                 timeout=_AI_TIMEOUT_SECONDS,
             )
             cr.ai_verdict_json = json.dumps(verdict_dict)
             cr.ai_verdict_error = ""
             cr.status = "done"
-            _record_ai_cost(
-                cr, usage,
-                ai_provider,
-                # If model_override was None we still want the resolved
-                # model name on the CR — ai_judge resolved it via
-                # default_model. Best-effort: use override or recorded
-                # ai_model on the run's spec.
-                ai_model or (ai_block.get("model") or "") or "",
-            )
+            _record_ai_cost(cr, usage, ai_provider, effective_model)
             db.commit()
             rd.status = "done"
             rd.finished_at = datetime.utcnow()

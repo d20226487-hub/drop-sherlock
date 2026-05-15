@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { useT } from "@/lib/i18n";
 import { RunDomainDetail } from "@/lib/api";
+import { AiPreviewPanel } from "@/components/ai-preview-panel";
 
 // Per-domain page for whois_history-kind runs (Wave 2b, 2026-05-15).
 // Rendered INSTEAD of the Quality criterion tabs when
@@ -125,6 +126,13 @@ export function WhoisHistoryDomainView({ data }: { data: RunDomainDetail }) {
         </div>
       )}
 
+      {/* AI input preview — same component the Quality criterion tabs
+          use. Renders the EXACT system prompt + user message the runner
+          would send if you re-judged this domain right now (structured
+          diff + raw records). Lazy-loaded on first expand so domains
+          with hundreds of snapshots don't pay the bytes until inspected. */}
+      <AiPreviewPanel runDomainId={data.id} criterion="whois_history" />
+
       {/* Diff signals — hard first, then soft. */}
       {diff && diff.snapshot_count > 0 && (
         <DiffSignalsPanel diff={diff} />
@@ -149,29 +157,50 @@ function dropTone(score: number | undefined): {
   badge: string;
   accent: string;
 } {
-  // High dropped_confidence → green (good outcome for drop-hunting:
-  // domain is genuinely available, send to Quality). Medium → amber.
-  // Low → grey/neutral.
+  // Color semantics (revised 2026-05-15 per user feedback): high
+  // drop confidence is a CAUTION signal in drop-hunting context —
+  // domains that have flipped owners repeatedly often carry SEO
+  // baggage (penalties, spam history, PBN traces). Stable ownership
+  // history is the "clean asset" outcome.
+  //
+  // Bands (against dropped_confidence ∈ [0, 1]):
+  //   > 0.80              → red    (multiple drops / strong evidence)
+  //   > 0.50, ≤ 0.80      → amber  (mixed signals)
+  //   ≥ 0.30, ≤ 0.50      → grey   (insufficient evidence)
+  //   < 0.30              → green  (stable ownership)
+  //
+  // Boundaries deliberately follow the user's spec exactly: 0.80
+  // sits in amber (not red), 0.50 sits in grey (not amber), 0.30
+  // sits in grey (not green). At-boundary domains pick the safer
+  // (lower-severity) band so a borderline 80% doesn't get red unless
+  // it's clearly past the threshold.
   const v = typeof score === "number" ? score : 0;
-  if (v >= 0.8)
+  if (v > 0.8)
     return {
-      bg: "bg-emerald-50 dark:bg-emerald-950/30 border-emerald-300 dark:border-emerald-700",
+      bg: "bg-rose-50 dark:bg-rose-950/30 border-rose-300 dark:border-rose-700",
       badge:
-        "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300",
-      accent: "text-emerald-700 dark:text-emerald-300",
+        "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300",
+      accent: "text-rose-700 dark:text-rose-300",
     };
-  if (v >= 0.5)
+  if (v > 0.5)
     return {
       bg: "bg-amber-50 dark:bg-amber-950/30 border-amber-300 dark:border-amber-700",
       badge:
         "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
       accent: "text-amber-700 dark:text-amber-300",
     };
+  if (v >= 0.3)
+    return {
+      bg: "bg-neutral-50 dark:bg-neutral-900/40 border-neutral-300 dark:border-neutral-700",
+      badge:
+        "bg-neutral-100 text-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-300",
+      accent: "text-neutral-700 dark:text-neutral-300",
+    };
   return {
-    bg: "bg-neutral-50 dark:bg-neutral-900/40 border-neutral-300 dark:border-neutral-700",
+    bg: "bg-emerald-50 dark:bg-emerald-950/30 border-emerald-300 dark:border-emerald-700",
     badge:
-      "bg-neutral-100 text-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-300",
-    accent: "text-neutral-700 dark:text-neutral-300",
+      "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300",
+    accent: "text-emerald-700 dark:text-emerald-300",
   };
 }
 

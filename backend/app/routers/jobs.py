@@ -146,6 +146,11 @@ class RunDetail(BaseModel):
     name: str = ""
     job_id: int
     job_name: str
+    # Pillar discriminator (Wave 2b, 2026-05-15) — surfaced here so the
+    # Run page can hide Quality-only controls (Score Weights panel,
+    # Wayback CDX filter) when the parent job is whois_history or
+    # availability. Defaults to 'quality' for pre-Wave-1 rows.
+    job_kind: str = "quality"
     status: str
     started_at: datetime | None
     finished_at: datetime | None
@@ -312,7 +317,53 @@ def get_job(job_id: int, db: Session = Depends(get_db)) -> JobDetail:
     source_run = pinned_run or latest_run
     counts: dict[str, int] = {}
     if source_run is not None:
+        # Wave 2b (2026-05-15): whois_history jobs have no
+        # final_assessment_json (no final-synth step). Their verdict
+        # lives on each RunDomain's whois_history CR as
+        # `ai_verdict_json.dropped_confidence`. Map that to the same
+        # bucket keys Quality uses (good / mixed / low_quality /
+        # no_verdict) so the frontend's existing pill colors apply
+        # without a kind-aware renderer.
+        #
+        # Bucket mapping mirrors the per-domain view's color bands
+        # (see WhoisHistoryDomainView.dropTone):
+        #   dropped_confidence > 0.80  → low_quality  (red — multi-drop history is risky)
+        #   0.50 < c ≤ 0.80            → mixed        (amber — borderline)
+        #   0.30 ≤ c ≤ 0.50            → no_verdict   (grey — insufficient evidence)
+        #   c < 0.30                   → good         (green — stable owner)
+        # Domains with no AI verdict at all (failed fetch, no key,
+        # provider 429) → no_verdict.
+        is_whois_job = (job.kind or "quality") == "whois_history"
         for d in source_run.domains:
+            if is_whois_job:
+                cr = next(
+                    (c for c in d.results if c.criterion == "whois_history"),
+                    None,
+                )
+                verdict: dict | None = None
+                if cr is not None and cr.ai_verdict_json:
+                    try:
+                        verdict = json.loads(cr.ai_verdict_json)
+                    except json.JSONDecodeError:
+                        verdict = None
+                score = (
+                    verdict.get("dropped_confidence")
+                    if isinstance(verdict, dict) else None
+                )
+                if isinstance(score, (int, float)):
+                    s = float(score)
+                    if s > 0.80:
+                        key = "low_quality"
+                    elif s > 0.50:
+                        key = "mixed"
+                    elif s >= 0.30:
+                        key = "no_verdict"
+                    else:
+                        key = "good"
+                else:
+                    key = "no_verdict"
+                counts[key] = counts.get(key, 0) + 1
+                continue
             parsed: dict | None = None
             if d.final_assessment_json:
                 try:
@@ -701,6 +752,7 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
         name=run.name or "",
         job_id=run.job_id,
         job_name=run.job.name,
+        job_kind=(run.job.kind or "quality"),
         status=run.status,
         started_at=run.started_at,
         finished_at=run.finished_at,
@@ -924,7 +976,20 @@ def get_run_domain_detail(
                 break
 
     criteria: dict[str, dict] = {}
-    for criterion_name in ("backlinks", "refdomains", "anchors", "keywords", "wayback", "wayback_classify"):
+    # Iteration list MUST include every criterion type that can show up
+    # on a CR row, else the response's `criteria` dict comes back empty
+    # for any rd whose only CR is one of the omitted criteria — which
+    # is exactly what happened for whois_history rds pre-2026-05-15.
+    for criterion_name in (
+        "backlinks", "refdomains", "anchors", "keywords",
+        "wayback", "wayback_classify",
+        # Whois History pillar (Wave 2b, 2026-05-15) — single criterion,
+        # same CR shape (data_json + ai_verdict_json), surfaced through
+        # the same per-domain detail builder. Frontend's
+        # WhoisHistoryDomainView reads criteria.whois_history.ai_verdict
+        # + .raw, so the criterion MUST appear in this loop's output.
+        "whois_history",
+    ):
         picked_cr: CriterionResult | None = own_crs.get(criterion_name)
         picked_rd: RunDomain | None = rd if picked_cr is not None else None
         if picked_cr is None and parent_rd is not None:
@@ -1132,6 +1197,12 @@ def get_run_domain_detail(
     cost_fresh = 0
     cost_cache = 0
     cost_seen_models: set[tuple[str, str]] = set()
+    # Per-domain WhoisFreaks request count (Wave 2b). Same accounting
+    # rule as the run-level aggregate above. Surfaced on the domain
+    # page header so the operator sees "1 whois request" alongside
+    # the AI cost pill for whois_history runs.
+    whois_fresh = 0
+    whois_cache = 0
     own_crs_for_cost = crs_by_rd.get(rd.id, {})
     for cr in own_crs_for_cost.values():
         if cr.ai_input_tokens:
@@ -1146,6 +1217,11 @@ def get_run_domain_detail(
             cost_fresh += 1
         if cr.ai_provider and cr.ai_model:
             cost_seen_models.add((cr.ai_provider, cr.ai_model))
+        if cr.criterion == "whois_history":
+            if cr.fetched_at is not None and cr.cached_from_run_id is None:
+                whois_fresh += 1
+            elif cr.cached_from_run_id is not None:
+                whois_cache += 1
     if rd.final_input_tokens:
         cost_in += int(rd.final_input_tokens)
     if rd.final_output_tokens:
@@ -1168,6 +1244,8 @@ def get_run_domain_detail(
         for p, m in sorted(cost_seen_models)
         if _gmp(p, m) is None
     ]
+    from ..app_settings import get_whois_history_units_per_request
+    _whois_upr = get_whois_history_units_per_request()
     cost_payload = {
         "total_cost_usd": round(cost_total, 6),
         "total_input_tokens": cost_in,
@@ -1175,6 +1253,13 @@ def get_run_domain_detail(
         "fresh_calls": cost_fresh,
         "cache_hits": cost_cache,
         "missing_pricing": cost_missing,
+        # Wave 2b: WhoisFreaks request count + units for this domain.
+        # Same multiplier as the run-level rollup so the per-domain
+        # number matches what the operator's plan dashboard shows.
+        "whois_fresh_calls": whois_fresh,
+        "whois_cached_calls": whois_cache,
+        "whois_units_per_request": _whois_upr,
+        "whois_units_billed": whois_fresh * _whois_upr,
     }
 
     note_row = db.get(DomainNote, rd.domain)
@@ -1415,6 +1500,13 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
     ahrefs_units_list = 0
     ahrefs_fresh_calls = 0
     ahrefs_cached_calls = 0
+    # WhoisFreaks request accounting (Wave 2b, 2026-05-15). One
+    # whois_history CR = one WhoisFreaks API request (the provider
+    # bills per request, not per record returned, so no "units" math
+    # like Ahrefs — just a count). `whois_cached_calls` is wired as 0
+    # today; reserved for a future cache-pre-check optimisation.
+    whois_fresh_calls = 0
+    whois_cached_calls = 0
     for cr in crs:
         if cr.ai_input_tokens:
             total_in += int(cr.ai_input_tokens)
@@ -1442,6 +1534,17 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
                 ahrefs_cached_calls += 1
             if cr.units_cost_total is not None:
                 ahrefs_units_list += int(cr.units_cost_total)
+        # WhoisFreaks: 1 CR = 1 request. We count CRs that landed
+        # results in data_json — a CR with status=failed AND no
+        # fetched_at represents a request that bailed before reaching
+        # the provider (missing API key / config error) and didn't
+        # touch quota. Anything with fetched_at set hit the provider,
+        # even if records came back empty.
+        elif cr.criterion == "whois_history":
+            if cr.fetched_at is not None and cr.cached_from_run_id is None:
+                whois_fresh_calls += 1
+            elif cr.cached_from_run_id is not None:
+                whois_cached_calls += 1
 
     # Final-synth tokens land on RunDomain.
     for rd in run.domains:
@@ -1476,6 +1579,13 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
         if get_model_price(provider, model) is None:
             missing_pricing.append({"provider": provider, "model": model})
 
+    # Units-per-request multiplier reflects the WhoisFreaks plan tier
+    # — settable in Settings → Whois History → "Units per request"
+    # because pricing varies between Free / Standard / Pro / Premium.
+    # Default 1; operator updates to match their plan dashboard.
+    from ..app_settings import get_whois_history_units_per_request
+    whois_units_per_request = get_whois_history_units_per_request()
+    whois_units_billed = whois_fresh_calls * whois_units_per_request
     return {
         "total_cost_usd": round(total_cost, 6),
         "total_input_tokens": total_in,
@@ -1487,6 +1597,14 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
         "ahrefs_units_list": ahrefs_units_list,
         "ahrefs_fresh_calls": ahrefs_fresh_calls,
         "ahrefs_cached_calls": ahrefs_cached_calls,
+        # WhoisFreaks request accounting (Wave 2b). One request per
+        # whois_history CR; `units_per_request` is the plan-tier
+        # multiplier, `units_billed = fresh_calls * units_per_request`
+        # is what the operator's WhoisFreaks dashboard will reflect.
+        "whois_fresh_calls": whois_fresh_calls,
+        "whois_cached_calls": whois_cached_calls,
+        "whois_units_per_request": whois_units_per_request,
+        "whois_units_billed": whois_units_billed,
     }
 
 

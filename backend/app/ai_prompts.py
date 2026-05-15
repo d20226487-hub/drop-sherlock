@@ -429,7 +429,7 @@ _RU_OUTPUT_DIRECTIVE = (
     "\n\n---\n"
     "ВЫВОД НА РУССКОМ ЯЗЫКЕ.\n"
     "Все свободные текстовые поля JSON-ответа (например summary, "
-    "recommendation, key_findings, red_flags, primary_theme, "
+    "recommendation, key_findings, key_signals, red_flags, primary_theme, "
     "secondary_themes, theme в history, reasoning) должны быть на "
     "русском языке. Будь краток и по делу.\n"
     "ИСКЛЮЧЕНИЯ — оставлять как есть, не переводить:\n"

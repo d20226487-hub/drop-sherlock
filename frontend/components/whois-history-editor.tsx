@@ -33,6 +33,10 @@ export function WhoisHistoryEditor() {
   const [maxRecords, setMaxRecords] = useState("");
   const [gapDays, setGapDays] = useState("");
   const [dropThreshold, setDropThreshold] = useState("");
+  // Plan-tier multiplier — how many WhoisFreaks units one request
+  // costs. Default 1 (free tier); paid tiers can be 2+. Drives the
+  // Whois pill labels on Run + Domain pages.
+  const [unitsPerRequest, setUnitsPerRequest] = useState("");
 
   // API key — string input, never pre-filled with the stored value.
   const [apiKeyDraft, setApiKeyDraft] = useState("");
@@ -59,6 +63,7 @@ export function WhoisHistoryEditor() {
       setMaxRecords(String(r.max_records));
       setGapDays(String(r.coverage_gap_threshold_days));
       setDropThreshold(String(r.drop_confidence_threshold));
+      setUnitsPerRequest(String(r.units_per_request));
       setRpm(String(r.rate_limits.rpm));
       setMaxConcurrent(String(r.rate_limits.max_concurrent));
     } catch (e) {
@@ -328,6 +333,31 @@ export function WhoisHistoryEditor() {
             />
           </label>
         </div>
+      </section>
+
+      {/* Plan-tier units per request — drives the Whois pill totals
+          on Run / Domain pages. Operator looks up the real number on
+          their WhoisFreaks dashboard. */}
+      <section className="space-y-2">
+        <label className="text-sm font-medium text-neutral-700 dark:text-neutral-300 block">
+          {ts.unitsPerRequestLabel}
+        </label>
+        <p className="text-xs text-neutral-500 dark:text-neutral-400">
+          {ts.unitsPerRequestHint}
+        </p>
+        <input
+          type="number"
+          min={1}
+          max={100}
+          value={unitsPerRequest}
+          onChange={(e) => setUnitsPerRequest(e.target.value)}
+          onBlur={() =>
+            unitsPerRequest !== String(cfg.units_per_request) &&
+            setOne("whois_history__units_per_request", unitsPerRequest)
+          }
+          disabled={busy}
+          className="w-32 text-sm rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 outline-none focus:ring-2 focus:ring-blue-500/40 disabled:opacity-50"
+        />
       </section>
 
       {/* Drop confidence threshold */}

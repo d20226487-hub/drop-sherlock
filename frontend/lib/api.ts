@@ -163,7 +163,11 @@ export type Criterion =
   // raw rows. Result lives in the CR's ai_verdict_json with shape
   // {primary_language, primary_theme, drift_detected, history?, category,
   // category_confidence, category_was?, ...}.
-  | "wayback_classify";
+  | "wayback_classify"
+  // whois_history (Wave 2b) — single criterion for the whois_history
+  // pillar. Stored on the same CR table as Quality criteria; the
+  // AI-preview endpoint accepts it too.
+  | "whois_history";
 
 export type SortField =
   // backlinks
@@ -428,6 +432,14 @@ export type AiPreview = {
   // small key-value table so the user can verify actual values
   // without parsing the JSON view.
   classify_context?: Record<string, unknown> | null;
+  // whois_history-only fields (Wave 2b, 2026-05-15). `whois_provider`
+  // surfaces which historical-WHOIS vendor (whoisfreaks today) the
+  // records came from — distinct from the AI `provider` field above
+  // (which is the model vendor). `snapshot_count_total` is how many
+  // records exist on the CR; `row_count` is how many actually reach
+  // the AI prompt (capped at MAX_RECORDS_IN_PROMPT = 30).
+  whois_provider?: string;
+  snapshot_count_total?: number;
 };
 
 export type RunSummaryDomain = {
@@ -668,6 +680,16 @@ export type RunCost = {
   ahrefs_units_list: number;
   ahrefs_fresh_calls: number;
   ahrefs_cached_calls: number;
+  // WhoisFreaks request count (Wave 2b, 2026-05-15). One whois_history
+  // CR = one provider request. `units_per_request` is the plan-tier
+  // multiplier (free=1, paid tiers can be 2+); `units_billed =
+  // fresh_calls * units_per_request` matches what the operator's
+  // WhoisFreaks dashboard reflects. `cached_calls` is 0 today —
+  // reserved for a future cache-pre-check.
+  whois_fresh_calls: number;
+  whois_cached_calls: number;
+  whois_units_per_request: number;
+  whois_units_billed: number;
 };
 
 export type ModelPriceRow = {
@@ -683,6 +705,10 @@ export type RunDetail = {
   name: string;
   job_id: number;
   job_name: string;
+  // Pillar discriminator (Wave 2b, 2026-05-15). Drives kind-aware
+  // hiding of Quality-only controls (Score Weights panel, Wayback
+  // CDX filter) on whois_history / availability runs.
+  job_kind?: JobKind;
   status: string;
   started_at: string | null;
   finished_at: string | null;
@@ -2122,6 +2148,10 @@ export type WhoisHistorySettings = {
   max_records: number;
   coverage_gap_threshold_days: number;
   drop_confidence_threshold: number;
+  // Plan-tier multiplier — how many WhoisFreaks units one request
+  // consumes (Wave 2b, 2026-05-15). Default 1 (free tier); operator
+  // updates to match the value shown on their WhoisFreaks dashboard.
+  units_per_request: number;
   // Rate limits applied to the configured provider (Wave 2b,
   // 2026-05-15). Storing per-provider means a future provider swap
   // doesn't inherit WhoisFreaks's tuning.

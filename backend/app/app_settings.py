@@ -1391,8 +1391,16 @@ WHOIS_HISTORY_DEFAULTS = {
     # the chip + are eligible for the Backlog "send to Quality" bulk
     # filter. 0.8 is a reasonable conservative default.
     "whois_history__drop_confidence_threshold": "0.8",
+    # Units billed per provider request (Wave 2b, added 2026-05-15).
+    # WhoisFreaks's pricing differs by plan tier — some plans bill 1
+    # unit per request, others 2+. Default 1; operator sets the real
+    # number from their plan dashboard. Used purely for display (the
+    # Whois request pill shows "N units"); doesn't affect quota math
+    # since WhoisFreaks bills server-side regardless of what we count.
+    "whois_history__units_per_request": "1",
 }
 WHOIS_HISTORY_MAX_RECORDS_CEILING = 500
+WHOIS_HISTORY_UNITS_PER_REQUEST_CEILING = 100
 
 
 def get_whois_history_provider() -> str:
@@ -1468,6 +1476,26 @@ def get_whois_history_coverage_gap_threshold() -> int:
     return max(1, min(365, v))
 
 
+def get_whois_history_units_per_request() -> int:
+    """How many provider-plan units each WhoisFreaks request consumes.
+    Defaults to 1 (free / starter tier); operators on higher tiers set
+    the actual value. Clamped to [1, WHOIS_HISTORY_UNITS_PER_REQUEST_CEILING]."""
+    db = SessionLocal()
+    try:
+        raw = (
+            _get(db, "whois_history__units_per_request") or ""
+        ).strip()
+    finally:
+        db.close()
+    try:
+        v = int(raw) if raw else int(
+            WHOIS_HISTORY_DEFAULTS["whois_history__units_per_request"]
+        )
+    except ValueError:
+        v = int(WHOIS_HISTORY_DEFAULTS["whois_history__units_per_request"])
+    return max(1, min(WHOIS_HISTORY_UNITS_PER_REQUEST_CEILING, v))
+
+
 def get_whois_history_drop_threshold() -> float:
     """Float in [0, 1]. AI verdicts whose `dropped_confidence` >= this
     threshold get the green "high confidence: dropped" chip in the UI
@@ -1507,6 +1535,7 @@ def get_whois_history_config() -> dict:
             get_whois_history_coverage_gap_threshold()
         ),
         "drop_confidence_threshold": get_whois_history_drop_threshold(),
+        "units_per_request": get_whois_history_units_per_request(),
         "rate_limits": {
             "rpm": rl["rpm"],
             "max_concurrent": rl["max_concurrent"],
@@ -1548,6 +1577,17 @@ def set_whois_history_setting(key: str, value: str) -> None:
         value = f"{f:.4f}".rstrip("0").rstrip(".")
         if not value:
             value = "0"
+    elif key == "whois_history__units_per_request":
+        try:
+            n = int(value)
+        except ValueError as e:
+            raise ValueError(f"{key} must be an integer") from e
+        if n < 1 or n > WHOIS_HISTORY_UNITS_PER_REQUEST_CEILING:
+            raise ValueError(
+                f"{key} must be between 1 and "
+                f"{WHOIS_HISTORY_UNITS_PER_REQUEST_CEILING}"
+            )
+        value = str(n)
     elif key == "whois_history__provider":
         if value not in ("whoisfreaks",):
             raise ValueError(

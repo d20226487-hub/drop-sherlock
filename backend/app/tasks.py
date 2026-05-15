@@ -113,7 +113,14 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
     Used by the UI's "Preview AI input" link so users can see the data
     behind a verdict (e.g. is_spam / first_seen / last_seen fields that
     aren't in the default raw-data table)."""
-    if criterion not in ("backlinks", "refdomains", "anchors", "keywords", "wayback", "wayback_classify"):
+    if criterion not in (
+        "backlinks", "refdomains", "anchors", "keywords",
+        "wayback", "wayback_classify",
+        # Wave 2b (2026-05-15): whois_history pillar criterion. Has its
+        # own dedicated branch below (single-shot prompt, no row-trim,
+        # no classify-context).
+        "whois_history",
+    ):
         raise ValueError(f"invalid criterion: {criterion}")
 
     db = SessionLocal()
@@ -191,6 +198,74 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
         cr_model = (cr.ai_model or "") if cr is not None else ""
     finally:
         db.close()
+
+    # Whois History uses its own prompt + user-message builder
+    # (whois_history.runner.build_user_message). The standard Ahrefs/
+    # Wayback row-trimming logic doesn't apply — the prompt body is
+    # the structured diff + raw historical records.
+    if criterion == "whois_history":
+        from .whois_history.runner import (
+            MAX_RECORDS_IN_PROMPT,
+            build_user_message,
+        )
+        records: list[dict] = []
+        diff_dict: dict = {}
+        provider_name = ""
+        if cr is not None and cr.data_json:
+            try:
+                body = json.loads(cr.data_json)
+            except json.JSONDecodeError:
+                body = None
+            if isinstance(body, dict):
+                rec_val = body.get("records")
+                if isinstance(rec_val, list):
+                    records = [r for r in rec_val if isinstance(r, dict)]
+                diff_val = body.get("diff")
+                if isinstance(diff_val, dict):
+                    diff_dict = diff_val
+                provider_val = body.get("provider")
+                if isinstance(provider_val, str):
+                    provider_name = provider_val
+        system_prompt = localize_prompt(
+            get_ai_prompt("whois_history_judge"), spec_lang,
+        )
+        user_message = build_user_message(domain, records, diff_dict)
+        effective_provider = cr_provider or spec_provider
+        effective_model = cr_model or spec_model
+        if not cr_model and effective_provider:
+            try:
+                effective_model = _resolve_model(effective_provider, spec_model)
+            except Exception:  # noqa: BLE001
+                effective_model = spec_model
+        return {
+            "domain": domain,
+            "criterion": criterion,
+            "provider": effective_provider,
+            "model": effective_model,
+            # No row-trim metadata for whois_history (the prompt body
+            # is structured diff + raw records, not a column-trimmed
+            # table). Frontend treats empty `fields_sent` as "no
+            # field-trim chip row" and falls through to the system-
+            # prompt + user-message preview.
+            "fields_sent": [],
+            # `row_count` here = how many records made it into the
+            # prompt (capped at MAX_RECORDS_IN_PROMPT). Frontend
+            # surfaces it as "N records" chip.
+            "row_count": min(len(records), MAX_RECORDS_IN_PROMPT),
+            "system_prompt": system_prompt,
+            "user_message": user_message,
+            # `rows` for the whois_history preview is the same record
+            # set the prompt embeds — same shape (dict), same field
+            # names (query_time, creation_date, registrar_name, etc.).
+            # Newest-first to match the prompt order.
+            "rows": list(reversed(records))[:MAX_RECORDS_IN_PROMPT],
+            # Surface the WhoisFreaks/etc provider name for the UI's
+            # provenance chip — distinct from the AI provider above.
+            "whois_provider": provider_name,
+            # Snapshot count BEFORE the cap so the user can see how
+            # much history exists vs. how much actually reached the AI.
+            "snapshot_count_total": len(records),
+        }
 
     # wayback_classify uses its own prompt + user-message builder. The
     # standard fields_sent / row-trimming logic doesn't apply (it doesn't

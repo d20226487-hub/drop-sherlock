@@ -95,6 +95,39 @@ function AhrefsUnitsPill({ cost }: { cost: RunCost }) {
   );
 }
 
+// WhoisFreaks units pill (Wave 2b, 2026-05-15 — revised same-day to
+// display units instead of raw request count after observing that
+// WhoisFreaks's paid tiers bill > 1 unit per request). The number
+// shown is `whois_units_billed = fresh_calls * units_per_request`,
+// matching what the operator's WhoisFreaks dashboard reports.
+// Tooltip carries the raw request count so the multiplier is
+// auditable. Indigo tone keeps the visual distinction from Ahrefs's
+// sky pill.
+function WhoisUnitsPill({ cost }: { cost: RunCost }) {
+  const tooltip = [
+    `Fresh WhoisFreaks requests: ${cost.whois_fresh_calls}`,
+    cost.whois_cached_calls > 0
+      ? `Cache hits: ${cost.whois_cached_calls} (zero WhoisFreaks cost)`
+      : null,
+    `Units per request: ${cost.whois_units_per_request} (your plan tier — change in Settings → Whois History)`,
+    `Units billed: ${cost.whois_units_billed.toLocaleString()} = ${cost.whois_fresh_calls} × ${cost.whois_units_per_request}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return (
+    <span
+      className="px-2 py-0.5 rounded-md font-medium bg-indigo-100 text-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-200"
+      title={tooltip}
+    >
+      <span className="opacity-70 mr-1">Whois</span>
+      {cost.whois_units_billed.toLocaleString()}
+      <span className="ml-1 opacity-70">
+        unit{cost.whois_units_billed === 1 ? "" : "s"}
+      </span>
+    </span>
+  );
+}
+
 function formatDate(iso: string | null): string {
   if (!iso) return "—";
   try {
@@ -1316,6 +1349,11 @@ export default function RunDetailPage({
               cost.ahrefs_cached_calls > 0) && (
               <AhrefsUnitsPill cost={cost} />
             )}
+          {cost &&
+            (cost.whois_fresh_calls > 0 ||
+              cost.whois_cached_calls > 0) && (
+              <WhoisUnitsPill cost={cost} />
+            )}
         </div>
         {run.error && (
           <p className="text-sm text-red-600 dark:text-red-400">{run.error}</p>
@@ -1335,14 +1373,18 @@ export default function RunDetailPage({
             partial set of CRs available; recompute-final on the backend
             already skips partial rds, so an Apply on a paused/pending
             run only rewrites the rds that have settled. Useful for
-            staging the weights before a run finishes. */}
-        {run.status !== "failed" && run.status !== "canceled" && (
-          <ScoreWeightsPanel
-            runId={runId}
-            currentOverride={run.scoring_override ?? null}
-            onApplied={reload}
-          />
-        )}
+            staging the weights before a run finishes.
+            Hidden for whois_history / availability runs (Wave 2b) —
+            those pillars have no per-criterion weights to balance. */}
+        {run.status !== "failed" &&
+          run.status !== "canceled" &&
+          (run.job_kind ?? "quality") === "quality" && (
+            <ScoreWeightsPanel
+              runId={runId}
+              currentOverride={run.scoring_override ?? null}
+              onApplied={reload}
+            />
+          )}
         {/* Per-criterion pins panel: visible on every non-failed/non-
             canceled run, given there's at least one criterion in the
             run's spec. Pre-`done` you can already see which Run the
@@ -1523,6 +1565,7 @@ export default function RunDetailPage({
         jobId={jobId}
         runId={runId}
         runStatus={run.status}
+        jobKind={run.job_kind ?? "quality"}
         onChanged={reload}
       />
     </div>
@@ -1544,12 +1587,17 @@ function DomainsSection({
   jobId,
   runId,
   runStatus,
+  // Wave 2b (2026-05-15): pillar discriminator so Quality-only
+  // filters (today: Wayback CDX) can hide on whois_history /
+  // availability runs. Defaults to 'quality' on legacy callers.
+  jobKind = "quality",
   onChanged,
 }: {
   domains: RunDomainProgress[];
   jobId: number;
   runId: number;
   runStatus: string;
+  jobKind?: string;
   onChanged: () => void;
 }) {
   const { t } = useT();
@@ -1796,22 +1844,27 @@ function DomainsSection({
                 <option value="canceled">{ts.filterStatusCanceled}</option>
               </select>
             </label>
-            <label className="flex items-center gap-1.5">
-              <span className="font-medium text-neutral-700 dark:text-neutral-300">
-                {ts.filterWaybackLabel}
-              </span>
-              <select
-                value={waybackFilter}
-                onChange={(e) =>
-                  setWaybackFilter(e.target.value as WaybackFilterValue)
-                }
-                className="px-2 py-1 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950"
-              >
-                <option value="any">{ts.filterWaybackAny}</option>
-                <option value="zero">{ts.filterWaybackZero}</option>
-                <option value="nonzero">{ts.filterWaybackNonzero}</option>
-              </select>
-            </label>
+            {/* Wayback CDX filter hidden on whois_history / availability
+                runs (Wave 2b) — neither pillar fetches CDX rows so the
+                filter has nothing to filter against. */}
+            {jobKind === "quality" && (
+              <label className="flex items-center gap-1.5">
+                <span className="font-medium text-neutral-700 dark:text-neutral-300">
+                  {ts.filterWaybackLabel}
+                </span>
+                <select
+                  value={waybackFilter}
+                  onChange={(e) =>
+                    setWaybackFilter(e.target.value as WaybackFilterValue)
+                  }
+                  className="px-2 py-1 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950"
+                >
+                  <option value="any">{ts.filterWaybackAny}</option>
+                  <option value="zero">{ts.filterWaybackZero}</option>
+                  <option value="nonzero">{ts.filterWaybackNonzero}</option>
+                </select>
+              </label>
+            )}
             <span className="text-neutral-500 dark:text-neutral-400">
               ({search.filteredTotal})
             </span>

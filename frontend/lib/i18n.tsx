@@ -1073,6 +1073,9 @@ const messagesEn = {
         dropThresholdLabel: "Drop confidence threshold",
         dropThresholdHint:
           "AI verdicts whose dropped_confidence ≥ this value get the green \"high confidence: dropped\" chip in the UI and are eligible for the bulk \"send passers to Quality\" filter. Range: 0–1.",
+        unitsPerRequestLabel: "Units per request (plan tier)",
+        unitsPerRequestHint:
+          "How many WhoisFreaks units one historical-WHOIS request consumes against your plan's monthly quota. Free tier = 1; paid tiers can be 2 or more — check the cost displayed on your WhoisFreaks dashboard. Range: 1–100.",
         testLabel: "Test connection",
         testHint:
           "Live probe — fetches one domain's history through the configured provider and shows the result inline. Costs 1 provider request (a few cents).",
@@ -1334,6 +1337,8 @@ const messagesEn = {
           wayback_classify_theme_only:
             "Wayback classify — theme only (library mode)",
           wayback_category: "Wayback classify — category classification",
+          whois_history_judge:
+            "Whois History judge (drop vs transferred — Wave 2)",
           final: "Ahrefs final assessment",
           localize_ru:
             "Russian output directive (appended to every prompt on RU runs)",
@@ -1670,6 +1675,35 @@ const messagesEn = {
       title: "Availability — Jobs",
       subtitle:
         "Past + ongoing availability-cascade jobs.",
+    },
+    // Per-pillar copy for the shared JobsListByKind component (Wave
+    // 2b, 2026-05-15). The shape MUST mirror `pages.jobs.tabs` /
+    // `pages.jobs.bulk` / `pages.jobs.cols` from the legacy pillar
+    // (we keep those under pages.jobs for backward compat); only the
+    // headings + empty-state CTA copy diverge per pillar.
+    jobsByKind: {
+      quality: {
+        title: "Jobs — Quality",
+        intro:
+          "Submitted Quality (Wayback + Ahrefs) jobs. Click a job to see its runs + per-domain verdicts.",
+        empty: "No Quality jobs yet — start one from Check → Quality.",
+        goCheck: "Open Check → Quality",
+      },
+      whois_history: {
+        title: "Jobs — Whois History",
+        intro:
+          "Submitted Whois History (drop-detection) jobs. Click a job to see its runs + per-domain WHOIS verdicts.",
+        empty:
+          "No Whois History jobs yet — start one from Check → Whois History.",
+        goCheck: "Open Check → Whois History",
+      },
+      availability: {
+        title: "Jobs — Availability",
+        intro:
+          "Submitted Availability (RDAP / Domainr / WHOIS-43 cascade) jobs.",
+        empty: "No Availability jobs yet — Wave 3 ships the submit page.",
+        goCheck: "Open Check → Availability",
+      },
     },
     // Wave 2b (2026-05-15) — per-domain page for whois_history-kind
     // runs (rendered via WhoisHistoryDomainView when job_kind matches).
@@ -3014,6 +3048,9 @@ const messagesRu: Messages = {
         dropThresholdLabel: "Порог уверенности «дроп»",
         dropThresholdHint:
           "Вердикты ИИ с dropped_confidence ≥ этого значения получают зелёный чип «высокая уверенность: дроп» в интерфейсе и попадают в фильтр массового действия «отправить прошедших в Качество». Диапазон: 0–1.",
+        unitsPerRequestLabel: "Юнитов за запрос (тариф)",
+        unitsPerRequestHint:
+          "Сколько юнитов WhoisFreaks стоит один запрос исторического WHOIS против месячной квоты вашего плана. Free = 1; платные тарифы — 2 и более. Сверьтесь с дашбордом WhoisFreaks. Диапазон: 1–100.",
         testLabel: "Проверка соединения",
         testHint:
           "Живой запрос — получает историю одного домена через выбранного провайдера и показывает результат тут же. Стоит 1 запрос (несколько центов).",
@@ -3284,6 +3321,8 @@ const messagesRu: Messages = {
           wayback_classify_theme_only:
             "Wayback classify — только тематика (режим библиотеки)",
           wayback_category: "Wayback classify — классификация категории",
+          whois_history_judge:
+            "Судья Whois History (дроп vs трансфер — Волна 2)",
           final: "Итоговая оценка Ahrefs",
           localize_ru:
             "Директива русского вывода (добавляется к каждому промпту в RU-запусках)",
@@ -3634,6 +3673,30 @@ const messagesRu: Messages = {
       title: "Доступность — Задачи",
       subtitle:
         "Прошлые и текущие задачи каскада доступности.",
+    },
+    jobsByKind: {
+      quality: {
+        title: "Задачи — Качество",
+        intro:
+          "Отправленные задачи раздела Качество (Wayback + Ahrefs). Кликните на задачу, чтобы увидеть её запуски и вердикты по доменам.",
+        empty: "Пока нет задач Качества — начните в Проверка → Качество.",
+        goCheck: "Открыть Проверка → Качество",
+      },
+      whois_history: {
+        title: "Задачи — История Whois",
+        intro:
+          "Отправленные задачи раздела История Whois (выявление дропов). Кликните на задачу, чтобы увидеть её запуски и WHOIS-вердикты по доменам.",
+        empty:
+          "Пока нет задач Истории Whois — начните в Проверка → История Whois.",
+        goCheck: "Открыть Проверка → История Whois",
+      },
+      availability: {
+        title: "Задачи — Доступность",
+        intro:
+          "Отправленные задачи раздела Доступность (RDAP / Domainr / WHOIS-43 каскад).",
+        empty: "Пока нет задач Доступности — отправка появится в Волне 3.",
+        goCheck: "Открыть Проверка → Доступность",
+      },
     },
     whoisDomain: {
       pending: "Запрос Whois и/или вердикт ИИ для этого домена ещё в работе.",
