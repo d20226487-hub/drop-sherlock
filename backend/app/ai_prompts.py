@@ -469,6 +469,78 @@ def localize_prompt(prompt: str, lang: str | None) -> str:
     return prompt
 
 
+# Default prompt for the Whois History judge (Wave 2, 2026-05-15).
+# Phrased around the signal hierarchy in the project memory's WHOIS
+# section: hard signals (creation-date change, EPP drop-pipeline codes,
+# coverage gaps) outweigh strong signals (owner/email/org), which
+# outweigh medium (country/city), which outweigh weak (registrar/NS/
+# DNSSEC — these happen on owned domains too).
+#
+# Output shape is deliberately small. The frontend chip / "highly
+# confident dropped" filter reads `dropped_confidence`; the rest is
+# prose for the operator to skim.
+WHOIS_HISTORY_JUDGE_PROMPT = (
+    "You are evaluating a domain's WHOIS history to decide whether it was "
+    "DELETED and RE-REGISTERED (i.e. dropped + picked up by a new owner) "
+    "versus just transferred / re-configured by the same long-term owner. "
+    "The operator uses your verdict to skip Wayback + Ahrefs spend on "
+    "domains that didn't actually drop.\n\n"
+    "Signal hierarchy (USE THIS, do not invent your own):\n\n"
+    "HARD signals (any one is near-definitive evidence the domain dropped):\n"
+    "  • creation_date_changes — a live domain's creation_date is immutable. "
+    "If snapshot A says created=YYYY-MM-DD and snapshot B says a different "
+    "date, the domain WAS deleted + re-registered. No legitimate transfer "
+    "can change creation_date.\n"
+    "  • drop_pipeline_status_events — any historical snapshot showing "
+    "pendingDelete, redemptionPeriod, pendingRestore, or clientHold is the "
+    "registry itself reporting the domain was in the drop pipeline.\n"
+    "  • coverage_gaps_days — large gaps (>= 30 days by default) between "
+    "consecutive snapshots usually mean the registry returned NXDOMAIN "
+    "(deleted, nothing to poll). Less clean than the other two — also "
+    "happens if the provider's polling broke — but combined with another "
+    "signal it's decisive.\n\n"
+    "STRONG signals (clear evidence of ownership change, fall back to here "
+    "when the hard signals are silent):\n"
+    "  • owner_changes — registrant name. Post-GDPR most are 'REDACTED', so "
+    "what matters is when REDACTED → different REDACTED, or REDACTED → "
+    "actual-name, or vice versa.\n"
+    "  • email_changes — registrant_email patterns. Email differs even "
+    "when names are uniformly redacted.\n"
+    "  • org_changes — registrant_org (company).\n\n"
+    "MEDIUM signals:\n"
+    "  • country_changes, city_changes — location.\n\n"
+    "WEAK signals (NORMAL lifecycle activity on owned domains — do NOT use "
+    "as a drop signal alone):\n"
+    "  • registrar_changes — owners transfer registrars routinely.\n"
+    "  • ns_changes — owners migrate hosting / CDN / DNS providers.\n"
+    "  • dnssec_toggles — owners toggle DNSSEC when adding/removing CDNs.\n\n"
+    "Confidence calibration:\n"
+    "  • dropped_confidence >= 0.85 — at least one HARD signal present.\n"
+    "  • 0.55 - 0.85 — multiple STRONG signals, no hard ones (e.g. owner + "
+    "email + org all changed at the same time).\n"
+    "  • 0.30 - 0.55 — one STRONG signal in isolation, or several MEDIUM "
+    "ones.\n"
+    "  • < 0.30 — only WEAK signals visible; this looks like normal owner "
+    "activity.\n\n"
+    "  • transferred_confidence is the symmetric judgment for "
+    "ownership-preserving change. dropped + transferred do NOT need to sum "
+    "to 1 — both can be low (insufficient history) or both relatively high "
+    "if the signals are mixed.\n\n"
+    "Output ONLY a single JSON object with this exact shape:\n"
+    "{\n"
+    '  "dropped_confidence": 0.0..1.0,\n'
+    '  "transferred_confidence": 0.0..1.0,\n'
+    '  "summary": "<1-3 sentences naming the strongest signals you saw>",\n'
+    '  "key_signals": ["<short bullet about hard/strong signal>", ...],\n'
+    '  "recommendation": "<one sentence: skip Quality / send to Quality / '
+    'insufficient history>"\n'
+    "}\n\n"
+    "No extra prose around the JSON. No markdown fences. If the history "
+    "is empty (snapshot_count = 0) return dropped_confidence and "
+    "transferred_confidence both at 0 with summary 'no history available'."
+)
+
+
 # Logical key → default prompt. Used by app_settings.get_ai_prompt() and the
 # /settings/prompts endpoints so the UI can iterate them in a stable order.
 PROMPT_KEYS: dict[str, str] = {
@@ -480,6 +552,7 @@ PROMPT_KEYS: dict[str, str] = {
     "wayback_classify_combined": WAYBACK_CLASSIFY_COMBINED_PROMPT,
     "wayback_classify_theme_only": WAYBACK_CLASSIFY_THEME_ONLY_PROMPT,
     "wayback_category": WAYBACK_CATEGORY_PROMPT,
+    "whois_history_judge": WHOIS_HISTORY_JUDGE_PROMPT,
     "final": DEFAULT_FINAL_PROMPT,
     # Output-language directive appended to every system prompt on RU
     # runs (via `localize_prompt`). Exposed in Settings so the user can

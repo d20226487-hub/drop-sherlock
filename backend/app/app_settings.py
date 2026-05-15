@@ -1342,3 +1342,184 @@ def reset_classify_context_config() -> dict:
     finally:
         db.close()
     return get_classify_context_config()
+
+
+# --- Whois History pillar (added Wave 2, 2026-05-15) -----------------------
+#
+# Settings for the new whois_history pillar. The API key is the secret
+# bit (Fernet-encrypted at rest via `crypto.key_is_secret(...)` which
+# matches the `__api_key` suffix); everything else is plain int/string.
+#
+# Default provider is `whoisfreaks` so a fresh deploy works the moment
+# the operator drops a key into Settings — no extra provider toggle
+# needed. The dispatch in `whois_history/fetcher.py` falls back to
+# WhoisFreaks when the value is empty.
+
+WHOIS_HISTORY_DEFAULTS = {
+    "whois_history__provider": "whoisfreaks",
+    "whois_history__max_records": "100",
+    "whois_history__coverage_gap_threshold_days": "30",
+    # Drop-confidence threshold the UI uses for the green "high
+    # confidence: dropped" chip. Verdicts at-or-above this score get
+    # the chip + are eligible for the Backlog "send to Quality" bulk
+    # filter. 0.8 is a reasonable conservative default.
+    "whois_history__drop_confidence_threshold": "0.8",
+}
+WHOIS_HISTORY_MAX_RECORDS_CEILING = 500
+
+
+def get_whois_history_provider() -> str:
+    """Provider name used by the fetcher. Defaults to 'whoisfreaks'."""
+    db = SessionLocal()
+    try:
+        raw = (_get(db, "whois_history__provider") or "").strip()
+    finally:
+        db.close()
+    return raw or "whoisfreaks"
+
+
+def get_whois_history_api_key() -> str:
+    """API key for the configured provider. Today only WhoisFreaks is
+    wired; the key suffix `__api_key` triggers Fernet encryption at
+    rest (see `crypto.key_is_secret`)."""
+    provider = get_whois_history_provider()
+    db = SessionLocal()
+    try:
+        # Per-provider key naming convention: `<provider>__api_key`.
+        # Mirrors the existing AI / Ahrefs / Domainr settings keys.
+        raw = (_get(db, f"{provider}__api_key") or "").strip()
+    finally:
+        db.close()
+    return raw
+
+
+def set_whois_history_api_key(value: str) -> None:
+    """Persist the API key for the currently-configured provider.
+    Empty string clears the credential."""
+    provider = get_whois_history_provider()
+    db = SessionLocal()
+    try:
+        _set(db, f"{provider}__api_key", value or "")
+    finally:
+        db.close()
+
+
+def get_whois_history_max_records() -> int:
+    """Soft cap on history depth per domain. Clamped to [1, 500]."""
+    db = SessionLocal()
+    try:
+        raw = (_get(db, "whois_history__max_records") or "").strip()
+    finally:
+        db.close()
+    try:
+        v = int(raw) if raw else int(
+            WHOIS_HISTORY_DEFAULTS["whois_history__max_records"]
+        )
+    except ValueError:
+        v = int(WHOIS_HISTORY_DEFAULTS["whois_history__max_records"])
+    return max(1, min(WHOIS_HISTORY_MAX_RECORDS_CEILING, v))
+
+
+def get_whois_history_coverage_gap_threshold() -> int:
+    """Days of "no snapshots" between consecutive records that the
+    diff computer treats as a hard drop signal. Clamped to [1, 365]."""
+    db = SessionLocal()
+    try:
+        raw = (
+            _get(db, "whois_history__coverage_gap_threshold_days") or ""
+        ).strip()
+    finally:
+        db.close()
+    try:
+        v = int(raw) if raw else int(
+            WHOIS_HISTORY_DEFAULTS["whois_history__coverage_gap_threshold_days"]
+        )
+    except ValueError:
+        v = int(
+            WHOIS_HISTORY_DEFAULTS["whois_history__coverage_gap_threshold_days"]
+        )
+    return max(1, min(365, v))
+
+
+def get_whois_history_drop_threshold() -> float:
+    """Float in [0, 1]. AI verdicts whose `dropped_confidence` >= this
+    threshold get the green "high confidence: dropped" chip in the UI
+    and are eligible for the Backlog 'send-passers-to-Quality' bulk
+    filter."""
+    db = SessionLocal()
+    try:
+        raw = (
+            _get(db, "whois_history__drop_confidence_threshold") or ""
+        ).strip()
+    finally:
+        db.close()
+    try:
+        v = float(raw) if raw else float(
+            WHOIS_HISTORY_DEFAULTS["whois_history__drop_confidence_threshold"]
+        )
+    except ValueError:
+        v = float(
+            WHOIS_HISTORY_DEFAULTS["whois_history__drop_confidence_threshold"]
+        )
+    return max(0.0, min(1.0, v))
+
+
+def get_whois_history_config() -> dict:
+    """Bundle of all whois_history settings for the Settings UI to
+    render in one shot. Mirrors `get_availability_config()` shape."""
+    return {
+        "provider": get_whois_history_provider(),
+        "api_key_set": bool(get_whois_history_api_key()),
+        "max_records": get_whois_history_max_records(),
+        "coverage_gap_threshold_days": (
+            get_whois_history_coverage_gap_threshold()
+        ),
+        "drop_confidence_threshold": get_whois_history_drop_threshold(),
+    }
+
+
+def set_whois_history_setting(key: str, value: str) -> None:
+    """Validated setter for the non-secret knobs. Raises ValueError
+    on unknown keys or invalid values; the route handler turns that
+    into HTTP 400."""
+    if key not in WHOIS_HISTORY_DEFAULTS:
+        raise ValueError(f"unknown whois_history key: {key}")
+    if key == "whois_history__max_records":
+        try:
+            n = int(value)
+        except ValueError as e:
+            raise ValueError(f"{key} must be an integer") from e
+        if n < 1 or n > WHOIS_HISTORY_MAX_RECORDS_CEILING:
+            raise ValueError(
+                f"{key} must be between 1 and {WHOIS_HISTORY_MAX_RECORDS_CEILING}"
+            )
+        value = str(n)
+    elif key == "whois_history__coverage_gap_threshold_days":
+        try:
+            n = int(value)
+        except ValueError as e:
+            raise ValueError(f"{key} must be an integer") from e
+        if n < 1 or n > 365:
+            raise ValueError(f"{key} must be between 1 and 365")
+        value = str(n)
+    elif key == "whois_history__drop_confidence_threshold":
+        try:
+            f = float(value)
+        except ValueError as e:
+            raise ValueError(f"{key} must be a number") from e
+        if f < 0 or f > 1:
+            raise ValueError(f"{key} must be between 0 and 1")
+        value = f"{f:.4f}".rstrip("0").rstrip(".")
+        if not value:
+            value = "0"
+    elif key == "whois_history__provider":
+        if value not in ("whoisfreaks",):
+            raise ValueError(
+                f"unknown provider {value!r}; only 'whoisfreaks' is "
+                f"supported today"
+            )
+    db = SessionLocal()
+    try:
+        _set(db, key, value)
+    finally:
+        db.close()

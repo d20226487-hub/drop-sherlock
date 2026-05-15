@@ -501,3 +501,48 @@ def run_vacuum_now():
     bytes reclaimed / skip reason."""
     from ..db_maintenance import try_vacuum
     return try_vacuum()
+
+
+# --- Whois History pillar settings (added Wave 2, 2026-05-15) -------------
+
+
+class WhoisHistorySettingIn(BaseModel):
+    key: str
+    value: str
+
+
+class WhoisHistoryApiKeyIn(BaseModel):
+    api_key: str
+
+
+@router.get("/whois-history")
+def get_whois_history_settings_route():
+    """Bundle: provider + api_key_set flag + numeric knobs. The actual
+    api_key value is NEVER returned (Fernet-encrypted at rest and
+    operator-only)."""
+    from ..app_settings import get_whois_history_config
+    return get_whois_history_config()
+
+
+@router.put("/whois-history")
+def set_whois_history_setting_route(payload: WhoisHistorySettingIn):
+    """Per-knob update for non-secret settings (provider / max_records /
+    coverage_gap_threshold_days / drop_confidence_threshold). API key
+    has its own dedicated endpoint below because the secret-write path
+    must never leak the key value through validation error messages."""
+    from ..app_settings import set_whois_history_setting
+    try:
+        set_whois_history_setting(payload.key, payload.value)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"updated": payload.key}
+
+
+@router.put("/whois-history/api-key")
+def set_whois_history_api_key_route(payload: WhoisHistoryApiKeyIn):
+    """Persist or clear the API key for the currently-configured
+    provider. Empty string clears. Encrypted at rest via the
+    `__api_key`-suffix rule in `crypto.key_is_secret`."""
+    from ..app_settings import set_whois_history_api_key
+    set_whois_history_api_key(payload.api_key)
+    return {"ok": True, "api_key_set": bool(payload.api_key)}

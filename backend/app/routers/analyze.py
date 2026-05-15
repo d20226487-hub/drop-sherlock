@@ -218,3 +218,142 @@ def _autoname(domains: list[str]) -> str:
     extra = f" +{len(domains) - 1} more" if len(domains) > 1 else ""
     when = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     return f"{head}{extra} · {when}"
+
+
+# --- Whois History submit (added Wave 2, 2026-05-15) -----------------------
+#
+# Parallel to /analyze/jobs but for the whois_history pillar. Shape is
+# narrower: no per-criterion knobs (the only "criterion" is whois_history
+# itself), so the payload carries just domains + AI selection + an
+# optional name/notes label. The shared `AnalyzeSpec` model is reused
+# as the persisted spec_json shape — we toggle ONLY the whois_history
+# criterion on and leave every other criterion disabled.
+
+class SubmitWhoisHistoryIn(BaseModel):
+    domains: list[str]
+    # AI provider + optional model. Required — there's no point running
+    # this pillar without an AI verdict (the diff alone is not what the
+    # operator is buying). Frontend form blocks submission when these
+    # are empty.
+    ai_provider: str
+    ai_model: str | None = None
+    # Same UI-language carry as the Quality pillar so the AI prompt
+    # gets the RU output directive appended for RU users.
+    lang: str = "en"
+    name: str | None = None
+    notes: str | None = None
+
+
+class SubmitWhoisHistoryOut(BaseModel):
+    job_id: int
+    run_id: int
+    skipped_banned: list[str]
+
+
+@router.post("/whois-history", response_model=SubmitWhoisHistoryOut)
+async def submit_whois_history_job(
+    payload: SubmitWhoisHistoryIn, db: Session = Depends(get_db)
+) -> SubmitWhoisHistoryOut:
+    """Mint a Job(kind='whois_history') + first Run + per-domain
+    RunDomains, then dispatch. Mirrors `submit_job` but the spec is
+    canonicalized to only enable the whois_history criterion."""
+    from .backlog import _normalize_domain
+    from ..ban_filter import filter_banned
+
+    cleaned_domains = [d.strip() for d in payload.domains if d.strip()]
+    if not cleaned_domains:
+        raise HTTPException(400, "at least one domain is required")
+
+    ai_provider = (payload.ai_provider or "").strip()
+    if not ai_provider:
+        raise HTTPException(400, "ai_provider is required")
+
+    # Ban-list pre-filter (same shape + error envelope as Quality
+    # submit so the frontend's "all_banned" handler matches).
+    normalized_for_check = [_normalize_domain(d) for d in cleaned_domains]
+    pairs = list(zip(cleaned_domains, normalized_for_check))
+    _, banned_normalized = filter_banned(
+        db, [n for n in normalized_for_check if n],
+    )
+    if banned_normalized:
+        skipped_banned = [
+            original for original, norm in pairs
+            if norm and norm in banned_normalized
+        ]
+        cleaned_domains = [
+            original for original, norm in pairs
+            if not (norm and norm in banned_normalized)
+        ]
+        if not cleaned_domains:
+            sample = sorted(banned_normalized)
+            SAMPLE_CAP = 10
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "all_banned",
+                    "count": len(sample),
+                    "sample": sample[:SAMPLE_CAP],
+                    "truncated": len(sample) > SAMPLE_CAP,
+                },
+            )
+    else:
+        skipped_banned = []
+
+    # Build a canonical AnalyzeSpec that ONLY has whois_history enabled.
+    # We reuse the existing schema rather than introducing a separate
+    # one — this keeps spec_json shape uniform across pillars so the
+    # Job-tree readers (per-job page, per-run page, etc.) don't need to
+    # branch on kind for serialization.
+    spec_dict = {
+        "domains": cleaned_domains,
+        "criteria": {
+            # Every Ahrefs/Wayback criterion explicitly OFF — only
+            # the whois_history one runs on this pillar.
+            "backlinks": {"enabled": False},
+            "refdomains": {"enabled": False},
+            "anchors": {"enabled": False},
+            "keywords": {"enabled": False},
+            "wayback": {"enabled": False},
+            "wayback_classify": {"enabled": False},
+            "whois_history": {"enabled": True},
+        },
+        "ai": {
+            "provider": ai_provider,
+            "model": payload.ai_model or "",
+        },
+        "use_cache": True,
+        "cross_job_cache": False,
+        "lang": payload.lang or "en",
+    }
+    # Validate via the schema so any future field renames trip a 422
+    # here rather than surfacing as a runner-side crash.
+    norm_spec = AnalyzeSpec.model_validate(spec_dict)
+    spec_json = norm_spec.model_dump_json()
+
+    name = (payload.name or "").strip() or _autoname(cleaned_domains)
+    notes = (payload.notes or "").strip()
+
+    job = Job(
+        name=name,
+        notes=notes,
+        spec_json=spec_json,
+        kind="whois_history",
+    )
+    db.add(job)
+    db.flush()
+
+    run = Run(job_id=job.id, status="pending", spec_json=spec_json)
+    db.add(run)
+    db.flush()
+    for d in cleaned_domains:
+        db.add(RunDomain(run_id=run.id, domain=d, status="pending"))
+    db.commit()
+
+    # Augmentation logic is Quality-only (the augmentation chain
+    # tracks per-criterion strict subsets). Whois History has one
+    # criterion so the concept doesn't apply.
+
+    dispatch_run(run.id)
+    return SubmitWhoisHistoryOut(
+        job_id=job.id, run_id=run.id, skipped_banned=skipped_banned,
+    )

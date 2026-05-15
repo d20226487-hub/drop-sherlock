@@ -235,6 +235,20 @@ class WaybackClassifyConfig(BaseModel):
     language_mode: Literal["ai", "library"] = "ai"
 
 
+class WhoisHistoryConfig(BaseModel):
+    """Whois History criterion config (added Wave 2, 2026-05-15).
+
+    Intentionally minimal — the provider returns everything available,
+    and all the user-tunable knobs (max records, gap threshold,
+    confidence threshold) live in Settings rather than per-job. The
+    `enabled` flag is the only per-job lever; Whois History jobs have
+    it True and everything else False. Mixing whois_history with
+    Quality criteria in one Job is NOT supported in Wave 2 — the
+    runner dispatches per-Job by `job.kind`, not per-criterion."""
+
+    enabled: bool = False
+
+
 class CriteriaSpec(BaseModel):
     backlinks: BacklinksConfig = Field(default_factory=BacklinksConfig)
     refdomains: RefdomainsConfig = Field(default_factory=RefdomainsConfig)
@@ -243,6 +257,9 @@ class CriteriaSpec(BaseModel):
     wayback: WaybackConfig = Field(default_factory=WaybackConfig)
     wayback_classify: WaybackClassifyConfig = Field(
         default_factory=WaybackClassifyConfig
+    )
+    whois_history: WhoisHistoryConfig = Field(
+        default_factory=WhoisHistoryConfig
     )
 
 

@@ -357,9 +357,31 @@ def mark_orphaned_runs_paused(db: Session) -> int:
 
 
 def dispatch_run(run_id: int) -> asyncio.Task:
-    """Schedule `process_run` to run on the current event loop. Returns the
-    Task handle so callers can keep a reference (asyncio GC's task objects
-    that aren't referenced anywhere)."""
+    """Schedule a runner for `run_id` based on the parent Job's `kind`.
+    Returns the Task handle so callers can keep a reference (asyncio
+    GC's task objects that aren't referenced anywhere).
+
+    Kind dispatch (Wave 1+2, 2026-05-15):
+      • quality       → tasks.process_run (Wayback + Ahrefs pipeline)
+      • whois_history → whois_history.runner.process_whois_history_run
+      • availability  → not yet wired (Wave 3) — falls through to
+                        Quality runner for backward-compat, since no
+                        UI creates that kind yet.
+
+    Cheap DB peek (one PK lookup) to read the kind. Done synchronously
+    here because the runner functions don't take spec via argument —
+    they re-load via SessionLocal inside their first transaction."""
+    db = SessionLocal()
+    kind = "quality"
+    try:
+        run = db.get(Run, run_id)
+        if run is not None and run.job is not None and run.job.kind:
+            kind = run.job.kind
+    finally:
+        db.close()
+    if kind == "whois_history":
+        from .whois_history.runner import process_whois_history_run
+        return asyncio.create_task(process_whois_history_run(run_id))
     return asyncio.create_task(process_run(run_id))
 
 
