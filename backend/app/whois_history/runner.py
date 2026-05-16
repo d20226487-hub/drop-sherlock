@@ -165,40 +165,66 @@ def _record_ai_cost(
         cr.ai_cost_usd = round(cost, 6)
 
 
-async def _process_whois_domain(rd_id: int, run_id: int) -> None:
-    """Fetch + judge one domain's WHOIS history. Each step writes its
-    own short transaction so an error in the AI judge step doesn't
-    cost us the (already-paid-for) provider fetch."""
+async def _process_whois_domain(
+    rd_id: int,
+    run_id: int,
+    spec_override: dict | None = None,
+) -> None:
+    """Fetch + judge one domain's WHOIS history.
+
+    Each phase opens its own short-lived DB session. Sessions are NEVER
+    held across the WhoisFreaks fetch await or the AI judge await —
+    holding a connection across I/O is a SQLAlchemy anti-pattern that
+    exhausted the 15-slot pool during multi-domain retry batches
+    (2026-05-16). The fetch can take 10–30s on rate-limited / slow
+    upstreams; the AI call can take 30–90s. Multiplying that by N
+    concurrent domains in a retry would block every other request.
+
+    `spec_override`: when provided, used in place of reading `run.spec_json`
+    for the AI step (provider/model/lang). Used by the retry path so the
+    user can re-run a failed whois domain under a different AI model
+    without persisting that change onto the original Run record."""
+    # --- Phase 1: mark RD running (own session, closed before fetch await)
     db: Session = SessionLocal()
     try:
         rd = db.get(RunDomain, rd_id)
         if rd is None:
             log.warning("whois_history runner: rd_id=%s missing", rd_id)
             return
+        domain = rd.domain
         rd.status = "running"
         rd.started_at = datetime.utcnow()
+        rd.error = ""
         db.commit()
+    finally:
+        db.close()
 
-        # --- 1. Fetch + diff
-        provider_name = ""
-        records_json: list[dict[str, Any]] = []
-        diff_json: dict[str, Any] = {}
-        fetch_error: str = ""
-        try:
-            result = await fetch_history(rd.domain)
-            provider_name = result.provider
-            records_json = result.records
-            diff_json = result.diff
-        except WhoisProviderError as e:
-            fetch_error = str(e)
-            log.warning(
-                "whois_history fetch failed for rd=%s domain=%s: %s",
-                rd_id, rd.domain, e,
-            )
+    # --- Phase 2: fetch + diff (NO session held across the network await)
+    provider_name = ""
+    records_json: list[dict[str, Any]] = []
+    diff_json: dict[str, Any] = {}
+    fetch_error: str = ""
+    try:
+        result = await fetch_history(domain)
+        provider_name = result.provider
+        records_json = result.records
+        diff_json = result.diff
+    except WhoisProviderError as e:
+        fetch_error = str(e)
+        log.warning(
+            "whois_history fetch failed for rd=%s domain=%s: %s",
+            rd_id, domain, e,
+        )
 
-        # --- 2. Persist data + create CR row
+    # --- Phase 3: create CR row + read spec (own session, no await inside)
+    db = SessionLocal()
+    cr_id: int | None = None
+    ai_provider = ""
+    ai_model_override: str | None = None
+    lang = "en"
+    try:
         cr = CriterionResult(
-            run_domain_id=rd.id,
+            run_domain_id=rd_id,
             criterion="whois_history",
             status="running",
             fetched_at=datetime.utcnow(),
@@ -213,115 +239,135 @@ async def _process_whois_domain(rd_id: int, run_id: int) -> None:
         db.add(cr)
         db.commit()
         db.refresh(cr)
+        cr_id = cr.id
 
-        # --- 3. AI judge
-        # Load spec each iteration — it's tiny, the per-CR isolation is
-        # not worth dragging spec across awaits.
-        run = db.get(Run, run_id)
-        spec_dict = json.loads(run.spec_json or "{}") if run else {}
+        # `spec_override` (from the retry path) wins over the DB-stored
+        # spec so retry-time AI selection takes effect without rewriting
+        # the original Run.spec_json.
+        if spec_override is not None:
+            spec_dict = spec_override
+        else:
+            run = db.get(Run, run_id)
+            spec_dict = json.loads(run.spec_json or "{}") if run else {}
         ai_block = (spec_dict.get("ai") or {})
         ai_provider = (ai_block.get("provider") or "").strip()
-        ai_model = (ai_block.get("model") or "").strip() or None
+        ai_model_override = (ai_block.get("model") or "").strip() or None
         lang = (spec_dict.get("lang") or "en").strip().lower()
+    finally:
+        db.close()
 
-        if not ai_provider:
-            cr.status = "done" if not fetch_error else "failed"
-            cr.ai_verdict_json = json.dumps(
-                _verdict_skeleton(
-                    "No AI provider configured for this run — "
-                    "showing raw history without verdict."
-                )
-            )
-            cr.ai_verdict_error = ""
-            db.commit()
-            rd.status = cr.status
-            rd.finished_at = datetime.utcnow()
-            rd.last_analyzed_at = datetime.utcnow()
-            db.commit()
-            return
-
-        if fetch_error:
-            # Skip AI when we have no data to feed it — save tokens.
-            cr.status = "failed"
-            cr.ai_verdict_json = json.dumps(
-                _verdict_skeleton(
-                    f"Provider fetch failed: {fetch_error}"
-                )
-            )
-            cr.ai_verdict_error = ""
-            db.commit()
-            rd.status = "failed"
-            rd.error = fetch_error
-            rd.finished_at = datetime.utcnow()
-            rd.last_analyzed_at = datetime.utcnow()
-            db.commit()
-            return
-
-        if not records_json:
-            # No history available — provider responded but with empty
-            # records (very new domain or unsupported TLD). Skip AI,
-            # write a "no history" verdict.
-            cr.status = "done"
-            cr.ai_verdict_json = json.dumps(
-                _verdict_skeleton("No historical WHOIS records available.")
-            )
-            cr.ai_verdict_error = ""
-            db.commit()
-            rd.status = "done"
-            rd.finished_at = datetime.utcnow()
-            rd.last_analyzed_at = datetime.utcnow()
-            db.commit()
-            return
-
-        # Real AI judge call. Resolve the concrete model name here
-        # (vs inside `judge()`) so we have it for both the call AND
-        # the post-call cost stamping — empty override on the spec
-        # otherwise stamped ai_model="" on the CR and broke pricing
-        # lookup (run 85 of job 47, fixed 2026-05-15).
-        effective_model = _resolve_effective_model(ai_provider, ai_model)
-        system_prompt = localize_prompt(
-            get_ai_prompt("whois_history_judge"), lang,
-        )
-        user_message = _build_user_message(
-            rd.domain,
-            {
-                "records": records_json,
-                "diff": diff_json,
-                "snapshot_count": len(records_json),
-            },
-        )
+    # --- Phase 4: short-circuit branches that don't need AI ----------------
+    def _finalize_short_circuit(
+        cr_status: str,
+        verdict_summary: str,
+        rd_status: str,
+        rd_error: str = "",
+    ) -> None:
+        """Commit a short-circuit terminal state on the CR + RD. Used
+        for the three "no AI call needed" branches below (no provider
+        configured, fetch failed, empty records). Each opens its own
+        session to keep this off the await path."""
+        s = SessionLocal()
         try:
-            verdict_dict, _raw, usage = await ai_judge.judge(
-                provider=ai_provider,
-                system_prompt=system_prompt,
-                user_message=user_message,
-                model_override=effective_model or None,
-                timeout=_AI_TIMEOUT_SECONDS,
+            cr_local = s.get(CriterionResult, cr_id)
+            rd_local = s.get(RunDomain, rd_id)
+            if cr_local is None or rd_local is None:
+                return
+            cr_local.status = cr_status
+            cr_local.ai_verdict_json = json.dumps(
+                _verdict_skeleton(verdict_summary)
             )
+            cr_local.ai_verdict_error = ""
+            rd_local.status = rd_status
+            if rd_error:
+                rd_local.error = rd_error
+            rd_local.finished_at = datetime.utcnow()
+            rd_local.last_analyzed_at = datetime.utcnow()
+            s.commit()
+        finally:
+            s.close()
+
+    if not ai_provider:
+        _finalize_short_circuit(
+            cr_status="done" if not fetch_error else "failed",
+            verdict_summary=(
+                "No AI provider configured for this run — "
+                "showing raw history without verdict."
+            ),
+            rd_status="done" if not fetch_error else "failed",
+            rd_error=fetch_error,
+        )
+        return
+
+    if fetch_error:
+        _finalize_short_circuit(
+            cr_status="failed",
+            verdict_summary=f"Provider fetch failed: {fetch_error}",
+            rd_status="failed",
+            rd_error=fetch_error,
+        )
+        return
+
+    if not records_json:
+        _finalize_short_circuit(
+            cr_status="done",
+            verdict_summary="No historical WHOIS records available.",
+            rd_status="done",
+        )
+        return
+
+    # --- Phase 5: AI judge (NO session held across the AI await) -----------
+    # Resolve concrete model name here (vs inside `judge()`) so it's
+    # available for both the call AND the post-call cost stamping —
+    # empty override would otherwise stamp ai_model="" on the CR and
+    # break pricing lookup (run 85 of job 47, fixed 2026-05-15).
+    effective_model = _resolve_effective_model(ai_provider, ai_model_override)
+    system_prompt = localize_prompt(
+        get_ai_prompt("whois_history_judge"), lang,
+    )
+    user_message = build_user_message(domain, records_json, diff_json)
+
+    verdict_dict: dict[str, Any] | None = None
+    usage: dict[str, int] = {}
+    ai_error: tuple[str, str] | None = None
+    try:
+        verdict_dict, _raw, usage = await ai_judge.judge(
+            provider=ai_provider,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            model_override=effective_model or None,
+            timeout=_AI_TIMEOUT_SECONDS,
+        )
+    except (
+        ProviderConfigError, ProviderError, ValueError,
+    ) as e:
+        ai_error = (type(e).__name__, str(e))
+        log.warning(
+            "whois_history AI judge failed for rd=%s domain=%s: %s",
+            rd_id, domain, e,
+        )
+
+    # --- Phase 6: persist AI result (own session) -------------------------
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        rd = db.get(RunDomain, rd_id)
+        if cr is None or rd is None:
+            return
+        if ai_error is not None:
+            cr.status = "failed"
+            cr.ai_verdict_error = f"{ai_error[0]}: {ai_error[1]}"
+            rd.status = "failed"
+            rd.error = ai_error[1]
+        else:
             cr.ai_verdict_json = json.dumps(verdict_dict)
             cr.ai_verdict_error = ""
             cr.status = "done"
             _record_ai_cost(cr, usage, ai_provider, effective_model)
-            db.commit()
             rd.status = "done"
-            rd.finished_at = datetime.utcnow()
-            rd.last_analyzed_at = datetime.utcnow()
-            db.commit()
-        except (
-            ProviderConfigError, ProviderError, ValueError,
-        ) as e:
-            log.warning(
-                "whois_history AI judge failed for rd=%s domain=%s: %s",
-                rd_id, rd.domain, e,
-            )
-            cr.status = "failed"
-            cr.ai_verdict_error = f"{type(e).__name__}: {e}"
-            db.commit()
-            rd.status = "failed"
-            rd.error = str(e)
-            rd.finished_at = datetime.utcnow()
-            rd.last_analyzed_at = datetime.utcnow()
-            db.commit()
+        rd.finished_at = datetime.utcnow()
+        rd.last_analyzed_at = datetime.utcnow()
+        db.commit()
     finally:
         db.close()
 

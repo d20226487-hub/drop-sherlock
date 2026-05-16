@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -145,6 +146,14 @@ def _migrate_sqlite_columns() -> None:
         # Added Wave 1 — drives the kind-filtered list endpoint
         # for the /jobs/{quality,whois_history,availability} pages.
         ("ix_jobs_kind", "jobs", "kind"),
+        # Added 2026-05-16 — critical for large-job scaling. The
+        # /jobs/{id} verdict-count aggregation and the
+        # /runs/{id}/progress slim poll both filter run_domains by
+        # run_id; CriterionResult lookups for per-domain CRs filter by
+        # run_domain_id. Without these indexes, every WHERE on a large
+        # run does a full table scan (e.g. 100k row scan per request).
+        ("ix_run_domains_run_id", "run_domains", "run_id"),
+        ("ix_criterion_results_run_domain_id", "criterion_results", "run_domain_id"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in additions:
@@ -306,6 +315,74 @@ def _reconcile_stale_failed_statuses() -> None:
                 "reconciled %s stale Run.failed row(s) on startup",
                 flipped_runs,
             )
+    finally:
+        db.close()
+
+
+def _reconcile_orphaned_running_run_domains() -> int:
+    """Self-heal RunDomain rows stuck in `status='running'` whose parent
+    Run is terminal. Pattern: a uvicorn restart killed the cascade task
+    mid-flight; the rd never reached its phase-3 'flip to done/failed'
+    write, so the badge says "running" forever and the chip silently
+    buckets it as "без вердикта" (no_verdict). At the user's scale this
+    accumulated to 40 zombie RDs across the DB and 8 in run 99 alone
+    before the 2026-05-17 fix.
+
+    Behaviour: flips rd.status='running' → 'failed' and any availability
+    CR also stuck at status='running' with empty data_json → 'failed'.
+    `rd.error` and `cr.error` get a stamp so operators know why. The
+    existing 'Retry failed' path catches `cr.status='failed'` and
+    deletes+re-cascades cleanly. Idempotent — only flips rows that meet
+    both 'rd is running' AND 'parent run is terminal' AND 'cr.data_json
+    is empty' (real partial data is preserved untouched).
+
+    Returns the number of RDs flipped."""
+    import logging
+
+    from .models import CriterionResult, Run, RunDomain
+    log = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        # Only act on RDs whose parent Run is in a terminal state — a
+        # running parent might legitimately have running children.
+        terminal_runs = {
+            r.id for r in db.query(Run).filter(
+                Run.status.in_(("done", "failed", "canceled")),
+            ).all()
+        }
+        if not terminal_runs:
+            return 0
+        rds = (
+            db.query(RunDomain)
+            .filter(RunDomain.status == "running")
+            .filter(RunDomain.run_id.in_(terminal_runs))
+            .all()
+        )
+        if not rds:
+            return 0
+        flipped = 0
+        now = datetime.utcnow()
+        for rd in rds:
+            rd.status = "failed"
+            rd.error = (
+                "orphaned at startup: cascade did not complete (likely "
+                "uvicorn restart mid-flight); reset by reconciliation"
+            )
+            if rd.finished_at is None or rd.finished_at < (rd.started_at or now):
+                rd.finished_at = now
+            for cr in rd.results:
+                if cr.status == "running" and not cr.data_json:
+                    cr.status = "failed"
+                    cr.error = (cr.error or "") + (
+                        "" if not cr.error else "; "
+                    ) + "orphaned at startup reconciliation"
+            flipped += 1
+        db.commit()
+        log.info(
+            "reconciled %s orphaned RunDomain.running row(s) on startup",
+            flipped,
+        )
+        return flipped
     finally:
         db.close()
 
@@ -507,6 +584,7 @@ async def lifespan(_: FastAPI):
     _backfill_augmentation()
     _migrate_wayback_concurrency_default()
     _reconcile_stale_failed_statuses()
+    _reconcile_orphaned_running_run_domains()
     _encrypt_legacy_secret_settings()
     _backfill_job_kind()
     _migrate_legacy_pins_to_criterion_pins()

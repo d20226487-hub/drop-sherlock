@@ -26,7 +26,7 @@ import asyncio
 import json
 import re
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -64,6 +64,16 @@ class CriterionSummary(BaseModel):
     source_job_id: int | None = None
     source_job_name: str = ""
     source_run_domain_id: int | None = None
+    # Per-criterion AI verdict (added for confidence-aware Criteria pills
+    # on the Database page). Populated from the source CR's
+    # `ai_verdict_json` when present. `ai_assessment` is one of
+    # "high_quality"/"mixed"/"low_quality" for Ahrefs + Wayback;
+    # whois_history reports `dropped_confidence` here under
+    # `ai_dropped_confidence` instead (different axis). Both null when
+    # the AI hasn't produced a verdict for that criterion yet.
+    ai_assessment: str | None = None
+    ai_confidence: float | None = None
+    ai_dropped_confidence: float | None = None
 
 
 class PinOption(BaseModel):
@@ -161,6 +171,22 @@ class DomainRow(BaseModel):
     whois_transferred_confidence: float | None = None
     whois_summary: str = ""
     whois_band: str = ""
+    # Domain-availability verdict (added 2026-05-16) — sourced from the
+    # aux availability source's CR `data_json.verdict` so the column
+    # agrees with the Job-page chip math. Pre-2026-05-16 the column
+    # hydrated from a separate `/availability/latest` cache lookup
+    # (cross-cutting, MAX(checked_at) over `availability_checks` with
+    # only AVAILABLE/REGISTERED rows), which surfaced stale "registered"
+    # data from older jobs even when the latest job concluded
+    # "unknown" — producing the chip/Database discrepancy reported on
+    # 2026-05-16 (Job 57: 3/832/165 vs Database 10/915). Now both views
+    # read the same CR row. Empty string when no availability CR is
+    # pinned or in fallback for this domain.
+    availability_status: str = ""
+    availability_provider: str = ""
+    availability_registrar: str = ""
+    availability_expires_on: date | None = None
+    availability_checked_at: datetime | None = None
     # Across-runs aggregates for the domain (independent of the pin).
     total_runs: int
     any_cached: bool = False
@@ -180,6 +206,12 @@ class DomainRow(BaseModel):
     # null when the domain has no backlog row yet.
     backlog_id: int | None = None
     backlog_status: str | None = None
+    # Backlog registrar (2026-05-17) — surfaced as the "Source" column on
+    # Database, mirroring the same column on the Backlog page. Comes from
+    # `BacklogDomain.registrar` (populated at import time from CSV / auction
+    # feeds). Empty when the domain has no backlog row or the import didn't
+    # carry a registrar string.
+    backlog_registrar: str = ""
     # Ban-list flag (added 2026-05-13 wave L). True when this domain is
     # on the ban list — drives the "banned" badge on Database rows.
     # Banning is orthogonal to pin/backlog status: a row can be both
@@ -220,6 +252,21 @@ CRITERIA = (
     # (no weight in scoring config).
     "availability",
 )
+
+# Independent-pillar criteria — surfacing only, never part of Quality
+# scoring math. Kept out of `per_crit_sources` (a.k.a. sources_by_domain
+# values) so they can't influence `primary_run`, `contributing_rd_ids`,
+# or the `synth_weights` selection inside compute_final. Tracked in a
+# parallel `aux_sources_by_domain` dict instead — the row still gets
+# its whois/availability column populated, but the Quality math stays
+# Quality-only.
+#
+# Concrete bug this prevents: a more-recent whois_history rd (e.g.,
+# from a whois-only job that ran after the Quality job) was becoming
+# `primary_run`, which dropped the Quality run's `scoring_override_json`
+# off the synth, silently re-scoring rows under global weights. See
+# 2026-05-16 fix for `45minut.kz` / `most.com.kz`.
+AUX_CRITERIA = ("whois_history", "availability")
 
 
 def _whois_band(dropped: float | None) -> str:
@@ -346,11 +393,12 @@ def list_domains(
     Domains with no pin still appear so the user can pin one — their cells
     are blank. Notes are domain-keyed and unaffected by the pin.
 
-    Pagination (added 2026-05-10): pass `offset` + `limit` to slice the
-    response. Filter universes (`filter_options`) are always computed
-    across the FULL row set so the frontend dropdowns stay complete.
-    `total` is the unpaginated row count. When `limit` is omitted (the
-    default and the legacy behavior) the full list is returned."""
+    The `offset` and `limit` parameters slice the returned `rows` list
+    in Python AFTER the global sort + filter-options computation. The
+    full per-domain aggregation always runs across every RunDomain in
+    the DB — this is heavy at large N (the load-everything design that
+    pre-dates 2026-05-16) and is the known scale ceiling for the
+    Database page."""
     all_rds: list[RunDomain] = db.query(RunDomain).all()
     rds_by_domain: dict[str, list[RunDomain]] = defaultdict(list)
     rds_by_run_and_domain: dict[tuple[int, str], RunDomain] = {}
@@ -378,7 +426,26 @@ def list_domains(
     rd_ids_needed: set[int] = set()
     # Pre-resolve per-(domain, criterion) → (rd, run, job) so the main
     # loop doesn't re-walk pins_by_job.
+    #
+    # The pin walk's output is split into two dicts:
+    #   sources_by_domain        — Quality-scoring criteria
+    #                              (backlinks/refdomains/anchors/keywords/
+    #                              wayback/wayback_classify). These drive
+    #                              the synth math: primary_run for weight
+    #                              selection, contributing_rd_ids for
+    #                              single-source detection, pinned_set for
+    #                              underweight calc.
+    #   aux_sources_by_domain    — Independent pillars (whois_history,
+    #                              availability) that should SURFACE on the
+    #                              row (whois column, criteria.X.enabled)
+    #                              but must NOT influence Quality-scoring
+    #                              math. Keeping them out prevents a more-
+    #                              recent whois/availability rd from
+    #                              hijacking `primary_run` and silently
+    #                              switching `synth_weights` away from the
+    #                              Quality run's scoring override.
     sources_by_domain: dict[str, dict[str, tuple[RunDomain, Run, Job]]] = {}
+    aux_sources_by_domain: dict[str, dict[str, tuple[RunDomain, Run, Job]]] = {}
     for domain, domain_rds in rds_by_domain.items():
         # Which jobs contain this domain (via their runs)?
         jobs_for_domain: set[int] = set()
@@ -389,6 +456,7 @@ def list_domains(
             jobs_for_domain.add(r.job_id)
         if not jobs_for_domain:
             sources_by_domain[domain] = {}
+            aux_sources_by_domain[domain] = {}
             continue
         per_crit: dict[str, tuple[RunDomain, Run, Job]] = {}
         for crit in CRITERIA:
@@ -418,7 +486,13 @@ def list_domains(
             if best is not None:
                 per_crit[crit] = (best[1], best[2], best[3])
                 rd_ids_needed.add(best[1].id)
+        # Split aux out so Quality math doesn't see them.
+        aux: dict[str, tuple[RunDomain, Run, Job]] = {}
+        for c in AUX_CRITERIA:
+            if c in per_crit:
+                aux[c] = per_crit.pop(c)
         sources_by_domain[domain] = per_crit
+        aux_sources_by_domain[domain] = aux
 
     # Single IN-list for every CriterionResult we'll surface — covers
     # exactly the rds resolved above.
@@ -431,25 +505,27 @@ def list_domains(
     for cr in cr_rows:
         crs_by_rd[cr.run_domain_id][cr.criterion] = cr
 
-    # Whois-history fallback (added 2026-05-15): pinning isn't required
-    # to surface a whois verdict on Database — when no JobCriterionPin
-    # exists for whois_history, use the most-recent rd that has a
-    # whois_history CR across ALL of the domain's rds. Whois jobs are
-    # typically one-shot per domain, so requiring an extra "pin" click
-    # would defeat the whole "send good-whois domains to Analyze"
-    # workflow. Pre-load all whois_history CRs once so the per-domain
-    # loop doesn't issue N more queries.
-    whois_crs_by_rd_id: dict[int, CriterionResult] = {
-        cr.run_domain_id: cr
-        for cr in db.query(CriterionResult)
-        .filter(CriterionResult.criterion == "whois_history")
-        .filter(CriterionResult.ai_verdict_json != "")
-        .all()
-    }
-    # Availability fallback (Wave 3, 2026-05-15): same pattern as
-    # whois_history. Availability runs have no AI verdict so we key
-    # off data_json instead — a `done` cascade always writes the
-    # trace + verdict there.
+    # Whois-history: PIN-ONLY (2026-05-17). The fallback that surfaced
+    # the most-recent whois CR per domain was removed at user request —
+    # they want symmetric behavior with availability after the cross-job
+    # surprises. The whois column on Database is now blank for any
+    # domain that has no `JobCriterionPin(criterion='whois_history')`.
+    # Workflow change: every whois run needs an explicit pin (via the
+    # per-domain pin selector or the Job page's "Pin run" action) before
+    # its data appears on Database. The trade-off — single-shot whois
+    # jobs no longer auto-surface — is what the user wants in exchange
+    # for guaranteed pin-driven provenance.
+    # Availability fallback (Wave 3, 2026-05-15): when no pin
+    # contributes an availability source, fall back to the most-recent
+    # rd with a populated availability CR. Availability runs have no
+    # AI verdict so we key off `data_json != ""` (a `done` cascade
+    # always writes the trace + verdict there). Kept as fallback (vs.
+    # whois which became pin-only) because availability is the cheap
+    # pre-filter step every operator runs; requiring a pin click on
+    # every availability job would be friction without a payoff —
+    # availability never had the cross-job surprise problem whois did
+    # (Availability has its own pillar runner; no Quality cascade
+    # contamination since the 2026-05-16 aux_sources refactor).
     availability_crs_by_rd_id: dict[int, CriterionResult] = {
         cr.run_domain_id: cr
         for cr in db.query(CriterionResult)
@@ -524,6 +600,17 @@ def list_domains(
     # 2026-05-15). Always a subset of {dropped, mixed, insufficient,
     # stable} — the four bands `_whois_band` produces.
     whois_bands_seen: set[str] = set()
+    # Availability-status universe for the Availability filter dropdown
+    # (added 2026-05-16, alongside the column rewire from
+    # `/availability/latest` cache to CR-scoped data). Subset of
+    # {available, registered, unknown, error} — the verdict.status values
+    # the availability runner writes into the CR data_json.
+    availability_statuses_seen: set[str] = set()
+    # Source universe (2026-05-17) for the Database "Source" filter
+    # dropdown. Same data the Backlog page filter populates from —
+    # BacklogDomain.registrar — scoped to domains that actually show up
+    # on Database (i.e. have at least one RD). Sorted alphabetically.
+    sources_seen: set[str] = set()
 
     for domain, domain_rds in rds_by_domain.items():
         # Banned domains are hidden from the Database listing entirely
@@ -554,40 +641,23 @@ def list_domains(
             ))
 
         per_crit_sources = sources_by_domain.get(domain, {})
+        aux_sources = aux_sources_by_domain.get(domain, {})
         note_row = notes_by_domain.get(domain)
         backlog_row = backlog_by_domain.get(domain)
 
-        # Whois-history fallback: if no pin contributed a whois source
-        # for this domain, surface the most-recent rd that has a
-        # whois_history CR with a verdict. Synthesize a source entry so
-        # the row goes through the populated path (gets pinned_run_*
-        # fields, whois column populated). Whois-only domains thus
-        # appear on Database without requiring the user to manually pin
-        # the whois run.
-        if "whois_history" not in per_crit_sources:
-            for d in domain_rds_sorted:
-                if d.id not in whois_crs_by_rd_id:
-                    continue
-                d_run = runs.get(d.run_id)
-                if d_run is None:
-                    continue
-                d_job = jobs.get(d_run.job_id)
-                if d_job is None:
-                    continue
-                per_crit_sources["whois_history"] = (d, d_run, d_job)
-                # CR row is in whois_crs_by_rd_id but might not be in
-                # crs_by_rd (only rd_ids_needed were pulled into that
-                # dict). Splice it in so the existing whois extraction
-                # block reads it via the same crs_by_rd path.
-                crs_by_rd[d.id]["whois_history"] = whois_crs_by_rd_id[d.id]
-                break
+        # Whois-history is PIN-ONLY (2026-05-17). `aux_sources` already
+        # contains a "whois_history" entry IFF a JobCriterionPin exists
+        # for this domain's job (handled by the pin-walk's AUX_CRITERIA
+        # split above); the column stays blank otherwise. No fallback
+        # block — see the comment near the (now-removed)
+        # `whois_crs_by_rd_id` preload for the rationale.
 
-        # Availability fallback (Wave 3): same pattern as whois — when
+        # Availability fallback: when
         # no pin contributes an availability source, fall back to the
         # most-recent rd that has an availability CR. Lets per-row
         # click-through reach the cascade trace page even before an
         # operator manually pins the run.
-        if "availability" not in per_crit_sources:
+        if "availability" not in aux_sources:
             for d in domain_rds_sorted:
                 if d.id not in availability_crs_by_rd_id:
                     continue
@@ -597,13 +667,13 @@ def list_domains(
                 d_job = jobs.get(d_run.job_id)
                 if d_job is None:
                     continue
-                per_crit_sources["availability"] = (d, d_run, d_job)
+                aux_sources["availability"] = (d, d_run, d_job)
                 crs_by_rd[d.id]["availability"] = (
                     availability_crs_by_rd_id[d.id]
                 )
                 break
 
-        if not per_crit_sources:
+        if not per_crit_sources and not aux_sources:
             # No criterion has a pin contributing to this domain. Emit an
             # empty row so the user can still pin one.
             rows.append(DomainRow(
@@ -624,23 +694,41 @@ def list_domains(
                 is_banned=domain in banned_set,
                 backlog_id=backlog_row.id if backlog_row else None,
                 backlog_status=backlog_row.status if backlog_row else None,
+                backlog_registrar=(backlog_row.registrar or "") if backlog_row else "",
             ))
+            if backlog_row and backlog_row.registrar:
+                sources_seen.add(backlog_row.registrar)
             continue
 
         # Pick a "primary" source for the row-level pinned_* identity
         # fields (click-through, finished_at sort, ai provenance fallback)
-        # — the most-recent contributing run wins. With per-criterion
-        # pinning the row no longer has a single canonical rd, but the
-        # frontend still wants ONE link target for the domain row chrome.
+        # — the most-recent contributing Quality run wins. With per-
+        # criterion pinning the row no longer has a single canonical rd,
+        # but the frontend still wants ONE link target for the row chrome.
+        #
+        # CRITICAL: prefer per_crit_sources (Quality criteria) over
+        # aux_sources. The most-recent rd from an aux pillar (whois /
+        # availability) must NEVER be promoted to primary_run on a row
+        # that has Quality data, because primary_run.scoring_override_json
+        # drives synth_weights in Case B below. A whois rd with no
+        # override would silently switch the synth to global weights and
+        # change the displayed score for already-scored Quality rows.
+        # Only fall back to aux when there is no Quality source at all
+        # (whois-only or availability-only domain) — in that case the
+        # Quality synth has no inputs and bucket stays "" anyway.
+        primary_source_pool = per_crit_sources if per_crit_sources else aux_sources
         primary_rd, primary_run, primary_job = max(
-            per_crit_sources.values(),
+            primary_source_pool.values(),
             key=lambda triple: triple[1].finished_at or datetime.min,
         )
 
         # Pre-load spec for every contributing run so we know which
         # criteria each run had ENABLED — drives the per-criterion
-        # "enabled" flag on the response.
+        # "enabled" flag on the response. Includes aux runs so the
+        # whois_history / availability columns also get their `enabled`
+        # flag populated correctly.
         contributing_run_ids = {r.id for (_, r, _) in per_crit_sources.values()}
+        contributing_run_ids |= {r.id for (_, r, _) in aux_sources.values()}
         specs_by_run: dict[int, AnalyzeSpec | None] = {}
         for rid in contributing_run_ids:
             r = runs.get(rid)
@@ -656,10 +744,18 @@ def list_domains(
         criteria_summary: dict[str, CriterionSummary] = {}
         any_cached = False
         # Collect per-criterion AI verdicts for synthetic-final derivation
-        # below.
+        # below. Sourced ONLY from per_crit_sources so aux pillars cannot
+        # leak into compute_final (defensive — neither whois nor
+        # availability has an `assessment` field that compute_final
+        # understands today, but a future format change shouldn't be able
+        # to silently start contributing to the Quality score).
         per_crit_ai_verdicts: dict[str, dict] = {}
         for c in CRITERIA:
-            src = per_crit_sources.get(c)
+            # Per-criterion source: Quality criteria come from
+            # per_crit_sources; aux pillars come from aux_sources. A
+            # pinned aux criterion (rare) lives in aux_sources after the
+            # pin-walk split above.
+            src = per_crit_sources.get(c) or aux_sources.get(c)
             if src is None:
                 criteria_summary[c] = CriterionSummary(
                     enabled=False, rows=0, cached_from_run_id=None,
@@ -677,6 +773,38 @@ def list_domains(
                     sort_rules = getattr(cfg, "sort", []) or []
                     sort_fields = [r.field for r in sort_rules]
             cr = crs_by_rd.get(src_rd.id, {}).get(c)
+            # Extract per-criterion AI verdict so the Database page's
+            # Criteria pills can render confidence-aware coloring that
+            # mirrors the per-domain page (grey-on-low-confidence + bucket
+            # tone from assessment). Ahrefs/Wayback expose
+            # {assessment, confidence}; whois_history exposes
+            # {dropped_confidence} on a different axis (handled separately).
+            ai_assessment_v: str | None = None
+            ai_confidence_v: float | None = None
+            ai_dropped_v: float | None = None
+            if cr is not None and cr.ai_verdict_json:
+                try:
+                    _parsed = json.loads(cr.ai_verdict_json)
+                except json.JSONDecodeError:
+                    _parsed = None
+                if isinstance(_parsed, dict):
+                    _a = _parsed.get("assessment")
+                    if isinstance(_a, str) and _a:
+                        ai_assessment_v = _a
+                    _cf = _parsed.get("confidence")
+                    if (
+                        isinstance(_cf, (int, float))
+                        and not isinstance(_cf, bool)
+                        and 0.0 <= float(_cf) <= 1.0
+                    ):
+                        ai_confidence_v = float(_cf)
+                    _dc = _parsed.get("dropped_confidence")
+                    if (
+                        isinstance(_dc, (int, float))
+                        and not isinstance(_dc, bool)
+                        and 0.0 <= float(_dc) <= 1.0
+                    ):
+                        ai_dropped_v = float(_dc)
             criteria_summary[c] = CriterionSummary(
                 enabled=enabled,
                 rows=_row_count(cr.data_json) if cr else 0,
@@ -690,10 +818,13 @@ def list_domains(
                 source_job_id=src_job.id,
                 source_job_name=src_job.name,
                 source_run_domain_id=src_rd.id,
+                ai_assessment=ai_assessment_v,
+                ai_confidence=ai_confidence_v,
+                ai_dropped_confidence=ai_dropped_v,
             )
             if cr and cr.cached_from_run_id is not None:
                 any_cached = True
-            if cr and cr.ai_verdict_json:
+            if cr and cr.ai_verdict_json and c not in AUX_CRITERIA:
                 try:
                     v = json.loads(cr.ai_verdict_json)
                     if isinstance(v, dict):
@@ -701,6 +832,11 @@ def list_domains(
                 except json.JSONDecodeError:
                     pass
 
+        # `pinned_criteria` reports the Quality criteria that contribute
+        # to the row's score. Aux pillars (whois / availability) are
+        # surfaced via their own columns and the criteria_summary entries
+        # above, but they don't count as "pinned" for the underweight /
+        # subset-badge math that consumers use this list for.
         pinned_criteria_list = sorted(per_crit_sources.keys())
 
         # Final-assessment synthesis.
@@ -941,14 +1077,16 @@ def list_domains(
                     category_was = cw
 
         # Whois-history verdict (added 2026-05-15) — sourced from
-        # whichever rd supplies the `whois_history` criterion pin. Shape:
+        # whichever rd supplies the `whois_history` criterion. Shape:
         # {dropped_confidence, transferred_confidence, summary,
-        #  key_signals[], recommendation}.
+        #  key_signals[], recommendation}. Lives in `aux_sources` (it's
+        # an independent pillar that surfaces a column without joining
+        # the Quality synth math).
         whois_dropped_confidence: float | None = None
         whois_transferred_confidence: float | None = None
         whois_summary = ""
         whois_band = ""
-        whois_src = per_crit_sources.get("whois_history")
+        whois_src = aux_sources.get("whois_history")
         whois_cr = (
             crs_by_rd.get(whois_src[0].id, {}).get("whois_history")
             if whois_src else None
@@ -973,6 +1111,52 @@ def list_domains(
         whois_band = _whois_band(whois_dropped_confidence)
         if whois_band:
             whois_bands_seen.add(whois_band)
+
+        # Domain-availability verdict (added 2026-05-16) — sourced from
+        # the aux availability CR's `data_json.verdict`. SAME source the
+        # Job-page chip SQL reads (`json_extract(cr.data_json,
+        # '$.verdict.status')` in `_bucket_counts_for_run`), so the
+        # Database column now matches the chip counts row-for-row.
+        # `availability_checked_at` reports the cascade-completion
+        # timestamp from the aux rd (the runner sets `rd.finished_at`
+        # immediately after writing `data_json` — see
+        # `availability_runner.process_one`).
+        availability_status = ""
+        availability_provider = ""
+        availability_registrar = ""
+        availability_expires_on: date | None = None
+        availability_checked_at: datetime | None = None
+        av_src = aux_sources.get("availability")
+        av_cr = (
+            crs_by_rd.get(av_src[0].id, {}).get("availability")
+            if av_src else None
+        )
+        if av_cr is not None and av_cr.data_json:
+            try:
+                av_parsed = json.loads(av_cr.data_json)
+            except json.JSONDecodeError:
+                av_parsed = None
+            if isinstance(av_parsed, dict):
+                verdict = av_parsed.get("verdict")
+                if isinstance(verdict, dict):
+                    vs = verdict.get("status")
+                    if isinstance(vs, str) and vs:
+                        availability_status = vs
+                        availability_statuses_seen.add(vs)
+                    vp = verdict.get("provider")
+                    if isinstance(vp, str):
+                        availability_provider = vp
+                    vr = verdict.get("registrar")
+                    if isinstance(vr, str):
+                        availability_registrar = vr
+                    ve = verdict.get("expires_on")
+                    if isinstance(ve, str) and ve:
+                        try:
+                            availability_expires_on = date.fromisoformat(ve)
+                        except ValueError:
+                            pass
+        if av_src is not None:
+            availability_checked_at = av_src[0].finished_at
 
         rows.append(DomainRow(
             domain=domain,
@@ -1015,6 +1199,11 @@ def list_domains(
             whois_transferred_confidence=whois_transferred_confidence,
             whois_summary=whois_summary,
             whois_band=whois_band,
+            availability_status=availability_status,
+            availability_provider=availability_provider,
+            availability_registrar=availability_registrar,
+            availability_expires_on=availability_expires_on,
+            availability_checked_at=availability_checked_at,
             total_runs=len(domain_rds),
             any_cached=any_cached,
             note=(note_row.note if note_row else ""),
@@ -1023,7 +1212,10 @@ def list_domains(
             is_banned=domain in banned_set,
             backlog_id=backlog_row.id if backlog_row else None,
             backlog_status=backlog_row.status if backlog_row else None,
+            backlog_registrar=(backlog_row.registrar or "") if backlog_row else "",
         ))
+        if backlog_row and backlog_row.registrar:
+            sources_seen.add(backlog_row.registrar)
 
     # Sort: pinned rows first (by pinned_finished_at desc), then unpinned
     # rows alphabetically.
@@ -1052,10 +1244,17 @@ def list_domains(
             "wayback_verdicts": sorted(wayback_assessments),
             "languages": sorted(languages_seen),
             "categories": sorted(categories_seen),
-            # Subset of {dropped, mixed, insufficient, stable}. Frontend
-            # uses this to disable the Whois filter when empty (no whois
-            # job has run for any pinned rd yet).
             "whois_bands": sorted(whois_bands_seen),
+            # Subset of {available, registered, unknown, error}. Frontend
+            # disables the Availability filter when empty (no availability
+            # CR exists yet for any pinned/fallback rd).
+            "availability_statuses": sorted(availability_statuses_seen),
+            # Distinct BacklogDomain.registrar values for the Source
+            # filter dropdown (2026-05-17). Empty list when no backlog
+            # rows carry a registrar yet — frontend disables the
+            # filter so the operator sees "Any source" with no options
+            # rather than a populated-but-useless control.
+            "sources": sorted(sources_seen),
         },
         total=total,
     )

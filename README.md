@@ -65,6 +65,8 @@ All settings have sensible defaults. The few you'll likely touch:
 
 Other knobs (rate limits, AI defaults, error retention, scoring weights, etc.) live in the Settings UI under **API**, **Brain**, **Wayback classification**, and **Others** tabs.
 
+Per-criterion deep-dives live inside the app under **/docs** — sidebar-navigable, Russian-only by design (single source of truth regardless of UI language).
+
 ## Deploying / updating on the VPS
 
 ```bash

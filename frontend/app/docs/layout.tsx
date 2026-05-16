@@ -49,6 +49,7 @@ const SECTIONS: { title: string; items: { slug: string; title: string }[] }[] = 
       { slug: "cache", title: "Кэш" },
       { slug: "pinning", title: "Закрепление (Pinning)" },
       { slug: "ai", title: "ИИ: провайдеры, модели, стоимость" },
+      { slug: "wayback", title: "Wayback History" },
       { slug: "wayback-classify", title: "Wayback Classify" },
       { slug: "reanalyze", title: "Переоценка (Reanalyze)" },
     ],

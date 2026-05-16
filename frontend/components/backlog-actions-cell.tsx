@@ -1,4 +1,5 @@
 "use client";
+import Link from "next/link";
 import { useState } from "react";
 import { api, BacklogStatus } from "@/lib/api";
 import { useT } from "@/lib/i18n";
@@ -87,12 +88,18 @@ export function BacklogActionsCell({
         </button>
       </div>
       {backlogStatus ? (
-        <div
-          className={`inline-block px-1.5 py-0.5 rounded ${STATUS_TONE[backlogStatus]}`}
+        // 2026-05-17 B5 fix: pill is now a click-through to the Backlog
+        // page filtered to this domain. Without the link, users had no
+        // visible signal that Order/Discard actually wrote to a Backlog
+        // row, and no path from Database → Backlog except hunting
+        // through the Backlog page manually.
+        <Link
+          href={`/backlog?search=${encodeURIComponent(domain)}`}
+          className={`inline-block px-1.5 py-0.5 rounded hover:underline ${STATUS_TONE[backlogStatus]}`}
           title={ts.currentStatus(labels[backlogStatus])}
         >
           {labels[backlogStatus]}
-        </div>
+        </Link>
       ) : (
         <div className="text-[11px] text-neutral-400 dark:text-neutral-500">
           {ts.notInBacklog}

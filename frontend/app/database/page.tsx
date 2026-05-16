@@ -5,11 +5,9 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useT } from "@/lib/i18n";
 import {
   api,
-  AIProvider,
   AvailabilityStatus,
   DatabaseDomainList,
   DatabaseDomainRow,
-  ProviderStatus,
 } from "@/lib/api";
 import { usePaginatedSearch } from "@/lib/use-paginated-search";
 import {
@@ -28,6 +26,8 @@ import { CsvColumn, csvFilename, downloadBlob, toCsv } from "@/lib/csv";
 import { MultiSelectFilter } from "@/components/multi-select-filter";
 import { VerdictHoverCard } from "@/components/verdict-hover-card";
 import { BacklogActionsCell } from "@/components/backlog-actions-cell";
+import { EditableTextCell } from "@/components/editable-cell";
+import { BACKLOG_HANDOFF_KEY } from "@/lib/backlog-handoff";
 
 // Helper: wrap children in a Next Link when href is non-null, otherwise
 // pass through. Used by the Database-page verdict cells so each cell
@@ -152,6 +152,7 @@ export default function DatabasePage() {
   const [data, setData] = useState<DatabaseDomainList | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+
   // Filter state. Multi-select filters store an array of selected option
   // values; an empty array means "no filter" (matches every row). The
   // sentinel values `__none__` and `__partial__` are valid array entries —
@@ -165,13 +166,19 @@ export default function DatabasePage() {
   // plus "__none__" for "never checked." Matches against the
   // domain's entry in `availabilityByDomain` (hydrated post-fetch).
   const [availabilityFilter, setAvailabilityFilter] = useState<string[]>([]);
-  const [provider, setProvider] = useState<string>("");
-  const [model, setModel] = useState<string>("");
+  // AI provider / model / minRecords filters removed 2026-05-17 — the
+  // user found them noisy and never used. The filter row stays cleaner
+  // with verdict / availability / wayback / confidence / language /
+  // category / pin / cache / notes / criteria multi-select doing the
+  // actual narrowing work.
   const [criteria, setCriteria] = useState<CriterionKey[]>([]);
   const [cache, setCache] = useState<CacheFilter>("any");
   const [notesFilter, setNotesFilter] = useState<NotesFilter>("any");
   const [pinFilter, setPinFilter] = useState<PinFilter>("any");
-  const [minRecords, setMinRecords] = useState<number>(0);
+  // Source filter (2026-05-17) — multi-select on BacklogDomain.registrar.
+  // Same vocabulary as the Backlog page's Source filter; backend
+  // populates `filter_options.sources` with the distinct universe.
+  const [sourceFilter, setSourceFilter] = useState<string[]>([]);
   // wayback_classify filters (added 2026-05-09).
   const [languages, setLanguages] = useState<string[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
@@ -212,13 +219,11 @@ export default function DatabasePage() {
   // single active sort signal.
   const [whoisSort, setWhoisSort] = useState<"asc" | "desc" | null>(null);
 
-  const [reanalyzeOpen, setReanalyzeOpen] = useState(false);
-  const [reanalyzeBusy, setReanalyzeBusy] = useState(false);
-  const [reanalyzeError, setReanalyzeError] = useState<string | null>(null);
-  const [reanalyzeResult, setReanalyzeResult] = useState<{
-    started: number;
-    skipped: number;
-  } | null>(null);
+  // Send-to-pillar state (replaces the old "Reanalyze" bulk picker
+  // 2026-05-18). Tracks which pillar dispatch is currently in flight
+  // so the toolbar buttons can disable themselves during navigation.
+  type Pillar = "quality" | "whois" | "availability";
+  const [sendingPillar, setSendingPillar] = useState<Pillar | null>(null);
   const [bulkBacklogBusy, setBulkBacklogBusy] = useState(false);
   const [bulkBacklogResult, setBulkBacklogResult] = useState<{
     status: string;
@@ -226,22 +231,17 @@ export default function DatabasePage() {
     created?: number;
     error?: string;
   } | null>(null);
-  const [bulkProvider, setBulkProvider] = useState<AIProvider | "">("");
-  const [bulkModel, setBulkModel] = useState<string>("");
-  const [providerStatuses, setProviderStatuses] = useState<
-    Record<string, ProviderStatus> | null
-  >(null);
-  const [bulkKnownModels, setBulkKnownModels] = useState<
-    Record<string, string[]>
-  >({});
-
   const dataRef = useRef<DatabaseDomainList | null>(null);
   dataRef.current = data;
 
-  // Availability cascade results, keyed by domain. Hydrated alongside
-  // the database rows in `reload()`, refreshed per-row by the recheck
-  // button. Domains absent from the map render the Availability cell
-  // as "—" (never checked).
+  // Ad-hoc recheck OVERLAY (2026-05-16 rewire). The Availability column
+  // primarily reads from `row.availability_*` (CR-scoped, matches the
+  // Job-page chip). The recheck button still triggers a fresh cascade
+  // via `/availability/check` and writes its result into this overlay so
+  // the user sees their click reflected immediately. The overlay is
+  // local to the page session — a full reload reverts the column to the
+  // CR-scoped value. Filter logic ignores the overlay on purpose so the
+  // filter universe stays consistent with chip-page semantics.
   const [availabilityByDomain, setAvailabilityByDomain] = useState<
     Record<
       string,
@@ -328,31 +328,14 @@ export default function DatabasePage() {
             for (const dom of prev) if (stillExists.has(dom)) next.add(dom);
             return next;
           });
-          // Hydrate availability column from the cache history. One
-          // read per refresh — never spawns a fresh cascade. Domains
-          // with no cached row stay rendered as "—".
-          const domains = d.rows.map((r) => r.domain);
-          if (domains.length > 0) {
-            api
-              .latestAvailability(domains)
-              .then((rows) => {
-                if (cancelled) return;
-                const map: typeof availabilityByDomain = {};
-                for (const r of rows) {
-                  map[r.domain] = {
-                    status: r.status,
-                    provider: r.provider,
-                    registrar: r.registrar,
-                    expires_on: r.expires_on,
-                    checked_at: r.checked_at,
-                  };
-                }
-                setAvailabilityByDomain(map);
-              })
-              .catch(() => {
-                // Non-fatal; column just stays empty.
-              });
-          }
+          // The /availability/latest cache hydration was removed
+          // 2026-05-16 — the Availability column now reads from
+          // `row.availability_*` (CR-scoped, populated server-side from
+          // the aux availability source), so the column agrees with the
+          // Job-page chip math. Clear any stale ad-hoc recheck overlay
+          // so a hard reload doesn't keep showing a fresher-than-CR
+          // result the user can't trace back to a job.
+          setAvailabilityByDomain({});
         }
       })
       .catch((e: Error) => {
@@ -371,6 +354,7 @@ export default function DatabasePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+
   useEffect(() => {
     function onVisible() {
       if (document.visibilityState === "visible") {
@@ -384,19 +368,6 @@ export default function DatabasePage() {
       window.removeEventListener("focus", onVisible);
     };
   }, []);
-
-  useEffect(() => {
-    if (!reanalyzeOpen || providerStatuses !== null) return;
-    api
-      .getSettings()
-      .then((d) => {
-        const m: Record<string, ProviderStatus> = {};
-        for (const p of d.providers) m[p.provider] = p;
-        setProviderStatuses(m);
-        setBulkKnownModels(d.known_models || {});
-      })
-      .catch(() => setProviderStatuses({}));
-  }, [reanalyzeOpen, providerStatuses]);
 
   function toggleOne(domain: string) {
     setSelected((prev) => {
@@ -416,7 +387,11 @@ export default function DatabasePage() {
     if (!data) return [];
     // OR semantics inside each multi-select: a row passes the filter if its
     // value is one of the selected options. AND semantics across distinct
-    // filters: a row must pass every active filter.
+    // filters: a row must pass every active filter. All filters operate
+    // CLIENT-SIDE on the current server slice (Phase 1 design, 2026-05-16).
+    // Phase 2 attempted to push the multi-select filters to backend SQL
+    // and was rolled back the same day — see the rollback comment in
+    // routers/database.py for context.
     function matchVerdict(r: DatabaseDomainRow): boolean {
       if (verdicts.length === 0) return true;
       return verdicts.some((v) => {
@@ -455,15 +430,24 @@ export default function DatabasePage() {
     }
     function matchAvailability(r: DatabaseDomainRow): boolean {
       if (availabilityFilter.length === 0) return true;
-      const avail = availabilityByDomain[r.domain];
+      // Reads CR-scoped data (row.availability_status), NOT the ad-hoc
+      // recheck overlay. Keeps the filter universe consistent with the
+      // Job-page chip math — a click on "available" returns the same
+      // domain set that the chip's "свободен" count is bucketing.
       return availabilityFilter.some((v) => {
-        if (v === "__none__") return !avail;
-        return !!avail && avail.status === v;
+        if (v === "__none__") return !r.availability_status;
+        return r.availability_status === v;
       });
     }
     return data.rows.filter((r) => {
       if (pinFilter === "pinned" && !r.is_pinned) return false;
       if (pinFilter === "unpinned" && r.is_pinned) return false;
+      if (
+        sourceFilter.length > 0 &&
+        !sourceFilter.includes(r.backlog_registrar || "")
+      ) {
+        return false;
+      }
       if (!matchVerdict(r)) return false;
       if (!matchWayback(r)) return false;
       if (!matchWhois(r)) return false;
@@ -489,31 +473,16 @@ export default function DatabasePage() {
           return false;
         }
       }
-      if (provider) {
-        if (provider === "__none__") {
-          if (r.ai_provider) return false;
-        } else if (r.ai_provider !== provider) {
-          return false;
-        }
-      }
-      if (model && r.ai_model !== model) return false;
       // "Any criterion" semantics: a row passes if at least one of the
-      // selected criteria is enabled (and ≥ minRecords when set). With no
-      // criteria selected and minRecords > 0, fall back to "any criterion at
-      // all meets minRecords" — preserves the prior behaviour.
+      // selected criteria is enabled. The pre-2026-05-17 `minRecords`
+      // companion was dropped along with the input — operators filter
+      // by verdict + confidence which already screens out empty results.
       if (criteria.length > 0) {
         const anyMatch = criteria.some((k) => {
           const c = r.criteria[k];
-          if (!c || !c.enabled) return false;
-          if (minRecords > 0 && c.rows < minRecords) return false;
-          return true;
+          return !!c && c.enabled;
         });
         if (!anyMatch) return false;
-      } else if (minRecords > 0) {
-        const anyMeets = CRITERIA_KEYS.some(
-          (k) => r.criteria[k]?.enabled && r.criteria[k].rows >= minRecords,
-        );
-        if (!anyMeets) return false;
       }
       if (cache === "cached" && !r.any_cached) return false;
       if (cache === "fresh" && r.any_cached) return false;
@@ -524,19 +493,16 @@ export default function DatabasePage() {
   }, [
     data,
     pinFilter,
+    sourceFilter,
     verdicts,
     waybackVerdicts,
     whoisBands,
     availabilityFilter,
-    availabilityByDomain,
     languages,
     categories,
-    provider,
-    model,
     criteria,
     cache,
     notesFilter,
-    minRecords,
     waybackConfMin,
     ahrefsConfMin,
   ]);
@@ -610,35 +576,73 @@ export default function DatabasePage() {
     });
   }
 
-  async function handleBulkReanalyze() {
-    if (selected.size === 0) return;
-    const ids: number[] = [];
-    if (data) {
-      const byDomain = new Map(data.rows.map((r) => [r.domain, r]));
-      for (const dom of selected) {
-        const r = byDomain.get(dom);
-        // Only domains with a pinned rd are reanalyzable from here. Skip
-        // unpinned rows silently — the picker is gated on pin anyway.
-        if (r && r.pinned_run_domain_id != null) {
-          ids.push(r.pinned_run_domain_id);
-        }
-      }
-    }
-    if (ids.length === 0) return;
-    setReanalyzeBusy(true);
-    setReanalyzeError(null);
-    setReanalyzeResult(null);
+  // Send the current selection to a pillar's /check page (2026-05-18,
+  // mirrors the Backlog page's 3-button pattern).
+  //
+  // - Quality keeps its legacy URL-param plumbing (`?domains=` +
+  //   `cross_cache=1` + dominant `source_job_id`) so the Quality form
+  //   can pre-fill criteria + AI from the source job to maximize cache
+  //   hits. Pushes to `/check/quality` directly — no /analyze redirect
+  //   hop.
+  // - Whois + Availability use the sessionStorage handoff (same key
+  //   the Backlog page uses) since those pages already drain from it.
+  //   They don't need cache hinting today.
+  async function handleSendToPillar(pillar: Pillar) {
+    if (selected.size === 0 || sendingPillar !== null) return;
+    const domains = Array.from(selected);
+    setSendingPillar(pillar);
     try {
-      const r = await api.bulkReanalyzeDomains(ids, {
-        provider: bulkProvider || undefined,
-        model: bulkModel.trim() || undefined,
-      });
-      setReanalyzeResult({ started: r.started, skipped: r.skipped });
-      reload({ silent: true });
-    } catch (e) {
-      setReanalyzeError((e as Error).message || "bulk reanalyze failed");
+      if (pillar === "quality") {
+        const param = encodeURIComponent(domains.join(","));
+        // Dominant wayback source job — same logic as the pre-2026-05-18
+        // single "Analyze N" button. Used to pre-fill the Quality form
+        // so cache hits stay warm.
+        const counts = new Map<number, { n: number; maxRun: number }>();
+        if (data) {
+          for (const r of data.rows) {
+            if (!selected.has(r.domain)) continue;
+            const wb = r.criteria?.wayback;
+            const jid = wb?.source_job_id;
+            const rid = wb?.source_run_id;
+            if (typeof jid !== "number") continue;
+            const cur = counts.get(jid) ?? { n: 0, maxRun: 0 };
+            cur.n += 1;
+            if (typeof rid === "number" && rid > cur.maxRun) {
+              cur.maxRun = rid;
+            }
+            counts.set(jid, cur);
+          }
+        }
+        let dominantJobId: number | null = null;
+        let bestN = 0;
+        let bestRun = 0;
+        for (const [jid, { n, maxRun }] of counts) {
+          if (n > bestN || (n === bestN && maxRun > bestRun)) {
+            dominantJobId = jid;
+            bestN = n;
+            bestRun = maxRun;
+          }
+        }
+        let url = `/check/quality?domains=${param}&cross_cache=1`;
+        if (dominantJobId !== null) {
+          url += `&source_job_id=${dominantJobId}`;
+        }
+        router.push(url);
+        return;
+      }
+      sessionStorage.setItem(
+        BACKLOG_HANDOFF_KEY,
+        JSON.stringify({ domains }),
+      );
+      router.push(
+        pillar === "whois"
+          ? "/check/whois-history?from_backlog=1"
+          : "/check/availability?from_backlog=1",
+      );
     } finally {
-      setReanalyzeBusy(false);
+      // sendingPillar clears when this component unmounts on
+      // navigation; setting it false here would briefly re-enable the
+      // buttons during the route change and looks jittery.
     }
   }
 
@@ -735,13 +739,11 @@ export default function DatabasePage() {
     setAvailabilityFilter([]);
     setLanguages([]);
     setCategories([]);
-    setProvider("");
-    setModel("");
     setCriteria([]);
     setCache("any");
     setNotesFilter("any");
     setPinFilter("any");
-    setMinRecords(0);
+    setSourceFilter([]);
     setWaybackConfMin(0);
     setAhrefsConfMin(0);
   }
@@ -872,13 +874,11 @@ export default function DatabasePage() {
     availabilityFilter.length > 0 ||
     languages.length > 0 ||
     categories.length > 0 ||
-    !!provider ||
-    !!model ||
     criteria.length > 0 ||
     cache !== "any" ||
     notesFilter !== "any" ||
     pinFilter !== "any" ||
-    minRecords > 0 ||
+    sourceFilter.length > 0 ||
     waybackConfMin > 0 ||
     ahrefsConfMin > 0;
 
@@ -974,15 +974,24 @@ export default function DatabasePage() {
           )}
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 text-sm">
-          <select
-            value={pinFilter}
-            onChange={(e) => setPinFilter(e.target.value as PinFilter)}
-            className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none"
-          >
-            <option value="any">{ts.filters.pinAny}</option>
-            <option value="pinned">{ts.filters.pinPinned}</option>
-            <option value="unpinned">{ts.filters.pinUnpinned}</option>
-          </select>
+          {/* Source filter (2026-05-17) — multi-select on
+              BacklogDomain.registrar, mirrors the Backlog page filter.
+              Replaced the Pin filter at this position; Pin moved down
+              to live next to the confidence sliders since it's used
+              mostly during deep triage, not high-level scoping. */}
+          <MultiSelectFilter
+            label={ts.filters.sourceLabel}
+            anyLabel={ts.filters.sourceAny}
+            value={sourceFilter}
+            onChange={setSourceFilter}
+            options={(opts.sources ?? []).map((s) => ({
+              value: s,
+              label: s,
+            }))}
+            disabled={(opts.sources ?? []).length === 0}
+            searchable
+            searchPlaceholder={ts.filters.sourceSearchPlaceholder}
+          />
 
           <MultiSelectFilter
             label={ts.filters.verdictAhrefsLabel}
@@ -1125,33 +1134,8 @@ export default function DatabasePage() {
             searchPlaceholder={ts.filters.categorySearchPlaceholder}
           />
 
-          <select
-            value={provider}
-            onChange={(e) => setProvider(e.target.value)}
-            className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none"
-          >
-            <option value="">{ts.filters.providerAny}</option>
-            {opts.ai_providers.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-            <option value="__none__">{ts.filters.providerNone}</option>
-          </select>
-
-          <select
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none"
-            disabled={opts.ai_models.length === 0}
-          >
-            <option value="">{ts.filters.modelAny}</option>
-            {opts.ai_models.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-          </select>
+          {/* Provider / Model / Min records filters removed 2026-05-17 at
+              user request — never used, just noise in the filter row. */}
 
           <MultiSelectFilter
             label={ts.filters.criterionLabel}
@@ -1184,15 +1168,18 @@ export default function DatabasePage() {
             <option value="without">{ts.filters.notesWithout}</option>
           </select>
 
-          <input
-            type="number"
-            min={0}
-            value={minRecords || ""}
-            onChange={(e) => setMinRecords(parseInt(e.target.value, 10) || 0)}
-            placeholder={ts.filters.minRecords}
-            title={ts.filters.minRecordsHelp}
+          {/* Pin filter (2026-05-17) — moved here from the top of the
+              grid to sit next to the confidence sliders. Used during
+              deep triage, not high-level scoping. */}
+          <select
+            value={pinFilter}
+            onChange={(e) => setPinFilter(e.target.value as PinFilter)}
             className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none"
-          />
+          >
+            <option value="any">{ts.filters.pinAny}</option>
+            <option value="pinned">{ts.filters.pinPinned}</option>
+            <option value="unpinned">{ts.filters.pinUnpinned}</option>
+          </select>
 
           <ConfidenceSlider
             label={ts.filters.waybackConfMin}
@@ -1241,99 +1228,48 @@ export default function DatabasePage() {
             <div className="flex items-center gap-2 flex-wrap">
               <button
                 type="button"
-                onClick={() => {
-                  setSelected(new Set());
-                  setReanalyzeOpen(false);
-                  setReanalyzeResult(null);
-                }}
-                disabled={deleting || reanalyzeBusy}
+                onClick={() => setSelected(new Set())}
+                disabled={deleting || sendingPillar !== null}
                 className="text-xs px-2 py-1 rounded-md border border-blue-300 dark:border-blue-900/60 text-blue-800 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/40 disabled:opacity-50"
               >
                 {ts.clearSelection}
               </button>
+              {/* 3-pillar send buttons (2026-05-18) — same trio +
+                  color scheme as the Backlog page so the UX is
+                  consistent. Replaces the old single "Analyze N" + the
+                  "Reanalyze" picker. Reuses Backlog's sendToPicker
+                  i18n labels. */}
               <button
                 type="button"
-                onClick={() => {
-                  // Hand the selected domains to the Analyze page via
-                  // URL params + the cross-job cache flag, so prior
-                  // matching CR rows from ANY job can be reused on
-                  // submit. The Analyze page reads `domains=` and
-                  // pre-fills the textarea + ticks the cross-cache box.
-                  //
-                  // Additionally pass `source_job_id` — the dominant
-                  // job that produced the selected rows' WAYBACK
-                  // criterion (added 2026-05-13). Wayback's
-                  // `params_hash` is the cache-key-critical config for
-                  // this workflow; pre-filling the form from this
-                  // source job's spec guarantees the cache hits
-                  // instead of the user accidentally setting a
-                  // different limit / sample_pages / sample_count and
-                  // missing cache on every domain.
-                  const list = Array.from(selected);
-                  if (list.length === 0) return;
-                  // Comma-separated; domains can't contain commas.
-                  // encodeURIComponent handles any unicode/IDN domains.
-                  const param = encodeURIComponent(list.join(","));
-                  // Dominant wayback source job: count source_job_id
-                  // per selected row, pick the highest. Tie-break by
-                  // greatest source_run_id (most recent). Rows without
-                  // a wayback source (criterion not yet analyzed)
-                  // contribute nothing.
-                  const counts = new Map<number, { n: number; maxRun: number }>();
-                  if (data) {
-                    for (const r of data.rows) {
-                      if (!selected.has(r.domain)) continue;
-                      const wb = r.criteria?.wayback;
-                      const jid = wb?.source_job_id;
-                      const rid = wb?.source_run_id;
-                      if (typeof jid !== "number") continue;
-                      const cur = counts.get(jid) ?? { n: 0, maxRun: 0 };
-                      cur.n += 1;
-                      if (typeof rid === "number" && rid > cur.maxRun) {
-                        cur.maxRun = rid;
-                      }
-                      counts.set(jid, cur);
-                    }
-                  }
-                  let dominantJobId: number | null = null;
-                  let bestN = 0;
-                  let bestRun = 0;
-                  for (const [jid, { n, maxRun }] of counts) {
-                    if (
-                      n > bestN ||
-                      (n === bestN && maxRun > bestRun)
-                    ) {
-                      dominantJobId = jid;
-                      bestN = n;
-                      bestRun = maxRun;
-                    }
-                  }
-                  let url = `/analyze?domains=${param}&cross_cache=1`;
-                  if (dominantJobId !== null) {
-                    url += `&source_job_id=${dominantJobId}`;
-                  }
-                  router.push(url);
-                }}
-                disabled={deleting || reanalyzeBusy}
-                className="text-xs px-3 py-1 rounded-md border border-blue-300 dark:border-blue-900/60 text-blue-800 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/40 disabled:opacity-50"
-                title={ts.analyzeSelectedHint}
+                onClick={() => handleSendToPillar("quality")}
+                disabled={deleting || sendingPillar !== null}
+                className="text-xs px-3 py-1 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                title={t.pages.backlog.sendToPicker.qualityHint}
               >
-                {ts.analyzeSelected(selected.size)}
+                {t.pages.backlog.sendToPicker.quality}
               </button>
               <button
                 type="button"
-                onClick={() => setReanalyzeOpen((v) => !v)}
-                disabled={deleting || reanalyzeBusy}
-                className="text-xs px-3 py-1 rounded-md border border-blue-300 dark:border-blue-900/60 text-blue-800 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/40 disabled:opacity-50"
+                onClick={() => handleSendToPillar("whois")}
+                disabled={deleting || sendingPillar !== null}
+                className="text-xs px-3 py-1 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                title={t.pages.backlog.sendToPicker.whoisHint}
               >
-                {reanalyzeOpen
-                  ? ts.bulkReanalyzeHide
-                  : ts.bulkReanalyzeShow(selected.size)}
+                {t.pages.backlog.sendToPicker.whois}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSendToPillar("availability")}
+                disabled={deleting || sendingPillar !== null}
+                className="text-xs px-3 py-1 rounded-md bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-50"
+                title={t.pages.backlog.sendToPicker.availabilityHint}
+              >
+                {t.pages.backlog.sendToPicker.availability}
               </button>
               <button
                 type="button"
                 onClick={() => handleBulkBacklogStatus("order")}
-                disabled={deleting || reanalyzeBusy || bulkBacklogBusy}
+                disabled={deleting || sendingPillar !== null || bulkBacklogBusy}
                 title={ts.backlogActions.orderHint}
                 className="text-xs px-3 py-1 rounded-md border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/40 disabled:opacity-50"
               >
@@ -1344,7 +1280,7 @@ export default function DatabasePage() {
               <button
                 type="button"
                 onClick={() => handleBulkBacklogStatus("discarded")}
-                disabled={deleting || reanalyzeBusy || bulkBacklogBusy}
+                disabled={deleting || sendingPillar !== null || bulkBacklogBusy}
                 title={ts.backlogActions.discardHint}
                 className="text-xs px-3 py-1 rounded-md border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
               >
@@ -1355,7 +1291,7 @@ export default function DatabasePage() {
               <button
                 type="button"
                 onClick={handleBulkBan}
-                disabled={deleting || reanalyzeBusy || bulkBacklogBusy || bulkBanBusy}
+                disabled={deleting || sendingPillar !== null || bulkBacklogBusy || bulkBanBusy}
                 title={ts.bulkBanHint}
                 className="text-xs px-3 py-1 rounded-md border border-rose-400 dark:border-rose-700 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/40 disabled:opacity-50"
               >
@@ -1364,7 +1300,7 @@ export default function DatabasePage() {
               <button
                 type="button"
                 onClick={handleDeleteSelected}
-                disabled={deleting || reanalyzeBusy || bulkBacklogBusy}
+                disabled={deleting || sendingPillar !== null || bulkBacklogBusy}
                 className="text-xs px-3 py-1 rounded-md bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {deleting ? ts.deleting : ts.deleteSelected(selected.size)}
@@ -1393,106 +1329,6 @@ export default function DatabasePage() {
                   )}
             </div>
           )}
-          {reanalyzeOpen && (
-            <div className="flex items-center gap-2 flex-wrap pt-1 border-t border-blue-200 dark:border-blue-900/60">
-              <span className="text-xs text-blue-800 dark:text-blue-300">
-                {ts.bulkReanalyzePickerLabel}
-              </span>
-              <select
-                value={bulkProvider}
-                onChange={(e) =>
-                  setBulkProvider(e.target.value as AIProvider | "")
-                }
-                disabled={reanalyzeBusy}
-                className="text-xs rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-1.5 py-1 outline-none disabled:opacity-50"
-              >
-                <option value="">—</option>
-                {(["gemini", "github_models", "openrouter"] as const).map(
-                  (k) => {
-                    const s = providerStatuses?.[k];
-                    const credField =
-                      k === "github_models"
-                        ? s?.fields.token
-                        : s?.fields.api_key;
-                    const configured = !!(credField && credField.configured);
-                    return (
-                      <option key={k} value={k} disabled={!configured}>
-                        {k}
-                        {configured ? "" : " (not configured)"}
-                      </option>
-                    );
-                  },
-                )}
-              </select>
-              {(() => {
-                const known = bulkProvider
-                  ? (providerStatuses
-                      ? bulkKnownModels[bulkProvider] || []
-                      : [])
-                  : [];
-                const status = bulkProvider
-                  ? providerStatuses?.[bulkProvider]
-                  : null;
-                const defaultModel =
-                  status &&
-                  status.fields.default_model &&
-                  status.fields.default_model.configured &&
-                  "value" in status.fields.default_model
-                    ? status.fields.default_model.value
-                    : "";
-                return (
-                  <select
-                    value={bulkModel}
-                    onChange={(e) => setBulkModel(e.target.value)}
-                    disabled={
-                      reanalyzeBusy ||
-                      !bulkProvider ||
-                      known.length === 0
-                    }
-                    className="text-xs rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-1.5 py-1 outline-none disabled:opacity-50 font-mono w-56"
-                  >
-                    <option value="">
-                      {defaultModel
-                        ? `default · ${defaultModel}`
-                        : known.length === 0
-                          ? "no models in registry"
-                          : "default"}
-                    </option>
-                    {known
-                      .filter((m) => m !== defaultModel)
-                      .map((m) => (
-                        <option key={m} value={m}>
-                          {m}
-                        </option>
-                      ))}
-                  </select>
-                );
-              })()}
-              <button
-                type="button"
-                onClick={handleBulkReanalyze}
-                disabled={reanalyzeBusy || !bulkProvider}
-                className="text-xs px-3 py-1 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {reanalyzeBusy
-                  ? ts.bulkReanalyzeRunning
-                  : ts.bulkReanalyzeSubmit(selected.size)}
-              </button>
-              {reanalyzeResult && (
-                <span className="text-xs text-blue-800 dark:text-blue-300">
-                  {ts.bulkReanalyzeResult(
-                    reanalyzeResult.started,
-                    reanalyzeResult.skipped,
-                  )}
-                </span>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-      {reanalyzeError && (
-        <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-800 dark:bg-red-950/40 dark:text-red-300">
-          {reanalyzeError}
         </div>
       )}
       {deleteError && (
@@ -1537,7 +1373,17 @@ export default function DatabasePage() {
                     className="cursor-pointer"
                   />
                 </th>
+                {/* Row number for orientation. Absolute index across the
+                    full sorted set so the user can say "row 250" instead
+                    of "row 3 page 5". Bumped by `start` (the
+                    PaginatedSearch's first-row position). */}
+                <th className="px-3 py-2 font-medium text-right w-12">
+                  {ts.cols.rowNumber}
+                </th>
                 <th className="px-3 py-2 font-medium">{ts.cols.domain}</th>
+                {/* Column-group A — AI signals (Verdict, Whois, Wayback,
+                    Language, Theme, Category). Sortable headers stay on
+                    Verdict + Whois. */}
                 <th className="px-3 py-2 font-medium">
                   <button
                     type="button"
@@ -1587,22 +1433,62 @@ export default function DatabasePage() {
                 <th className="px-3 py-2 font-medium">{ts.cols.wayback}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.language}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.theme}</th>
-                <th className="px-3 py-2 font-medium">{ts.cols.category}</th>
-                <th className="px-3 py-2 font-medium">{ts.cols.note}</th>
-                <th className="px-3 py-2 font-medium">{ts.cols.backlog}</th>
+                {/* Column-group B — operational state (Criteria pills,
+                    Backlog/queue status). Criteria-before-Backlog so the
+                    user reads "what ran" then "what stage it's in". */}
                 <th className="px-3 py-2 font-medium">{ts.cols.criteria}</th>
+                <th className="px-3 py-2 font-medium">{ts.cols.backlog}</th>
+                {/* Column-group C — identity + my own state (Source,
+                    Availability, Note). Pinned to the end 2026-05-18 so
+                    the AI signals + workflow state stay leftmost; the
+                    triage-record fields trail the row. */}
+                <th className="px-3 py-2 font-medium">{ts.cols.source}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.availability}</th>
+                <th className="px-3 py-2 font-medium">{ts.cols.note}</th>
               </tr>
             </thead>
             <tbody>
-              {search.paged.map((r) => (
+              {search.paged.map((r, i) => (
                 <DomainListRow
                   key={r.domain}
                   row={r}
+                  rowNumber={search.start + i}
                   selected={selected.has(r.domain)}
                   onToggle={() => toggleOne(r.domain)}
                   onBacklogUpdated={() => reload({ silent: true })}
-                  availability={availabilityByDomain[r.domain]}
+                  onNoteSaved={(note) => {
+                    // Optimistic merge so the new note is visible
+                    // immediately without a full /database/domains
+                    // round-trip. Other fields untouched.
+                    setData((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            rows: prev.rows.map((row) =>
+                              row.domain === r.domain
+                                ? { ...row, note }
+                                : row,
+                            ),
+                          }
+                        : prev,
+                    );
+                  }}
+                  availability={
+                    // Prefer ad-hoc recheck overlay when present (so the
+                    // user's recheck click shows immediately); fall back
+                    // to CR-scoped fields on the row (matches the
+                    // Job-page chip).
+                    availabilityByDomain[r.domain]
+                    ?? (r.availability_status
+                      ? {
+                          status: r.availability_status as AvailabilityStatus,
+                          provider: r.availability_provider,
+                          registrar: r.availability_registrar,
+                          expires_on: r.availability_expires_on,
+                          checked_at: r.availability_checked_at,
+                        }
+                      : undefined)
+                  }
                   recheckBusy={recheckBusy.has(r.domain)}
                   onRecheck={() => handleRecheckAvailability(r.domain)}
                 />
@@ -1619,17 +1505,21 @@ export default function DatabasePage() {
 
 function DomainListRow({
   row,
+  rowNumber,
   selected,
   onToggle,
   onBacklogUpdated,
+  onNoteSaved,
   availability,
   recheckBusy,
   onRecheck,
 }: {
   row: DatabaseDomainRow;
+  rowNumber: number;
   selected: boolean;
   onToggle: () => void;
   onBacklogUpdated: () => void;
+  onNoteSaved: (note: string) => void;
   availability?: {
     status: AvailabilityStatus;
     provider: string;
@@ -1671,6 +1561,26 @@ function DomainListRow({
   ]);
   const waybackHref = hrefFor(["wayback"]);
   const classifyHref = hrefFor(["wayback_classify"]);
+
+  // Domain-cell link target (U1, returned 2026-05-18). Prefers the
+  // pinned rd when set; otherwise falls back across every available
+  // criterion source so unpinned rows that still have a Whois /
+  // Availability / Wayback source land somewhere useful. Per-criterion
+  // verdict cells keep their own narrower hrefs above — this is just
+  // the catch-all anchor on the domain text.
+  const domainHref: string | null = (() => {
+    if (
+      row.pinned_run_domain_id != null &&
+      row.pinned_run_id != null &&
+      row.pinned_job_id != null
+    ) {
+      return `/jobs/${row.pinned_job_id}/runs/${row.pinned_run_id}/domains/${row.pinned_run_domain_id}`;
+    }
+    return hrefFor([
+      "backlinks", "refdomains", "anchors", "keywords",
+      "wayback", "wayback_classify", "whois_history", "availability",
+    ]);
+  })();
 
   // Per-cell cached-data marker (added 2026-05-12). A criterion is
   // "cached" if its underlying CR reused either raw data
@@ -1735,15 +1645,131 @@ function DomainListRow({
   ] as const;
   const enabledCriteriaPills = CRITERIA_LETTERS.filter(
     ([k]) => row.criteria[k]?.enabled,
-  ).map(([k, letter]) => ({
-    key: k,
-    letter,
-    rows: row.criteria[k].rows,
-    fullName: t.pages.analyze.criteria[k],
-    sourceRunId: row.criteria[k].source_run_id ?? null,
-    sourceJobName: row.criteria[k].source_job_name ?? "",
-    sourceRunName: row.criteria[k].source_run_name ?? "",
-  }));
+  ).map(([k, letter]) => {
+    const c = row.criteria[k];
+    return {
+      key: k,
+      letter,
+      rows: c.rows,
+      fullName: t.pages.analyze.criteria[k],
+      sourceRunId: c.source_run_id ?? null,
+      sourceJobName: c.source_job_name ?? "",
+      sourceRunName: c.source_run_name ?? "",
+      // Per-criterion AI verdict for confidence-aware coloring (U3).
+      // ai_assessment ∈ {high_quality, mixed, low_quality} for Ahrefs
+      // + Wayback; null for wayback_classify (no quality axis) and
+      // whois_history (uses dropped_confidence on a different axis).
+      aiAssessment: c.ai_assessment ?? null,
+      aiConfidence:
+        typeof c.ai_confidence === "number" ? c.ai_confidence : null,
+      aiDroppedConfidence:
+        typeof c.ai_dropped_confidence === "number"
+          ? c.ai_dropped_confidence
+          : null,
+    };
+  });
+
+  // Split chips into two rows (2026-05-18): Ahrefs criteria (B/D/A/K)
+  // on line 1, aux pillars (W/C/H) on line 2. Keeps the eye from
+  // having to parse a single dense 5-7 chip strip, and reinforces the
+  // mental grouping (quality-scoring vs auxiliary signals).
+  const AHREFS_KEYS = new Set([
+    "backlinks", "refdomains", "anchors", "keywords",
+  ]);
+  const ahrefsPills = enabledCriteriaPills.filter((p) =>
+    AHREFS_KEYS.has(p.key),
+  );
+  const auxPills = enabledCriteriaPills.filter(
+    (p) => !AHREFS_KEYS.has(p.key),
+  );
+
+  // Single source of truth for chip rendering — both row groups call
+  // this so the tone/tooltip logic doesn't drift between the two
+  // sub-rows. Closes over `row` (for theme_confidence +
+  // classify_drift_detected) so callers don't have to pass it.
+  const renderCriterionPill = (p: typeof enabledCriteriaPills[number]) => {
+    const sourceSuffix = p.sourceRunId
+      ? `\nFrom Run #${p.sourceRunId}${
+          p.sourceRunName ? ` "${p.sourceRunName}"` : ""
+        }${p.sourceJobName ? ` (Job: ${p.sourceJobName})` : ""}`
+      : "";
+    // Global 4-bucket text scheme used across this row:
+    //   grey  → low confidence / unknown
+    //   green → good
+    //   yellow → mixed
+    //   red   → bad
+    // Switched mixed from amber-700 to yellow-700 in 2026-05-18 because
+    // amber-700 reads as orange on white; yellow-700 stays clearly in
+    // the yellow band while keeping enough contrast for legibility.
+    const QUALITY_TEXT: Record<string, string> = {
+      high_quality: "text-emerald-700 dark:text-emerald-300",
+      mixed: "text-yellow-700 dark:text-yellow-400",
+      low_quality: "text-rose-700 dark:text-rose-300",
+    };
+    const NEUTRAL_TEXT = "text-neutral-500 dark:text-neutral-400";
+    let tone = "text-emerald-700 dark:text-emerald-300";
+    let assessmentLine = "";
+    if (p.key === "whois_history") {
+      if (typeof p.aiDroppedConfidence === "number") {
+        const pct = Math.round(p.aiDroppedConfidence * 100);
+        assessmentLine = `\nDropped confidence: ${pct}%`;
+        tone =
+          p.aiDroppedConfidence > 0.8
+            ? "text-rose-700 dark:text-rose-300"
+            : p.aiDroppedConfidence > 0.5
+              ? "text-yellow-700 dark:text-yellow-400"
+              : p.aiDroppedConfidence >= 0.3
+                ? NEUTRAL_TEXT
+                : "text-emerald-700 dark:text-emerald-300";
+      }
+    } else if (p.key === "wayback_classify") {
+      // 4-bucket scheme for classify (2026-05-18):
+      //   grey  → theme_confidence missing or below threshold
+      //   red   → drift detected (site changed topics; SEO baggage)
+      //   yellow → no drift, but multi-topic (≥1 secondary theme)
+      //   green → no drift, single primary theme, high confidence
+      const conf =
+        typeof row.theme_confidence === "number"
+          ? row.theme_confidence
+          : null;
+      const drift = !!row.classify_drift_detected;
+      const hasSecondaries =
+        (row.secondary_themes ?? []).filter(Boolean).length > 0;
+      if (conf == null || isLowConfidence(conf)) {
+        tone = NEUTRAL_TEXT;
+        assessmentLine = `\nLow theme confidence`;
+      } else if (drift) {
+        tone = QUALITY_TEXT.low_quality;
+        assessmentLine = `\nTheme drift detected`;
+      } else if (hasSecondaries) {
+        tone = QUALITY_TEXT.mixed;
+        assessmentLine = `\nMulti-topic site`;
+      } else {
+        tone = QUALITY_TEXT.high_quality;
+        assessmentLine = `\nClean single-topic site`;
+      }
+    } else if (p.aiAssessment) {
+      const isLow = isLowConfidence(p.aiConfidence);
+      tone = isLow
+        ? NEUTRAL_TEXT
+        : (QUALITY_TEXT[p.aiAssessment] ?? NEUTRAL_TEXT);
+      if (typeof p.aiConfidence === "number") {
+        const pct = Math.round(p.aiConfidence * 100);
+        assessmentLine = `\nAI: ${p.aiAssessment} · confidence ${pct}%`;
+      } else {
+        assessmentLine = `\nAI: ${p.aiAssessment}`;
+      }
+    }
+    return (
+      <span
+        key={p.key}
+        className={`leading-none text-sm font-semibold ${tone}`}
+        title={`${p.fullName} (${p.rows.toLocaleString()})${assessmentLine}${sourceSuffix}`}
+      >
+        {p.letter}
+      </span>
+    );
+  };
 
   const finishedAt = row.pinned_finished_at
     ? new Date(row.pinned_finished_at).toLocaleString()
@@ -1777,10 +1803,25 @@ function DomainListRow({
           className="cursor-pointer"
         />
       </td>
+      {/* Row number — bumped up 2026-05-17 from a muted text-xs to a
+          prominent semibold text-base so operators can scan position
+          at a glance without leaning in. */}
+      <td className="px-3 py-2 align-top text-right text-base font-semibold text-neutral-700 dark:text-neutral-200 font-mono tabular-nums">
+        {rowNumber}
+      </td>
       <td className="px-3 py-2 align-top">
-        <span className="font-mono text-neutral-700 dark:text-neutral-300 break-all">
-          {row.domain}
-        </span>
+        {domainHref ? (
+          <Link
+            href={domainHref}
+            className="font-mono text-blue-700 dark:text-blue-300 hover:text-blue-900 dark:hover:text-blue-200 hover:underline break-all"
+          >
+            {row.domain}
+          </Link>
+        ) : (
+          <span className="font-mono text-neutral-700 dark:text-neutral-300 break-all">
+            {row.domain}
+          </span>
+        )}
         {row.is_banned && (
           <span
             className="ml-2 inline-block text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300"
@@ -2140,8 +2181,12 @@ function DomainListRow({
           <span className="text-xs text-neutral-400 dark:text-neutral-500">—</span>
         ) : row.primary_theme ? (
           (() => {
+            // Grey out when confidence is below threshold OR missing
+            // entirely (2026-05-18). Missing confidence is treated as
+            // low — matches the per-domain page rule "if we don't know
+            // how sure the AI was, don't render in full color."
             const lowConf =
-              row.theme_confidence != null &&
+              row.theme_confidence == null ||
               isLowConfidence(row.theme_confidence);
             return (
               <MaybeLink href={classifyHref}>
@@ -2179,50 +2224,30 @@ function DomainListRow({
           <span className="text-xs text-neutral-400 dark:text-neutral-500">—</span>
         )}
       </td>
-      {/* Category column */}
-      <td className="px-3 py-2 align-top">
-        {!row.is_pinned ? (
-          <span className="text-xs text-neutral-400 dark:text-neutral-500">—</span>
-        ) : row.category ? (
-          <MaybeLink href={classifyHref}>
-          <span
-            className={`text-xs px-2 py-0.5 rounded-full ${
-              row.category === "other"
-                ? "bg-neutral-100 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
-                : "bg-violet-100 text-violet-800 dark:bg-[#1a1030] dark:text-violet-100"
-            }`}
-            title={(() => {
-              const conf = row.category_confidence != null
-                ? ` · ${Math.round(row.category_confidence * 100)}%`
-                : "";
-              const was = row.category_was
-                ? ` · was: ${row.category_was}`
-                : "";
-              return `${row.category}${conf}${was}`;
-            })()}
-          >
-            {row.category}
-            {row.category_was && (
-              <span className="ml-1 opacity-70">← {row.category_was}</span>
-            )}
-          </span>
-          </MaybeLink>
-        ) : (
-          <span className="text-xs text-neutral-400 dark:text-neutral-500">—</span>
-        )}
-      </td>
       <td className="px-3 py-2 align-top text-xs">
-        {row.note ? (
-          <div
-            className="max-w-[18rem] text-neutral-700 dark:text-neutral-200 line-clamp-3 whitespace-pre-wrap break-all"
-            title={row.note}
-          >
-            {row.note}
-          </div>
+        {row.is_pinned ? (
+          enabledCriteriaPills.length === 0 ? (
+            <span className="text-neutral-400 dark:text-neutral-500">—</span>
+          ) : (
+            <div className="space-y-2.5">
+              {ahrefsPills.length > 0 && (
+                <div className="flex flex-wrap gap-x-1.5">
+                  {ahrefsPills.map(renderCriterionPill)}
+                </div>
+              )}
+              {auxPills.length > 0 && (
+                <div className="flex flex-wrap gap-x-1.5">
+                  {auxPills.map(renderCriterionPill)}
+                </div>
+              )}
+            </div>
+          )
         ) : (
           <span className="text-neutral-400 dark:text-neutral-500">—</span>
         )}
       </td>
+      {/* Backlog (queue) cell — last of the operational-state group
+          (Criteria → Backlog reads "what ran" → "what stage it's at"). */}
       <td className="px-3 py-2 align-top">
         <BacklogActionsCell
           domain={row.domain}
@@ -2230,41 +2255,12 @@ function DomainListRow({
           onUpdated={onBacklogUpdated}
         />
       </td>
-      <td className="px-3 py-2 align-top text-xs">
-        {row.is_pinned ? (
-          enabledCriteriaPills.length === 0 ? (
-            <span className="text-neutral-400 dark:text-neutral-500">—</span>
-          ) : (
-            <div className="flex flex-wrap gap-1">
-              {enabledCriteriaPills.map(
-                ({
-                  key,
-                  letter,
-                  rows,
-                  fullName,
-                  sourceRunId,
-                  sourceJobName,
-                  sourceRunName,
-                }) => {
-                  const sourceSuffix = sourceRunId
-                    ? `\nFrom Run #${sourceRunId}${
-                        sourceRunName ? ` "${sourceRunName}"` : ""
-                      }${sourceJobName ? ` (Job: ${sourceJobName})` : ""}`
-                    : "";
-                  return (
-                    <span
-                      key={key}
-                      className="text-xs px-1.5 py-0.5 rounded font-medium tabular-nums bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
-                      title={`${fullName} (${rows.toLocaleString()})${sourceSuffix}`}
-                    >
-                      {letter}
-                    </span>
-                  );
-                },
-              )}
-            </div>
-          )
-        ) : (
+      {/* Identity / triage-record trailing group (Source → Availability
+          → Note). Pinned to the row end 2026-05-18 — domain + AI verdicts
+          + workflow state read left-to-right, then the operator's own
+          metadata trails. */}
+      <td className="px-3 py-2 align-top text-xs text-neutral-700 dark:text-neutral-300">
+        {row.backlog_registrar || (
           <span className="text-neutral-400 dark:text-neutral-500">—</span>
         )}
       </td>
@@ -2277,6 +2273,21 @@ function DomainListRow({
           checkedAt={availability?.checked_at ?? null}
           busy={recheckBusy}
           onRecheck={onRecheck}
+        />
+      </td>
+      <td className="px-3 py-2 align-top text-xs max-w-[20rem]">
+        <EditableTextCell
+          value={row.note}
+          multiline
+          onSave={async (v) => {
+            const next = String(v ?? "").trim();
+            if (next === "") {
+              if (row.note) await api.deleteDomainNote(row.domain);
+            } else {
+              await api.putDomainNote(row.domain, next);
+            }
+            onNoteSaved(next);
+          }}
         />
       </td>
     </tr>

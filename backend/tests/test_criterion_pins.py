@@ -386,3 +386,200 @@ def test_pin_run_all_criteria_endpoint(fresh_db):
         for p in session.query(JobCriterionPin).all()
     }
     assert by_crit == {"backlinks": run_b.id, "refdomains": run_b.id}
+
+
+def test_aux_pillar_rd_does_not_steal_primary_run(fresh_db):
+    """Regression for 2026-05-16: a more-recent whois_history rd was
+    becoming `primary_run`, which silently dropped the Quality run's
+    `scoring_override_json` off the synth and re-scored already-scored
+    Quality rows under global weights.
+
+    Scenario: Quality job pins B/D/A/K on a run with an override that
+    differs sharply from global weights. A separate whois_history job
+    runs LATER and creates a whois CR for the same domain (not pinned).
+    Expectation: the Database row still synthesizes under the Quality
+    run's override weights, not the whois run's (absent) override —
+    so the score must match what the Quality run alone would have
+    produced.
+    """
+    session, _ = fresh_db
+    from app.models import (
+        CriterionResult,
+        Job,
+        JobCriterionPin,
+        Run,
+        RunDomain,
+    )
+    from app.routers.database import list_domains
+    now = datetime.utcnow()
+
+    # Quality job — finishes EARLIER. Override weights skew toward
+    # backlinks/anchors; deliberately differ from default global weights
+    # (B:0.3, D:0.1, A:0.2, K:0.4) so the score differs depending on
+    # which weights win.
+    qjob = Job(name="quality", kind="quality", spec_json="{}")
+    session.add(qjob)
+    session.flush()
+    override = {
+        "weights": {
+            "backlinks": 0.4, "refdomains": 0.2,
+            "anchors": 0.3, "keywords": 0.1,
+            "wayback": 0.0, "wayback_classify": 0.0,
+        },
+    }
+    qrun = Run(
+        job_id=qjob.id, status="done", spec_json="{}",
+        finished_at=now - timedelta(days=1),
+        scoring_override_json=json.dumps(override),
+        name="quality-pass",
+    )
+    session.add(qrun)
+    session.flush()
+    qrd = RunDomain(
+        run_id=qrun.id, domain="ex.com", status="done",
+        finished_at=now - timedelta(days=1),
+    )
+    session.add(qrd)
+    session.flush()
+    # B/D/A/K verdicts. Score under override (B:0.4 D:0.2 A:0.3 K:0.1):
+    # 0.4·85 + 0.2·85 + 0.3·50 + 0.1·50 = 71.0. Score under global
+    # weights (B:0.3 D:0.1 A:0.2 K:0.4): 0.3·85 + 0.1·85 + 0.2·50 +
+    # 0.4·50 = 64.0. 7 points apart, well outside floating-point noise.
+    session.add_all([
+        CriterionResult(
+            run_domain_id=qrd.id, criterion=c, status="done",
+            data_json="{}",
+            ai_verdict_json=json.dumps({
+                "assessment": a, "confidence": 0.85,
+            }),
+        )
+        for c, a in (
+            ("backlinks", "high_quality"),
+            ("refdomains", "high_quality"),
+            ("anchors", "mixed"),
+            ("keywords", "mixed"),
+        )
+    ])
+    for crit in ("backlinks", "refdomains", "anchors", "keywords"):
+        session.add(JobCriterionPin(
+            job_id=qjob.id, criterion=crit, run_id=qrun.id,
+        ))
+
+    # Whois-history job — finishes AFTER the Quality run. No
+    # scoring_override. Domain is the same.
+    wjob = Job(name="whois", kind="whois_history", spec_json="{}")
+    session.add(wjob)
+    session.flush()
+    wrun = Run(
+        job_id=wjob.id, status="done", spec_json="{}",
+        finished_at=now,
+        name="whois-pass",
+    )
+    session.add(wrun)
+    session.flush()
+    wrd = RunDomain(
+        run_id=wrun.id, domain="ex.com", status="done", finished_at=now,
+    )
+    session.add(wrd)
+    session.flush()
+    session.add(CriterionResult(
+        run_domain_id=wrd.id, criterion="whois_history", status="done",
+        data_json="{}",
+        ai_verdict_json=json.dumps({
+            "dropped_confidence": 0.1, "summary": "stable",
+        }),
+    ))
+    # Whois became pin-only 2026-05-17. Add an explicit pin so the
+    # whois column populates — without it the column would correctly
+    # render blank (which would no longer exercise the "aux source can
+    # contaminate primary_run" path this test guards).
+    session.add(JobCriterionPin(
+        job_id=wjob.id, criterion="whois_history", run_id=wrun.id,
+    ))
+    session.commit()
+
+    resp = list_domains(db=session)
+    row = next(r for r in resp.rows if r.domain == "ex.com")
+
+    # The score must reflect the Quality run's override weights, not
+    # the global fallback. Pre-fix this came out as 64.0 (global
+    # weights via the whois rd's primary_run promotion) instead of
+    # 71.0.
+    assert row.final_score is not None
+    assert 70.5 < row.final_score < 71.5, (
+        f"Expected ~71.0 from override weights; got {row.final_score}. "
+        "Whois rd likely contaminated primary_run."
+    )
+    # Whois column populated from the explicit pin (aux_sources entry).
+    assert row.whois_dropped_confidence == 0.1
+    assert row.whois_band == "stable"
+    # `pinned_criteria` reports Quality criteria only — whois is an aux
+    # pillar, not part of the scoring math.
+    assert "whois_history" not in row.pinned_criteria
+    assert set(row.pinned_criteria) == {
+        "backlinks", "refdomains", "anchors", "keywords",
+    }
+
+
+def test_whois_history_is_pin_only_on_database(fresh_db):
+    """2026-05-17: whois_history became pin-only on the Database page,
+    same contract as every Quality criterion. A whois CR with a populated
+    verdict must NOT auto-surface on the Database row until the operator
+    explicitly pins the whois run.
+
+    Asserts both halves:
+      1. CR present, no pin → whois column stays blank.
+      2. Same data + a pin → whois column populates.
+    """
+    from app.models import (
+        CriterionResult,
+        Job,
+        JobCriterionPin,
+        Run,
+        RunDomain,
+    )
+    from app.routers.database import list_domains
+    session, _ = fresh_db
+    now = datetime.utcnow()
+
+    job = Job(name="whois-only", kind="whois_history", spec_json="{}")
+    session.add(job)
+    session.flush()
+    run = Run(
+        job_id=job.id, status="done", spec_json="{}", finished_at=now,
+    )
+    session.add(run)
+    session.flush()
+    rd = RunDomain(run_id=run.id, domain="pin-test.example",
+                   status="done", finished_at=now)
+    session.add(rd)
+    session.flush()
+    session.add(CriterionResult(
+        run_domain_id=rd.id, criterion="whois_history", status="done",
+        data_json="{}",
+        ai_verdict_json=json.dumps(
+            {"dropped_confidence": 0.85, "summary": "drop signals"},
+        ),
+    ))
+    session.commit()
+
+    # Phase 1 — no pin yet: column must be blank.
+    resp = list_domains(db=session)
+    row = next(r for r in resp.rows if r.domain == "pin-test.example")
+    assert row.whois_dropped_confidence is None, (
+        "whois column auto-surfaced without a pin — pin-only contract "
+        "is broken (the fallback is back)"
+    )
+    assert row.whois_band == ""
+    assert row.whois_summary == ""
+    assert "whois_history" not in (row.pinned_criteria or [])
+
+    # Phase 2 — explicit pin: column populates.
+    session.add(JobCriterionPin(
+        job_id=job.id, criterion="whois_history", run_id=run.id,
+    ))
+    session.commit()
+    resp = list_domains(db=session)
+    row = next(r for r in resp.rows if r.domain == "pin-test.example")
+    assert row.whois_dropped_confidence == 0.85
+    assert row.whois_band == "dropped"  # > 0.80 → 'dropped' band

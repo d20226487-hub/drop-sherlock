@@ -38,7 +38,21 @@ export default function BacklogPage() {
   // "__none__" matches domains that have never had an availability
   // check. Server-side resolved via the `availability` query param.
   const [availabilityFilter, setAvailabilityFilter] = useState<string[]>([]);
-  const [search, setSearch] = useState<string>("");
+  // Initial search seed (2026-05-17 B5 fix): read `?search=` from the
+  // URL on mount so the Database → Backlog status-pill link can land
+  // the user on a pre-filtered view. Uses window.location (vs.
+  // useSearchParams) to avoid the Suspense-boundary requirement
+  // Next.js 15 imposes on the hook. After mount the URL is left alone
+  // — the search box owns subsequent edits and the URL doesn't
+  // round-trip.
+  const [search, setSearch] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    try {
+      return new URLSearchParams(window.location.search).get("search") || "";
+    } catch {
+      return "";
+    }
+  });
 
   // --- Pagination state ---------------------------------------------------
   const [page, setPage] = useState<number>(1);
@@ -121,37 +135,6 @@ export default function BacklogPage() {
     }
   }
 
-  async function recheckBulk() {
-    const domains = Array.from(selected)
-      .map((id) => data?.rows.find((r) => r.id === id)?.domain)
-      .filter((d): d is string => !!d);
-    if (domains.length === 0) return;
-    setAvailabilityBusy((prev) => {
-      const next = new Set(prev);
-      for (const d of domains) next.add(d);
-      return next;
-    });
-    try {
-      const r = await api.bulkCheckAvailability(domains, false);
-      setAvailabilityByDomain((prev) => {
-        const next = { ...prev };
-        for (const item of r.items) {
-          next[item.domain] = {
-            status: item.status,
-            provider: item.provider,
-            registrar: item.registrar,
-            expires_on: item.expires_on,
-            checked_at: new Date().toISOString(),
-          };
-        }
-        return next;
-      });
-    } catch {
-      // /errors picks this up.
-    } finally {
-      setAvailabilityBusy(new Set());
-    }
-  }
 
   // Build the export URL from the current filter state. `scope=filtered`
   // includes the filters; `scope=all` ignores them. Browser's native
@@ -924,16 +907,6 @@ export default function BacklogPage() {
               title={ts.sendToPicker.availabilityHint}
             >
               {ts.sendToPicker.availability}
-            </button>
-            <button
-              type="button"
-              onClick={recheckBulk}
-              disabled={bulkBusy || availabilityBusy.size > 0}
-              className="text-xs px-3 py-1 rounded-md bg-neutral-100 text-neutral-800 hover:bg-neutral-200 dark:bg-neutral-800 dark:text-neutral-200 dark:hover:bg-neutral-700 disabled:opacity-50"
-            >
-              {availabilityBusy.size > 0
-                ? t.pages.availability.bulkRecheckRunning
-                : t.pages.availability.bulkRecheck(selected.size)}
             </button>
             <button
               type="button"

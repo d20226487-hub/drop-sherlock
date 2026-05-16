@@ -490,26 +490,44 @@ export default function DomainDetailPage({
         )}
       </header>
 
-      {data.final_assessment ? (
-        <FinalBanner
-          final={data.final_assessment}
-          sourceRunId={data.final_source_run_id ?? null}
-          sourceJobId={data.final_source_job_id ?? null}
-          sourceRunDomainId={data.final_source_run_domain_id ?? null}
-        />
-      ) : (
-        // No final yet. While this rd is still being processed, surface
-        // an explicit "Final pending…" placeholder so the user knows the
-        // headline is *coming* — instead of just missing-banner ambiguity.
-        // (Once the rd is done/failed and there's still no final, render
-        // nothing — the verdict boxes below or the partial stub speak
-        // for themselves.)
-        (data.status === "pending" || data.status === "running") && (
+      {(() => {
+        // 2026-05-17 B6 fix: the banner is labeled "Final Ahrefs
+        // Assessment" — only render it when at least one Ahrefs
+        // criterion (B/D/A/K) actually contributed data to this rd.
+        // A Wayback+CLS-only run still produces a `final_assessment`
+        // (the synth runs over whatever per-criterion verdicts exist),
+        // but showing it under an "Ahrefs" header on a run that never
+        // touched Ahrefs is misleading.
+        const AHREFS = ["backlinks", "refdomains", "anchors", "keywords"];
+        const criteriaDict = (data.criteria ?? {}) as Record<string, unknown>;
+        const hasAhrefs = AHREFS.some((c) => {
+          const cell = criteriaDict[c];
+          return cell != null && typeof cell === "object";
+        });
+        if (data.final_assessment && hasAhrefs) {
+          return (
+            <FinalBanner
+              final={data.final_assessment}
+              sourceRunId={data.final_source_run_id ?? null}
+              sourceJobId={data.final_source_job_id ?? null}
+              sourceRunDomainId={data.final_source_run_domain_id ?? null}
+            />
+          );
+        }
+        // No final yet (or no Ahrefs to summarize). While this rd is
+        // still being processed AND Ahrefs criteria are present, surface
+        // an explicit "Final pending…" placeholder so the user knows
+        // the headline is *coming*. Once the rd is terminal, render
+        // nothing — verdict boxes below speak for themselves.
+        const pending =
+          (data.status === "pending" || data.status === "running") &&
+          hasAhrefs;
+        return pending ? (
           <div className="rounded-md border border-dashed dark:border-neutral-700 px-4 py-3 text-sm text-neutral-500 dark:text-neutral-400">
             {ts.finalBanner.pending}
           </div>
-        )
-      )}
+        ) : null;
+      })()}
 
       {/* Section 2 — All AI verdicts stacked, no tabs. Only render boxes
           for criteria that actually produced a verdict (or errored). The

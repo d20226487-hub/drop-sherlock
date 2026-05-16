@@ -9,9 +9,10 @@ import asyncio
 import json
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import bindparam, case, func as sqla_func, literal, select, text
+from sqlalchemy.orm import Session, aliased, selectinload
 
 from ..db import SessionLocal, get_db
 from ..models import (
@@ -139,6 +140,13 @@ class RunDomainProgress(BaseModel):
     # the signal the Run-page filter targets, since 0 CDX rows guarantees
     # V2 sampling + wayback_classify will also have nothing to work with.
     wayback_rows: int | None = None
+    # Availability verdict status for THIS rd's availability CR
+    # (2026-05-16). One of "available"/"registered"/"unknown"/"error" or
+    # empty when no availability CR exists on this rd / data_json is
+    # malformed. Sourced from `cr.data_json.verdict.status`, the SAME
+    # field the Job-page chip math reads. Drives the Run-page
+    # Availability filter dropdown for availability-pillar runs.
+    availability_status: str = ""
 
 
 class RunDetail(BaseModel):
@@ -157,6 +165,14 @@ class RunDetail(BaseModel):
     error: str
     spec_json: str
     domains: list[RunDomainProgress]
+    # Server-side pagination support (added 2026-05-16). `domains` above
+    # carries only the slice for the requested `offset/limit`; the
+    # frontend uses `total_count` to render the pagination footer and
+    # `filtered_count` (post-status-filter) to drive the page count.
+    # Pre-pagination callers leave the defaults (page=1, large limit) and
+    # see the same numbers, so existing tests + integrations keep working.
+    total_count: int = 0
+    filtered_count: int = 0
     # Per-run scoring override (added 2026-05-13 wave J). None = run uses
     # global Settings weights; dict = {"weights": {<criterion>: <float>}}
     # with the override that was last applied via the recompute endpoints.
@@ -207,6 +223,10 @@ class RunDomainProgressSlim(BaseModel):
     # the expensive columns (language / theme / category / final score)
     # refresh. The value itself is a cheap DATETIME column read.
     last_analyzed_at: datetime | None = None
+    # Mirror of `RunDomainProgress.availability_status` (2026-05-16) so
+    # the slim polling tick keeps the Availability filter source field
+    # populated. Cheap: same data_json.verdict.status read the chip uses.
+    availability_status: str = ""
 
 
 class RunProgress(BaseModel):
@@ -215,13 +235,33 @@ class RunProgress(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     error: str = ""
+    # `counts` is run-wide (always reflects every domain in the run,
+    # independent of the requested page). Drives the progress bar in the
+    # Run page header.
     counts: dict[str, int] = Field(default_factory=dict)
     domains: list[RunDomainProgressSlim] = Field(default_factory=list)
+    # Server-side pagination (added 2026-05-16). `domains` is the slice
+    # for the requested offset/limit; `total_count` is the run-wide
+    # count and `filtered_count` is the post-status-filter count for
+    # rendering the page footer.
+    total_count: int = 0
+    filtered_count: int = 0
+    # Run-level reanalyze flag (added 2026-05-16). Was previously
+    # derived in the frontend by OR'ing per-domain `reanalyzing` flags;
+    # with paginated payloads the FE no longer sees every domain, so
+    # the backend now reports the run-level signal directly.
+    reanalyzing: bool = False
 
 
 # --- Helpers ----------------------------------------------------------------
 
 def _summarize_run(run: Run) -> RunSummary:
+    """Per-run summary. ONLY use this for small jobs (≤ few hundred
+    domains) or when you've already loaded `run.domains`. For large
+    jobs, call `_batch_summarize_runs` instead — that one fetches all
+    run-status counts in a single GROUP BY and avoids the O(N) walk.
+    Kept here for the handful of callers that pass a single Run with
+    pre-loaded domains (e.g. /runs/{id}/pin response builder)."""
     total = len(run.domains)
     done = sum(1 for d in run.domains if d.status == "done")
     failed = sum(1 for d in run.domains if d.status == "failed")
@@ -237,6 +277,218 @@ def _summarize_run(run: Run) -> RunSummary:
         failed_domains=failed,
         is_pinned=bool(run.is_pinned),
     )
+
+
+def _batch_summarize_runs(db: Session, runs: list[Run]) -> list[RunSummary]:
+    """SQL-batched version of `_summarize_run` for use on the /jobs/{id}
+    page. One GROUP BY query returns (run_id, status, count) for every
+    run; we then build RunSummary objects from the small in-memory
+    aggregate. Replaces the previous O(N domains) Python loop that
+    timed out on 100k-domain runs (the user's /jobs/57 freeze, 2026-05-16).
+
+    Preserves response shape exactly — same field set as _summarize_run."""
+    if not runs:
+        return []
+    run_ids = [r.id for r in runs]
+    rows = db.execute(
+        text(
+            "SELECT run_id, status, COUNT(*) AS cnt "
+            "FROM run_domains "
+            "WHERE run_id IN :run_ids "
+            "GROUP BY run_id, status"
+        ).bindparams(bindparam("run_ids", expanding=True)),
+        {"run_ids": run_ids},
+    ).all()
+    # run_id -> status -> cnt
+    by_run: dict[int, dict[str, int]] = {}
+    for run_id, status, cnt in rows:
+        by_run.setdefault(run_id, {})[status or ""] = int(cnt)
+    out: list[RunSummary] = []
+    for r in runs:
+        statuses = by_run.get(r.id, {})
+        out.append(RunSummary(
+            id=r.id,
+            name=r.name or "",
+            status=r.status,
+            started_at=r.started_at,
+            finished_at=r.finished_at,
+            error=r.error,
+            total_domains=sum(statuses.values()),
+            done_domains=statuses.get("done", 0),
+            failed_domains=statuses.get("failed", 0),
+            is_pinned=bool(r.is_pinned),
+        ))
+    return out
+
+
+def _bucket_counts_for_run(
+    db: Session,
+    run: Run,
+    *,
+    kind: str,
+    good_threshold: float,
+    mixed_threshold: float,
+) -> dict[str, int]:
+    """Aggregate verdict-bucket counts for one Run via a single SQL
+    query. Replaces the per-domain Python loop in get_job that walked
+    `run.domains` and json.loads()'d every verdict — a pattern that
+    timed out at 10k+ domains.
+
+    Pillar-specific:
+      • availability — bucketed off `data_json.verdict.status` on the
+        availability CR.
+      • whois_history — bucketed off `ai_verdict_json.dropped_confidence`
+        on the whois_history CR, with the same thresholds the per-
+        domain view uses (>0.80 low_quality, >0.50 mixed, ≥0.30
+        no_verdict, <0.30 good).
+      • quality (default) — bucketed off RunDomain.final_assessment_json's
+        `partial` flag + `final` field (numeric score against the
+        configurable good/mixed thresholds, or label-string fallback).
+
+    Bucket keys: good / mixed / low_quality / partial / no_verdict —
+    same vocabulary as the old Python path. Zero-count buckets are
+    omitted so callers can `.get(key, 0)` freely."""
+    # Malformed-JSON guard: SQLite's `json_extract` raises on invalid
+    # input — the legacy Python path caught these via try/except, so a
+    # naked json_extract here would 500 on rows that the old code
+    # treated as "no verdict". Every json_extract call below is wrapped
+    # in a `json_valid()` check that falls through to the no-verdict
+    # branch when the JSON is unparseable. Cheap (SQLite parses once
+    # and short-circuits the CASE).
+    # Each pillar joins to the LATEST CR per (rd, criterion) so duplicate
+    # CR rows on the same RD don't inflate the bucket counts. Production
+    # data on run 99 had 616 RDs with 3 CRs each (availability runner
+    # creates a fresh CR on every invocation; resume-after-restart paths
+    # re-invoke for already-done RDs, leaving duplicates). Counting raw
+    # JOIN rows gave 2317 for a 1000-domain run. The subselect picks the
+    # newest CR id per RD via correlated lookup — indexes on
+    # criterion_results.run_domain_id make it O(log N) per RD.
+    if kind == "availability":
+        # Split `unknown` and `error` into distinct buckets (2026-05-16):
+        # they're different operator states. `unknown` = cascade ran to
+        # completion but no provider could conclusively classify the
+        # domain (e.g., RDAP returned ambiguous data for .kz) — final,
+        # no retry helps. `error` = cascade itself failed (rate limits,
+        # network, all providers down) — retryable. Lumping them under
+        # `no_verdict` (pre-2026-05-16) hid which subset of "не
+        # determined" rows the user could profitably re-run. `no_verdict`
+        # now only catches truly anomalous rows (cr missing, status
+        # 'failed' at the runner level, malformed data_json) — typically
+        # zero in practice.
+        sql = text("""
+            SELECT
+              CASE
+                WHEN cr.id IS NULL THEN 'no_verdict'
+                WHEN cr.status = 'failed' THEN 'no_verdict'
+                WHEN cr.data_json IS NULL OR cr.data_json = '' THEN 'no_verdict'
+                WHEN NOT json_valid(cr.data_json) THEN 'no_verdict'
+                WHEN json_extract(cr.data_json, '$.verdict.status') = 'available' THEN 'good'
+                WHEN json_extract(cr.data_json, '$.verdict.status') = 'registered' THEN 'mixed'
+                WHEN json_extract(cr.data_json, '$.verdict.status') = 'unknown' THEN 'unknown'
+                WHEN json_extract(cr.data_json, '$.verdict.status') = 'error' THEN 'error'
+                ELSE 'no_verdict'
+              END AS bucket,
+              COUNT(*) AS cnt
+            FROM run_domains rd
+            LEFT JOIN criterion_results cr ON cr.id = (
+              SELECT cr2.id FROM criterion_results cr2
+              WHERE cr2.run_domain_id = rd.id
+                AND cr2.criterion = 'availability'
+              ORDER BY cr2.id DESC
+              LIMIT 1
+            )
+            WHERE rd.run_id = :run_id
+            GROUP BY bucket
+        """)
+        rows = db.execute(sql, {"run_id": run.id}).all()
+    elif kind == "whois_history":
+        # Same latest-CR-per-RD trick as availability. Whois history is
+        # less likely to accumulate duplicates today (the retry path
+        # explicitly deletes the old CR before re-fetching, 2026-05-16),
+        # but the SQL stays robust against future paths that don't.
+        sql = text("""
+            SELECT
+              CASE
+                WHEN cr.id IS NULL THEN 'no_verdict'
+                WHEN cr.status = 'failed' THEN 'no_verdict'
+                WHEN cr.ai_verdict_json IS NULL OR cr.ai_verdict_json = '' THEN 'no_verdict'
+                WHEN NOT json_valid(cr.ai_verdict_json) THEN 'no_verdict'
+                WHEN json_extract(cr.ai_verdict_json, '$.dropped_confidence') IS NULL THEN 'no_verdict'
+                WHEN CAST(json_extract(cr.ai_verdict_json, '$.dropped_confidence') AS REAL) > 0.80 THEN 'low_quality'
+                WHEN CAST(json_extract(cr.ai_verdict_json, '$.dropped_confidence') AS REAL) > 0.50 THEN 'mixed'
+                WHEN CAST(json_extract(cr.ai_verdict_json, '$.dropped_confidence') AS REAL) >= 0.30 THEN 'no_verdict'
+                ELSE 'good'
+              END AS bucket,
+              COUNT(*) AS cnt
+            FROM run_domains rd
+            LEFT JOIN criterion_results cr ON cr.id = (
+              SELECT cr2.id FROM criterion_results cr2
+              WHERE cr2.run_domain_id = rd.id
+                AND cr2.criterion = 'whois_history'
+              ORDER BY cr2.id DESC
+              LIMIT 1
+            )
+            WHERE rd.run_id = :run_id
+            GROUP BY bucket
+        """)
+        rows = db.execute(sql, {"run_id": run.id}).all()
+    else:
+        # Quality. The bucket logic mirrors _bucket_for in
+        # routers/database.py: prefer numeric final.final against the
+        # configured good/mixed thresholds, else match a text label in
+        # final.final or final_summary, else no_verdict.
+        sql = text("""
+            SELECT
+              CASE
+                WHEN rd.final_assessment_json IS NULL OR rd.final_assessment_json = '' THEN
+                  CASE LOWER(TRIM(COALESCE(rd.final_summary, '')))
+                    WHEN 'good' THEN 'good'
+                    WHEN 'quality' THEN 'good'
+                    WHEN 'high_quality' THEN 'good'
+                    WHEN 'mixed' THEN 'mixed'
+                    WHEN 'low_quality' THEN 'low_quality'
+                    WHEN 'low' THEN 'low_quality'
+                    ELSE 'no_verdict'
+                  END
+                WHEN NOT json_valid(rd.final_assessment_json) THEN
+                  CASE LOWER(TRIM(COALESCE(rd.final_summary, '')))
+                    WHEN 'good' THEN 'good'
+                    WHEN 'quality' THEN 'good'
+                    WHEN 'high_quality' THEN 'good'
+                    WHEN 'mixed' THEN 'mixed'
+                    WHEN 'low_quality' THEN 'low_quality'
+                    WHEN 'low' THEN 'low_quality'
+                    ELSE 'no_verdict'
+                  END
+                WHEN json_extract(rd.final_assessment_json, '$.partial') = 1 THEN 'partial'
+                WHEN typeof(json_extract(rd.final_assessment_json, '$.final')) IN ('integer','real') THEN
+                  CASE
+                    WHEN CAST(json_extract(rd.final_assessment_json, '$.final') AS REAL) >= :good_t THEN 'good'
+                    WHEN CAST(json_extract(rd.final_assessment_json, '$.final') AS REAL) >= :mixed_t THEN 'mixed'
+                    ELSE 'low_quality'
+                  END
+                ELSE
+                  CASE LOWER(TRIM(COALESCE(json_extract(rd.final_assessment_json, '$.final'), rd.final_summary, '')))
+                    WHEN 'good' THEN 'good'
+                    WHEN 'quality' THEN 'good'
+                    WHEN 'high_quality' THEN 'good'
+                    WHEN 'mixed' THEN 'mixed'
+                    WHEN 'low_quality' THEN 'low_quality'
+                    WHEN 'low' THEN 'low_quality'
+                    ELSE 'no_verdict'
+                  END
+              END AS bucket,
+              COUNT(rd.id) AS cnt
+            FROM run_domains rd
+            WHERE rd.run_id = :run_id
+            GROUP BY bucket
+        """)
+        rows = db.execute(sql, {
+            "run_id": run.id,
+            "good_t": good_threshold,
+            "mixed_t": mixed_threshold,
+        }).all()
+    return {bucket: int(cnt) for bucket, cnt in rows if bucket}
 
 
 # --- Job endpoints ----------------------------------------------------------
@@ -295,17 +547,22 @@ def list_jobs(
 
 @router.get("/{job_id}", response_model=JobDetail)
 def get_job(job_id: int, db: Session = Depends(get_db)) -> JobDetail:
+    """Job detail with per-run summaries + verdict roll-up.
+
+    Performance: every aggregate here is computed via SQL GROUP BY
+    instead of walking `job.runs` × `run.domains` in Python. The
+    earlier loop-based version timed out at 100k+ domains
+    (incident 2026-05-16, /jobs/57 — the user's "all pages froze"
+    report). Each large-scan endpoint now scales O(buckets), not
+    O(domains)."""
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(404, "job not found")
-    # Roll up verdict counts. Source-of-truth rule (added 2026-05-10):
-    # if the user pinned a run for this job, count from that run; else
-    # fall back to the latest run (max(Run.id) — chronological since
-    # runs are insertion-ordered). The pin pattern mirrors per-domain
-    # pinning: at most one run per job is pinned, enforced at the pin
-    # endpoint inside one transaction.
+    # Source-of-truth rule: if the user pinned a run for this job,
+    # count from that run; else fall back to the latest run (max(Run.id),
+    # chronological since runs are insertion-ordered). The pin pattern
+    # mirrors per-domain pinning: at most one run per job is pinned.
     from ..app_settings import get_scoring_config
-    from .database import _bucket_for
     sc = get_scoring_config()
     good_t = sc["good_threshold"]
     mixed_t = sc["mixed_threshold"]
@@ -317,104 +574,12 @@ def get_job(job_id: int, db: Session = Depends(get_db)) -> JobDetail:
     source_run = pinned_run or latest_run
     counts: dict[str, int] = {}
     if source_run is not None:
-        # Wave 2b (2026-05-15): whois_history jobs have no
-        # final_assessment_json (no final-synth step). Their verdict
-        # lives on each RunDomain's whois_history CR as
-        # `ai_verdict_json.dropped_confidence`. Map that to the same
-        # bucket keys Quality uses (good / mixed / low_quality /
-        # no_verdict) so the frontend's existing pill colors apply
-        # without a kind-aware renderer.
-        #
-        # Bucket mapping mirrors the per-domain view's color bands
-        # (see WhoisHistoryDomainView.dropTone):
-        #   dropped_confidence > 0.80  → low_quality  (red — multi-drop history is risky)
-        #   0.50 < c ≤ 0.80            → mixed        (amber — borderline)
-        #   0.30 ≤ c ≤ 0.50            → no_verdict   (grey — insufficient evidence)
-        #   c < 0.30                   → good         (green — stable owner)
-        # Domains with no AI verdict at all (failed fetch, no key,
-        # provider 429) → no_verdict.
-        is_whois_job = (job.kind or "quality") == "whois_history"
-        # Wave 3 (2026-05-15): availability jobs have no AI verdict
-        # and no final_assessment_json either. Their result lives in
-        # the availability CR's `data_json.verdict.status` — one of
-        # available / registered / unknown / error. Map to the same
-        # bucket keys so existing pill colors apply:
-        #   status='available'              → good        (green — actionable)
-        #   status='registered'             → mixed       (amber — owned, may still be worth waiting on)
-        #   status='unknown' | 'error'      → no_verdict  (grey)
-        # `partial` and `low_quality` are not used by this pillar.
-        is_availability_job = (
-            (job.kind or "quality") == "availability"
+        counts = _bucket_counts_for_run(
+            db, source_run,
+            kind=(job.kind or "quality"),
+            good_threshold=good_t,
+            mixed_threshold=mixed_t,
         )
-        for d in source_run.domains:
-            if is_availability_job:
-                cr = next(
-                    (c for c in d.results if c.criterion == "availability"),
-                    None,
-                )
-                payload: dict | None = None
-                if cr is not None and cr.data_json:
-                    try:
-                        payload = json.loads(cr.data_json)
-                    except json.JSONDecodeError:
-                        payload = None
-                status = None
-                if isinstance(payload, dict):
-                    verdict = payload.get("verdict")
-                    if isinstance(verdict, dict):
-                        status = verdict.get("status")
-                if status == "available":
-                    key = "good"
-                elif status == "registered":
-                    key = "mixed"
-                else:
-                    key = "no_verdict"
-                counts[key] = counts.get(key, 0) + 1
-                continue
-            if is_whois_job:
-                cr = next(
-                    (c for c in d.results if c.criterion == "whois_history"),
-                    None,
-                )
-                verdict: dict | None = None
-                if cr is not None and cr.ai_verdict_json:
-                    try:
-                        verdict = json.loads(cr.ai_verdict_json)
-                    except json.JSONDecodeError:
-                        verdict = None
-                score = (
-                    verdict.get("dropped_confidence")
-                    if isinstance(verdict, dict) else None
-                )
-                if isinstance(score, (int, float)):
-                    s = float(score)
-                    if s > 0.80:
-                        key = "low_quality"
-                    elif s > 0.50:
-                        key = "mixed"
-                    elif s >= 0.30:
-                        key = "no_verdict"
-                    else:
-                        key = "good"
-                else:
-                    key = "no_verdict"
-                counts[key] = counts.get(key, 0) + 1
-                continue
-            parsed: dict | None = None
-            if d.final_assessment_json:
-                try:
-                    parsed = json.loads(d.final_assessment_json)
-                except json.JSONDecodeError:
-                    parsed = None
-            if isinstance(parsed, dict) and parsed.get("partial"):
-                key = "partial"
-            else:
-                bucket = _bucket_for(
-                    parsed, d.final_summary or "",
-                    good_threshold=good_t, mixed_threshold=mixed_t,
-                )
-                key = bucket or "no_verdict"
-            counts[key] = counts.get(key, 0) + 1
     return JobDetail(
         id=job.id,
         name=job.name,
@@ -423,11 +588,8 @@ def get_job(job_id: int, db: Session = Depends(get_db)) -> JobDetail:
         created_at=job.created_at,
         updated_at=job.updated_at,
         archived_at=job.archived_at,
-        runs=[_summarize_run(r) for r in job.runs],
+        runs=_batch_summarize_runs(db, list(job.runs)),
         latest_run_verdict_counts=counts,
-        # `latest_run_id` reports the run the counts actually came from
-        # (pinned when set, else newest). Frontend cross-references with
-        # `pinned_run_id` to pick the pill label ("Pinned" vs "Latest").
         latest_run_id=source_run.id if source_run else None,
         pinned_run_id=pinned_run.id if pinned_run else None,
     )
@@ -618,22 +780,110 @@ async def rerun_job(
 
 # --- Run endpoints ----------------------------------------------------------
 
-def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
-    # Sync impl. The async route below (`_get_run_route`) dispatches
-    # this via asyncio.to_thread; tests import + call it directly.
-    # Eager-load Run → RunDomains → CriterionResults in one IN-list
-    # query each instead of lazy-loading per-domain (regression observed
-    # 2026-05-12 with a 352-domain run — N+1 became 700+ SQLite
-    # roundtrips and the endpoint timed out at 15s, freezing the Run
-    # page). `selectinload` issues 3 queries total: Run, RunDomains,
-    # CriterionResults. The per-domain loop below accesses .results
-    # purely from the populated collection.
-    run = (
-        db.query(Run)
-        .options(selectinload(Run.domains).selectinload(RunDomain.results))
-        .filter(Run.id == run_id)
-        .one_or_none()
+# Accepted values for the availability filter dropdown. Must match the
+# bucket keys `_bucket_counts_for_run` emits for availability runs so
+# "picking 'без вердикта' returns exactly the chip's no_verdict count".
+# 'available'/'registered'/'unknown'/'error' map to the verdict.status
+# values the runner writes; 'no_verdict' is the residual chip bucket
+# (missing CR, status='failed'/'running'/'pending', empty/malformed
+# data_json, or any other verdict.status not in the four known ones).
+_AVAILABILITY_VERDICT_STATUSES = ("available", "registered", "unknown", "error")
+_AVAILABILITY_FILTER_BUCKETS = _AVAILABILITY_VERDICT_STATUSES + ("no_verdict",)
+
+
+def _apply_availability_filter(filter_q, buckets: list[str]):
+    """Narrow a `RunDomain.query()` to rows whose latest availability CR
+    falls into any of the chip-bucket keys in `buckets`. Mirrors the chip
+    SQL exactly so filter results equal chip counts. Bucket vocabulary:
+    available / registered / unknown / error / no_verdict.
+
+    Implementation: LEFT OUTER JOIN the latest availability CR per RD
+    (correlated subselect, same `ORDER BY cr.id DESC LIMIT 1` trick as
+    the chip, so duplicate-CR-bug doesn't double-count). Then a CASE
+    expression assigns each row to a bucket using the same WHEN-chain
+    the chip uses (short-circuit on cr.id IS NULL, cr.status='failed',
+    empty/invalid data_json BEFORE the json_extract call, so SQLite
+    never sees malformed JSON). Filter by `bucket IN (selected)`."""
+    requested = [b for b in buckets if b in _AVAILABILITY_FILTER_BUCKETS]
+    if not requested:
+        # Caller passed only unrecognised values — match nothing, same
+        # as the strict status_filter behavior elsewhere.
+        return filter_q.filter(literal(False))
+
+    av_cr = aliased(CriterionResult)
+    latest_av_cr_id = (
+        select(CriterionResult.id)
+        .where(CriterionResult.run_domain_id == RunDomain.id)
+        .where(CriterionResult.criterion == "availability")
+        .order_by(CriterionResult.id.desc())
+        .limit(1)
+        .correlate(RunDomain)
+        .scalar_subquery()
     )
+    filter_q = filter_q.outerjoin(av_cr, av_cr.id == latest_av_cr_id)
+    # SQLite short-circuits CASE WHEN evaluation, so the json_extract
+    # calls in the inner CASE only fire when all the data_json safety
+    # checks above have passed. Without this guard `json_extract('')`
+    # raises and 500s the whole endpoint.
+    bucket_expr = case(
+        (av_cr.id.is_(None), literal("no_verdict")),
+        (av_cr.status == "failed", literal("no_verdict")),
+        (av_cr.data_json.is_(None), literal("no_verdict")),
+        (av_cr.data_json == "", literal("no_verdict")),
+        (sqla_func.json_valid(av_cr.data_json) == 0, literal("no_verdict")),
+        else_=case(
+            (
+                sqla_func.json_extract(av_cr.data_json, "$.verdict.status")
+                == "available",
+                literal("available"),
+            ),
+            (
+                sqla_func.json_extract(av_cr.data_json, "$.verdict.status")
+                == "registered",
+                literal("registered"),
+            ),
+            (
+                sqla_func.json_extract(av_cr.data_json, "$.verdict.status")
+                == "unknown",
+                literal("unknown"),
+            ),
+            (
+                sqla_func.json_extract(av_cr.data_json, "$.verdict.status")
+                == "error",
+                literal("error"),
+            ),
+            else_=literal("no_verdict"),
+        ),
+    )
+    return filter_q.filter(bucket_expr.in_(requested))
+
+
+def get_run(
+    run_id: int,
+    db: Session = Depends(get_db),
+    *,
+    limit: int = 200,
+    offset: int = 0,
+    status_filter: str | None = None,
+    availability_status_filter: list[str] | None = None,
+) -> RunDetail:
+    """Run detail endpoint, now paginated (added 2026-05-16).
+
+    Returns a SLICE of `limit` domains starting at `offset`, plus
+    `total_count` (run-wide) and `filtered_count` (post-status filter
+    when set). Default `limit=200` keeps pre-pagination callers happy
+    while still capping the heavy JSON-parsing loop at a manageable
+    window. Pass `limit=0` to disable pagination entirely — only
+    appropriate when you know the run is small (e.g. tests).
+
+    Performance: the per-domain loop below parses
+    `ai_verdict_json` + `final_assessment_json` + wayback `data_json`
+    for every domain it touches. At 100k+ domains, walking the full
+    set in one request timed out (the 2026-05-16 incident on /jobs/57).
+    Pagination caps the loop at O(limit) regardless of run size."""
+    # Resolve the Run header first (lightweight) so we know it exists
+    # before doing any heavy joins.
+    run = db.query(Run).filter(Run.id == run_id).one_or_none()
     if run is None:
         raise HTTPException(404, "run not found")
 
@@ -643,11 +893,44 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
     sc = get_scoring_config()
     good_t = sc["good_threshold"]
     mixed_t = sc["mixed_threshold"]
-    # Run-level reanalyze applies to every RD in the run. Cache once per
-    # request so we don't re-check the TaskMap N times.
+    # Run-level reanalyze applies to every RD in the run.
     run_reanalyzing = is_reanalyzing_run(run.id)
+
+    # Total + filtered counts via cheap SQL aggregations — never load
+    # all rows just to count them.
+    total_count = (
+        db.query(RunDomain.id)
+        .filter(RunDomain.run_id == run.id)
+        .count()
+    )
+    filter_q = db.query(RunDomain).filter(RunDomain.run_id == run.id)
+    if status_filter:
+        filter_q = filter_q.filter(RunDomain.status == status_filter)
+    # Availability-verdict filter (2026-05-16, revised second-pass).
+    # Multi-select. Matches the chip's bucket vocabulary 1:1 so picking
+    # "без вердикта" returns the SAME rows the chip counts in its
+    # no_verdict bucket — including cascade-orphaned rows (CR missing
+    # or status='failed'/'running'/'pending' with empty data_json).
+    # Previous implementation used INNER JOIN + verdict.status filter
+    # and was unreachable for the no_verdict bucket; the user's
+    # "Неизвестно returned 0 but chip showed 8" bug.
+    if availability_status_filter:
+        filter_q = _apply_availability_filter(
+            filter_q, availability_status_filter,
+        )
+    filtered_count = filter_q.with_entities(RunDomain.id).count()
+
+    # Domain slice — apply pagination AT THE DB layer. `limit=0` is the
+    # opt-out for "give me everything" (tests, exports). Always order
+    # by id for stable pagination.
+    page_q = filter_q.order_by(RunDomain.id.asc())
+    if limit > 0:
+        page_q = page_q.offset(max(offset, 0)).limit(limit)
+    page_q = page_q.options(selectinload(RunDomain.results))
+    page_domains: list[RunDomain] = list(page_q.all())
+
     progress: list[RunDomainProgress] = []
-    for d in run.domains:
+    for d in page_domains:
         parsed_final: dict | None = None
         if d.final_assessment_json:
             try:
@@ -688,6 +971,33 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
                     rows_val = wb_body.get("wayback")
                     if isinstance(rows_val, list):
                         wayback_rows = len(rows_val)
+        # Availability verdict (2026-05-16) — same `data_json.verdict.status`
+        # the chip SQL and Database column read. CRITICAL: pick the
+        # LATEST availability CR by id, NOT the first one in iteration
+        # order. The availability runner creates a fresh CR on every
+        # invocation (resume-after-restart paths re-invoke for already-
+        # done RDs — see memory line 2448), and the chip SQL and the
+        # server-side filter both `ORDER BY cr.id DESC LIMIT 1`. Reading
+        # the first CR in `d.results` (which is unordered for
+        # selectinload) made the displayed status disagree with the
+        # filter's view of the row on duplicated rds.
+        availability_status = ""
+        latest_av_cr = max(
+            (cr for cr in d.results if cr.criterion == "availability"),
+            key=lambda cr: cr.id,
+            default=None,
+        )
+        if latest_av_cr is not None and latest_av_cr.data_json:
+            try:
+                av_body = json.loads(latest_av_cr.data_json)
+            except json.JSONDecodeError:
+                av_body = None
+            if isinstance(av_body, dict):
+                verdict = av_body.get("verdict")
+                if isinstance(verdict, dict):
+                    vs = verdict.get("status")
+                    if isinstance(vs, str):
+                        availability_status = vs
         # wayback_classify columns — pull straight from THIS rd's
         # classify CR ai_verdict_json. No cross-run stitching here:
         # the run page is run-isolated by design (per 2026-05-08 fix),
@@ -780,6 +1090,7 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
                 category_confidence=wbc_category_confidence,
                 category_was=wbc_category_was,
                 wayback_rows=wayback_rows,
+                availability_status=availability_status,
             )
         )
     from ..tasks import get_run_scoring_override
@@ -795,61 +1106,114 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetail:
         error=run.error,
         spec_json=run.spec_json,
         domains=progress,
+        total_count=total_count,
+        filtered_count=filtered_count,
         scoring_override=get_run_scoring_override(run.id),
     )
 
 
 @runs_router.get("/{run_id}", response_model=RunDetail)
-async def _get_run_route(run_id: int) -> RunDetail:
+async def _get_run_route(
+    run_id: int,
+    limit: int = 200,
+    offset: int = 0,
+    status_filter: str | None = None,
+    availability_status_filter: list[str] | None = Query(None),
+) -> RunDetail:
     """Async wrapper for `get_run`. Off-loads the eager-loaded query +
     per-domain JSON walk to `asyncio.to_thread` so the event loop stays
     free during multi-hundred-domain payloads. Opens a fresh Session
-    inside the executor — no Session ever crosses thread boundaries."""
-    return await asyncio.to_thread(_run_get_run, run_id)
+    inside the executor — no Session ever crosses thread boundaries.
+
+    Pagination params (added 2026-05-16): the FE drives offset/limit
+    from its current page; status_filter narrows to one of the
+    pending/running/done/failed/canceled enum values.
+    `availability_status_filter` (multi-valued, 2026-05-16) narrows to
+    rows whose latest availability CR has verdict.status in the set —
+    only meaningful for availability-pillar runs."""
+    return await asyncio.to_thread(
+        _run_get_run, run_id, limit, offset, status_filter,
+        availability_status_filter,
+    )
 
 
-def _run_get_run(run_id: int) -> RunDetail:
+def _run_get_run(
+    run_id: int,
+    limit: int = 200,
+    offset: int = 0,
+    status_filter: str | None = None,
+    availability_status_filter: list[str] | None = None,
+) -> RunDetail:
     db = SessionLocal()
     try:
-        return get_run(run_id, db=db)
+        return get_run(
+            run_id, db=db,
+            limit=limit, offset=offset, status_filter=status_filter,
+            availability_status_filter=availability_status_filter,
+        )
     finally:
         db.close()
 
 
-def get_run_progress(run_id: int, db: Session = Depends(get_db)) -> RunProgress:
+def get_run_progress(
+    run_id: int,
+    db: Session = Depends(get_db),
+    *,
+    limit: int = 200,
+    offset: int = 0,
+    status_filter: str | None = None,
+    availability_status_filter: list[str] | None = None,
+) -> RunProgress:
     """Slim companion to `get_run` for the Run-page polling loop. Returns
     just the fields that change every tick: per-domain status pills,
-    criterion fetch+AI status, reanalyzing flag, last_analyzed_at. NO
-    JSON parsing of ai_verdict_json / final_assessment_json / wayback
-    data_json — those are the costly walks in get_run.
+    criterion fetch+AI status, reanalyzing flag, last_analyzed_at.
 
-    The frontend keeps the last full /runs/{id} snapshot in state and
-    overlays this slim payload onto it. When a domain's last_analyzed_at
-    or per-criterion status changes between ticks, the page fires a
-    full reload to refresh the expensive columns (language / theme /
-    category / final score). Net result: per-tick server CPU + payload
-    drop ~30–40% at 1k+ domains without the table going stale.
-
-    Sync impl — the async route below wraps in asyncio.to_thread.
-    Tests can call this directly with a session."""
+    Now paginated (added 2026-05-16). The polling loop sends the
+    current page's offset/limit so a 100k-domain run polls a fixed
+    window's worth of rows per tick instead of all 100k. `counts` is
+    still run-wide (it's a cheap GROUP BY) so the header progress bar
+    keeps showing the full-run state."""
     from ..tasks import is_reanalyzing_run, is_reanalyzing_run_domain
 
-    run = (
-        db.query(Run)
-        .options(selectinload(Run.domains).selectinload(RunDomain.results))
-        .filter(Run.id == run_id)
-        .one_or_none()
-    )
+    run = db.query(Run).filter(Run.id == run_id).one_or_none()
     if run is None:
         raise HTTPException(404, "run not found")
 
     run_reanalyzing = is_reanalyzing_run(run.id)
+    # Run-wide status counts via SQL aggregation — never load all rows
+    # just to count them.
     counts = {"total": 0, "done": 0, "failed": 0, "running": 0, "pending": 0}
+    status_rows = (
+        db.query(RunDomain.status, sqla_func.count(RunDomain.id))
+        .filter(RunDomain.run_id == run.id)
+        .group_by(RunDomain.status)
+        .all()
+    )
+    total = 0
+    for status, cnt in status_rows:
+        total += int(cnt)
+        if status in counts:
+            counts[status] = int(cnt)
+    counts["total"] = total
+
+    # Domain slice.
+    filter_q = db.query(RunDomain).filter(RunDomain.run_id == run.id)
+    if status_filter:
+        filter_q = filter_q.filter(RunDomain.status == status_filter)
+    # Availability-verdict filter — see get_run for the rationale.
+    if availability_status_filter:
+        filter_q = _apply_availability_filter(
+            filter_q, availability_status_filter,
+        )
+    filtered_count = filter_q.with_entities(RunDomain.id).count()
+    page_q = filter_q.order_by(RunDomain.id.asc())
+    if limit > 0:
+        page_q = page_q.offset(max(offset, 0)).limit(limit)
+    page_q = page_q.options(selectinload(RunDomain.results))
+    page_domains: list[RunDomain] = list(page_q.all())
+
     rows: list[RunDomainProgressSlim] = []
-    for d in run.domains:
-        counts["total"] += 1
-        if d.status in counts:
-            counts[d.status] += 1
+    for d in page_domains:
         ai_status: dict[str, str] = {}
         criteria: dict[str, str] = {}
         for cr in d.results:
@@ -860,6 +1224,24 @@ def get_run_progress(run_id: int, db: Session = Depends(get_db)) -> RunProgress:
                 ai_status[cr.criterion] = "done"
             else:
                 ai_status[cr.criterion] = "pending"
+        # Availability verdict — latest CR by id (see full-path comment).
+        availability_status = ""
+        latest_av_cr = max(
+            (cr for cr in d.results if cr.criterion == "availability"),
+            key=lambda cr: cr.id,
+            default=None,
+        )
+        if latest_av_cr is not None and latest_av_cr.data_json:
+            try:
+                av_body = json.loads(latest_av_cr.data_json)
+            except json.JSONDecodeError:
+                av_body = None
+            if isinstance(av_body, dict):
+                verdict = av_body.get("verdict")
+                if isinstance(verdict, dict):
+                    vs = verdict.get("status")
+                    if isinstance(vs, str):
+                        availability_status = vs
         rows.append(RunDomainProgressSlim(
             id=d.id,
             status=d.status,
@@ -867,6 +1249,7 @@ def get_run_progress(run_id: int, db: Session = Depends(get_db)) -> RunProgress:
             ai_status=ai_status,
             reanalyzing=run_reanalyzing or is_reanalyzing_run_domain(d.id),
             last_analyzed_at=d.last_analyzed_at,
+            availability_status=availability_status,
         ))
 
     return RunProgress(
@@ -877,22 +1260,44 @@ def get_run_progress(run_id: int, db: Session = Depends(get_db)) -> RunProgress:
         error=run.error or "",
         counts=counts,
         domains=rows,
+        total_count=total,
+        filtered_count=filtered_count,
+        reanalyzing=run_reanalyzing,
     )
 
 
 @runs_router.get("/{run_id}/progress", response_model=RunProgress)
-async def _get_run_progress_route(run_id: int) -> RunProgress:
+async def _get_run_progress_route(
+    run_id: int,
+    limit: int = 200,
+    offset: int = 0,
+    status_filter: str | None = None,
+    availability_status_filter: list[str] | None = Query(None),
+) -> RunProgress:
     """Async wrapper for the slim progress endpoint. Off-loads the
     eager-loaded query to asyncio.to_thread so the polling loop can
     run at 2s cadence without holding an anyio threadpool slot for
     each tick."""
-    return await asyncio.to_thread(_run_get_run_progress, run_id)
+    return await asyncio.to_thread(
+        _run_get_run_progress, run_id, limit, offset, status_filter,
+        availability_status_filter,
+    )
 
 
-def _run_get_run_progress(run_id: int) -> RunProgress:
+def _run_get_run_progress(
+    run_id: int,
+    limit: int = 200,
+    offset: int = 0,
+    status_filter: str | None = None,
+    availability_status_filter: list[str] | None = None,
+) -> RunProgress:
     db = SessionLocal()
     try:
-        return get_run_progress(run_id, db=db)
+        return get_run_progress(
+            run_id, db=db,
+            limit=limit, offset=offset, status_filter=status_filter,
+            availability_status_filter=availability_status_filter,
+        )
     finally:
         db.close()
 
@@ -1259,7 +1664,16 @@ def get_run_domain_detail(
         if cr.ai_provider and cr.ai_model:
             cost_seen_models.add((cr.ai_provider, cr.ai_model))
         if cr.criterion == "whois_history":
-            if cr.fetched_at is not None and cr.cached_from_run_id is None:
+            # WhoisFreaks bills per successful request. A failed fetch
+            # (provider raised before producing records) doesn't consume a
+            # plan unit — `cr.error` holds the fetch-side error (distinct
+            # from `ai_verdict_error` which is the AI step). Count only
+            # when both `fetched_at` is set AND no fetch error landed.
+            if (
+                cr.fetched_at is not None
+                and cr.cached_from_run_id is None
+                and not (cr.error or "")
+            ):
                 whois_fresh += 1
             elif cr.cached_from_run_id is not None:
                 whois_cache += 1
@@ -1383,20 +1797,30 @@ def get_run_summary(run_id: int, db: Session = Depends(get_db)) -> dict:
                     verdict = json.loads(cr.ai_verdict_json)
                 except json.JSONDecodeError:
                     verdict = None
-            per_crit[cr.criterion] = (
-                {
-                    "fetch_status": cr.status,
-                    "ai_assessment": (verdict or {}).get("assessment")
-                    if verdict
-                    else None,
-                    "ai_confidence": (verdict or {}).get("confidence")
-                    if verdict
-                    else None,
-                    "ai_error": cr.ai_verdict_error or None,
-                    "ai_provider": cr.ai_provider or "",
-                    "ai_model": cr.ai_model or "",
-                }
-            )
+            entry: dict = {
+                "fetch_status": cr.status,
+                "ai_assessment": (verdict or {}).get("assessment")
+                if verdict
+                else None,
+                "ai_confidence": (verdict or {}).get("confidence")
+                if verdict
+                else None,
+                "ai_error": cr.ai_verdict_error or None,
+                "ai_provider": cr.ai_provider or "",
+                "ai_model": cr.ai_model or "",
+            }
+            # wayback_classify doesn't emit an `assessment` field — its
+            # verdict shape is {primary_theme, primary_language, category,
+            # drift_detected, ...}. Surface those explicitly so the Compare
+            # page can render category as the cell value and theme as its
+            # own column. Empty strings when missing so the FE can rely on
+            # truthy checks without optional-chaining the whole way down.
+            if cr.criterion == "wayback_classify" and isinstance(verdict, dict):
+                entry["theme"] = verdict.get("primary_theme") or ""
+                entry["language"] = verdict.get("primary_language") or ""
+                entry["category"] = verdict.get("category") or ""
+                entry["drift_detected"] = bool(verdict.get("drift_detected"))
+            per_crit[cr.criterion] = entry
         # Surface the numeric score from final_assessment_json so the
         # Analyze summary table can render the score pill (the score is
         # computed deterministically from sub-verdicts; see scoring.py).
@@ -1579,10 +2003,16 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
         # results in data_json — a CR with status=failed AND no
         # fetched_at represents a request that bailed before reaching
         # the provider (missing API key / config error) and didn't
-        # touch quota. Anything with fetched_at set hit the provider,
-        # even if records came back empty.
+        # touch quota. Anything with fetched_at set + no fetch error
+        # hit the provider successfully (records may be empty but the
+        # call was billed). Failed fetches (cr.error non-empty) raised
+        # before producing a billable response, so don't count them.
         elif cr.criterion == "whois_history":
-            if cr.fetched_at is not None and cr.cached_from_run_id is None:
+            if (
+                cr.fetched_at is not None
+                and cr.cached_from_run_id is None
+                and not (cr.error or "")
+            ):
                 whois_fresh_calls += 1
             elif cr.cached_from_run_id is not None:
                 whois_cached_calls += 1

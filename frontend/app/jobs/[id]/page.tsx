@@ -243,6 +243,7 @@ export default function JobDetailPage({
               counts={job.latest_run_verdict_counts}
               sourceRunId={job.latest_run_id}
               pinnedRunId={job.pinned_run_id ?? null}
+              jobKind={job.kind || "quality"}
             />
           </div>
           <div className="flex flex-wrap gap-2">
@@ -740,11 +741,17 @@ function RunSummaryRow({
 }
 
 // Order matters — match the user's requested layout: good · mixed · low ·
-// partial · no_verdict.
+// partial · no_verdict. The `unknown` and `error` keys are only emitted
+// by the availability bucketing (2026-05-16 split — see
+// `_bucket_counts_for_run`); quality and whois never produce them, so
+// the chip is rendered as 0 → hidden via the `if (n === 0) return null`
+// guard in `VerdictRollupPills`.
 const ROLLUP_ORDER: { key: string; bucket: FinalBucket | null }[] = [
   { key: "good", bucket: "good" },
   { key: "mixed", bucket: "mixed" },
   { key: "low_quality", bucket: "low_quality" },
+  { key: "unknown", bucket: null },
+  { key: "error", bucket: null },
   { key: "partial", bucket: null },
   { key: "no_verdict", bucket: null },
 ];
@@ -753,6 +760,7 @@ function VerdictRollupPills({
   counts,
   sourceRunId,
   pinnedRunId,
+  jobKind = "quality",
 }: {
   counts: Record<string, number>;
   // The run id the counts actually came from (pinned when set, else latest).
@@ -760,9 +768,23 @@ function VerdictRollupPills({
   // The pinned run id, if any. When set, counts came from the pinned run
   // and we render the "Pinned: Run #N" prefix; otherwise "Latest: Run #N".
   pinnedRunId: number | null;
+  // Pillar discriminator. Drives the chip vocabulary — availability
+  // jobs say "available / registered / unknown", whois says
+  // "stable / drift suspected / dropped". Quality uses the default
+  // good/mixed/low quality labels.
+  jobKind?: string;
 }) {
   const { t } = useT();
   const ts = t.pages.jobs.detail.rollup;
+  // Pick the right label map for the pillar. Falls back to the
+  // default `label` (quality) if the kind doesn't have a dedicated
+  // dictionary — keeps newer pillars working without an i18n edit.
+  const labelMap: Record<string, string> =
+    jobKind === "availability"
+      ? (ts.labelAvailability as unknown as Record<string, string>)
+      : jobKind === "whois_history"
+        ? (ts.labelWhois as unknown as Record<string, string>)
+        : (ts.label as unknown as Record<string, string>);
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   if (total === 0) return null;
   const isPinnedSource = pinnedRunId != null && pinnedRunId === sourceRunId;
@@ -793,17 +815,24 @@ function VerdictRollupPills({
       {ROLLUP_ORDER.map(({ key, bucket }) => {
         const n = counts[key] || 0;
         if (n === 0) return null;
+        // Tone selection for bucket=null chips:
+        //   `error`     → red (cascade failed, retryable)
+        //   `unknown`   → neutral-grey (cascade ran, no terminal answer)
+        //   `partial`   → slightly stronger neutral (mid-run / blocked)
+        //   `no_verdict`→ neutral (default catch-all)
         const tone = bucket
           ? bucketPillTone(bucket)
-          : key === "partial"
-            ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
-            : "bg-neutral-100 text-neutral-600 dark:bg-neutral-900 dark:text-neutral-400";
+          : key === "error"
+            ? "bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300"
+            : key === "partial"
+              ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
+              : "bg-neutral-100 text-neutral-600 dark:bg-neutral-900 dark:text-neutral-400";
         return (
           <span
             key={key}
             className={`text-xs px-2 py-0.5 rounded-full font-medium ${tone}`}
           >
-            {n} {ts.label[key as keyof typeof ts.label]}
+            {n} {labelMap[key] ?? key}
           </span>
         );
       })}

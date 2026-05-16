@@ -606,6 +606,16 @@ def update_row(row_id: int, payload: UpdateRowIn, db: Session = Depends(get_db))
     row.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(row)
+    # 2026-05-17 B2 fix: the response MUST include analyzed_* cross-link
+    # IDs (same shape as list_backlog), or the frontend's optimistic
+    # row-merge after an inline edit (date / price / comment) overwrites
+    # the rich row with one that has analyzed_* = None → the per-row
+    # domain link silently vanishes until the next full refresh. Resolve
+    # for just this single domain — _resolve_analyzed_links handles
+    # variable-length input fine and the query is sub-millisecond at
+    # this size.
+    analyzed_links = _resolve_analyzed_links(db, [row.domain])
+    link = analyzed_links.get(row.domain) or (None, None, None)
     return BacklogRow(
         id=row.id,
         domain=row.domain,
@@ -617,6 +627,9 @@ def update_row(row_id: int, payload: UpdateRowIn, db: Session = Depends(get_db))
         max_price=row.max_price,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        analyzed_run_domain_id=link[0],
+        analyzed_run_id=link[1],
+        analyzed_job_id=link[2],
     )
 
 

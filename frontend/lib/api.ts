@@ -455,6 +455,14 @@ export type RunSummaryDomain = {
       ai_error: string | null;
       ai_provider: string;
       ai_model: string;
+      // wayback_classify-only fields. Backend populates these only for the
+      // `wayback_classify` criterion entry; absent for the quality pillar
+      // criteria. Empty strings (not null) when the field exists but the
+      // AI returned blank — that lets FE rely on truthy checks.
+      theme?: string;
+      language?: string;
+      category?: string;
+      drift_detected?: boolean;
     }
   >;
   final_summary: string | null;
@@ -519,6 +527,10 @@ export type RunDomainProgressSlim = {
   ai_status: Record<string, string>;
   reanalyzing: boolean;
   last_analyzed_at: string | null;
+  // Mirror of RunDomainProgress.availability_status (2026-05-16) so the
+  // slim polling tick keeps the Availability filter source field
+  // populated.
+  availability_status?: string;
 };
 
 export type RunProgress = {
@@ -527,6 +539,8 @@ export type RunProgress = {
   started_at: string | null;
   finished_at: string | null;
   error: string;
+  // Run-wide counts — always reflects every domain in the run,
+  // independent of the requested page.
   counts: {
     total: number;
     done: number;
@@ -534,7 +548,15 @@ export type RunProgress = {
     running: number;
     pending: number;
   };
+  // Slice of domains for the requested page (added 2026-05-16).
   domains: RunDomainProgressSlim[];
+  total_count?: number;
+  filtered_count?: number;
+  // Backend-reported run-level reanalyze flag (added 2026-05-16).
+  // Pre-pagination the FE OR'd per-domain `reanalyzing` flags; with
+  // paginated payloads the FE no longer sees every domain so the
+  // backend now exposes this directly.
+  reanalyzing?: boolean;
 };
 
 export type JobsListItem = {
@@ -657,6 +679,11 @@ export type RunDomainProgress = {
   // with no snapshots (the "structurally nothing to classify" signal the
   // Run-page Wayback CDX filter targets); >=1 = real CDX rows present.
   wayback_rows?: number | null;
+  // Per-rd availability verdict (2026-05-16). One of "available" /
+  // "registered" / "unknown" / "error" or empty when no availability CR
+  // for this rd. Drives the Availability-pillar Run-page filter
+  // dropdown and the per-row verdict pill.
+  availability_status?: string;
 };
 
 // AI cost accounting for one run, returned by /runs/{id}/cost. Cache hits
@@ -714,7 +741,13 @@ export type RunDetail = {
   finished_at: string | null;
   error: string;
   spec_json: string;
+  // Slice of domains for the current page (added 2026-05-16: server-
+  // side pagination). `total_count` is the run-wide total;
+  // `filtered_count` is the post-status-filter count. Use both to
+  // drive the page footer + page count.
   domains: RunDomainProgress[];
+  total_count?: number;
+  filtered_count?: number;
   // Per-run scoring override (added 2026-05-13 wave J). null = run uses
   // global Settings weights; non-null = the override last applied via
   // the /recompute-final endpoints. The Run-page "Score weights" panel
@@ -882,6 +915,13 @@ export type DatabaseCriterionSummary = {
   source_job_id?: number | null;
   source_job_name?: string;
   source_run_domain_id?: number | null;
+  // Per-criterion AI verdict (added for confidence-aware Criteria pills).
+  // ai_assessment ∈ {high_quality, mixed, low_quality} for Ahrefs +
+  // Wayback. whois_history reports ai_dropped_confidence on a different
+  // axis. All null when no AI verdict exists for that criterion yet.
+  ai_assessment?: string | null;
+  ai_confidence?: number | null;
+  ai_dropped_confidence?: number | null;
 };
 
 export type PinOption = {
@@ -961,6 +1001,16 @@ export type DatabaseDomainRow = {
   whois_transferred_confidence: number | null;
   whois_summary: string;
   whois_band: string;
+  // Domain-availability verdict (added 2026-05-16) — sourced from the
+  // aux availability CR (same data the Job-page chip math reads).
+  // Replaces the prior `/availability/latest` cache hydration so the
+  // column matches the chip row-for-row. Empty status when no
+  // availability CR is pinned/in fallback for this domain.
+  availability_status: string;
+  availability_provider: string;
+  availability_registrar: string;
+  availability_expires_on: string | null;
+  availability_checked_at: string | null;
   total_runs: number;
   any_cached: boolean;
   // User-authored note attached to this domain. Empty string when no note.
@@ -976,6 +1026,10 @@ export type DatabaseDomainRow = {
   // actions without bouncing back to the Backlog page.
   backlog_id: number | null;
   backlog_status: BacklogStatus | null;
+  // Registrar string from the matching BacklogDomain row (2026-05-17).
+  // Same data shown as the "Source" column on the Backlog page. Empty
+  // when the domain has no backlog row or no registrar was captured.
+  backlog_registrar?: string;
   // Ban-list flag (added 2026-05-13 wave L). True when the domain is
   // on the ban list. The row stays visible per design call (i) — the
   // UI renders a small "banned" badge in the domain cell.
@@ -1045,6 +1099,13 @@ export type DatabaseDomainList = {
     // 2026-05-15). Subset of {dropped, mixed, insufficient, stable}.
     // Drives the Whois filter dropdown's enabled state.
     whois_bands: string[];
+    // Availability verdict values (2026-05-16). Subset of
+    // {available, registered, unknown, error}.
+    availability_statuses?: string[];
+    // BacklogDomain.registrar values for the Source filter (2026-05-17).
+    // Empty when no backlog row carries a registrar yet; frontend
+    // disables the dropdown in that case.
+    sources?: string[];
   };
   // Total domain count across the full set (regardless of pagination).
   // Equal to rows.length when no offset/limit was passed.
@@ -1293,8 +1354,35 @@ export const api = {
   // full /runs/{id} payload; the polling loop overlays slim updates
   // on top of the last full snapshot and auto-fires a full reload
   // whenever a status transition is detected.
-  getRunProgress: (runId: number) =>
-    request<RunProgress>(`/runs/${runId}/progress`),
+  //
+  // Pagination (added 2026-05-16). Sends the visible-page offset/limit
+  // so 100k-domain runs poll a fixed-size window per tick instead of
+  // the full list. `counts` in the response is still run-wide so the
+  // header progress bar shows the aggregate state.
+  getRunProgress: (
+    runId: number,
+    opts?: {
+      limit?: number;
+      offset?: number;
+      status?: string;
+      // Multi-valued (2026-05-16). Empty/missing = no filter. Each value
+      // becomes its own `?availability_status_filter=` query param so
+      // FastAPI parses them as a list.
+      availabilityStatuses?: string[];
+    },
+  ) => {
+    const qs = new URLSearchParams();
+    if (opts?.limit !== undefined) qs.set("limit", String(opts.limit));
+    if (opts?.offset !== undefined) qs.set("offset", String(opts.offset));
+    if (opts?.status) qs.set("status_filter", opts.status);
+    for (const s of opts?.availabilityStatuses ?? []) {
+      qs.append("availability_status_filter", s);
+    }
+    const suffix = qs.toString();
+    return request<RunProgress>(
+      `/runs/${runId}/progress${suffix ? `?${suffix}` : ""}`,
+    );
+  },
 
   // SSE URL for live run status — frontend can subscribe via:
   //   const es = new EventSource(api.runEventsUrl(123));
@@ -1595,7 +1683,30 @@ export const api = {
       `/run-domains/${runDomainId}/ai-preview/${criterion}`,
     ),
 
-  getRun: (runId: number) => request<RunDetail>(`/runs/${runId}`),
+  // Full run detail (added 2026-05-16: paginated). `opts` lets the
+  // caller request a slice of domains by offset/limit + an optional
+  // status filter. Defaults (200 / 0 / no filter) preserve pre-
+  // pagination behavior for callers that don't pass opts. `total_count`
+  // + `filtered_count` on the response drive the page footer.
+  getRun: (
+    runId: number,
+    opts?: {
+      limit?: number;
+      offset?: number;
+      status?: string;
+      availabilityStatuses?: string[];
+    },
+  ) => {
+    const qs = new URLSearchParams();
+    if (opts?.limit !== undefined) qs.set("limit", String(opts.limit));
+    if (opts?.offset !== undefined) qs.set("offset", String(opts.offset));
+    if (opts?.status) qs.set("status_filter", opts.status);
+    for (const s of opts?.availabilityStatuses ?? []) {
+      qs.append("availability_status_filter", s);
+    }
+    const suffix = qs.toString();
+    return request<RunDetail>(`/runs/${runId}${suffix ? `?${suffix}` : ""}`);
+  },
 
   getRunDomain: (runDomainId: number) =>
     request<RunDomainDetail>(`/run-domains/${runDomainId}`),

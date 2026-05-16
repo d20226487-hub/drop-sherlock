@@ -39,7 +39,11 @@ from sqlalchemy.orm import Session
 
 from .app_settings import SessionLocal
 from .availability.cascade import check_availability_async
-from .availability.common import STATUS_ERROR
+from .availability.common import (
+    STATUS_AVAILABLE,
+    STATUS_ERROR,
+    STATUS_REGISTERED,
+)
 from .models import AvailabilityCheck, CriterionResult, Run, RunDomain
 
 log = logging.getLogger(__name__)
@@ -83,15 +87,29 @@ def _serialize_trace(
 async def _process_availability_domain(
     rd_id: int, run_id: int, client: httpx.AsyncClient,
 ) -> None:
-    """Run the cascade for one domain. Each step writes its own short
-    transaction so a cascade error doesn't lose the (already-paid-for)
-    provider results."""
+    """Run the cascade for one domain.
+
+    DB sessions are NEVER held across the cascade await (refactored
+    2026-05-16). Previously the runner opened one session and kept it
+    around for the entire cascade — including the provider HTTP calls,
+    each of which could take seconds. With `_OUTER_CONCURRENCY=8` that
+    meant 8 long-lived sessions during a 1000-domain run; combined with
+    FE polling + a concurrent whois retry, the 15-slot pool exhausted
+    and the entire app stopped responding (the user's "all pages
+    stopped responding" report).
+
+    Each DB step now opens its own short-lived session — fast in/out,
+    no await held inside."""
+    # --- Phase 1: mark RD running + create CR row (own session)
+    domain: str | None = None
+    cr_id: int | None = None
     db: Session = SessionLocal()
     try:
         rd = db.get(RunDomain, rd_id)
         if rd is None:
             log.warning("availability runner: rd_id=%s missing", rd_id)
             return
+        domain = rd.domain
         rd.status = "running"
         rd.started_at = datetime.utcnow()
         db.commit()
@@ -110,51 +128,87 @@ async def _process_availability_domain(
         db.add(cr)
         db.commit()
         db.refresh(cr)
+        cr_id = cr.id
+    finally:
+        db.close()
 
-        # Walk the cascade. use_cache=False because a Job is an
-        # explicit "give me fresh state" request (Wave 3 decision (b)).
-        # run_id stamping on the persisted AvailabilityCheck rows lets
-        # the trace query below scope to "this run's results only" —
-        # critical when the domain has prior availability_checks rows
-        # from other contexts.
-        cascade_error: str = ""
-        result_status: str = STATUS_ERROR
-        result_provider: str = ""
-        result_registrar: str = ""
-        result_expires_on = None
-        try:
-            result = await check_availability_async(
-                rd.domain,
-                run_id=run_id,
-                use_cache=False,
-                db=db,
-                client=client,
-            )
-            result_status = result.status
-            result_provider = result.provider
-            result_registrar = result.registrar
-            result_expires_on = result.expires_on
-        except Exception as e:  # noqa: BLE001
-            # Cascade should never raise (it catches per-provider
-            # errors and returns status='error'/'unknown'); if it does,
-            # log + mark this rd failed but let the run continue.
-            cascade_error = f"{type(e).__name__}: {e}"
-            log.exception(
-                "availability cascade raised for rd=%s domain=%s",
-                rd_id, rd.domain,
-            )
+    # --- Phase 2: cascade (NO session held; cascade manages its own
+    # short-lived sessions internally). use_cache=False because a Job
+    # is an explicit "give me fresh state" request (Wave 3 decision (b)).
+    # run_id stamping on the persisted AvailabilityCheck rows lets the
+    # trace query below scope to "this run's results only" — critical
+    # when the domain has prior availability_checks rows from other
+    # contexts.
+    cascade_error: str = ""
+    result_status: str = STATUS_ERROR
+    result_provider: str = ""
+    result_registrar: str = ""
+    result_expires_on = None
+    try:
+        result = await check_availability_async(
+            domain,
+            run_id=run_id,
+            use_cache=False,
+            client=client,
+        )
+        result_status = result.status
+        result_provider = result.provider
+        result_registrar = result.registrar
+        result_expires_on = result.expires_on
+    except Exception as e:  # noqa: BLE001
+        # Cascade should never raise (it catches per-provider errors
+        # and returns status='error'/'unknown'); if it does, log + mark
+        # this rd failed but let the run continue.
+        cascade_error = f"{type(e).__name__}: {e}"
+        log.exception(
+            "availability cascade raised for rd=%s domain=%s",
+            rd_id, domain,
+        )
 
+    # --- Phase 3: query trace + write verdict (own session)
+    db = SessionLocal()
+    try:
         # Fetch the trace rows the cascade just wrote for this run.
-        # AvailabilityCheck.run_id was added so we can scope exactly
+        # `AvailabilityCheck.run_id` was added so we can scope exactly
         # to "this Run's cascade calls" — including the cases where a
-        # provider was attempted and errored, not just the terminal
-        # row. Sorted newest-first.
+        # provider was attempted and errored, not just the terminal row.
         trace_rows = (
             db.query(AvailabilityCheck)
-            .filter(AvailabilityCheck.domain == rd.domain)
+            .filter(AvailabilityCheck.domain == domain)
             .filter(AvailabilityCheck.run_id == run_id)
             .all()
         )
+
+        # Verdict-preservation across cascade retries (2026-05-17 fix
+        # for B9). Each retry of a failed RD invokes a fresh cascade
+        # call, but RDAP can intermittently rate-limit (429) AFTER an
+        # earlier call already returned a confirmed terminal answer
+        # (available / registered) for the same domain in this run. The
+        # naive "latest cascade result wins" policy then silently
+        # downgraded a known-good 'available' to 'error', and the user's
+        # chip / filter showed the domain under "ошибка" forever. Now:
+        # if the current cascade returned a non-terminal result but a
+        # PRIOR row in this run's history is terminal, prefer that
+        # terminal answer. Scope is `run_id` (not all-time), so the
+        # operator can still get a fresh "now error" verdict by spinning
+        # up a brand-new availability run.
+        if result_status not in (STATUS_AVAILABLE, STATUS_REGISTERED):
+            terminal_row = (
+                db.query(AvailabilityCheck)
+                .filter(AvailabilityCheck.domain == domain)
+                .filter(AvailabilityCheck.run_id == run_id)
+                .filter(AvailabilityCheck.status.in_(
+                    (STATUS_AVAILABLE, STATUS_REGISTERED),
+                ))
+                .order_by(AvailabilityCheck.checked_at.desc())
+                .first()
+            )
+            if terminal_row is not None:
+                result_status = terminal_row.status
+                result_provider = terminal_row.provider or ""
+                result_registrar = terminal_row.registrar or ""
+                result_expires_on = terminal_row.expires_on
+
         data_payload = {
             "verdict": {
                 "status": result_status,
@@ -167,6 +221,10 @@ async def _process_availability_domain(
             },
             "trace": _serialize_trace(trace_rows),
         }
+        cr = db.get(CriterionResult, cr_id)
+        rd = db.get(RunDomain, rd_id)
+        if cr is None or rd is None:
+            return
         cr.data_json = json.dumps(data_payload)
         cr.error = cascade_error
 

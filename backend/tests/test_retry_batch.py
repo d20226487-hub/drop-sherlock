@@ -469,3 +469,102 @@ def test_retry_batch_refuses_non_terminal_run(fresh_db, monkeypatch):
     )
     assert "error" in result
     assert "wait" in result["error"]
+
+
+def _seed_availability_run(session):
+    """Seed an Availability-kind Job + Run with three RDs:
+      - rd_ok: cascade succeeded (cr.status='done', verdict='registered') — NOT a retry candidate
+      - rd_err: cascade completed but every provider errored (cr.status='done',
+                verdict='error') — IS a retry candidate per the 2026-05-16 split
+      - rd_orphan: cascade died mid-flight (cr.status='running') — IS a candidate"""
+    from app.models import CriterionResult, Job, Run, RunDomain
+    job = Job(
+        name="avail-retry", kind="availability",
+        spec_json=json.dumps({
+            "criteria": {
+                "backlinks": {"enabled": False},
+                "refdomains": {"enabled": False},
+                "anchors": {"enabled": False},
+                "keywords": {"enabled": False},
+                "wayback": {"enabled": False},
+                "wayback_classify": {"enabled": False},
+                "whois_history": {"enabled": False},
+                "availability": {"enabled": True},
+            },
+            # No AI on availability — provider is None. This is the exact
+            # shape /analyze/availability writes.
+            "ai": {"provider": None, "model": None},
+            "use_cache": False,
+        }),
+    )
+    session.add(job)
+    session.flush()
+    run = Run(
+        job_id=job.id, status="done", spec_json=job.spec_json,
+        finished_at=datetime.utcnow(),
+    )
+    session.add(run)
+    session.flush()
+    rd_ok = RunDomain(run_id=run.id, domain="ok.example", status="done",
+                      finished_at=datetime.utcnow())
+    rd_err = RunDomain(run_id=run.id, domain="err.example", status="done",
+                       finished_at=datetime.utcnow())
+    rd_orphan = RunDomain(run_id=run.id, domain="orphan.example",
+                          status="running")
+    session.add_all([rd_ok, rd_err, rd_orphan])
+    session.flush()
+    session.add_all([
+        CriterionResult(
+            run_domain_id=rd_ok.id, criterion="availability", status="done",
+            data_json=json.dumps({
+                "verdict": {"status": "registered", "provider": "rdap",
+                            "registrar": "Foo Inc.", "expires_on": "2028-01-01"},
+                "trace": [],
+            }),
+        ),
+        CriterionResult(
+            run_domain_id=rd_err.id, criterion="availability", status="done",
+            data_json=json.dumps({
+                "verdict": {"status": "error", "provider": "", "registrar": "",
+                            "expires_on": None},
+                "trace": [{"provider": "rdap", "status": "error",
+                           "error_message": "429"}],
+            }),
+        ),
+        CriterionResult(
+            run_domain_id=rd_orphan.id, criterion="availability",
+            status="running", data_json="",
+        ),
+    ])
+    session.commit()
+    return job, run, rd_ok, rd_err, rd_orphan
+
+
+def test_retry_failed_on_availability_run_skips_ai_gate(
+    fresh_db, monkeypatch,
+):
+    """Regression for 2026-05-16: retrying failed criteria on an
+    Availability-kind run used to 400 with "no AI provider configured
+    for this run" because the AI-provider gate fired regardless of
+    pillar. Availability cascades never use AI, so the gate must be
+    skipped for `Job.kind == 'availability'`.
+
+    Also verifies the failed-criteria collector picks up BOTH the
+    cr.status='done' + verdict='error' rows AND the orphaned 'running'
+    rows, without retrying the cleanly-resolved 'registered' row."""
+    from app.tasks import retry_failed_run_now
+    session = fresh_db
+    _job, run, rd_ok, rd_err, rd_orphan = _seed_availability_run(session)
+    spawned = _patch_dispatch(monkeypatch)
+
+    result = retry_failed_run_now(run.id)
+
+    # No AI-gate error. Two RDs retried (the cleanly-resolved one is
+    # skipped). Both pulled in `availability` as the failed criterion.
+    assert "error" not in result, result
+    assert result["status"] == "started"
+    assert result["domains"] == 2
+    retried_rd_ids = {rd_id for (rd_id, _) in spawned}
+    assert retried_rd_ids == {rd_err.id, rd_orphan.id}
+    for _rd_id, crits in spawned:
+        assert crits == ["availability"]

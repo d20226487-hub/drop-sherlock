@@ -325,7 +325,27 @@ export default function BanListPage() {
                       aria-label={r.domain}
                     />
                   </td>
-                  <td className="px-3 py-2 font-mono">{r.domain}</td>
+                  <td className="px-3 py-2 font-mono">
+                    {(() => {
+                      // Domain-page link (U1, returned 2026-05-18).
+                      // Prefer Ahrefs → Wayback → Whois — same precedence
+                      // the per-pillar pill links to the right of the
+                      // domain use, just collapsed into one anchor on the
+                      // domain text. Banned rows without any analysis
+                      // history render as plain text.
+                      const link =
+                        r.ahrefs_link ?? r.wayback_link ?? r.whois_link;
+                      if (!link) return r.domain;
+                      return (
+                        <Link
+                          href={`/jobs/${link.job_id}/runs/${link.run_id}/domains/${link.run_domain_id}`}
+                          className="text-blue-700 dark:text-blue-300 hover:text-blue-900 dark:hover:text-blue-200 hover:underline"
+                        >
+                          {r.domain}
+                        </Link>
+                      );
+                    })()}
+                  </td>
                   <td className="px-3 py-2 text-neutral-600 dark:text-neutral-300">
                     {r.note || (
                       <span className="text-neutral-400">—</span>

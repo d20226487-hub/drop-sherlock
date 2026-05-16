@@ -17,7 +17,46 @@ import {
   pillToneWithConfidence,
 } from "@/lib/score";
 
+// Canonical display order for the known quality-pillar criteria. Any
+// criterion produced by a run but absent from this list (e.g. a future
+// pillar) is appended after these in alphabetical order — the page itself
+// derives the column set from what each run actually ran, not from this
+// hardcoded order.
 const CRITERIA_ORDER = ["backlinks", "refdomains", "anchors", "keywords", "wayback"] as const;
+
+// A criterion "ran" in a run iff at least one domain has an entry for it
+// in the criteria dict. Backend populates that dict from CriterionResult
+// rows, which only exist for criteria the runner actually executed — so
+// presence is a reliable "did this run run this criterion" signal.
+function criteriaRanIn(run: RunSummaryResponse): Set<string> {
+  const out = new Set<string>();
+  for (const d of run.domains) {
+    for (const key of Object.keys(d.criteria || {})) {
+      out.add(key);
+    }
+  }
+  return out;
+}
+
+// Intersection of `criteriaRanIn` for both runs, ordered: known criteria
+// in their canonical order first, then any extras alphabetically. Used to
+// drive both the header and the per-row cells so columns line up.
+function sharedCriteria(
+  runA: RunSummaryResponse,
+  runB: RunSummaryResponse,
+): string[] {
+  const a = criteriaRanIn(runA);
+  const b = criteriaRanIn(runB);
+  const both = new Set<string>();
+  a.forEach((k) => {
+    if (b.has(k)) both.add(k);
+  });
+  const known = CRITERIA_ORDER.filter((k) => both.has(k));
+  const extras = Array.from(both)
+    .filter((k) => !(CRITERIA_ORDER as readonly string[]).includes(k))
+    .sort();
+  return [...known, ...extras];
+}
 
 export default function ComparePage({
   params,
@@ -248,6 +287,22 @@ function VerdictPill({ value }: { value: string | null }) {
   );
 }
 
+// Neutral text chip for wayback_classify outputs (category, theme). These
+// aren't quality verdicts — they're free-form / user-defined strings — so
+// they get a neutral tone, no semantic color coding. Wraps long themes
+// gracefully and shows the full value on hover.
+function TextChip({ value }: { value: string | null | undefined }) {
+  if (!value) return <span className="text-neutral-400 dark:text-neutral-600">—</span>;
+  return (
+    <span
+      className="text-xs px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
+      title={value}
+    >
+      {value}
+    </span>
+  );
+}
+
 // Final-assessment pill: score-aware. Numeric scores get rendered as a
 // percentage with bucket tone; the pill greys out when the AI's confidence
 // in its sub-verdicts was too low to trust the aggregate.
@@ -311,6 +366,30 @@ function CompareTable({
   const aLabel = runLabel(runA.run_id, runA.name);
   const bLabel = runLabel(runB.run_id, runB.name);
 
+  // Columns to show: criteria that ran in BOTH runs (intersection). Excludes
+  // criteria only one side ran — those would be all-dashes on the empty side
+  // and add noise to the diff view.
+  const visibleCriteria = useMemo(
+    () => sharedCriteria(runA, runB),
+    [runA, runB],
+  );
+  // Theme is a derived column attached to wayback_classify — only render
+  // when both runs actually ran classify. The runner emits `theme` on the
+  // classify CR's summary entry; backend surfaces it via get_run_summary.
+  const showThemeColumn = visibleCriteria.includes("wayback_classify");
+  // Friendly labels. i18n only has entries for the 5 quality criteria —
+  // for `wayback_classify` use the existing "Classify" string from the
+  // backlog/analyze cards; for `theme` use a dedicated key. Unknown
+  // criteria fall back to the raw key.
+  const colLabel = (key: string): string => {
+    const known = ts.cols as unknown as Record<string, string>;
+    if (key === "wayback_classify") {
+      return known.wayback_classify ?? "Classify";
+    }
+    return known[key] ?? key;
+  };
+  const themeLabel = (ts.cols as unknown as Record<string, string>).theme ?? "Theme";
+
   // Pair domains by name. A domain may exist in only one run (e.g. user
   // changed the domain list between runs); show those rows with a missing
   // marker on the empty side.
@@ -330,15 +409,32 @@ function CompareTable({
               <th rowSpan={2} className="px-3 py-2 font-medium align-bottom">
                 {ts.cols.domain}
               </th>
-              {CRITERIA_ORDER.map((c) => (
-                <th
-                  key={c}
-                  colSpan={2}
-                  className="px-3 py-2 font-medium border-l dark:border-neutral-800 text-center"
-                >
-                  {ts.cols[c as keyof typeof ts.cols]}
-                </th>
-              ))}
+              {visibleCriteria.flatMap((c) => {
+                // For wayback_classify, render its own column AND a
+                // sibling "Theme" column right after it — keeps both
+                // pieces of the classify verdict adjacent in the table.
+                const cells = [
+                  <th
+                    key={c}
+                    colSpan={2}
+                    className="px-3 py-2 font-medium border-l dark:border-neutral-800 text-center"
+                  >
+                    {colLabel(c)}
+                  </th>,
+                ];
+                if (c === "wayback_classify") {
+                  cells.push(
+                    <th
+                      key={`${c}-theme`}
+                      colSpan={2}
+                      className="px-3 py-2 font-medium border-l dark:border-neutral-800 text-center"
+                    >
+                      {themeLabel}
+                    </th>,
+                  );
+                }
+                return cells;
+              })}
               <th
                 colSpan={2}
                 className="px-3 py-2 font-medium border-l dark:border-neutral-800 text-center"
@@ -347,22 +443,43 @@ function CompareTable({
               </th>
             </tr>
             <tr className="text-xs text-neutral-500">
-              {CRITERIA_ORDER.flatMap((c) => [
-                <th
-                  key={`${c}-A`}
-                  className="px-2 py-1 font-normal border-l dark:border-neutral-800"
-                  title={aLabel}
-                >
-                  {aLabel}
-                </th>,
-                <th
-                  key={`${c}-B`}
-                  className="px-2 py-1 font-normal"
-                  title={bLabel}
-                >
-                  {bLabel}
-                </th>,
-              ])}
+              {visibleCriteria.flatMap((c) => {
+                const cells = [
+                  <th
+                    key={`${c}-A`}
+                    className="px-2 py-1 font-normal border-l dark:border-neutral-800"
+                    title={aLabel}
+                  >
+                    {aLabel}
+                  </th>,
+                  <th
+                    key={`${c}-B`}
+                    className="px-2 py-1 font-normal"
+                    title={bLabel}
+                  >
+                    {bLabel}
+                  </th>,
+                ];
+                if (c === "wayback_classify") {
+                  cells.push(
+                    <th
+                      key={`${c}-theme-A`}
+                      className="px-2 py-1 font-normal border-l dark:border-neutral-800"
+                      title={aLabel}
+                    >
+                      {aLabel}
+                    </th>,
+                    <th
+                      key={`${c}-theme-B`}
+                      className="px-2 py-1 font-normal"
+                      title={bLabel}
+                    >
+                      {bLabel}
+                    </th>,
+                  );
+                }
+                return cells;
+              })}
               <th
                 className="px-2 py-1 font-normal border-l dark:border-neutral-800"
                 title={aLabel}
@@ -389,12 +506,19 @@ function CompareTable({
                   runBId={runB.run_id}
                   aLabel={aLabel}
                   bLabel={bLabel}
+                  visibleCriteria={visibleCriteria}
                 />
               );
             })}
           </tbody>
         </table>
       </div>
+      {visibleCriteria.length === 0 && (
+        <p className="text-xs text-neutral-500 italic">
+          {ts.noSharedCriteria ??
+            "No criteria were run by both runs — only the Final column applies."}
+        </p>
+      )}
     </section>
   );
 }
@@ -431,6 +555,7 @@ function CompareRow({
   runBId,
   aLabel,
   bLabel,
+  visibleCriteria,
 }: {
   domain: string;
   a: RunSummaryDomain | null;
@@ -440,6 +565,7 @@ function CompareRow({
   runBId: number;
   aLabel: string;
   bLabel: string;
+  visibleCriteria: string[];
 }) {
   const aOnly = a && !b;
   const bOnly = !a && b;
@@ -469,7 +595,43 @@ function CompareRow({
           )}
         </div>
       </td>
-      {CRITERIA_ORDER.flatMap((c) => {
+      {visibleCriteria.flatMap((c) => {
+        // wayback_classify carries non-quality outputs (category + theme),
+        // not the high_quality/mixed/low_quality assessment. Render its
+        // category in the criterion column and the theme in an adjacent
+        // column pair.
+        if (c === "wayback_classify") {
+          const aCat = a?.criteria[c]?.category ?? "";
+          const bCat = b?.criteria[c]?.category ?? "";
+          const catDiff = both && aCat !== bCat
+            ? "bg-amber-50 dark:bg-amber-900/10"
+            : "";
+          const aTheme = a?.criteria[c]?.theme ?? "";
+          const bTheme = b?.criteria[c]?.theme ?? "";
+          const themeDiff = both && aTheme !== bTheme
+            ? "bg-amber-50 dark:bg-amber-900/10"
+            : "";
+          return [
+            <td
+              key={`${c}-A`}
+              className={`px-2 py-2 border-l dark:border-neutral-800 ${catDiff}`}
+            >
+              <TextChip value={aCat} />
+            </td>,
+            <td key={`${c}-B`} className={`px-2 py-2 ${catDiff}`}>
+              <TextChip value={bCat} />
+            </td>,
+            <td
+              key={`${c}-theme-A`}
+              className={`px-2 py-2 border-l dark:border-neutral-800 ${themeDiff}`}
+            >
+              <TextChip value={aTheme} />
+            </td>,
+            <td key={`${c}-theme-B`} className={`px-2 py-2 ${themeDiff}`}>
+              <TextChip value={bTheme} />
+            </td>,
+          ];
+        }
         const aVal = a?.criteria[c]?.ai_assessment ?? null;
         const bVal = b?.criteria[c]?.ai_assessment ?? null;
         const diffShade = both && aVal !== bVal

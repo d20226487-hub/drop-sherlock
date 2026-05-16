@@ -1,6 +1,7 @@
 "use client";
 import { useT } from "@/lib/i18n";
 import { CriterionVerdict } from "@/lib/api";
+import { isLowConfidence } from "@/lib/score";
 
 // Dark mode: neutral background + colored LEFT STRIPE only. See score.ts
 // BUCKET_BANNER_TONE for the design rationale (3-iteration tuneup).
@@ -216,18 +217,47 @@ function ClassifyVerdictBox({
   const langConf = verdict.language_confidence;
   const themeConf = verdict.theme_confidence;
   const drift = !!verdict.drift_detected;
-  // Header tone: drift detected → amber stripe, otherwise blue (neutral
-  // informational, not a quality verdict). Matches the rest of the
-  // codebase's color semantics — amber = needs-attention, blue = info.
-  const tone = drift
-    ? "bg-amber-50 text-amber-900 border-amber-200 border-l-4 border-l-amber-500 dark:bg-neutral-800/80 dark:text-neutral-200 dark:border-neutral-700 dark:border-l-amber-500/70"
-    : "bg-blue-50 text-blue-900 border-blue-200 border-l-4 border-l-blue-500 dark:bg-neutral-800/80 dark:text-neutral-200 dark:border-neutral-700 dark:border-l-blue-500/70";
-  const accent = drift
-    ? "text-amber-700 dark:text-amber-300"
-    : "text-blue-700 dark:text-blue-300";
-  const dot = drift
-    ? "bg-amber-500 dark:bg-amber-400"
-    : "bg-blue-500 dark:bg-blue-400";
+  // 4-bucket tone scheme (2026-05-18) — matches the Database C chip:
+  //   grey  → theme_confidence missing or below threshold
+  //   red   → drift detected (site changed topics; SEO baggage)
+  //   yellow → no drift, but multi-topic (≥1 secondary theme)
+  //   green → no drift, single primary theme, high confidence
+  // Yellow uses `yellow-*` (not amber) so the chip + box stay clearly
+  // yellow in light mode — amber reads as orange there.
+  const _secondaryThemesAll = (verdict.secondary_themes ?? []).filter(
+    (s): s is string => typeof s === "string" && s.length > 0,
+  );
+  const hasSecondaryThemes = _secondaryThemesAll.length > 0;
+  const lowConf = themeConf == null || isLowConfidence(themeConf);
+  type ClassifyBucket = "grey" | "good" | "mixed" | "bad";
+  const bucket: ClassifyBucket = lowConf
+    ? "grey"
+    : drift
+      ? "bad"
+      : hasSecondaryThemes
+        ? "mixed"
+        : "good";
+  const TONES: Record<ClassifyBucket, string> = {
+    grey: "bg-neutral-50 text-neutral-700 border-neutral-200 border-l-4 border-l-neutral-400 dark:bg-neutral-800/80 dark:text-neutral-300 dark:border-neutral-700 dark:border-l-neutral-500",
+    good: "bg-emerald-50 text-emerald-900 border-emerald-200 border-l-4 border-l-emerald-500 dark:bg-neutral-800/80 dark:text-neutral-200 dark:border-neutral-700 dark:border-l-emerald-500/70",
+    mixed: "bg-yellow-50 text-yellow-900 border-yellow-200 border-l-4 border-l-yellow-500 dark:bg-neutral-800/80 dark:text-neutral-200 dark:border-neutral-700 dark:border-l-yellow-500/70",
+    bad: "bg-red-50 text-red-900 border-red-200 border-l-4 border-l-red-500 dark:bg-neutral-800/80 dark:text-neutral-200 dark:border-neutral-700 dark:border-l-red-500/70",
+  };
+  const ACCENTS: Record<ClassifyBucket, string> = {
+    grey: "text-neutral-600 dark:text-neutral-400",
+    good: "text-emerald-700 dark:text-emerald-300",
+    mixed: "text-yellow-700 dark:text-yellow-400",
+    bad: "text-red-700 dark:text-red-300",
+  };
+  const DOTS: Record<ClassifyBucket, string> = {
+    grey: "bg-neutral-400 dark:bg-neutral-500",
+    good: "bg-emerald-500 dark:bg-emerald-400",
+    mixed: "bg-yellow-500 dark:bg-yellow-400",
+    bad: "bg-red-500 dark:bg-red-400",
+  };
+  const tone = TONES[bucket];
+  const accent = ACCENTS[bucket];
+  const dot = DOTS[bucket];
   const fmtConf = (c: number | undefined) =>
     typeof c === "number" ? `${Math.round(c * 100)}%` : "—";
   const secondaries = (verdict.secondary_languages ?? []).filter(Boolean);
@@ -242,8 +272,16 @@ function ClassifyVerdictBox({
           {criterionLabel && (
             <span className="opacity-70 font-normal">· {criterionLabel}</span>
           )}
-          {drift && (
-            <span className="opacity-90 font-normal">· drift detected</span>
+          {bucket !== "good" && (
+            <span className="opacity-90 font-normal">
+              · {
+                bucket === "bad"
+                  ? "drift detected"
+                  : bucket === "mixed"
+                    ? "multi-topic"
+                    : "low confidence"
+              }
+            </span>
           )}
         </span>
         {lang && (

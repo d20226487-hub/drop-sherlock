@@ -157,9 +157,18 @@ async def check_availability_async(
     pages.
 
     `db` / `client` accept caller-supplied handles so a batch can share
-    one Session + one httpx pool. When omitted, fresh ones are spawned
-    per call.
-    """
+    one httpx pool (and optionally a DB session for sync callers). When
+    omitted, fresh ones are spawned per call.
+
+    DB sessions are never held across the provider awaits (refactored
+    2026-05-16). Earlier behavior held one session for the full cascade
+    duration; a 1000-domain availability run with `_OUTER_CONCURRENCY=8`
+    in the parent runner kept ≥8 sessions open during the slow provider
+    HTTP calls, exhausting the 15-slot pool whenever FE polling + a
+    concurrent whois retry stacked on top. Each DB step now opens its
+    own short-lived session: cache check (if `use_cache`) and the
+    terminal `_persist` write. The provider await loop runs with NO
+    session held."""
     domain = normalize_domain(domain)
     if not domain:
         return AvailabilityResult(
@@ -167,16 +176,27 @@ async def check_availability_async(
             checked_at=datetime.utcnow(),
         )
 
-    own_db = db is None
-    if db is None:
-        db = SessionLocal()
     own_client = client is None
     if client is None:
         client = httpx.AsyncClient(timeout=10.0)
 
+    def _open_session() -> tuple[Session, bool]:
+        """Return (session, owned). If the caller passed `db`, reuse it
+        (caller closes); otherwise open a fresh one we'll close right
+        after the sync step."""
+        if db is not None:
+            return db, False
+        return SessionLocal(), True
+
     try:
+        # --- Phase 1: cache check (short session, no await held)
         if use_cache:
-            cached = _read_cached(db, domain)
+            s, owned = _open_session()
+            try:
+                cached = _read_cached(s, domain)
+            finally:
+                if owned:
+                    s.close()
             if cached is not None:
                 return AvailabilityResult(
                     domain=domain,
@@ -188,7 +208,7 @@ async def check_availability_async(
                     checked_at=cached.checked_at,
                 )
 
-        # Live cascade
+        # --- Phase 2: live cascade (NO session held across provider awaits)
         order = get_availability_cascade_order()
         results: list[ProviderResult] = []
         terminal: ProviderResult | None = None
@@ -201,12 +221,19 @@ async def check_availability_async(
                 terminal = r
                 break
 
-        # Nothing responded terminally → if we have at least one error
-        # result, surface that. Otherwise return 'unknown'.
+        # --- Phase 3: persist (short session, no await held)
+        s, owned = _open_session()
+        try:
+            _persist(s, domain, results, run_id)
+        finally:
+            if owned:
+                s.close()
+
+        # Pick the return value based on what came back from the cascade.
         if terminal is None:
-            persisted = _persist(db, domain, results, run_id)
-            # Pick the most informative non-terminal — prefer error over
-            # unknown so the user sees a real reason.
+            # Nothing responded terminally — prefer the first error
+            # result so the user sees a real reason; fall back to
+            # 'unknown' when even errors are absent.
             for r in results:
                 if r.status == STATUS_ERROR:
                     return AvailabilityResult(
@@ -222,7 +249,6 @@ async def check_availability_async(
                 checked_at=datetime.utcnow(),
             )
 
-        _persist(db, domain, results, run_id)
         return AvailabilityResult(
             domain=domain,
             status=terminal.status,
@@ -235,8 +261,6 @@ async def check_availability_async(
     finally:
         if own_client:
             await client.aclose()
-        if own_db:
-            db.close()
 
 
 def check_availability(

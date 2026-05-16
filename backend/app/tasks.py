@@ -33,7 +33,7 @@ from .cache import (
 )
 from .db import SessionLocal
 from .limits import limit
-from .models import CriterionResult, Run, RunDomain
+from .models import CriterionResult, Job, Run, RunDomain
 from .providers import get_provider
 from .providers.ahrefs_requests import build_preview
 from .providers.base import ProviderConfigError, ProviderError
@@ -757,6 +757,18 @@ def reanalyze_run_domain_criterion_now(
 _ALL_CRITERIA = (
     "backlinks", "refdomains", "anchors", "keywords",
     "wayback", "wayback_classify",
+    # Pillar criteria (Wave 2+). Included so the retry/reanalyze path
+    # picks them up; quality jobs leave these `.enabled=False` so they
+    # get skipped, whois-kind/availability-kind jobs flip exactly one
+    # of them on. `_reanalyze_run_domain_criterion` special-cases
+    # whois_history below the way it does wayback_classify.
+    "whois_history",
+    # availability (2026-05-16, retry path) — same shape as
+    # whois_history: pillar runner owns the per-domain cascade, retry
+    # path deletes the failed CR + dispatches to the pillar runner.
+    # Distinguished from whois in that NO AI is ever involved — the
+    # retry-time AI-provider gate is skipped for availability-kind runs.
+    "availability",
 )
 
 # Criteria that CAN consume the wayback_classify "Site context" block
@@ -777,6 +789,13 @@ def _collect_failed_criteria(
       • CR row missing entirely (e.g. run aborted before this criterion
         started — `_reanalyze_run_domain_criterion` will create + fetch),
       • CR.status == "failed" (fetch failed → refetch + re-judge),
+      • CR.status in ("running", "pending") — orphaned mid-pipeline. The
+        caller (`retry_failed_run_now`) only invokes this when the parent
+        Run is in a terminal state (done/failed/canceled), so any CR
+        still in a non-terminal status is by definition not being worked
+        on (its task died, e.g. uvicorn restart mid-retry). Without this
+        branch the user is stuck — the per-RD page shows "running" but
+        no work is happening and the retry button silently skips it.
       • CR.ai_verdict_error != "" (fetch OK, AI judge failed → re-judge).
     Disabled criteria in the spec are never retried."""
     by_name = {cr.criterion: cr for cr in rd.results}
@@ -789,11 +808,30 @@ def _collect_failed_criteria(
         if cr is None:
             failed.append(c)
             continue
-        if cr.status == "failed":
+        if cr.status in ("failed", "running", "pending"):
             failed.append(c)
             continue
         if cr.ai_verdict_error:
             failed.append(c)
+            continue
+        # Availability special case (2026-05-16): cascade may complete
+        # cleanly (cr.status='done') but EVERY provider errored, leaving
+        # `data_json.verdict.status='error'`. Those rows are retryable —
+        # network/rate-limit problems often clear on a second pass — but
+        # neither cr.status nor ai_verdict_error catches them since the
+        # runner stamps 'done' once the cascade returned at all (verdict
+        # 'error' is still a verdict). Look inside data_json to pick
+        # them up. Verdict 'unknown' is NOT included — it's a final
+        # "cascade said: can't tell" answer, retrying won't change it.
+        if c == "availability" and cr.data_json:
+            try:
+                av_body = json.loads(cr.data_json)
+            except json.JSONDecodeError:
+                av_body = None
+            if isinstance(av_body, dict):
+                verdict = av_body.get("verdict")
+                if isinstance(verdict, dict) and verdict.get("status") == "error":
+                    failed.append(c)
     return failed
 
 
@@ -926,7 +964,13 @@ def retry_run_batch_now(
         if ai_override:
             spec.ai.provider = ai_override.get("provider") or spec.ai.provider
             spec.ai.model = ai_override.get("model") or spec.ai.model
-        if not spec.ai or not spec.ai.provider:
+        # Availability-pillar runs never use AI — see retry_failed_run_now
+        # for the rationale and the original bug report.
+        job = db.get(Job, run.job_id)
+        job_kind = job.kind if job is not None else "quality"
+        if job_kind != "availability" and (
+            not spec.ai or not spec.ai.provider
+        ):
             return {
                 "id": run_id, "found": True,
                 "error": "no AI provider configured for this run",
@@ -1020,7 +1064,16 @@ def retry_failed_run_now(
         if ai_override:
             spec.ai.provider = ai_override.get("provider") or spec.ai.provider
             spec.ai.model = ai_override.get("model") or spec.ai.model
-        if not spec.ai or not spec.ai.provider:
+        # Availability-pillar runs never use AI (cascade output IS the
+        # verdict). Skip the AI-provider gate for them — without this
+        # branch the user's "Retry failed" on /jobs/X/runs/Y for an
+        # availability job 400s with "no AI provider configured for this
+        # run" even though no AI would ever be called.
+        job = db.get(Job, run.job_id)
+        job_kind = job.kind if job is not None else "quality"
+        if job_kind != "availability" and (
+            not spec.ai or not spec.ai.provider
+        ):
             return {
                 "id": run_id, "found": True,
                 "error": "no AI provider configured for this run",
@@ -1240,6 +1293,104 @@ async def _reanalyze_run_domain_criterion(
                             break
         finally:
             db.close()
+
+        # Special case: whois_history lives in the whois_history pillar
+        # runner, not the Quality runner. The pillar's `_process_whois_domain`
+        # does fetch + diff + AI judge in one shot. The retry path here
+        # wipes the existing failed CR row first (the pillar runner
+        # always creates fresh — there's no unique constraint on
+        # (run_domain_id, criterion), so duplicates would otherwise
+        # accumulate), then dispatches to the pillar runner with the
+        # retry-time `spec` so the user's ai_override (if any) takes
+        # effect without rewriting the original Run.spec_json.
+        if criterion == "whois_history":
+            wh_cfg = _cfg_for_criterion(spec, "whois_history")
+            if wh_cfg is None or not getattr(wh_cfg, "enabled", False):
+                return
+            db2 = SessionLocal()
+            try:
+                rd2 = db2.get(RunDomain, run_domain_id)
+                if rd2 is None:
+                    return
+                for cr in list(rd2.results):
+                    if cr.criterion == "whois_history":
+                        db2.delete(cr)
+                # Reset rd to a pristine state so the pillar runner
+                # flips it correctly. Don't touch other criteria — none
+                # exist on a whois-kind run, but be defensive anyway.
+                rd2.status = "pending"
+                rd2.error = ""
+                rd2.finished_at = None
+                rd2.started_at = None
+                rd2.last_analyzed_at = None
+                rd2.final_assessment_json = ""
+                rd2.final_summary = ""
+                db2.commit()
+            finally:
+                db2.close()
+            # Import inline to keep tasks.py decoupled from the pillar
+            # module at import time (the pillar module already imports
+            # from app_settings/models/ai_judge — adding a top-level
+            # back-import would risk a cycle if anything in tasks.py
+            # ever needed importing into the pillar runner).
+            from .whois_history.runner import (
+                _process_whois_domain as _process_whois_domain_retry,
+            )
+            spec_dict_for_retry = spec.model_dump()
+            await _process_whois_domain_retry(
+                run_domain_id, run_id,
+                spec_override=spec_dict_for_retry,
+            )
+            # Roll run.status forward if every rd is now done. Same
+            # bookkeeping the wayback_classify branch does — the pillar
+            # runner sets rd.status itself, but the parent Run's status
+            # is owned by this re-evaluator.
+            _reevaluate_domain_and_run_status(run_domain_id)
+            return
+
+        # Special case: availability (2026-05-16). Mirrors whois_history
+        # — pillar runner owns the cascade; retry deletes the failed CR
+        # and re-runs `_process_availability_domain`. Targets both the
+        # cr.status='failed' rows (cascade crashed) AND the
+        # cr.status='done' + verdict='error' rows that _collect_failed_
+        # criteria now picks up (cascade completed, every provider
+        # errored — retrying often clears transient rate-limit /
+        # network failures).
+        if criterion == "availability":
+            av_cfg = _cfg_for_criterion(spec, "availability")
+            if av_cfg is None or not getattr(av_cfg, "enabled", False):
+                return
+            db_av = SessionLocal()
+            try:
+                rd_av = db_av.get(RunDomain, run_domain_id)
+                if rd_av is None:
+                    return
+                for cr in list(rd_av.results):
+                    if cr.criterion == "availability":
+                        db_av.delete(cr)
+                # Reset rd to pristine — the pillar runner stamps these
+                # itself but we clear them first so the in-flight state
+                # is visible immediately and a partial cascade can't
+                # leave stale 'done' timestamps.
+                rd_av.status = "pending"
+                rd_av.error = ""
+                rd_av.finished_at = None
+                rd_av.started_at = None
+                rd_av.last_analyzed_at = None
+                db_av.commit()
+            finally:
+                db_av.close()
+            # Inline import (avoids a top-level cycle with
+            # availability_runner, which imports from .models /
+            # .app_settings — same pattern as the whois_history retry).
+            import httpx as _httpx
+            from .availability_runner import _process_availability_domain
+            async with _httpx.AsyncClient(timeout=15.0) as client:
+                await _process_availability_domain(
+                    run_domain_id, run_id, client,
+                )
+            _reevaluate_domain_and_run_status(run_domain_id)
+            return
 
         # Special case: wayback_classify has no fetch step. Drive it
         # directly via _run_wayback_classify_for_domain (which the main

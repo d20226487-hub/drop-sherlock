@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { use, useCallback, useEffect, useMemo, useState } from "react";
+import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useT } from "@/lib/i18n";
 import {
   api,
@@ -754,10 +754,44 @@ export default function RunDetailPage({
     text: string;
   } | null>(null);
 
+  // Server-driven pagination was introduced 2026-05-16 (SERVER_PAGE_LIMIT
+  // = 200) to handle 100k+ availability runs. It also added a dedicated
+  // cross-batch navigator widget alongside the existing PaginationBottomBar,
+  // producing two stacked paginators that the user (rightly) found
+  // confusing. Rolled back 2026-05-17: backend `limit=0` returns every
+  // row in a single request, and the existing client-side
+  // PaginationBottomBar handles in-page navigation as it always did.
+  // Trade-off: if a future run grows past ~10k rows the single fetch may
+  // get heavy — add server pagination back behind a clear single-paginator
+  // UI when that actually bites.
+  const SERVER_PAGE_LIMIT = 0;
+  const serverOffset = 0;
+  // Status filter declaration hoisted up here so `reload()` below can
+  // pass it to the backend. Originally lived deeper in the file next to
+  // the other table filters; moved 2026-05-16 to break the TDZ on the
+  // `reload` body. The other filter states (waybackFilter, classify
+  // filters) stay where they are — they're client-side only.
+  const [statusFilter, setStatusFilter] = useState<StatusFilterValue>("all");
+  // Availability-verdict filter (2026-05-16) — multi-select. Only
+  // applied on Availability-pillar runs (the dropdown is hidden on
+  // Quality/Whois). Server-side: passes through to the API so a
+  // 100k-domain run filters across ALL rows, not just the 200-row page.
+  const [availabilityFilter, setAvailabilityFilter] = useState<string[]>([]);
+
   async function reload() {
     try {
+      const opts = {
+        limit: SERVER_PAGE_LIMIT,
+        offset: serverOffset,
+        status:
+          statusFilter !== "all" && typeof statusFilter === "string"
+            ? statusFilter
+            : undefined,
+        availabilityStatuses:
+          availabilityFilter.length > 0 ? availabilityFilter : undefined,
+      };
       const [d, s, c] = await Promise.all([
-        api.getRun(runId),
+        api.getRun(runId, opts),
         api.getRunStatus(runId).catch(() => null),
         api.getRunCost(runId).catch(() => null),
       ]);
@@ -781,8 +815,18 @@ export default function RunDetailPage({
   // + `cost` still come from their own slim endpoints.
   async function reloadProgress() {
     try {
+      const opts = {
+        limit: SERVER_PAGE_LIMIT,
+        offset: serverOffset,
+        status:
+          statusFilter !== "all" && typeof statusFilter === "string"
+            ? statusFilter
+            : undefined,
+        availabilityStatuses:
+          availabilityFilter.length > 0 ? availabilityFilter : undefined,
+      };
       const [p, s, c] = await Promise.all([
-        api.getRunProgress(runId),
+        api.getRunProgress(runId, opts),
         api.getRunStatus(runId).catch(() => null),
         api.getRunCost(runId).catch(() => null),
       ]);
@@ -1139,6 +1183,16 @@ export default function RunDetailPage({
     reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
+
+  // Refetch when a server-side filter changes (status / availability).
+  // Pagination state lives entirely in PaginationBottomBar's client-side
+  // search hook — no `serverOffset` bumps to react to anymore (see the
+  // SERVER_PAGE_LIMIT=0 rollback note above).
+  useEffect(() => {
+    if (!run) return;
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusFilter, availabilityFilter]);
 
   // Refresh when the tab regains focus. Catches state changes the user
   // made in another tab — particularly scoring_override toggled on/off
@@ -1575,6 +1629,12 @@ export default function RunDetailPage({
         runStatus={run.status}
         jobKind={run.job_kind ?? "quality"}
         onChanged={reload}
+        statusFilter={statusFilter}
+        setStatusFilter={setStatusFilter}
+        availabilityFilter={availabilityFilter}
+        setAvailabilityFilter={setAvailabilityFilter}
+        totalCount={run.total_count ?? run.domains.length}
+        filteredCount={run.filtered_count ?? run.domains.length}
       />
     </div>
   );
@@ -1590,6 +1650,104 @@ type StatusFilterValue = "all" | RunRowStatus;
 // row doesn't get lumped in with structurally empty CDX results.
 type WaybackFilterValue = "any" | "zero" | "nonzero";
 
+// Availability verdict filter (2026-05-16) — multi-select. Matches the
+// Job-page chip vocabulary 1:1: available / registered / unknown /
+// error / no_verdict (the residual chip bucket for missing CRs,
+// cascade-orphaned rows, and verdict.status values outside the four
+// terminal ones). Empty selection = no filter.
+const AVAILABILITY_FILTER_OPTIONS: { value: string; key: keyof TextsType["pages"]["jobs"]["run"] }[] = [
+  { value: "available", key: "filterAvailabilityAvailable" },
+  { value: "registered", key: "filterAvailabilityRegistered" },
+  { value: "unknown", key: "filterAvailabilityUnknown" },
+  { value: "error", key: "filterAvailabilityError" },
+  { value: "no_verdict", key: "filterAvailabilityNoVerdict" },
+];
+
+type TextsType = ReturnType<typeof useT>["t"];
+
+function AvailabilityVerdictFilter({
+  value,
+  onChange,
+}: {
+  value: string[];
+  onChange: (v: string[]) => void;
+}) {
+  const { t } = useT();
+  const ts = t.pages.jobs.run;
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    function onDoc(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+  function toggle(v: string) {
+    const next = value.includes(v)
+      ? value.filter((x) => x !== v)
+      : [...value, v];
+    onChange(next);
+  }
+  const summary =
+    value.length === 0
+      ? ts.filterAvailabilityAny
+      : value
+          .map((v) => {
+            const opt = AVAILABILITY_FILTER_OPTIONS.find((o) => o.value === v);
+            return opt ? (ts[opt.key] as string) : v;
+          })
+          .join(", ");
+  return (
+    <div ref={ref} className="relative inline-block">
+      <label className="flex items-center gap-1.5">
+        <span className="font-medium text-neutral-700 dark:text-neutral-300">
+          {ts.filterAvailabilityLabel}
+        </span>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="px-2 py-1 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 text-left min-w-[8rem]"
+        >
+          {summary}
+        </button>
+      </label>
+      {open && (
+        <div className="absolute z-20 mt-1 min-w-[12rem] rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 shadow-lg p-1">
+          {AVAILABILITY_FILTER_OPTIONS.map((opt) => {
+            const checked = value.includes(opt.value);
+            return (
+              <label
+                key={opt.value}
+                className="flex items-center gap-2 px-2 py-1 text-xs rounded hover:bg-neutral-100 dark:hover:bg-neutral-900 cursor-pointer"
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => toggle(opt.value)}
+                />
+                <span>{ts[opt.key] as string}</span>
+              </label>
+            );
+          })}
+          {value.length > 0 && (
+            <button
+              type="button"
+              onClick={() => onChange([])}
+              className="block w-full text-left px-2 py-1 text-xs text-neutral-600 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-900 rounded"
+            >
+              {ts.filterAvailabilityClear}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DomainsSection({
   domains,
   jobId,
@@ -1600,6 +1758,22 @@ function DomainsSection({
   // availability runs. Defaults to 'quality' on legacy callers.
   jobKind = "quality",
   onChanged,
+  // Status filter lifted to the parent (2026-05-16) so the parent's
+  // server-side fetch can pass it as `?status_filter=...` to the
+  // backend. The section's filter dropdown updates the parent state;
+  // the parent's useEffect refetches.
+  statusFilter,
+  setStatusFilter,
+  // Availability-verdict filter (2026-05-16) — same lifting pattern as
+  // statusFilter; only rendered on Availability-pillar runs.
+  availabilityFilter,
+  setAvailabilityFilter,
+  // Run-wide totals from the backend. `totalCount` is every domain in
+  // the run; `filteredCount` is the count after the server-side filter
+  // (status / availability) is applied. Drives the inline filter footer
+  // count under the filter row.
+  totalCount,
+  filteredCount,
 }: {
   domains: RunDomainProgress[];
   jobId: number;
@@ -1607,16 +1781,19 @@ function DomainsSection({
   runStatus: string;
   jobKind?: string;
   onChanged: () => void;
+  statusFilter: StatusFilterValue;
+  setStatusFilter: (v: StatusFilterValue) => void;
+  availabilityFilter: string[];
+  setAvailabilityFilter: (v: string[]) => void;
+  totalCount: number;
+  filteredCount: number;
 }) {
   const { t } = useT();
   const ts = t.pages.jobs.run;
 
-  // Status filter (added 2026-05-12). Applied BEFORE search/pagination
-  // so the page counts + select-all reflect the filtered set.
-  const [statusFilter, setStatusFilter] = useState<StatusFilterValue>("all");
-  // Wayback CDX row-count filter (added 2026-05-13). ANDed with statusFilter;
-  // common combo is status=done + cdx=zero → done-but-empty wayback for
-  // bulk-retry of wayback / wayback_classify on those rows.
+  // Wayback CDX row-count filter (added 2026-05-13). Client-side only —
+  // ANDed with statusFilter; common combo is status=done + cdx=zero →
+  // done-but-empty wayback for bulk-retry of wayback / wayback_classify.
   const [waybackFilter, setWaybackFilter] = useState<WaybackFilterValue>("any");
   const filtered = useMemo<RunDomainProgress[]>(() => {
     return domains.filter((d) => {
@@ -1637,7 +1814,7 @@ function DomainsSection({
   const [selected, setSelected] = useState<Set<number>>(new Set());
   useEffect(() => {
     setSelected(new Set());
-  }, [statusFilter, waybackFilter]);
+  }, [statusFilter, waybackFilter, availabilityFilter]);
 
   // Bulk-retry state.
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -1825,10 +2002,23 @@ function DomainsSection({
           </div>
         )}
       </div>
-      {domains.length === 0 && (
+      {/* Empty state — only fired when the run genuinely has no domains.
+          The "filtered to zero" case used to render an amber banner
+          with a "Clear filter" button that only reset `statusFilter`,
+          which was glitchy when other filters were also active. Removed
+          2026-05-17: filter dropdowns are visible right above the
+          table, and PaginationBottomBar shows "0 of N" — that's enough
+          signal that the current filter combination matches nothing. */}
+      {totalCount === 0 && (
         <p className="text-sm text-neutral-500">{ts.empty}</p>
       )}
-      {domains.length > 0 && (
+      {/* Filter UI is shown whenever the RUN has any domains at all
+          (totalCount > 0), NOT only when the current filtered page has
+          rows (domains.length > 0). Otherwise a filter that narrows to
+          zero rows hides the filter controls themselves and the user
+          can't widen the filter to escape — the bug reported after the
+          orange-banner removal. */}
+      {totalCount > 0 && (
         <>
           {/* Status filter (added 2026-05-12) + Wayback CDX filter
               (added 2026-05-13). Both ANDed via the `filtered` useMemo. */}
@@ -1872,6 +2062,17 @@ function DomainsSection({
                   <option value="nonzero">{ts.filterWaybackNonzero}</option>
                 </select>
               </label>
+            )}
+            {/* Availability verdict filter — only on availability runs.
+                Multi-select via checkboxes inside a popover button so the
+                user can pick e.g. error + unknown to triage non-terminal
+                rows in one view. Server-side: parent re-fetches when the
+                selection changes (matches statusFilter pattern). */}
+            {jobKind === "availability" && (
+              <AvailabilityVerdictFilter
+                value={availabilityFilter}
+                onChange={setAvailabilityFilter}
+              />
             )}
             <span className="text-neutral-500 dark:text-neutral-400">
               ({search.filteredTotal})
@@ -2078,6 +2279,18 @@ function DomainsSection({
                   return (
                     <tr
                       key={d.id}
+                      // `content-visibility: auto` lets the browser skip
+                      // layout + paint for off-screen rows. Pagination
+                      // already caps the visible set at 20 rows but a
+                      // user who bumps page size to several hundred (or
+                      // we add an "All" mode later) gets free virtualization
+                      // from the browser. `contain-intrinsic-size` reserves
+                      // a stable height per row so the scrollbar doesn't
+                      // jitter while skipped rows resolve.
+                      style={{
+                        contentVisibility: "auto",
+                        containIntrinsicSize: "0 56px",
+                      }}
                       className={
                         "border-t dark:border-neutral-800 " +
                         (isSel

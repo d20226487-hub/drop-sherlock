@@ -232,7 +232,7 @@ function AnalyzePageInner() {
   }, [rerunJobId]);
 
   function clearRerun() {
-    router.replace("/analyze");
+    router.replace("/check/quality");
   }
 
   // Prefill from Database "Analyze selected" — runs once per param-change.
@@ -251,14 +251,21 @@ function AnalyzePageInner() {
     // Strip ONLY `domains=` (the bulky payload) — preserve every other
     // URL param so the source_job_id pre-fill effect still has its
     // input to act on. Building this URL as
-    // `/analyze?cross_cache=1` (the pre-2026-05-13 version) would
-    // accidentally strip `source_job_id=N` and cancel the in-flight
-    // pre-fill fetch (since sourceJobIdParam transitioning to null
-    // triggers the effect's cleanup → cancelled=true).
+    // `/check/quality?cross_cache=1` (without preserving other params)
+    // would accidentally strip `source_job_id=N` and cancel the
+    // in-flight pre-fill fetch (since sourceJobIdParam transitioning
+    // to null triggers the effect's cleanup → cancelled=true).
+    //
+    // CRITICAL (2026-05-17 B3 fix): replace MUST target /check/quality
+    // (the page's actual route post-Wave-1, 2026-05-15) — NOT /analyze.
+    // /analyze is the 307-redirect shim, and replacing to it triggers
+    // a server-side redirect that re-mounts this page with empty
+    // searchParams → state resets to "" → user sees an empty textarea
+    // even though they just clicked "Analyze selected" with N domains.
     const remaining = new URLSearchParams(searchParams.toString());
     remaining.delete("domains");
     const qs = remaining.toString();
-    router.replace(qs ? `/analyze?${qs}` : "/analyze");
+    router.replace(qs ? `/check/quality?${qs}` : "/check/quality");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fromDatabaseDomains, fromDatabaseCrossCache]);
 
@@ -266,7 +273,7 @@ function AnalyzePageInner() {
     setFromDatabase(false);
     setCrossJobCache(false);
     setPrefillSource(null);
-    router.replace("/analyze");
+    router.replace("/check/quality");
   }
 
   // Pre-fill criteria + AI from the source job (Database → Analyze
@@ -295,7 +302,7 @@ function AnalyzePageInner() {
         const remaining = new URLSearchParams(searchParams.toString());
         remaining.delete("source_job_id");
         const qs = remaining.toString();
-        router.replace(qs ? `/analyze?${qs}` : "/analyze");
+        router.replace(qs ? `/check/quality?${qs}` : "/check/quality");
       })
       .catch(() => {
         // Source job missing or fetch failed — leave defaults, no banner.
@@ -341,7 +348,7 @@ function AnalyzePageInner() {
       .catch(() => {
         // Silent fail — defaults are fine.
       });
-    router.replace("/analyze");
+    router.replace("/check/quality");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fromBacklog]);
 

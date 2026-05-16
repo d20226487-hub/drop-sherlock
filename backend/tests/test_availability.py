@@ -268,3 +268,168 @@ def test_cascade_skips_disabled_providers(fresh_db, monkeypatch):
     r = asyncio.run(cascade.check_availability_async("a.com", use_cache=False))
     assert r.status == STATUS_REGISTERED
     assert r.provider == "whois"
+
+
+def test_runner_preserves_terminal_verdict_across_cascade_retries(
+    fresh_db, monkeypatch,
+):
+    """Regression for B9 (2026-05-17). When a cascade retry returns an
+    error (e.g. RDAP 429) but the same run previously got a terminal
+    answer for the same domain, the runner must use the prior terminal
+    answer for the persisted verdict. Without this, intermittent
+    rate-limits silently downgrade confirmed 'available' rows to 'error'
+    and the operator sees them as failed forever."""
+    from app.availability.common import STATUS_AVAILABLE, STATUS_ERROR
+    from app.availability_runner import _process_availability_domain
+    from app.models import AvailabilityCheck, CriterionResult, Run, RunDomain
+
+    session = fresh_db
+    run = Run(job_id=0, status="running", spec_json="{}")
+    session.add(run)
+    session.flush()
+    rd = RunDomain(run_id=run.id, domain="b9.example", status="pending")
+    session.add(rd)
+    session.flush()
+
+    # Stage the "earlier successful" attempt in this run's history: the
+    # cascade already wrote one AvailabilityCheck row saying 'available'.
+    earlier = datetime(2026, 5, 17, 12, 0, 0)
+    session.add(AvailabilityCheck(
+        domain="b9.example", run_id=run.id, provider="rdap",
+        status=STATUS_AVAILABLE, checked_at=earlier,
+    ))
+    session.commit()
+
+    # Now stub the cascade so the CURRENT call returns 'error' (429),
+    # mimicking the retry hitting a rate-limit AFTER the original
+    # cascade succeeded. The runner should still persist 'available'.
+    from app import availability_runner as runner_mod
+
+    async def fake_cascade(domain, *, run_id, use_cache, client):
+        # Append the error row the cascade would have written.
+        s = runner_mod.SessionLocal()
+        try:
+            s.add(AvailabilityCheck(
+                domain=domain, run_id=run_id, provider="rdap",
+                status=STATUS_ERROR,
+                checked_at=datetime(2026, 5, 17, 12, 5, 0),
+                error_message="429",
+            ))
+            s.commit()
+        finally:
+            s.close()
+        from app.availability_runner import check_availability_async
+        # Mimic an AvailabilityResult shape — borrow the real dataclass.
+        return type(
+            "R", (), dict(
+                domain=domain, status=STATUS_ERROR, provider="rdap",
+                registrar="", expires_on=None, from_cache=False,
+                checked_at=datetime(2026, 5, 17, 12, 5, 0),
+            ),
+        )()
+
+    monkeypatch.setattr(runner_mod, "check_availability_async", fake_cascade)
+
+    async def _run():
+        async with httpx.AsyncClient() as client:
+            await _process_availability_domain(rd.id, run.id, client)
+
+    asyncio.run(_run())
+
+    # Verdict must reflect the prior terminal answer, not the retry's
+    # 429. Trace should include both attempts.
+    cr = session.query(CriterionResult).filter_by(
+        run_domain_id=rd.id, criterion="availability",
+    ).one()
+    body = json.loads(cr.data_json)
+    assert body["verdict"]["status"] == STATUS_AVAILABLE, (
+        f"Expected 'available' (preserved), got "
+        f"{body['verdict']['status']!r}. Retry's 429 silently "
+        "overwrote the prior good answer."
+    )
+    assert body["verdict"]["provider"] == "rdap"
+    assert len(body["trace"]) == 2  # both the prior 'available' + the 429
+    # The rd should also report 'done' (cascade completed cleanly; no
+    # cascade_error raised), not 'failed'.
+    session.refresh(rd)
+    assert rd.status == "done"
+
+
+def test_reconcile_orphaned_running_run_domains(fresh_db):
+    """B12 (2026-05-17): on startup, RDs stuck in status='running' with
+    a terminal parent Run are zombie cascades from a uvicorn-restart-
+    mid-flight. The reconciler must flip them to 'failed' so they show
+    up correctly in the UI and the Retry-failed button can pick them
+    up. Real partial data (data_json non-empty) is preserved untouched."""
+    from app.main import _reconcile_orphaned_running_run_domains
+    from app.models import CriterionResult, Run, RunDomain
+
+    session = fresh_db
+    # Setup: one terminal Run with three RDs to cover every case
+    run_terminal = Run(job_id=0, status="done", spec_json="{}")
+    # Active Run — RDs in it must NOT be touched
+    run_active = Run(job_id=0, status="running", spec_json="{}")
+    session.add_all([run_terminal, run_active])
+    session.flush()
+
+    # rd_orphan: stuck running on a terminal run + empty data_json — RESET
+    rd_orphan = RunDomain(
+        run_id=run_terminal.id, domain="orphan.example", status="running",
+        started_at=datetime(2026, 5, 16, 8, 5, 0),
+        finished_at=None,
+    )
+    # rd_active_running: stuck running BUT parent Run is active — KEEP
+    rd_active_running = RunDomain(
+        run_id=run_active.id, domain="active.example", status="running",
+        started_at=datetime(2026, 5, 16, 12, 0, 0),
+    )
+    # rd_with_data: running on a terminal run BUT cr has data_json — KEEP
+    # cr (real partial data). The rd itself still gets flipped to failed
+    # because rd.status='running' under a terminal run is impossible-by-
+    # invariant; the data CR is preserved untouched.
+    rd_with_data = RunDomain(
+        run_id=run_terminal.id, domain="hasdata.example", status="running",
+        started_at=datetime(2026, 5, 16, 8, 6, 0),
+    )
+    session.add_all([rd_orphan, rd_active_running, rd_with_data])
+    session.flush()
+
+    cr_orphan = CriterionResult(
+        run_domain_id=rd_orphan.id, criterion="availability",
+        status="running", data_json="", error="",
+    )
+    cr_active = CriterionResult(
+        run_domain_id=rd_active_running.id, criterion="availability",
+        status="running", data_json="", error="",
+    )
+    cr_partial = CriterionResult(
+        run_domain_id=rd_with_data.id, criterion="availability",
+        status="running",
+        data_json='{"verdict": {"status": "registered"}}',
+        error="",
+    )
+    session.add_all([cr_orphan, cr_active, cr_partial])
+    session.commit()
+
+    flipped = _reconcile_orphaned_running_run_domains()
+    assert flipped == 2, f"expected 2 flips, got {flipped}"
+
+    session.expire_all()
+    # rd_orphan: now failed; cr_orphan: now failed (empty data_json)
+    assert session.get(RunDomain, rd_orphan.id).status == "failed"
+    assert "orphaned" in session.get(RunDomain, rd_orphan.id).error
+    assert session.get(CriterionResult, cr_orphan.id).status == "failed"
+    # rd_active_running untouched
+    assert session.get(RunDomain, rd_active_running.id).status == "running"
+    assert session.get(CriterionResult, cr_active.id).status == "running"
+    # rd_with_data: rd flipped, but its data-carrying CR is preserved
+    assert session.get(RunDomain, rd_with_data.id).status == "failed"
+    cr_after = session.get(CriterionResult, cr_partial.id)
+    assert cr_after.status == "running", (
+        "CR with real data_json must not be touched"
+    )
+    assert cr_after.data_json == '{"verdict": {"status": "registered"}}'
+
+    # Idempotent — second call flips nothing
+    flipped2 = _reconcile_orphaned_running_run_domains()
+    assert flipped2 == 0

@@ -480,6 +480,31 @@ const messagesEn = {
             partial: "partial",
             no_verdict: "no verdict",
           },
+          // Pillar-native labels for the verdict rollup chips (added
+          // 2026-05-16). Same bucket keys, different names so the
+          // job-page pills match the pillar vocabulary instead of
+          // forcing every job kind through the quality-pillar words.
+          labelAvailability: {
+            good: "available",
+            mixed: "registered",
+            low_quality: "low quality",
+            // 2026-05-16 split: distinct keys for the two non-terminal
+            // outcomes. `unknown` = cascade ran, couldn't classify (no
+            // retry helps); `error` = cascade itself failed (retryable).
+            // `no_verdict` now only fires for runner-level anomalies
+            // (missing CR, malformed data_json) and is typically zero.
+            unknown: "unknown",
+            error: "error",
+            partial: "partial",
+            no_verdict: "no verdict",
+          },
+          labelWhois: {
+            good: "stable",
+            mixed: "drift suspected",
+            low_quality: "dropped/transferred",
+            partial: "partial",
+            no_verdict: "no verdict",
+          },
         },
       },
       run: {
@@ -511,6 +536,20 @@ const messagesEn = {
         },
         viewDomain: "Open",
         empty: "This run has no domains.",
+        emptyFiltered:
+          "No domains match the current filter. Clear it to see the rest.",
+        clearFilter: "Clear filter",
+        // Server-side batch paginator. The label functions take 1-based
+        // indexes so the user-visible numbers match what they'd see in
+        // a typical "showing 1–200 of 1000" pagination.
+        serverBatchRange: (start: number, end: number, total: number) =>
+          `Showing ${start.toLocaleString()}–${end.toLocaleString()} of ${total.toLocaleString()}`,
+        serverBatchUnfilteredHint: (total: number) =>
+          `(filtered from ${total.toLocaleString()} total)`,
+        serverBatchPage: (current: number, total: number) =>
+          `Batch ${current} / ${total}`,
+        serverBatchPrev: "← Prev",
+        serverBatchNext: "Next →",
         reanalyze: "Reanalyze with AI",
         reanalyzeHint:
           "Re-judge every domain in this run with a fresh AI call. Bypasses the AI cache. Reuses existing Ahrefs data — no refetch.",
@@ -564,6 +603,21 @@ const messagesEn = {
         filterWaybackAny: "any",
         filterWaybackZero: "0 rows",
         filterWaybackNonzero: "≥ 1 row",
+        // Availability verdict filter (2026-05-16) — only rendered on
+        // Availability-pillar runs.
+        filterAvailabilityLabel: "Availability",
+        filterAvailabilityAny: "any",
+        filterAvailabilityAvailable: "available",
+        filterAvailabilityRegistered: "registered",
+        filterAvailabilityUnknown: "unknown",
+        filterAvailabilityError: "error",
+        // 5th option (2026-05-16 follow-up) — covers the chip's
+        // no_verdict bucket: orphaned/missing CR, status='failed'/
+        // 'running'/'pending', empty/malformed data_json. Distinct from
+        // 'unknown' (which is a real cascade verdict meaning "RDAP
+        // returned ambiguously"); chip and filter use the same split.
+        filterAvailabilityNoVerdict: "no verdict",
+        filterAvailabilityClear: "Clear selection",
         selectAllOnPage: "Select all on this page",
         selectAllMatching: (n: number) =>
           `Select all matching the current filter (${n})`,
@@ -648,6 +702,8 @@ const messagesEn = {
           anchors: "Anchors",
           keywords: "Keywords",
           wayback: "Wayback",
+          wayback_classify: "Classify",
+          theme: "Theme",
           final: "Final",
         },
         legendDiff: "Different",
@@ -656,6 +712,8 @@ const messagesEn = {
         legendOnlyB: "Only in B",
         viewDomainA: "Open A",
         viewDomainB: "Open B",
+        noSharedCriteria:
+          "No criteria were run by both runs — only the Final column applies.",
       },
       domain: {
         backToRun: (id: number, name: string = "") =>
@@ -842,7 +900,11 @@ const messagesEn = {
       empty: "No domains yet — kick off your first analysis on the Analyze page.",
       noMatch: "No domains match your filters.",
       cols: {
+        // 2026-05-17: row-number column for "I'm on row N" orientation.
+        rowNumber: "#",
         domain: "Domain",
+        // 2026-05-17: mirrors the Backlog page's renamed Source column.
+        source: "Source",
         verdict: "Ahrefs",
         verdictSortHint:
           "Click to sort by score. Cycles desc → asc → default. Partial / no-verdict rows always sink to the bottom.",
@@ -969,6 +1031,11 @@ const messagesEn = {
         pinAny: "Pin: any",
         pinPinned: "Pin: pinned only",
         pinUnpinned: "Pin: unpinned only",
+        // Source filter (2026-05-17) — multi-select on
+        // BacklogDomain.registrar, mirrors the Backlog page.
+        sourceLabel: "Source",
+        sourceAny: "Any source",
+        sourceSearchPlaceholder: "Search sources…",
         minRecords: "Min records",
         minRecordsHelp:
           "Minimum row count in the chosen criterion (latest run).",
@@ -1858,7 +1925,11 @@ const messagesEn = {
       cols: {
         domain: "Domain",
         status: "Status",
-        registrar: "Registrar",
+        // 2026-05-17: renamed "Registrar" → "Source" at user request.
+        // The underlying BacklogDomain.registrar field name unchanged;
+        // this is a header label only. Same column also appears on the
+        // Database page now under the same label.
+        registrar: "Source",
         expirationDate: "Expiration",
         availability: "Availability",
         comments: "Comments",
@@ -1880,9 +1951,13 @@ const messagesEn = {
         clear: "Clear filters",
         statusLabel: "Status",
         statusAny: "Any status",
-        registrarLabel: "Registrar",
-        registrarAny: "Any registrar",
-        registrarSearchPlaceholder: "Search registrars…",
+        // 2026-05-17: filter renamed "Registrar" → "Source" to match
+        // the column header rename. Key name stays `registrarLabel`
+        // since the underlying state is `registrarFilter` (which maps
+        // to BacklogDomain.registrar) — label-only swap.
+        registrarLabel: "Source",
+        registrarAny: "Any source",
+        registrarSearchPlaceholder: "Search sources…",
         expiryFrom: "Expires from",
         expiryTo: "Expires to",
         availabilityLabel: "Availability",
@@ -2497,6 +2572,23 @@ const messagesRu: Messages = {
             partial: "частично",
             no_verdict: "без вердикта",
           },
+          labelAvailability: {
+            good: "свободен",
+            mixed: "занят",
+            low_quality: "низкое качество",
+            // 2026-05-16 split (см. EN labelAvailability).
+            unknown: "неизвестно",
+            error: "ошибка",
+            partial: "частично",
+            no_verdict: "без вердикта",
+          },
+          labelWhois: {
+            good: "стабильный",
+            mixed: "возможный дрифт",
+            low_quality: "дроп/смена владельца",
+            partial: "частично",
+            no_verdict: "без вердикта",
+          },
         },
       },
       run: {
@@ -2527,6 +2619,17 @@ const messagesRu: Messages = {
         },
         viewDomain: "Открыть",
         empty: "В этом запуске нет доменов.",
+        emptyFiltered:
+          "Ни один домен не подходит под текущий фильтр. Снимите его, чтобы увидеть остальные.",
+        clearFilter: "Снять фильтр",
+        serverBatchRange: (start, end, total) =>
+          `Показано ${start.toLocaleString()}–${end.toLocaleString()} из ${total.toLocaleString()}`,
+        serverBatchUnfilteredHint: (total) =>
+          `(отфильтровано из ${total.toLocaleString()} всего)`,
+        serverBatchPage: (current, total) =>
+          `Партия ${current} / ${total}`,
+        serverBatchPrev: "← Назад",
+        serverBatchNext: "Вперёд →",
         reanalyze: "Переоценить ИИ",
         reanalyzeHint:
           "Заново оценить все домены этого запуска свежим AI-вызовом. Игнорирует AI-кэш. Переиспользует существующие данные Ahrefs — без перезагрузки.",
@@ -2579,6 +2682,16 @@ const messagesRu: Messages = {
         filterWaybackAny: "любое",
         filterWaybackZero: "0 строк",
         filterWaybackNonzero: "≥ 1 строки",
+        // Availability verdict filter (2026-05-16) — only on Availability runs.
+        filterAvailabilityLabel: "Доступность",
+        filterAvailabilityAny: "любая",
+        filterAvailabilityAvailable: "свободен",
+        filterAvailabilityRegistered: "занят",
+        filterAvailabilityUnknown: "неизвестно",
+        filterAvailabilityError: "ошибка",
+        // 5th option (см. EN labels) — соответствует чипу "без вердикта".
+        filterAvailabilityNoVerdict: "без вердикта",
+        filterAvailabilityClear: "Очистить выбор",
         selectAllOnPage: "Выбрать все на этой странице",
         selectAllMatching: (n: number) =>
           `Выбрать все под фильтром (${n})`,
@@ -2661,6 +2774,8 @@ const messagesRu: Messages = {
           anchors: "Анкоры",
           keywords: "Ключи",
           wayback: "Wayback",
+          wayback_classify: "Классификация",
+          theme: "Тематика",
           final: "Итог",
         },
         legendDiff: "Разные",
@@ -2669,6 +2784,8 @@ const messagesRu: Messages = {
         legendOnlyB: "Только в B",
         viewDomainA: "Открыть A",
         viewDomainB: "Открыть B",
+        noSharedCriteria:
+          "Ни один критерий не был выполнен в обоих запусках — применима только колонка «Итог».",
       },
       domain: {
         backToRun: (id, name = "") =>
@@ -2881,7 +2998,11 @@ const messagesRu: Messages = {
       empty: "Доменов пока нет — запустите первый анализ на странице Анализ.",
       noMatch: "Нет доменов, подходящих под фильтры.",
       cols: {
+        // 2026-05-17: row-number column for "I'm on row N" orientation.
+        rowNumber: "№",
         domain: "Домен",
+        // 2026-05-17: mirrors the Backlog page's renamed Source column.
+        source: "Источник",
         verdict: "Ahrefs",
         verdictSortHint:
           "Кликните для сортировки по баллу. Цикл: убыв → возр → по умолчанию. Частичные / без вердикта всегда уходят вниз.",
@@ -3006,6 +3127,10 @@ const messagesRu: Messages = {
         pinAny: "Пин: любой",
         pinPinned: "Пин: только закреплённые",
         pinUnpinned: "Пин: только незакреплённые",
+        // Source filter (2026-05-17) — см. EN.
+        sourceLabel: "Источник",
+        sourceAny: "Любой источник",
+        sourceSearchPlaceholder: "Поиск источников…",
         minRecords: "Мин. записей",
         minRecordsHelp:
           "Минимальное число строк в выбранном критерии (последний запуск).",
@@ -3948,7 +4073,10 @@ const messagesRu: Messages = {
       cols: {
         domain: "Домен",
         status: "Статус",
-        registrar: "Регистратор",
+        // 2026-05-17: переименовано из "Регистратор" по запросу
+        // пользователя. То же поле теперь и в Базе под этим же
+        // заголовком.
+        registrar: "Источник",
         expirationDate: "Истечение",
         availability: "Доступность",
         comments: "Комментарии",
@@ -3970,9 +4098,10 @@ const messagesRu: Messages = {
         clear: "Очистить фильтры",
         statusLabel: "Статус",
         statusAny: "Любой статус",
-        registrarLabel: "Регистратор",
-        registrarAny: "Любой регистратор",
-        registrarSearchPlaceholder: "Поиск регистраторов…",
+        // 2026-05-17: см. EN — label-only swap "Регистратор" → "Источник".
+        registrarLabel: "Источник",
+        registrarAny: "Любой источник",
+        registrarSearchPlaceholder: "Поиск источников…",
         expiryFrom: "Истекает с",
         expiryTo: "Истекает по",
         availabilityLabel: "Доступность",
