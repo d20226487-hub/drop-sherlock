@@ -656,8 +656,23 @@ def delete_job(job_id: int, db: Session = Depends(get_db)) -> dict:
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(404, "job not found")
+    # Signal cancel to any in-flight worker BEFORE the cascade. The
+    # worker checks `is_canceled(run_id)` between fetches/AI calls and
+    # exits cleanly; without this, a paused/running worker keeps
+    # writing CriterionResult rows after the cascade has removed the
+    # parent RunDomains (FK enforcement is off in our SQLite config),
+    # which leaks orphan CR rows that subsequent runs can claim via
+    # rowid reuse. Also clear pause flags so the next Run that reuses
+    # one of these rowids doesn't inherit a stale "paused" state.
+    from ..tasks import _clear_cancel, _clear_pause, request_cancel
+    run_ids = [r.id for r in job.runs]
+    for rid in run_ids:
+        request_cancel(rid)
     db.delete(job)
     db.commit()
+    for rid in run_ids:
+        _clear_pause(rid)
+        _clear_cancel(rid)
     return {"deleted": job_id}
 
 
@@ -683,10 +698,24 @@ def bulk_delete_jobs(
     )
     found_ids = {j.id for j in found}
     missing = [i for i in payload.ids if i not in found_ids]
+    # Same in-flight-cleanup pattern as the single-job DELETE endpoint
+    # above: cancel any active workers BEFORE the cascade, then clear
+    # the in-memory pause/cancel flags AFTER so SQLite-reused rowids
+    # in subsequent submits start with a clean slate. See that
+    # endpoint's comment for the underlying reasoning.
+    from ..tasks import _clear_cancel, _clear_pause, request_cancel
+    run_ids: list[int] = []
+    for j in found:
+        run_ids.extend(r.id for r in j.runs)
+    for rid in run_ids:
+        request_cancel(rid)
     for j in found:
         db.delete(j)
     if found:
         db.commit()
+    for rid in run_ids:
+        _clear_pause(rid)
+        _clear_cancel(rid)
     return {"deleted": sorted(found_ids), "missing": missing}
 
 

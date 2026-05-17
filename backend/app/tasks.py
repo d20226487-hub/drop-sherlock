@@ -445,7 +445,20 @@ def dispatch_run(run_id: int) -> asyncio.Task:
 
     Cheap DB peek (one PK lookup) to read the kind. Done synchronously
     here because the runner functions don't take spec via argument —
-    they re-load via SessionLocal inside their first transaction."""
+    they re-load via SessionLocal inside their first transaction.
+
+    Clears any stale `_PAUSED_RUNS` / `_CANCELED_RUNS` entry for
+    `run_id` before dispatching. SQLite reuses rowids after DELETE
+    (no AUTOINCREMENT here), so a newly-created Run can collide with
+    an in-memory flag left over from a previously paused/canceled run
+    whose row got deleted (`POST /jobs/bulk-delete` and
+    `DELETE /jobs/{id}` don't clear these flags — only the per-run
+    delete endpoint does). Without this guard, the fresh worker
+    short-circuits at the first pause/cancel check for every domain
+    and the run marks itself failed in milliseconds with zero
+    progress."""
+    _clear_pause(run_id)
+    _clear_cancel(run_id)
     db = SessionLocal()
     kind = "quality"
     try:
@@ -1660,9 +1673,10 @@ async def process_run(run_id: int) -> None:
     _track(asyncio.current_task())  # type: ignore[arg-type]
 
     # 1. Mark the run as running, load the spec.
-    spec = _begin_run(run_id)
-    if spec is None:
+    begun = _begin_run(run_id)
+    if begun is None:
         return  # Already terminal, or row gone.
+    spec, ownership_token = begun
 
     # 2. Fan out per-domain workers. Per-provider semaphores inside
     #    `limit("...")` bound HTTP concurrency to each upstream, but we
@@ -1694,14 +1708,15 @@ async def process_run(run_id: int) -> None:
             *(_run_one(rd_id) for rd_id in domain_ids),
             return_exceptions=False,
         )
-        # Re-read status from DB rather than trusting the in-memory pause/cancel
-        # flag. Race: user pauses → worker exits its gather slot → user resumes
-        # (clears pause flag, dispatches a NEW worker) → THIS old worker reaches
-        # this check with the flag already cleared. If we trusted the flag we'd
-        # call _finish_run and clobber the new worker's run. Instead: only
-        # finalize if status is still "running" (i.e. WE own the run).
-        current_status = _read_run_status(run_id)
-        if current_status != "running":
+        # Ownership re-check (2026-05-17): status alone isn't enough.
+        # SQLite reuses rowids after DELETE, so a freshly-submitted Run
+        # can land on the same id as a just-deleted Run whose worker is
+        # still draining. Without the started_at token compare, that
+        # old worker would finalize the fresh Run — observed as Job 61
+        # short-circuiting with "no work" the moment the user re-
+        # submitted after a pause+delete. Status="running" passes for
+        # both the stale and the fresh worker; the token doesn't.
+        if not _still_owns_run(run_id, ownership_token):
             return
         # Sanity: did any domain actually start? If every `_process_domain`
         # short-circuited at the cancel/pause guard (real bug observed
@@ -1726,7 +1741,7 @@ async def process_run(run_id: int) -> None:
     except Exception as e:  # noqa: BLE001
         log.exception("run %s failed", run_id)
         # Same race protection — only flip to failed if we still own the run.
-        if _read_run_status(run_id) == "running":
+        if _still_owns_run(run_id, ownership_token):
             _finish_run(run_id, success=False, error=f"{type(e).__name__}: {e}")
     finally:
         _clear_cancel(run_id)
@@ -1734,17 +1749,37 @@ async def process_run(run_id: int) -> None:
 
 # --- Step helpers, each self-contained around a session --------------------
 
-def _begin_run(run_id: int) -> AnalyzeSpec | None:
+def _begin_run(run_id: int) -> tuple[AnalyzeSpec, datetime] | None:
+    """Mark the run running + return its spec AND the timestamp we just
+    wrote into `started_at`. The timestamp acts as an ownership token —
+    callers re-check it before finalizing so a stale worker (e.g. one
+    whose run was deleted and whose run_id got reused by SQLite for a
+    fresh Run) cannot clobber the new worker's status."""
     db = SessionLocal()
     try:
         run = db.get(Run, run_id)
         if run is None or run.status not in ("pending",):
             return None
+        token = datetime.utcnow()
         run.status = "running"
-        run.started_at = datetime.utcnow()
+        run.started_at = token
         run.error = ""
         db.commit()
-        return AnalyzeSpec.model_validate(json.loads(run.spec_json or "{}"))
+        spec = AnalyzeSpec.model_validate(json.loads(run.spec_json or "{}"))
+        return spec, token
+    finally:
+        db.close()
+
+
+def _still_owns_run(run_id: int, token: datetime) -> bool:
+    """True iff this worker still owns `run_id`. False once the Run row
+    is gone or its `started_at` has been overwritten by a fresh
+    `_begin_run` (rowid-reuse scenario). Used at every finalize point to
+    refuse writes that would belong to someone else's run."""
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        return run is not None and run.started_at == token
     finally:
         db.close()
 

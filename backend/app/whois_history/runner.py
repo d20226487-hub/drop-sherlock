@@ -375,14 +375,18 @@ async def _process_whois_domain(
 async def process_whois_history_run(run_id: int) -> None:
     """Top-level orchestrator for a whois_history-kind Run. Dispatched
     by `tasks.dispatch_run` based on the parent Job's kind."""
-    # 1. Mark running.
+    # 1. Mark running + capture an ownership token (the started_at value
+    #    we just wrote). Re-checked before any finalize write so a stale
+    #    worker whose run was deleted + whose run_id got reused by
+    #    SQLite for a fresh Run can't clobber the new owner's status.
     db: Session = SessionLocal()
     try:
         run = db.get(Run, run_id)
         if run is None or run.status != "pending":
             return
+        ownership_token = datetime.utcnow()
         run.status = "running"
-        run.started_at = datetime.utcnow()
+        run.started_at = ownership_token
         run.error = ""
         db.commit()
         rd_ids = [
@@ -391,6 +395,14 @@ async def process_whois_history_run(run_id: int) -> None:
         ]
     finally:
         db.close()
+
+    def _still_owns() -> bool:
+        s = SessionLocal()
+        try:
+            r = s.get(Run, run_id)
+            return r is not None and r.started_at == ownership_token
+        finally:
+            s.close()
 
     # 2. Fan out, bounded.
     outer_sem = asyncio.Semaphore(_OUTER_CONCURRENCY)
@@ -405,6 +417,8 @@ async def process_whois_history_run(run_id: int) -> None:
         )
     except Exception as e:  # noqa: BLE001
         log.exception("whois_history run %s failed", run_id)
+        if not _still_owns():
+            return
         db = SessionLocal()
         try:
             run = db.get(Run, run_id)
@@ -418,6 +432,8 @@ async def process_whois_history_run(run_id: int) -> None:
         return
 
     # 3. Mark done.
+    if not _still_owns():
+        return
     db = SessionLocal()
     try:
         run = db.get(Run, run_id)
