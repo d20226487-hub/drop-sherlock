@@ -720,6 +720,109 @@ def add_categories(items: list) -> list[dict]:
     return merged
 
 
+# --- Wayback auto-retry settings (added 2026-05-17) -----------------------
+# When a Quality run with `wayback` enabled finishes, optionally re-fire
+# the existing /runs/{id}/retry-failed flow on a backoff schedule until
+# either every Wayback (and chained classify) failure is resolved or the
+# attempt budget runs out. Scoped to Wayback only — Ahrefs / Whois /
+# Availability failures stay manual so we don't silently burn provider
+# units. Knobs:
+#   enabled              — master switch.
+#   max_attempts         — how many retry passes after the initial run.
+#                          1 means "one retry then stop"; 0 disables.
+#   initial_delay_sec    — sleep before the first retry pass. Most CDX
+#                          flakiness clears in <2 min so 60s is the
+#                          default sweet spot.
+#   backoff_multiplier   — applied between successive passes. 2.0 means
+#                          60s → 120s → 240s for the 3-attempt default.
+_WAYBACK_AUTO_RETRY_KEY = "wayback_auto_retry_config"
+DEFAULT_WAYBACK_AUTO_RETRY = {
+    "enabled": True,
+    "max_attempts": 3,
+    "initial_delay_sec": 60,
+    "backoff_multiplier": 2.0,
+}
+# Conservative caps so a typo in Settings (`max_attempts: 9999`,
+# `initial_delay_sec: 0`) can't pin the event loop or DDoS Wayback.
+_AUTO_RETRY_MAX_ATTEMPTS_CAP = 20
+_AUTO_RETRY_MAX_DELAY_SEC = 3600   # 1 h between passes
+_AUTO_RETRY_MAX_MULTIPLIER = 10.0
+
+
+def get_wayback_auto_retry_config() -> dict:
+    """DB override merged onto defaults. Always returns the full 4-key
+    shape so callers don't have to defend against partial dicts."""
+    db = SessionLocal()
+    try:
+        raw = _get(db, _WAYBACK_AUTO_RETRY_KEY) or ""
+    finally:
+        db.close()
+    out = dict(DEFAULT_WAYBACK_AUTO_RETRY)
+    if not raw:
+        return out
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return out
+    if not isinstance(parsed, dict):
+        return out
+    if isinstance(parsed.get("enabled"), bool):
+        out["enabled"] = parsed["enabled"]
+    if isinstance(parsed.get("max_attempts"), int):
+        out["max_attempts"] = max(
+            0, min(parsed["max_attempts"], _AUTO_RETRY_MAX_ATTEMPTS_CAP),
+        )
+    if isinstance(parsed.get("initial_delay_sec"), (int, float)):
+        out["initial_delay_sec"] = max(
+            0, min(int(parsed["initial_delay_sec"]), _AUTO_RETRY_MAX_DELAY_SEC),
+        )
+    if isinstance(parsed.get("backoff_multiplier"), (int, float)):
+        out["backoff_multiplier"] = max(
+            1.0, min(float(parsed["backoff_multiplier"]), _AUTO_RETRY_MAX_MULTIPLIER),
+        )
+    return out
+
+
+def set_wayback_auto_retry_config(cfg: dict) -> dict:
+    """Merge `cfg` over the current config + persist. Same key shape +
+    cap semantics as `get_wayback_auto_retry_config`. Returns the
+    effective post-merge value (so the API response can echo what
+    actually got saved)."""
+    if not isinstance(cfg, dict):
+        raise ValueError("wayback_auto_retry config must be a dict")
+    current = get_wayback_auto_retry_config()
+    if "enabled" in cfg:
+        if not isinstance(cfg["enabled"], bool):
+            raise ValueError("enabled must be a boolean")
+        current["enabled"] = cfg["enabled"]
+    if "max_attempts" in cfg:
+        if not isinstance(cfg["max_attempts"], int):
+            raise ValueError("max_attempts must be an integer")
+        current["max_attempts"] = max(
+            0, min(cfg["max_attempts"], _AUTO_RETRY_MAX_ATTEMPTS_CAP),
+        )
+    if "initial_delay_sec" in cfg:
+        if not isinstance(cfg["initial_delay_sec"], (int, float)):
+            raise ValueError("initial_delay_sec must be a number")
+        current["initial_delay_sec"] = max(
+            0,
+            min(int(cfg["initial_delay_sec"]), _AUTO_RETRY_MAX_DELAY_SEC),
+        )
+    if "backoff_multiplier" in cfg:
+        if not isinstance(cfg["backoff_multiplier"], (int, float)):
+            raise ValueError("backoff_multiplier must be a number")
+        current["backoff_multiplier"] = max(
+            1.0,
+            min(float(cfg["backoff_multiplier"]), _AUTO_RETRY_MAX_MULTIPLIER),
+        )
+    db = SessionLocal()
+    try:
+        _set(db, _WAYBACK_AUTO_RETRY_KEY, json.dumps(current))
+    finally:
+        db.close()
+    return current
+
+
 def get_scoring_config() -> dict:
     """Effective scoring config — DB override merged on top of defaults.
     Always returns a complete config (every key present) so downstream

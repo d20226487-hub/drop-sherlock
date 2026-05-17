@@ -1175,6 +1175,215 @@ async def _retry_failed_run_domain(
             _REANALYZING_RUN_DOMAINS.discard(run_domain_id)
 
 
+# --- Wayback auto-retry watcher (added 2026-05-17) --------------------------
+#
+# Lives between process_run finalize and the manual /retry-failed endpoint.
+# When a Quality run with `wayback` enabled finishes, this loop wakes up
+# after a configurable delay, asks "are there any wayback-criterion
+# failures worth retrying?", fires the existing per-RD retry machinery
+# for them, waits for the pass to complete, and repeats until either no
+# failures remain or the attempt budget is exhausted.
+#
+# Strictly scoped to wayback + chained wayback_classify (NOT Ahrefs /
+# whois / availability) per the 2026-05-17 design call — silently
+# burning Ahrefs units in the background would violate user expectations.
+#
+# Skip rules (locked 2026-05-17):
+#   - wayback CR.status='failed'                → retry wayback (cascade
+#                                                  pulls classify in)
+#   - classify CR.status='failed' AND wayback
+#     CR has ≥1 row                            → retry classify only
+#   - classify CR.status='failed' AND wayback
+#     CR has 0 rows                            → SKIP (the empty archive
+#                                                  is the answer; the
+#                                                  classify "no samples"
+#                                                  failure is not flake)
+
+
+def _wayback_cr_has_rows(cr: "CriterionResult") -> bool:
+    """True iff the wayback CR completed cleanly with at least one CDX
+    row. Used by the auto-retry's skip-empty-CDX rule so we don't waste
+    a retry pass on a wayback_classify failure whose only fix is "the
+    domain has no Wayback history" — retrying would re-emit the same
+    'no samples' verdict every time."""
+    if cr.status != "done":
+        return False
+    if not cr.data_json:
+        return False
+    try:
+        body = json.loads(cr.data_json)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    rows = body.get("wayback")
+    return isinstance(rows, list) and len(rows) > 0
+
+
+def _collect_wayback_retry_candidates(
+    run_id: int, spec: AnalyzeSpec,
+) -> dict[int, list[str]]:
+    """Stricter cousin of `_collect_failed_criteria`. Returns only
+    wayback-criterion failures worth retrying — never Ahrefs / Whois /
+    Availability — and skips classify failures rooted in an empty CDX
+    response (see module docstring for the rule)."""
+    out: dict[int, list[str]] = {}
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return out
+        wb_cfg = getattr(spec.criteria, "wayback", None)
+        wb_enabled = wb_cfg is not None and getattr(wb_cfg, "enabled", False)
+        if not wb_enabled:
+            return out
+        cls_cfg = getattr(spec.criteria, "wayback_classify", None)
+        cls_enabled = (
+            cls_cfg is not None and getattr(cls_cfg, "enabled", False)
+        )
+        for rd in run.domains:
+            if rd.status == "canceled":
+                continue
+            crs = {cr.criterion: cr for cr in rd.results}
+            wb_cr = crs.get("wayback")
+            cls_cr = crs.get("wayback_classify")
+
+            retry: list[str] = []
+            # Wayback fetch failure → retry; cascade handles classify.
+            if wb_cr is None or wb_cr.status == "failed":
+                retry.append("wayback")
+                if cls_enabled:
+                    retry.append("wayback_classify")
+            elif cls_enabled and cls_cr is not None and cls_cr.status == "failed":
+                # Classify failed but the wayback fetch is fine. Only
+                # worth retrying if the wayback CR actually has rows —
+                # otherwise the failure mode is "no archive history",
+                # which a re-judge can't fix.
+                if _wayback_cr_has_rows(wb_cr):
+                    retry.append("wayback_classify")
+            if retry:
+                out[rd.id] = retry
+        return out
+    finally:
+        db.close()
+
+
+# Process-level set of run ids currently being auto-retried, so we don't
+# double-schedule. Cleared in the loop's finally clause; lost on uvicorn
+# restart (acceptable — manual retry is always available, and the next
+# run kicks off its own auto-retry loop).
+_AUTO_RETRY_RUNS: set[int] = set()
+
+
+def is_auto_retry_active(run_id: int) -> bool:
+    return run_id in _AUTO_RETRY_RUNS
+
+
+def schedule_wayback_auto_retry(run_id: int) -> None:
+    """Spawn the auto-retry watcher for `run_id` if Settings allow it
+    and the run's spec has wayback enabled. Idempotent — does nothing
+    when an auto-retry loop is already in flight for this run. Called
+    from `process_run` right after `_finish_run(success=True)`."""
+    if run_id in _AUTO_RETRY_RUNS:
+        return
+    try:
+        from .app_settings import get_wayback_auto_retry_config
+        cfg = get_wayback_auto_retry_config()
+    except Exception:  # noqa: BLE001
+        log.exception("could not read wayback_auto_retry config")
+        return
+    if not cfg.get("enabled") or int(cfg.get("max_attempts", 0)) <= 0:
+        return
+
+    # Read the spec ONCE here so the watcher doesn't have to (cheap, and
+    # lets us bail before spawning the task when the run isn't a
+    # wayback-bearing Quality run).
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return
+        try:
+            spec = AnalyzeSpec.model_validate(
+                json.loads(run.spec_json or "{}"),
+            )
+        except Exception:  # noqa: BLE001
+            return
+    finally:
+        db.close()
+    wb_cfg = getattr(spec.criteria, "wayback", None)
+    if wb_cfg is None or not getattr(wb_cfg, "enabled", False):
+        return
+
+    _AUTO_RETRY_RUNS.add(run_id)
+    task = asyncio.create_task(
+        _wayback_auto_retry_loop(run_id, spec, dict(cfg)),
+    )
+    _track(task)
+
+
+async def _wayback_auto_retry_loop(
+    run_id: int, spec: AnalyzeSpec, cfg: dict,
+) -> None:
+    """Sleep / scan / retry / repeat until budget is hit or no failures
+    remain. Caller guarantees:
+      - the run's spec has wayback enabled
+      - the auto-retry Settings toggle is on
+      - max_attempts > 0
+      - this run is not already being auto-retried"""
+    try:
+        delay = float(cfg.get("initial_delay_sec", 60))
+        multiplier = float(cfg.get("backoff_multiplier", 2.0))
+        max_attempts = int(cfg.get("max_attempts", 3))
+        for _attempt in range(max_attempts):
+            await asyncio.sleep(max(0.0, delay))
+            delay *= multiplier
+
+            # Bail if the user re-ran / canceled / paused this run while
+            # we were sleeping — they're driving now, get out of the way.
+            if _read_run_status(run_id) not in ("done", "failed"):
+                return
+            # Bail if a manual run-level retry is in flight; that path
+            # owns the retries from here.
+            if _REANALYZING_RUNS.is_active(run_id):
+                continue
+
+            candidates = _collect_wayback_retry_candidates(run_id, spec)
+            if not candidates:
+                return  # nothing left to fix
+
+            # Skip RDs already being worked on by a manual retry — partial
+            # dispatch confuses both the in-flight workers and the UI.
+            candidates = {
+                rd_id: criteria
+                for rd_id, criteria in candidates.items()
+                if not _REANALYZING_RUN_DOMAINS.is_active(rd_id)
+            }
+            if not candidates:
+                continue
+
+            # Force use_cache=False so a flaky wayback fetch's cached row
+            # doesn't get served back to us instead of re-querying CDX.
+            retry_spec = spec.model_copy(deep=True)
+            retry_spec.use_cache = False
+
+            tasks: list[asyncio.Task] = []
+            for rd_id, criteria in candidates.items():
+                t = asyncio.create_task(
+                    _retry_failed_run_domain(
+                        rd_id, criteria, retry_spec, track_set=True,
+                    ),
+                )
+                _REANALYZING_RUN_DOMAINS.add_task(rd_id, t)
+                _track(t)
+                tasks.append(t)
+            await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception:  # noqa: BLE001
+        log.exception("wayback auto-retry loop crashed for run %s", run_id)
+    finally:
+        _AUTO_RETRY_RUNS.discard(run_id)
+
+
 def reanalyze_run_domain_now(
     run_domain_id: int, ai_override: dict | None = None
 ) -> dict:
@@ -1738,6 +1947,11 @@ async def process_run(run_id: int) -> None:
             )
             return
         _finish_run(run_id, success=True, error="")
+        # Wayback auto-retry — opt-in via Settings, fires only when the
+        # spec has wayback enabled. The helper is a no-op when disabled
+        # or when no auto-retry budget remains, so calling it
+        # unconditionally is safe (and keeps the wiring tight).
+        schedule_wayback_auto_retry(run_id)
     except Exception as e:  # noqa: BLE001
         log.exception("run %s failed", run_id)
         # Same race protection — only flip to failed if we still own the run.

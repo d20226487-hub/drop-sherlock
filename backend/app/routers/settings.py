@@ -89,7 +89,27 @@ def settings_root():
             "allowed_criteria": list(_CLASSIFY_CONTEXT_ALLOWED_CRITERIA),
             "allowed_fields": list(_CLASSIFY_CONTEXT_ALLOWED_FIELDS),
         },
+        # Post-run Wayback auto-retry knobs (added 2026-05-17). Surfaced
+        # here so the Wayback tab renders without a second fetch.
+        "wayback_auto_retry": {
+            "config": _wayback_auto_retry_for_root(),
+            "defaults": _wayback_auto_retry_defaults_for_root(),
+        },
     }
+
+
+def _wayback_auto_retry_for_root() -> dict:
+    """Inline helper kept here (rather than imported at module top) so
+    `app_settings` isn't pulled into the import graph until /settings/
+    is actually called. Matches the pattern other recent settings
+    blocks use."""
+    from ..app_settings import get_wayback_auto_retry_config
+    return get_wayback_auto_retry_config()
+
+
+def _wayback_auto_retry_defaults_for_root() -> dict:
+    from ..app_settings import DEFAULT_WAYBACK_AUTO_RETRY
+    return DEFAULT_WAYBACK_AUTO_RETRY
 
 
 @router.get("/providers")
@@ -275,6 +295,46 @@ def get_scoring_route():
         "config": get_scoring_config(),
         "defaults": DEFAULT_SCORING_CONFIG,
     }
+
+
+# --- Wayback auto-retry config ---------------------------------------------
+# Controls the post-run watcher that reruns /retry-failed against wayback
+# (and chained wayback_classify) failures on a backoff schedule. See
+# app_settings.get_wayback_auto_retry_config for the field semantics and
+# the safety caps.
+
+class WaybackAutoRetryIn(BaseModel):
+    enabled: bool | None = None
+    max_attempts: int | None = Field(default=None, ge=0)
+    initial_delay_sec: int | None = Field(default=None, ge=0)
+    backoff_multiplier: float | None = Field(default=None, ge=1.0)
+
+
+@router.get("/wayback-auto-retry")
+def get_wayback_auto_retry_route():
+    from ..app_settings import (
+        DEFAULT_WAYBACK_AUTO_RETRY,
+        get_wayback_auto_retry_config,
+    )
+    return {
+        "config": get_wayback_auto_retry_config(),
+        "defaults": DEFAULT_WAYBACK_AUTO_RETRY,
+    }
+
+
+@router.put("/wayback-auto-retry")
+def update_wayback_auto_retry_route(payload: WaybackAutoRetryIn):
+    from ..app_settings import (
+        DEFAULT_WAYBACK_AUTO_RETRY,
+        set_wayback_auto_retry_config,
+    )
+    raw = payload.model_dump(exclude_unset=True)
+    raw = {k: v for k, v in raw.items() if v is not None}
+    try:
+        new_cfg = set_wayback_auto_retry_config(raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"config": new_cfg, "defaults": DEFAULT_WAYBACK_AUTO_RETRY}
 
 
 @router.put("/scoring")

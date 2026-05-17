@@ -4,6 +4,7 @@ import { useT } from "@/lib/i18n";
 import { api, ProviderStatus, RateLimits, SettingsPayload } from "@/lib/api";
 import { ProviderCard } from "@/components/provider-card";
 import { WaybackClassifyEditor } from "@/components/wayback-classify-editor";
+import { WaybackAutoRetryEditor } from "@/components/wayback-auto-retry-editor";
 import { RateLimitsTable } from "@/components/rate-limits-table";
 import { ClassifyContextEditor } from "@/components/classify-context-editor";
 import { PromptEditors } from "@/components/prompt-editors";
@@ -194,6 +195,15 @@ export default function SettingsPage() {
 
           {tab === "wayback" && (
             <div className="space-y-8">
+              {/* Post-run auto-retry sits ABOVE the classify config
+                  because it's the toggle the user is most likely to
+                  reach for ("I just want the run to finish without me
+                  babysitting it") — same logic that puts the most-
+                  used controls at the top elsewhere in Settings. */}
+              <section className="space-y-4">
+                <h2 className="text-lg font-semibold">Auto-retry</h2>
+                <WaybackAutoRetryEditor />
+              </section>
               <section className="space-y-4">
                 <h2 className="text-lg font-semibold">
                   {ts.sections.waybackClassify}

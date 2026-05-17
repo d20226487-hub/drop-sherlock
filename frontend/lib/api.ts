@@ -1460,6 +1460,51 @@ export const api = {
       { method: "POST" },
     ),
 
+  // Post-run Wayback auto-retry config — toggle + budget. See
+  // backend/app_settings.get_wayback_auto_retry_config for the
+  // field semantics (and the safety caps).
+  getWaybackAutoRetry: () =>
+    request<{
+      config: {
+        enabled: boolean;
+        max_attempts: number;
+        initial_delay_sec: number;
+        backoff_multiplier: number;
+      };
+      defaults: {
+        enabled: boolean;
+        max_attempts: number;
+        initial_delay_sec: number;
+        backoff_multiplier: number;
+      };
+    }>(`/settings/wayback-auto-retry`),
+
+  updateWaybackAutoRetry: (
+    patch: Partial<{
+      enabled: boolean;
+      max_attempts: number;
+      initial_delay_sec: number;
+      backoff_multiplier: number;
+    }>,
+  ) =>
+    request<{
+      config: {
+        enabled: boolean;
+        max_attempts: number;
+        initial_delay_sec: number;
+        backoff_multiplier: number;
+      };
+      defaults: {
+        enabled: boolean;
+        max_attempts: number;
+        initial_delay_sec: number;
+        backoff_multiplier: number;
+      };
+    }>(`/settings/wayback-auto-retry`, {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
+
   // Per-Job export bundle download URL. Native `<a download>` consumes
   // this — the response is a gzipped JSON tree (Job + Run + RunDomain
   // + CriterionResult + JobCriterionPin) the user can import on
