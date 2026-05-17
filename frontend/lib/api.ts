@@ -886,10 +886,20 @@ async function request<T>(
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
+  // Drop the default application/json content-type when the body is a
+  // FormData — multipart uploads need the browser-set boundary param in
+  // the header, and forcing application/json corrupts the wire format
+  // so multer/python-multipart can't parse it. JSON requests still get
+  // the default. Callers can always override via init.headers.
+  const isMultipart =
+    typeof FormData !== "undefined" && init.body instanceof FormData;
+  const defaultHeaders: Record<string, string> = isMultipart
+    ? {}
+    : { "Content-Type": "application/json" };
   const res = await fetch(`${BASE}${path}`, {
     ...init,
     headers: {
-      "Content-Type": "application/json",
+      ...defaultHeaders,
       ...(init.headers || {}),
     },
   });
@@ -1450,6 +1460,31 @@ export const api = {
       { method: "POST" },
     ),
 
+  // Per-Job export bundle download URL. Native `<a download>` consumes
+  // this — the response is a gzipped JSON tree (Job + Run + RunDomain
+  // + CriterionResult + JobCriterionPin) the user can import on
+  // another server via importJob. Auth comes from the browser's cached
+  // basic-auth header for /api/*, same as every other API call.
+  exportJobUrl: (jobId: number) => `${BASE}/jobs/${jobId}/export`,
+
+  // Multipart upload of a bundle produced by exportJobUrl. Returns the
+  // import summary. `dupe_skipped: true` means the bundle's UUID is
+  // already present on this server — no rows were inserted, the
+  // existing Job's id is returned for convenience.
+  importJob: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return request<{
+      job_id: number;
+      kind: string;
+      runs: number;
+      run_domains: number;
+      criterion_results: number;
+      job_criterion_pins: number;
+      dupe_skipped: boolean;
+    }>(`/jobs/import`, { method: "POST", body: form });
+  },
+
   cancelRun: (runId: number) =>
     request<{ id: number; status?: string; already_terminal?: boolean }>(
       `/runs/${runId}/cancel`,
@@ -1901,8 +1936,12 @@ export const api = {
     if (opts.search) params.set("search", opts.search);
     if (opts.status && opts.status.length)
       params.set("status", opts.status.join(","));
+    // Registrar is sent as repeated query params (not comma-joined) so
+    // values that legitimately contain commas — e.g. "seo.domains: DR
+    // >=10, en, ru, it, pt" — survive the trip. status / availability
+    // are short well-known enums, no commas inside, so they stay CSV.
     if (opts.registrar && opts.registrar.length)
-      params.set("registrar", opts.registrar.join(","));
+      for (const r of opts.registrar) params.append("registrar", r);
     if (opts.expiry_from) params.set("expiry_from", opts.expiry_from);
     if (opts.expiry_to) params.set("expiry_to", opts.expiry_to);
     if (opts.availability && opts.availability.length)
@@ -1947,9 +1986,9 @@ export const api = {
         status_filter: filters.status?.length
           ? filters.status.join(",")
           : null,
-        registrar: filters.registrar?.length
-          ? filters.registrar.join(",")
-          : null,
+        // Registrar is now an explicit list (commas inside a name no
+        // longer break the filter).
+        registrar: filters.registrar?.length ? filters.registrar : null,
         expiry_from: filters.expiry_from || null,
         expiry_to: filters.expiry_to || null,
         availability: filters.availability?.length
@@ -2003,9 +2042,7 @@ export const api = {
         status_filter: payload.status?.length
           ? payload.status.join(",")
           : null,
-        registrar: payload.registrar?.length
-          ? payload.registrar.join(",")
-          : null,
+        registrar: payload.registrar?.length ? payload.registrar : null,
         expiry_from: payload.expiry_from || null,
         expiry_to: payload.expiry_to || null,
         availability: payload.availability?.length
@@ -2037,9 +2074,7 @@ export const api = {
         // `status_filter` carries the filter selection so they don't
         // collide.
         status_filter: filters.status?.length ? filters.status.join(",") : null,
-        registrar: filters.registrar?.length
-          ? filters.registrar.join(",")
-          : null,
+        registrar: filters.registrar?.length ? filters.registrar : null,
         expiry_from: filters.expiry_from || null,
         expiry_to: filters.expiry_to || null,
         availability: filters.availability?.length

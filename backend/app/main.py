@@ -15,6 +15,7 @@ from .routers import (
     dashboard,
     database as database_router,
     errors as errors_router,
+    job_io as job_io_router,
     jobs as jobs_router,
     public_shares as public_shares_router,
     settings as settings_router,
@@ -115,6 +116,12 @@ def _migrate_sqlite_columns() -> None:
         # availability sets 'availability', whois_history sets
         # 'whois_history').
         ("jobs", "kind", "VARCHAR(32) DEFAULT 'quality'"),
+        # Export bundle UUID (2026-05-17). NULL on jobs that have never
+        # been exported; set on first /jobs/{id}/export and copied across
+        # by /jobs/import so re-importing the same bundle is a no-op
+        # (the importer looks up by this column). Plain string UUID4
+        # text; not a DB-native UUID type for SQLite portability.
+        ("jobs", "export_uuid", "VARCHAR(36)"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding
@@ -154,6 +161,9 @@ def _migrate_sqlite_columns() -> None:
         # run does a full table scan (e.g. 100k row scan per request).
         ("ix_run_domains_run_id", "run_domains", "run_id"),
         ("ix_criterion_results_run_domain_id", "criterion_results", "run_domain_id"),
+        # 2026-05-17: import-dedup lookup keyed on the per-bundle UUID
+        # written at export time.
+        ("ix_jobs_export_uuid", "jobs", "export_uuid"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in additions:
@@ -780,6 +790,12 @@ app.add_middleware(
 
 app.include_router(dashboard.router)
 app.include_router(analyze.router)
+# job_io must register BEFORE jobs_router so `/jobs/import` (literal)
+# doesn't get swallowed by the `/jobs/{job_id}` int-typed catch-all
+# defined in jobs_router. Starlette tries routes in registration order
+# and a failed int-parse on "import" would return 422 instead of
+# falling through.
+app.include_router(job_io_router.router)
 app.include_router(jobs_router.router)
 app.include_router(jobs_router.runs_router)
 app.include_router(jobs_router.run_domains_router)

@@ -139,6 +139,15 @@ class Job(Base):
     # Active queries default to filtering archived jobs out; the Jobs UI has
     # an explicit Archived tab to bring them back into view.
     archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Export/import idempotency key (2026-05-17). NULL by default; set on
+    # first /jobs/{id}/export and preserved by /jobs/import so re-importing
+    # the same bundle into a server that already holds that Job is a no-op
+    # (dupe-skipped in the import summary). Indexed because the import
+    # path looks the value up. Plain string column (UUID4 text); not a DB-
+    # native UUID type to keep SQLite portability painless.
+    export_uuid: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True, unique=True,
+    )
 
     runs: Mapped[list["Run"]] = relationship(
         back_populates="job", cascade="all, delete-orphan", order_by="Run.id.desc()"

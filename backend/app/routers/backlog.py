@@ -163,10 +163,26 @@ def _parse_status_csv(raw: str | None) -> list[str]:
     return out
 
 
-def _parse_registrar_csv(raw: str | None) -> list[str]:
+def _normalize_registrar_list(raw: list[str] | None) -> list[str]:
+    """Strip + dedup-preserve-order, drop empties. The wire format is
+    repeated `?registrar=a&registrar=b` (GET) or `registrar: [a, b]`
+    (POST body). Comma-split is NOT used anymore — registrar names can
+    legitimately contain commas (e.g. "seo.domains: DR >=10, en, ru, it,
+    pt") which the old `raw.split(",")` corrupted into 5 fragments that
+    matched nothing."""
     if not raw:
         return []
-    return [s.strip() for s in raw.split(",") if s.strip()]
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in raw:
+        if s is None:
+            continue
+        v = s.strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
 
 
 # Valid AvailabilityCheck.status values. Mirrors models.AvailabilityCheck
@@ -488,7 +504,10 @@ def list_backlog(
     per_page: int = Query(50, ge=1, le=500),
     search: str = "",
     status: str | None = None,
-    registrar: str | None = None,
+    # Repeated `?registrar=a&registrar=b` (not comma-joined) so registrar
+    # strings that legitimately contain commas survive the trip — see
+    # _normalize_registrar_list.
+    registrar: list[str] | None = Query(None),
     expiry_from: date | None = None,
     expiry_to: date | None = None,
     availability: str | None = None,
@@ -508,7 +527,7 @@ def list_backlog(
     Sync impl. The async route (`_list_backlog_route`) wraps this in
     asyncio.to_thread."""
     statuses = _parse_status_csv(status)
-    registrars_filter = _parse_registrar_csv(registrar)
+    registrars_filter = _normalize_registrar_list(registrar)
     availability_statuses = _parse_availability_csv(availability)
 
     base = db.query(BacklogDomain)
@@ -595,7 +614,12 @@ async def _list_backlog_route(
     per_page: int = Query(50, ge=1, le=500),
     search: str = "",
     status: str | None = None,
-    registrar: str | None = None,
+    # Repeated `?registrar=a&registrar=b` (not comma-joined). MUST match
+    # the inner `list_backlog`'s type — FastAPI only binds repeated
+    # query params to `list[str]`, and a plain `str` here would silently
+    # drop all but the first value (or, worse, accept the comma-joined
+    # form and re-introduce the same split-on-comma bug).
+    registrar: list[str] | None = Query(None),
     expiry_from: date | None = None,
     expiry_to: date | None = None,
     availability: str | None = None,
@@ -628,7 +652,7 @@ def _run_list_backlog(
     per_page: int,
     search: str,
     status: str | None,
-    registrar: str | None,
+    registrar: list[str] | None,
     expiry_from: date | None,
     expiry_to: date | None,
     availability: str | None,
@@ -775,7 +799,8 @@ def export_csv(
     scope: str = Query("filtered", pattern="^(filtered|all)$"),
     search: str = "",
     status: str | None = None,
-    registrar: str | None = None,
+    # Repeated query-param shape — see list_backlog for the rationale.
+    registrar: list[str] | None = Query(None),
     expiry_from: date | None = None,
     expiry_to: date | None = None,
     availability: str | None = None,
@@ -794,7 +819,7 @@ def export_csv(
             q,
             search=search,
             statuses=_parse_status_csv(status),
-            registrars_filter=_parse_registrar_csv(registrar),
+            registrars_filter=_normalize_registrar_list(registrar),
             expiry_from=expiry_from,
             expiry_to=expiry_to,
             availability_statuses=_parse_availability_csv(availability),
@@ -878,12 +903,13 @@ def bulk_status(payload: BulkStatusIn, db: Session = Depends(get_db)) -> dict:
 class BulkStatusFilteredIn(BaseModel):
     """Bulk status change scoped by the same filters as the list endpoint.
     Lets the user say "set every filtered row to discarded" without first
-    selecting a page's worth of rows. Filters are CSV strings to match the
-    list endpoint's query-param shape."""
+    selecting a page's worth of rows. `status_filter` / `availability`
+    are CSV strings to match the list endpoint's GET shape; `registrar`
+    is now an explicit list to support commas inside registrar names."""
     status: str
     search: str = ""
     status_filter: str | None = None
-    registrar: str | None = None
+    registrar: list[str] | None = None
     expiry_from: date | None = None
     expiry_to: date | None = None
     availability: str | None = None
@@ -900,7 +926,7 @@ class SendToAnalyzeIn(BaseModel):
     ids: list[int] | None = None
     search: str = ""
     status_filter: str | None = None
-    registrar: str | None = None
+    registrar: list[str] | None = None
     expiry_from: date | None = None
     expiry_to: date | None = None
     availability: str | None = None
@@ -919,7 +945,7 @@ def send_to_analyze(
             db.query(BacklogDomain),
             search=payload.search,
             statuses=_parse_status_csv(payload.status_filter),
-            registrars_filter=_parse_registrar_csv(payload.registrar),
+            registrars_filter=_normalize_registrar_list(payload.registrar),
             expiry_from=payload.expiry_from,
             expiry_to=payload.expiry_to,
             availability_statuses=_parse_availability_csv(payload.availability),
@@ -989,7 +1015,7 @@ def bulk_status_filtered(
         db.query(BacklogDomain),
         search=payload.search,
         statuses=_parse_status_csv(payload.status_filter),
-        registrars_filter=_parse_registrar_csv(payload.registrar),
+        registrars_filter=_normalize_registrar_list(payload.registrar),
         expiry_from=payload.expiry_from,
         expiry_to=payload.expiry_to,
         availability_statuses=_parse_availability_csv(payload.availability),
@@ -1037,7 +1063,7 @@ class BulkDeleteFilteredIn(BaseModel):
     without first selecting page-by-page. Mirrors BulkStatusFilteredIn."""
     search: str = ""
     status_filter: str | None = None
-    registrar: str | None = None
+    registrar: list[str] | None = None
     expiry_from: date | None = None
     expiry_to: date | None = None
     availability: str | None = None
@@ -1051,7 +1077,7 @@ def bulk_delete_filtered(
         db.query(BacklogDomain),
         search=payload.search,
         statuses=_parse_status_csv(payload.status_filter),
-        registrars_filter=_parse_registrar_csv(payload.registrar),
+        registrars_filter=_normalize_registrar_list(payload.registrar),
         expiry_from=payload.expiry_from,
         expiry_to=payload.expiry_to,
         availability_statuses=_parse_availability_csv(payload.availability),

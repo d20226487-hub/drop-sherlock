@@ -144,8 +144,10 @@ export default function BacklogPage() {
     if (scope === "filtered") {
       if (search.trim()) params.set("search", search.trim());
       if (statusFilter.length) params.set("status", statusFilter.join(","));
-      if (registrarFilter.length)
-        params.set("registrar", registrarFilter.join(","));
+      // Repeated `registrar=` params (not comma-joined) — matches the
+      // list endpoint's new shape; commas in registrar names no longer
+      // break the round-trip.
+      for (const r of registrarFilter) params.append("registrar", r);
       if (expiryFrom) params.set("expiry_from", expiryFrom);
       if (expiryTo) params.set("expiry_to", expiryTo);
       if (availabilityFilter.length)
@@ -213,7 +215,18 @@ export default function BacklogPage() {
       });
   }
 
-  function reload(opts: { silent?: boolean; refreshOptions?: boolean } = {}) {
+  function reload(
+    opts: {
+      silent?: boolean;
+      refreshOptions?: boolean;
+      // True when the candidate set is changing (filter / sort / search
+      // / per-page). The page navigation case + the manual Refresh
+      // button + post-mutation reloads explicitly keep the selection
+      // — pagination because the user is sweeping across pages, the
+      // others because the rows they picked still exist.
+      clearSelection?: boolean;
+    } = {},
+  ) {
     if (!opts.silent) setError(null);
     setLoading(true);
     // Refresh options (total count + distinct registrars) on initial load
@@ -244,15 +257,15 @@ export default function BacklogPage() {
           if (d.registrars) setCachedRegistrars(d.registrars);
           refreshAnalyzedPending();
         }
-        // Drop selections that are no longer visible on the current page.
-        // Keeps the bulk action counter honest after pagination/filter
-        // changes.
-        const visibleIds = new Set(d.rows.map((r) => r.id));
-        setSelected((prev) => {
-          const next = new Set<number>();
-          for (const id of prev) if (visibleIds.has(id)) next.add(id);
-          return next;
-        });
+        // Selection survives pagination + manual Refresh + post-
+        // mutation reload (bulk action handlers already clear it
+        // themselves where appropriate). Only the deps-effect path
+        // sets `clearSelection: true`, and only when filter / sort /
+        // search / per-page actually changed — in that case the
+        // candidate set reshapes and old picks may not apply.
+        if (opts.clearSelection) {
+          setSelected(new Set());
+        }
         // Hydrate availability column from the cache history (no
         // fresh cascade calls).
         const domains = d.rows.map((r) => r.domain);
@@ -299,7 +312,13 @@ export default function BacklogPage() {
     const onlyPageChanged =
       lastDepsRef.current !== null && lastDepsRef.current === nonPageDeps;
     lastDepsRef.current = nonPageDeps;
-    reload({ silent: true, refreshOptions: !onlyPageChanged });
+    reload({
+      silent: true,
+      refreshOptions: !onlyPageChanged,
+      // Filter / sort / search / per-page change → drop stale picks.
+      // Pure page-flip keeps the selection so the user can sweep.
+      clearSelection: !onlyPageChanged,
+    });
     if (onlyPageChanged) {
       // Page-flip: jump to the top so the user lands at the first row of
       // the new page instead of staying scrolled into the previous page.

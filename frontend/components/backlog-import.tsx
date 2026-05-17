@@ -122,14 +122,22 @@ export function BacklogImport({
     setResult(null);
   }
 
-  // Close-on-Escape — convenient for a modal.
+  // "Safe to dismiss without warning?" — yes on the file-picker step
+  // (nothing entered yet) and yes on the result screen (work already
+  // committed). On `map` the user has invested time in column mapping +
+  // defaults, so a stray backdrop click or Escape press shouldn't wipe
+  // it — we require an explicit Cancel/X click there.
+  const safeToDismiss = step === "pick" || step === "result";
+
+  // Close-on-Escape — convenient on the safe-to-dismiss steps; on `map`
+  // it's blocked so the user doesn't lose their mapping work.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape" && !busy) onClose();
+      if (e.key === "Escape" && !busy && safeToDismiss) onClose();
     }
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [busy, onClose]);
+  }, [busy, safeToDismiss, onClose]);
 
   // Fetch the live import-row cap on mount. Cheap (3-key JSON) and lets
   // the user change the cap in Settings → Others without a page reload.
@@ -260,7 +268,12 @@ export function BacklogImport({
     <div
       className="fixed inset-0 z-50 flex items-start justify-center p-4 bg-black/50 overflow-y-auto"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !busy) onClose();
+        // Backdrop click only dismisses when there's no in-progress
+        // work to lose. On the `map` step the user has already picked
+        // a file + entered column mappings — protect that. The X
+        // button and Cancel button still work; this only blocks the
+        // accidental-click-outside path.
+        if (e.target === e.currentTarget && !busy && safeToDismiss) onClose();
       }}
     >
       <div className="w-full max-w-3xl rounded-lg border dark:border-neutral-800 bg-white dark:bg-neutral-950 shadow-xl mt-12 mb-12">

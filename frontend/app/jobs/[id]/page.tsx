@@ -279,6 +279,19 @@ export default function JobDetailPage({
                   ? ts.unarchive
                   : ts.archive}
             </button>
+            {/* Per-Job export — bundles Job + Runs + RunDomains +
+                CriterionResults + JobCriterionPins into one gzip JSON
+                file the user can import on another server (e.g. move
+                analysis from local to deploy without touching the
+                colleagues' Database/Backlog state). Native <a download>
+                handles the streaming response; no fetch+Blob needed. */}
+            <a
+              href={api.exportJobUrl(jobId)}
+              download
+              className="text-sm px-3 py-1.5 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+            >
+              Export
+            </a>
             <button
               onClick={deleteJob}
               disabled={busy !== null}

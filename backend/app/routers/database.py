@@ -1249,12 +1249,27 @@ def list_domains(
             # disables the Availability filter when empty (no availability
             # CR exists yet for any pinned/fallback rd).
             "availability_statuses": sorted(availability_statuses_seen),
-            # Distinct BacklogDomain.registrar values for the Source
-            # filter dropdown (2026-05-17). Empty list when no backlog
-            # rows carry a registrar yet — frontend disables the
-            # filter so the operator sees "Any source" with no options
-            # rather than a populated-but-useless control.
-            "sources": sorted(sources_seen),
+            # Source filter dropdown (2026-05-17, broadened
+            # 2026-05-17): union of (a) registrars surfaced on
+            # currently-analyzed rows and (b) every distinct
+            # BacklogDomain.registrar value in the table. (b) was added
+            # so the operator can see a source they imported but
+            # haven't analyzed yet — picking such a value will return 0
+            # rows on Database, but its presence in the dropdown is the
+            # honest "yes, you imported 346 from that source; none are
+            # in Database yet" signal. Mirrors the Backlog page's
+            # Source dropdown vocabulary (locked: chip/filter
+            # vocabulary lines up 1:1 across pages).
+            "sources": sorted(
+                sources_seen
+                | {
+                    r[0]
+                    for r in db.query(BacklogDomain.registrar)
+                    .filter(BacklogDomain.registrar != "")
+                    .distinct()
+                    .all()
+                }
+            ),
         },
         total=total,
     )

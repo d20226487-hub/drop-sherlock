@@ -9,7 +9,8 @@
 // in Wave 1 → extracted here in Wave 2b once a second pillar needed
 // the same shape.
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useT } from "@/lib/i18n";
 import { api, JobKind, JobsArchivedFilter, JobsListItem } from "@/lib/api";
 import { usePaginatedSearch } from "@/lib/use-paginated-search";
@@ -48,8 +49,20 @@ export function JobsListByKind({ kind }: { kind: JobKind }) {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState<
-    "idle" | "deleting" | "archiving" | "unarchiving"
+    "idle" | "deleting" | "archiving" | "unarchiving" | "importing"
   >("idle");
+  // Import flow: a hidden file input the "Import" button clicks. We
+  // route the file picker through it (instead of an inline `<input
+  // type=file>`) so the visible button can match the other toolbar
+  // buttons' styling. Result banner stays in component state until the
+  // user dismisses or kicks off another import.
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importResult, setImportResult] = useState<{
+    ok: boolean;
+    message: string;
+    job_id?: number;
+  } | null>(null);
+  const router = useRouter();
 
   const reload = useCallback(async () => {
     try {
@@ -140,17 +153,117 @@ export function JobsListByKind({ kind }: { kind: JobKind }) {
     }
   }
 
+  async function handleImportFile(file: File) {
+    setBusy("importing");
+    setImportResult(null);
+    try {
+      const r = await api.importJob(file);
+      // Soft-warn on pillar mismatch: importing a Whois bundle into the
+      // Quality jobs page works (the row carries `kind` so it lands in
+      // the correct list either way), but the user is probably about
+      // to be confused about which list to look at.
+      if (r.kind && r.kind !== kind) {
+        setImportResult({
+          ok: true,
+          message: `Imported a "${r.kind}" job — see the ${r.kind} jobs list.`,
+          job_id: r.job_id,
+        });
+      } else if (r.dupe_skipped) {
+        setImportResult({
+          ok: true,
+          message: `Already imported — opened existing Job #${r.job_id}.`,
+          job_id: r.job_id,
+        });
+      } else {
+        setImportResult({
+          ok: true,
+          message:
+            `Imported Job #${r.job_id}: ${r.runs} run(s), ${r.run_domains} domain(s), ${r.criterion_results} CR(s)` +
+            (r.job_criterion_pins ? `, ${r.job_criterion_pins} pin(s)` : ``) +
+            `.`,
+          job_id: r.job_id,
+        });
+      }
+      await reload();
+    } catch (e) {
+      setImportResult({
+        ok: false,
+        message: `Import failed: ${(e as Error).message}`,
+      });
+    } finally {
+      setBusy("idle");
+      // Reset the input so picking the same file again re-fires onChange.
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
   const showArchiveAction = tab !== "archived";
   const showUnarchiveAction = tab !== "active";
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold">{tsKind.title}</h1>
-        <p className="text-sm text-neutral-600 dark:text-neutral-400 mt-1">
-          {tsKind.intro}
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold">{tsKind.title}</h1>
+          <p className="text-sm text-neutral-600 dark:text-neutral-400 mt-1">
+            {tsKind.intro}
+          </p>
+        </div>
+        {/* Import a Job bundle exported from another instance. Hidden
+            file input + visible button so the styling matches the
+            rest of the toolbar. Re-importing the same bundle is a
+            safe no-op (the server's UUID lookup dupe-skips). */}
+        <div className="flex items-center gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".gz,.json,application/gzip,application/json"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) handleImportFile(f);
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={busy !== "idle"}
+            className="text-sm px-3 py-1.5 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+          >
+            {busy === "importing" ? "Importing…" : "Import Job"}
+          </button>
+        </div>
       </div>
+
+      {importResult && (
+        <div
+          className={
+            "flex items-start gap-3 rounded-md px-3 py-2 text-sm " +
+            (importResult.ok
+              ? "border border-green-300 dark:border-green-800 bg-green-50 dark:bg-green-900/20 text-green-900 dark:text-green-200"
+              : "border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-900/30 text-red-900 dark:text-red-300")
+          }
+        >
+          <div className="flex-1">{importResult.message}</div>
+          {importResult.ok && importResult.job_id !== undefined && (
+            <button
+              type="button"
+              onClick={() => router.push(`/jobs/${importResult.job_id}`)}
+              className="text-xs underline"
+            >
+              Open
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setImportResult(null)}
+            className="text-xs opacity-70 hover:opacity-100"
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       <div className="border-b dark:border-neutral-800 -mb-px">
         <nav className="flex flex-wrap gap-1">
