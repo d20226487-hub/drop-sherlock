@@ -71,6 +71,7 @@ const DEFAULT_CRITERIA: CriteriaSpec = {
     enabled: true,
     limit: 20,
     sort: [],
+    date_compared: "off",
   },
   // Wayback: opt-in. Hits the free CDX API — see WaybackCard for filter
   // semantics. Defaults updated 2026-05-07 after a 35-domain batch

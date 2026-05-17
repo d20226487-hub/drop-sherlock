@@ -191,6 +191,21 @@ const messagesEn = {
         languagesHint:
           "Empty = no language filter. Multiple = OR-matched against each row's languages array.",
       },
+      keywords: {
+        // Ahrefs organic-keywords `date_compared` (2026-05-17). Predefined
+        // buckets mirror Ahrefs's own UI choices.
+        dateComparedLabel: "Compare to",
+        dateComparedHelp:
+          "Optional. When set, Ahrefs adds prior-period `_prev` fields to each row so the AI judge sees keyword-footprint trend (growing vs decaying).",
+        dateCompared: {
+          off: "off (no comparison)",
+          "3m": "3 months ago",
+          "6m": "6 months ago",
+          "1y": "1 year ago",
+          "2y": "2 years ago",
+          "5y": "5 years ago",
+        },
+      },
       wayback: {
         intro:
           "Free, unauthenticated. Pulls snapshot history from the Wayback CDX API — surfaces site age, recent activity, and 301/302 redirect tails. Strong signal for spotting dropped domains that already migrated elsewhere.",
@@ -609,13 +624,17 @@ const messagesEn = {
         filterAvailabilityAny: "any",
         filterAvailabilityAvailable: "available",
         filterAvailabilityRegistered: "registered",
-        filterAvailabilityUnknown: "unknown",
+        // 'unknown' bucket relabeled "not supported" 2026-05-17 — in
+        // practice most cascade-unknown verdicts come from "no RDAP
+        // server for this TLD + WHOIS:43 couldn't parse" which is
+        // effectively "the providers we have don't cover this TLD."
+        // The bucket key stays `unknown` for backend stability.
+        filterAvailabilityUnknown: "not supported",
         filterAvailabilityError: "error",
-        // 5th option (2026-05-16 follow-up) — covers the chip's
-        // no_verdict bucket: orphaned/missing CR, status='failed'/
-        // 'running'/'pending', empty/malformed data_json. Distinct from
-        // 'unknown' (which is a real cascade verdict meaning "RDAP
-        // returned ambiguously"); chip and filter use the same split.
+        // `filterAvailabilityNoVerdict` removed from the Run-page
+        // filter 2026-05-17 (orphaned/missing CRs aren't actionable
+        // from a filter). Key kept for backward-compat in case other
+        // surfaces still reference it.
         filterAvailabilityNoVerdict: "no verdict",
         filterAvailabilityClear: "Clear selection",
         selectAllOnPage: "Select all on this page",
@@ -1000,7 +1019,7 @@ const messagesEn = {
           "Filter by the latest availability-check result (RDAP / Domainr / WHOIS:43 cascade). Separate from the criterion filter — availability isn't a CR-row criterion.",
         availabilityAvailable: "available",
         availabilityRegistered: "registered",
-        availabilityUnknown: "unknown",
+        availabilityUnknown: "not supported",
         availabilityError: "error",
         availabilityNeverChecked: "(never checked)",
         languageAny: "Any language",
@@ -1866,6 +1885,15 @@ const messagesEn = {
           first && last
             ? `${count} snapshots · ${first.slice(0, 10)} → ${last.slice(0, 10)}`
             : `${count} snapshots`,
+        // 2026-05-17: small always-visible chip for drop-hunters —
+        // raw count of distinct creation_date values in WhoisFreaks
+        // history. NOT a "drops" count (registry data scrubs /
+        // WHOIS-server migrations can also rewrite the field) — the
+        // AI judge weighs this signal separately via dropped_confidence.
+        creationDateChangesCount: (n: number) =>
+          `Creation date changes: ${n}`,
+        creationDateChangesCountHint:
+          "Raw count of distinct creation_date values in WhoisFreaks history. NOT necessarily the same as 'times dropped' — registry data scrubs or WHOIS-server migrations can also rewrite this field. Use the AI dropped_confidence chip above for a weighted verdict.",
         hardSignals: "Hard signals",
         softSignals: "Soft signals",
         noHardSignals:
@@ -1966,7 +1994,7 @@ const messagesEn = {
           "Filter by the latest availability-check result (RDAP / Domainr / WHOIS:43 cascade).",
         availabilityAvailable: "available",
         availabilityRegistered: "registered",
-        availabilityUnknown: "unknown",
+        availabilityUnknown: "not supported",
         availabilityError: "error",
         availabilityNeverChecked: "(never checked)",
       },
@@ -2271,6 +2299,19 @@ const messagesRu: Messages = {
         languagesLabel: "Языки",
         languagesHint:
           "Пусто = без фильтра по языку. Несколько = ИЛИ-сравнение с массивом языков каждой строки.",
+      },
+      keywords: {
+        dateComparedLabel: "Сравнить с",
+        dateComparedHelp:
+          "Опционально. Если указать, Ahrefs добавит к каждой строке поля `_prev` за прошлый период — ИИ-судья видит тренд по ключам (рост или просадка).",
+        dateCompared: {
+          off: "выкл (без сравнения)",
+          "3m": "3 месяца назад",
+          "6m": "6 месяцев назад",
+          "1y": "1 год назад",
+          "2y": "2 года назад",
+          "5y": "5 лет назад",
+        },
       },
       wayback: {
         intro:
@@ -2687,9 +2728,10 @@ const messagesRu: Messages = {
         filterAvailabilityAny: "любая",
         filterAvailabilityAvailable: "свободен",
         filterAvailabilityRegistered: "занят",
-        filterAvailabilityUnknown: "неизвестно",
+        filterAvailabilityUnknown: "не поддерживается",
         filterAvailabilityError: "ошибка",
-        // 5th option (см. EN labels) — соответствует чипу "без вердикта".
+        // `filterAvailabilityNoVerdict` исключён из фильтра Run-страницы
+        // 2026-05-17 (см. EN). Ключ сохранён на случай других ссылок.
         filterAvailabilityNoVerdict: "без вердикта",
         filterAvailabilityClear: "Очистить выбор",
         selectAllOnPage: "Выбрать все на этой странице",
@@ -3096,7 +3138,7 @@ const messagesRu: Messages = {
           "Фильтр по последнему результату проверки доступности (каскад RDAP / Domainr / WHOIS:43). Отдельно от фильтра критериев — доступность не является CR-критерием.",
         availabilityAvailable: "свободен",
         availabilityRegistered: "занят",
-        availabilityUnknown: "неизвестно",
+        availabilityUnknown: "не поддерживается",
         availabilityError: "ошибка",
         availabilityNeverChecked: "(не проверялся)",
         languageAny: "Любой язык",
@@ -4012,6 +4054,10 @@ const messagesRu: Messages = {
           first && last
             ? `${count} снимков · ${first.slice(0, 10)} → ${last.slice(0, 10)}`
             : `${count} снимков`,
+        creationDateChangesCount: (n: number) =>
+          `Изменений creation_date: ${n}`,
+        creationDateChangesCountHint:
+          "Кол-во разных значений creation_date в истории WhoisFreaks. НЕ равно «сколько раз дроп» — реестр иногда переписывает поле при чистке данных или миграции WHOIS-сервера. Взвешенный вердикт берите из чипа dropped_confidence выше.",
         hardSignals: "Жёсткие сигналы",
         softSignals: "Мягкие сигналы",
         noHardSignals:
@@ -4110,7 +4156,7 @@ const messagesRu: Messages = {
           "Фильтр по последнему результату проверки доступности (каскад RDAP / Domainr / WHOIS:43).",
         availabilityAvailable: "свободен",
         availabilityRegistered: "занят",
-        availabilityUnknown: "неизвестно",
+        availabilityUnknown: "не поддерживается",
         availabilityError: "ошибка",
         availabilityNeverChecked: "(не проверялся)",
       },

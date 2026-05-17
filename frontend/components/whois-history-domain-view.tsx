@@ -271,10 +271,31 @@ function DiffSignalsPanel({ diff }: { diff: WhoisDiff }) {
     soft.ns_changes.length +
     soft.dnssec_toggles.length;
 
+  // Always-visible "creation date changes: N" chip (2026-05-17) —
+  // small human signal for drop-hunters. Not a verdict, not consumed
+  // by the AI (the AI already weighs the same signal into
+  // dropped_confidence). N=0 still shown so "clean history" is
+  // explicit rather than absent.
+  const creationDateChangesN = hard.creation_date_changes.length;
+  const creationChipCls =
+    creationDateChangesN === 0
+      ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
+      : creationDateChangesN === 1
+        ? "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200"
+        : "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300";
+
   return (
     <section className="space-y-3">
       <header className="flex items-baseline justify-between flex-wrap gap-2">
-        <h2 className="text-lg font-semibold">{ts.heading}</h2>
+        <div className="flex items-baseline gap-2 flex-wrap">
+          <h2 className="text-lg font-semibold">{ts.heading}</h2>
+          <span
+            className={`text-xs px-2 py-0.5 rounded-full ${creationChipCls}`}
+            title={ts.creationDateChangesCountHint}
+          >
+            {ts.creationDateChangesCount(creationDateChangesN)}
+          </span>
+        </div>
         <span className="text-xs text-neutral-500 dark:text-neutral-400">
           {ts.coverage(diff.snapshot_count, diff.first_seen, diff.last_seen)}
         </span>

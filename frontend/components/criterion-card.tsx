@@ -926,6 +926,15 @@ export function KeywordsCard({
   onChange: (next: CriteriaSpec["keywords"]) => void;
 }) {
   const { t } = useT();
+  const ts = t.pages.analyze.keywords;
+  const dcOptions: CriteriaSpec["keywords"]["date_compared"][] = [
+    "off",
+    "3m",
+    "6m",
+    "1y",
+    "2y",
+    "5y",
+  ];
   return (
     <CriterionShell
       title={t.pages.analyze.criteria.keywords}
@@ -935,6 +944,34 @@ export function KeywordsCard({
       limit={cfg.limit}
       onLimitChange={(v) => onChange({ ...cfg, limit: v })}
     >
+      {/* date_compared dropdown (2026-05-17) — Ahrefs organic-keywords
+          parameter that adds prior-period `_prev` fields. Predefined
+          buckets mirror Ahrefs's own UI choices. */}
+      <div className="space-y-1">
+        <label
+          className="text-sm text-neutral-600 dark:text-neutral-400 block"
+          title={ts.dateComparedHelp}
+        >
+          {ts.dateComparedLabel}
+        </label>
+        <select
+          value={cfg.date_compared}
+          onChange={(e) =>
+            onChange({
+              ...cfg,
+              date_compared:
+                e.target.value as CriteriaSpec["keywords"]["date_compared"],
+            })
+          }
+          className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-sm outline-none"
+        >
+          {dcOptions.map((opt) => (
+            <option key={opt} value={opt}>
+              {ts.dateCompared[opt]}
+            </option>
+          ))}
+        </select>
+      </div>
       <SortBuilder
         sort={cfg.sort}
         onChange={(s) => onChange({ ...cfg, sort: s })}

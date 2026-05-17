@@ -263,6 +263,37 @@ def _today_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+# Predefined "date_compared" buckets for the Ahrefs organic-keywords
+# endpoint (2026-05-17). Maps the user-facing dropdown choice to a
+# relative offset that gets subtracted from today's UTC date at request
+# build time. "off" is omitted — the caller skips the parameter
+# entirely so the URL stays comparison-free (legacy behaviour).
+#
+# Months are approximated as 30/31 days via dateutil-free arithmetic
+# (chose stdlib over adding a dep). Off-by-a-day at month boundaries is
+# fine — Ahrefs snaps date_compared to the nearest snapshot it has.
+_DATE_COMPARED_DELTAS_DAYS: dict[str, int] = {
+    "3m": 30 * 3,
+    "6m": 30 * 6,
+    "1y": 365,
+    "2y": 365 * 2,
+    "5y": 365 * 5,
+}
+
+
+def _resolve_date_compared(choice: str) -> str | None:
+    """Translate a `KeywordsConfig.date_compared` enum value into the
+    YYYY-MM-DD string Ahrefs expects. Returns None when the user picked
+    'off' (or any unknown sentinel) so the caller can skip the param."""
+    days = _DATE_COMPARED_DELTAS_DAYS.get(choice)
+    if days is None:
+        return None
+    from datetime import timedelta
+    return (
+        datetime.now(timezone.utc) - timedelta(days=days)
+    ).strftime("%Y-%m-%d")
+
+
 def _build_url(
     *,
     criterion: str,
@@ -425,14 +456,39 @@ def _preview_keywords(domain: str, cfg: KeywordsConfig) -> PreviewedRequest:
     # "live" mode we send today's UTC date — matches what the Ahrefs UI uses
     # when no explicit date filter is set.
     order_by = _build_order_by(cfg.sort)
+    extra: dict[str, str] = {"date": _today_iso()}
+    # Optional `date_compared` (2026-05-17) — Ahrefs returns one row per
+    # "keyword event" (gained / lost / changed); rows for keywords that
+    # exist at one date but not the other carry null base fields, and
+    # the historical values land on `_prev` mirrors. Originally we sent
+    # only base SELECT fields and got back all-null rows (verified live
+    # on kotopes.kz: 165 units billed, every base field null). Fix:
+    # augment SELECT with `_prev` mirrors of the columns that have
+    # historical analogs so the AI judge sees both periods.
+    select = list(SELECT_FIELDS["keywords"])
+    dc = _resolve_date_compared(cfg.date_compared)
+    if dc is not None:
+        extra["date_compared"] = dc
+        # `is_branded` doesn't have a `_prev` mirror — Ahrefs returns
+        # the current-period value only. The rest do.
+        for f in (
+            "keyword",
+            "sum_traffic",
+            "volume",
+            "best_position",
+            "keyword_difficulty",
+        ):
+            prev = f"{f}_prev"
+            if prev not in select:
+                select.append(prev)
     url = _build_url(
         criterion="keywords",
         target=_normalize_target(domain),
-        select=SELECT_FIELDS["keywords"],
+        select=select,
         limit=cfg.limit,
         where=None,
         order_by=order_by,
-        extra={"date": _today_iso()},
+        extra=extra,
     )
     return PreviewedRequest(
         criterion="keywords",

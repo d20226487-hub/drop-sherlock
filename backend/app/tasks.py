@@ -1912,63 +1912,15 @@ async def _run_availability_for_domain(
     from .availability import check_availability_async
     from .availability.common import STATUS_REGISTERED
     from .app_settings import get_skip_registered_policy
-    from .models import BacklogDomain, RunDomain
+    from .models import RunDomain
 
     result = await check_availability_async(domain, run_id=run_id)
 
-    # Approach-1↔approach-2 bridge: if the cascade returned an
-    # expiration date, write it into BacklogDomain.expiration_date.
-    # Creates the row if it doesn't exist yet (covers paste-into-
-    # Analyze domains that bypassed the backlog import flow).
-    if result.expires_on is not None:
-        bdb = SessionLocal()
-        try:
-            row = (
-                bdb.query(BacklogDomain)
-                .filter(BacklogDomain.domain == domain)
-                .one_or_none()
-            )
-            now = datetime.utcnow()
-            if row is None:
-                # Ban-list pre-filter (added 2026-05-13 wave L): refuse
-                # to auto-create a BacklogDomain for a banned domain
-                # via the availability cascade. Per (a), this branch is
-                # the only one that creates a NEW row — existing rows
-                # (the else branch below) are still updated normally.
-                # This is the leaky path the central-guard design was
-                # built to plug; without it, analyzing a banned domain
-                # with check_availability=true would silently re-insert
-                # it into the backlog. We only skip the upsert — the
-                # rest of `_run_availability_for_domain` (skip-policy
-                # check etc.) still runs.
-                from .ban_filter import is_banned
-                if is_banned(bdb, domain):
-                    log.info(
-                        "skipping availability auto-upsert for banned "
-                        "domain=%s",
-                        domain,
-                    )
-                else:
-                    bdb.add(BacklogDomain(
-                        domain=domain,
-                        status="analyzed",
-                        expiration_date=result.expires_on,
-                        registrar=result.registrar or "",
-                        created_at=now,
-                        updated_at=now,
-                    ))
-            else:
-                # Only update if blank or newer info — don't trample a
-                # user-edited date with a stale registry response.
-                if row.expiration_date != result.expires_on:
-                    row.expiration_date = result.expires_on
-                    row.updated_at = now
-                if result.registrar and not row.registrar:
-                    row.registrar = result.registrar
-                    row.updated_at = now
-            bdb.commit()
-        finally:
-            bdb.close()
+    # Approach-1↔approach-2 bridge — write expiration/registrar back to
+    # the BacklogDomain row. Helper extracted 2026-05-17 so the
+    # standalone Availability pillar runner shares the same code path.
+    from .availability.backlog_upsert import upsert_backlog_expiration
+    upsert_backlog_expiration(domain, result.expires_on, result.registrar)
 
     # Skip policy: registered + expires beyond horizon → no Ahrefs.
     policy = get_skip_registered_policy()

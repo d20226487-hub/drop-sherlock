@@ -174,8 +174,18 @@ class AnchorsConfig(CriterionBase):
     sort: list[SortRule] = Field(default_factory=list)
 
 
+DateComparedChoice = Literal["off", "3m", "6m", "1y", "2y", "5y"]
+
+
 class KeywordsConfig(CriterionBase):
     sort: list[SortRule] = Field(default_factory=list)
+    # date_compared (2026-05-17) — Ahrefs organic-keywords parameter that
+    # adds prior-period `_prev` fields to the response so the AI judge can
+    # see trend (growing vs decaying keyword footprint). Predefined buckets
+    # mirror Ahrefs's own UI choices; resolved to an absolute YYYY-MM-DD
+    # at request build time relative to the request's `date` snapshot.
+    # "off" = no comparison parameter sent (legacy behaviour).
+    date_compared: DateComparedChoice = "off"
 
 
 class WaybackConfig(BaseModel):

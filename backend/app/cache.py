@@ -136,6 +136,24 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
         payload["sample_count"] = getattr(cfg, "sample_count", 6)
         payload["sample_strategy"] = getattr(cfg, "sample_strategy", "even")
         payload["sample_path_mode"] = getattr(cfg, "sample_path_mode", "mixed")
+    # Keywords date_compared (2026-05-17). Only included when set away
+    # from the default "off" so pre-feature cache rows still match for
+    # jobs that don't use the comparison.
+    if criterion == "keywords":
+        dc = getattr(cfg, "date_compared", "off")
+        if dc and dc != "off":
+            payload["date_compared"] = dc
+            # SELECT-shape version sentinel. The request builder
+            # augments SELECT with `_prev` mirrors when date_compared
+            # is set; bumping this string when the SELECT shape changes
+            # invalidates cache rows fetched with an older shape so
+            # all-null rows from a pre-fix request don't keep getting
+            # served. Bump on any future SELECT change for the
+            # date_compared path. Bumped to v2 on 2026-05-17 after
+            # discovering Ahrefs returned all-null base fields for
+            # comparison rows (lost-keyword cohort) — added _prev
+            # mirrors to SELECT.
+            payload["select_shape"] = "v2"
     return hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest()
 
 

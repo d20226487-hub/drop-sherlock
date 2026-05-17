@@ -134,11 +134,18 @@ async def check(domain: str, client: httpx.AsyncClient | None = None) -> Provide
     try:
         server = await _get_rdap_server(domain, client)
         if not server:
+            # Early short-circuit: no RDAP server in the IANA bootstrap
+            # for this TLD ⇒ don't waste a request. Cascade continues to
+            # the next provider. Message changed from "no RDAP server
+            # registered" to "not supported by RDAP" (2026-05-17) — the
+            # latter matches the user-facing label and reads as a clear
+            # status, not a transient error.
+            tld = domain.rsplit(".", 1)[-1]
             return ProviderResult(
                 provider="rdap",
                 status=STATUS_UNKNOWN,
                 latency_ms=int((time.monotonic() - started) * 1000),
-                error_message=f"no RDAP server registered for TLD .{domain.rsplit('.', 1)[-1]}",
+                error_message=f"TLD .{tld} not supported by RDAP",
                 error_category=ERR_CAT_RDAP,
             )
         url = f"{server}/domain/{domain}"

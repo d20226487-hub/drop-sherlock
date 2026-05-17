@@ -247,6 +247,19 @@ async def _process_availability_domain(
     finally:
         db.close()
 
+    # Approach-1↔approach-2 bridge — write expires_on back to the
+    # BacklogDomain row so the Backlog Истечение column populates from
+    # a standalone Availability pillar job too (2026-05-17). Previously
+    # only the Quality runner (`tasks._run_availability_for_domain`)
+    # called this; without it, dedicated availability jobs surfaced the
+    # expiration in the Availability column but left Истечение empty.
+    # Called AFTER the verdict-preservation block in Phase 3 above so we
+    # use the post-preserved values when a stale 'error' was upgraded
+    # to a prior terminal 'available'/'registered' row.
+    if result_expires_on is not None:
+        from .availability.backlog_upsert import upsert_backlog_expiration
+        upsert_backlog_expiration(domain, result_expires_on, result_registrar)
+
 
 async def process_availability_run(run_id: int) -> None:
     """Top-level orchestrator for an availability-kind Run. Dispatched

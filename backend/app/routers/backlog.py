@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
+import threading
+import time
 from datetime import date, datetime
-from typing import Iterator, Literal, Optional
+from typing import Any, Callable, Iterator, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -90,16 +93,21 @@ class BulkDeleteIn(BaseModel):
     ids: list[int]
 
 
-# Caps for /backlog/import. The wizard's preview step warns the user
-# before they upload thousands of rows; these caps are the backstop in
-# case someone hits the endpoint directly (or accidentally pastes a
-# multi-GB cell). The row cap is two-layered:
-# - `_IMPORT_MAX_ROWS_HARD_CAP` is the absolute Pydantic-level safety
-#   net; nothing larger than this is ever accepted, regardless of
-#   settings.
-# - The user-configurable cap (Settings → Others, default 50k) is
-#   checked at request time below and produces a friendlier 422.
-_IMPORT_MAX_ROWS_HARD_CAP = 500_000
+# Caps for /backlog/import.
+#
+# Two-layer history (2026-05-17): there used to be a Pydantic-level hard
+# cap (`_IMPORT_MAX_ROWS_HARD_CAP`) on top of the user-configurable cap.
+# The user owns the deployment and wanted a single knob, so the hard cap
+# is gone — the only gate now is the Settings value (per-row check at
+# request time below, returns a clean 413). The Settings ceiling
+# `IMPORT_MAX_ROWS_MAX` (in app_settings.py) is the practical upper
+# bound the user sees in the Settings dropdown; bump it if you ever
+# need more headroom.
+#
+# The Pydantic list field carries NO max_length now — if you POST a
+# multi-GB payload the request-size limit on uvicorn / your reverse
+# proxy is the only OOM tripwire. For a single-user LAN tool with basic
+# auth that's the right trade-off.
 _IMPORT_MAX_DOMAIN_LEN = 512
 _IMPORT_MAX_REGISTRAR_LEN = 256
 _IMPORT_MAX_COMMENTS_LEN = 4000
@@ -119,7 +127,10 @@ class ImportRowIn(BaseModel):
 
 
 class ImportIn(BaseModel):
-    rows: list[ImportRowIn] = Field(max_length=_IMPORT_MAX_ROWS_HARD_CAP)
+    # No `max_length` here (2026-05-17): the Settings cap is the only
+    # gate, enforced at request time below. See the comment above
+    # `_IMPORT_MAX_DOMAIN_LEN` for rationale.
+    rows: list[ImportRowIn]
 
 
 class ImportResult(BaseModel):
@@ -407,6 +418,71 @@ def _apply_sort(q, sort: str | None, direction: str | None):
 
 # --- Endpoints --------------------------------------------------------------
 
+# --- Count-query cache (2026-05-17) ---------------------------------------
+# At ~1M rows the COUNT(*) queries that list_backlog issues per request
+# (full-table `total` and filtered `filtered_total`) become the slowest
+# part of a page-flip — SQLite scans roughly 50-200ms per 100k rows. A
+# 15-second TTL cache absorbs page-flip bursts (the common pattern: user
+# clicks Next a few times within seconds) without holding stale counts
+# for long. No explicit invalidation on writes: bulk operations are rare
+# enough that ≤15s of stale-count display is acceptable, and the cache
+# is bounded so it can't leak.
+_COUNT_CACHE_TTL_SEC = 15.0
+_COUNT_CACHE_MAX_ENTRIES = 128
+_count_cache: dict[str, tuple[float, int]] = {}
+_count_cache_lock = threading.Lock()
+
+
+def _cached_count(key: str, compute: Callable[[], int]) -> int:
+    """Return a cached count for `key`, falling through to `compute()` on
+    miss. TTL = `_COUNT_CACHE_TTL_SEC` from first-write time."""
+    now = time.monotonic()
+    with _count_cache_lock:
+        ent = _count_cache.get(key)
+        if ent is not None and ent[0] > now:
+            return ent[1]
+    # Compute outside the lock so a slow query doesn't block other
+    # cache readers.
+    value = int(compute())
+    with _count_cache_lock:
+        if len(_count_cache) >= _COUNT_CACHE_MAX_ENTRIES:
+            # Cheap LRU-ish eviction: drop half the entries by oldest
+            # expiry. Bounded so memory can't grow unboundedly even if
+            # the search box gets typed into wildly.
+            victims = sorted(
+                _count_cache.items(), key=lambda kv: kv[1][0]
+            )[: _COUNT_CACHE_MAX_ENTRIES // 2]
+            for k, _ in victims:
+                _count_cache.pop(k, None)
+        _count_cache[key] = (now + _COUNT_CACHE_TTL_SEC, value)
+    return value
+
+
+def _filter_cache_key(
+    *,
+    search: str,
+    statuses: list[str] | None,
+    registrars_filter: list[str] | None,
+    expiry_from: date | None,
+    expiry_to: date | None,
+    availability_statuses: list[str] | None,
+) -> str:
+    """Stable hash of the filter args — same filters across requests hit
+    the same cache entry. Lists are sorted so option order doesn't
+    bust the cache."""
+    parts: list[Any] = [
+        search,
+        sorted(statuses) if statuses else None,
+        sorted(registrars_filter) if registrars_filter else None,
+        expiry_from.isoformat() if expiry_from else None,
+        expiry_to.isoformat() if expiry_to else None,
+        sorted(availability_statuses) if availability_statuses else None,
+    ]
+    return "filtered:" + hashlib.sha1(
+        repr(parts).encode("utf-8")
+    ).hexdigest()
+
+
 def list_backlog(
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=500),
@@ -436,7 +512,14 @@ def list_backlog(
     availability_statuses = _parse_availability_csv(availability)
 
     base = db.query(BacklogDomain)
-    total = base.count() if include_options else 0
+    # Full-table count cached under a fixed key — there's only ever one
+    # "total" regardless of filters. Skipped entirely when the caller
+    # passes include_options=false (page-flip path).
+    total = (
+        _cached_count("total", lambda: base.count())
+        if include_options
+        else 0
+    )
 
     q = _apply_backlog_filters(
         base,
@@ -448,7 +531,15 @@ def list_backlog(
         availability_statuses=availability_statuses,
     )
 
-    filtered_total = q.count()
+    filtered_key = _filter_cache_key(
+        search=search,
+        statuses=statuses,
+        registrars_filter=registrars_filter,
+        expiry_from=expiry_from,
+        expiry_to=expiry_to,
+        availability_statuses=availability_statuses,
+    )
+    filtered_total = _cached_count(filtered_key, lambda: q.count())
 
     q = _apply_sort(q, sort, direction)
     rows: list[BacklogDomain] = (
@@ -858,6 +949,36 @@ def send_to_analyze(
     return {"domains": domains, "count": len(domains), "status_changed": n}
 
 
+# Chunk size for bulk-filtered UPDATE / DELETE operations (2026-05-17).
+# A single SQL statement against 100k+ matching rows would hold the
+# SQLite writer lock for many seconds and block every other request
+# (analyze runs, single-row PATCH, etc.). Chunking with commits between
+# batches keeps each lock window short — at the cost of one extra
+# small SELECT per chunk to fetch the next page of IDs.
+_BULK_FILTERED_CHUNK = 1000
+
+
+def _iter_filtered_ids(q, chunk: int = _BULK_FILTERED_CHUNK) -> Iterator[list[int]]:
+    """Yield successive chunks of BacklogDomain.id from `q` via keyset
+    pagination on id. Stable across deletes because each chunk uses
+    `id > last_id` instead of OFFSET (which would skip rows when the
+    underlying set shrinks)."""
+    last_id = 0
+    while True:
+        rows = (
+            q.filter(BacklogDomain.id > last_id)
+            .order_by(BacklogDomain.id.asc())
+            .with_entities(BacklogDomain.id)
+            .limit(chunk)
+            .all()
+        )
+        if not rows:
+            return
+        ids = [r[0] for r in rows]
+        yield ids
+        last_id = ids[-1]
+
+
 @router.post("/bulk-status-filtered")
 def bulk_status_filtered(
     payload: BulkStatusFilteredIn, db: Session = Depends(get_db),
@@ -874,12 +995,26 @@ def bulk_status_filtered(
         availability_statuses=_parse_availability_csv(payload.availability),
     )
 
-    n = q.update(
-        {"status": payload.status, "updated_at": datetime.utcnow()},
-        synchronize_session=False,
-    )
-    db.commit()
-    return {"updated": n}
+    # Chunked update — keyset-paginated by id, committed per chunk so the
+    # writer lock releases between batches. Last-writer-wins for rows
+    # mutated mid-flight (same semantic as the original single-statement
+    # path). `now` is stamped once at the start so all updated rows share
+    # an updated_at value (avoids "looks like they were updated at
+    # different times" confusion in logs).
+    now = datetime.utcnow()
+    total = 0
+    for ids in _iter_filtered_ids(q):
+        n = (
+            db.query(BacklogDomain)
+            .filter(BacklogDomain.id.in_(ids))
+            .update(
+                {"status": payload.status, "updated_at": now},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        total += int(n)
+    return {"updated": total}
 
 
 @router.post("/bulk-delete")
@@ -921,9 +1056,21 @@ def bulk_delete_filtered(
         expiry_to=payload.expiry_to,
         availability_statuses=_parse_availability_csv(payload.availability),
     )
-    n = q.delete(synchronize_session=False)
-    db.commit()
-    return {"deleted": int(n)}
+    # Chunked delete by primary-key cursor — same pattern as
+    # bulk_status_filtered. As each chunk commits, the matching set
+    # shrinks (we just deleted those rows); the next chunk's
+    # `id > last_id` cursor still walks forward without re-reading
+    # already-deleted rows.
+    total = 0
+    for ids in _iter_filtered_ids(q):
+        n = (
+            db.query(BacklogDomain)
+            .filter(BacklogDomain.id.in_(ids))
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        total += int(n)
+    return {"deleted": total}
 
 
 def _normalize_domain(raw: str) -> str:
@@ -984,10 +1131,9 @@ def import_rows(payload: ImportIn, db: Session = Depends(get_db)) -> ImportResul
     not provided; unknown statuses map to 'backlog' rather than failing the
     row, since the import wizard's mapping UI already constrains the choice."""
     # User-configurable row cap (Settings → Others). Read at request time
-    # so changes take effect without restarting. The Pydantic
-    # `_IMPORT_MAX_ROWS_HARD_CAP` already rejected anything obviously
-    # absurd above; this just enforces the user's narrower preference
-    # with a friendly message.
+    # so changes take effect without restarting. This is now the ONLY
+    # row-count gate — the prior Pydantic-level hard cap was removed
+    # 2026-05-17 (user controls everything via Settings).
     user_cap = get_import_max_rows()
     if len(payload.rows) > user_cap:
         raise HTTPException(

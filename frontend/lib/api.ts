@@ -273,6 +273,12 @@ export type CriteriaSpec = {
     enabled: boolean;
     limit: number;
     sort: SortRule[];
+    // Ahrefs organic-keywords `date_compared` (2026-05-17). When set
+    // away from "off", the request adds the corresponding YYYY-MM-DD
+    // and the response includes `_prev` trend fields. Predefined
+    // buckets mirror Ahrefs's own UI; backend resolves the enum to a
+    // date string at build time.
+    date_compared: "off" | "3m" | "6m" | "1y" | "2y" | "5y";
   };
   // Opt-in by default. Hits Wayback Machine CDX — free, unauthenticated,
   // separate rate-limit row in Settings (RPM 30 / max concurrent 2 default).

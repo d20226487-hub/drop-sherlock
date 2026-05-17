@@ -244,8 +244,23 @@ export function CriterionTable({
     );
   }
 
-  const baseColumns =
+  const defaultColumns =
     DEFAULT_COLUMNS[criterion] || Object.keys(detail.rows[0] || {});
+  // Interleave `_prev` mirrors when the row data carries them. Applies
+  // to organic-keywords with `date_compared` set (2026-05-17 fix): the
+  // base fields are null on "lost keyword" rows and the real values
+  // live on `keyword_prev`, `sum_traffic_prev`, etc. Without this the
+  // table looked empty even though the rows had real comparison data.
+  // Detect by probing the first row for the `${col}_prev` key.
+  const sampleRow = (detail.rows[0] || {}) as Record<string, unknown>;
+  const baseColumns: string[] = [];
+  for (const col of defaultColumns) {
+    baseColumns.push(col);
+    const prev = `${col}_prev`;
+    if (prev in sampleRow && !defaultColumns.includes(prev)) {
+      baseColumns.push(prev);
+    }
+  }
   const sortColumns = detail.sort_columns ?? [];
   // Append any user-chosen sort columns that aren't already in the default
   // set so the user can eyeball the ordering Ahrefs returned. Order matters:

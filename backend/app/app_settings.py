@@ -876,7 +876,12 @@ def set_error_retention_days(value: int | None) -> int | None:
 IMPORT_MAX_ROWS_KEY = "backlog_import_max_rows"
 DEFAULT_IMPORT_MAX_ROWS = 50_000
 IMPORT_MAX_ROWS_MIN = 100
-IMPORT_MAX_ROWS_MAX = 500_000
+# Upper bound for the user-editable cap in Settings → Others. Set
+# generously so the user owns the practical ceiling — the wire-level
+# Pydantic hard cap was removed 2026-05-17 along with this bump. 10M
+# covers ~5× the largest "store + occasionally browse" use case we
+# discussed; raise this constant if you ever need more.
+IMPORT_MAX_ROWS_MAX = 10_000_000
 
 
 def get_import_max_rows() -> int:

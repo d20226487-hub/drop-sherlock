@@ -898,6 +898,22 @@ export default function RunDetailPage({
     }
   }
 
+  // Latest-fn refs (2026-05-17) — fix for the stale-closure bug where
+  // changing a filter, tab-away, and tab-back swapped the table back
+  // to unfiltered. Cause: the visibilitychange + polling listeners
+  // installed once with deps `[runId]`/`[runId, run?.status, ...]` and
+  // closed over the FIRST render's `reload`/`reloadProgress` (where
+  // `statusFilter` was its initial value). Fix: keep refs pointing at
+  // the latest functions; listeners read through the ref so they
+  // always see the current filter state without tearing down and
+  // re-installing the listener on every render.
+  const reloadRef = useRef(reload);
+  const reloadProgressRef = useRef(reloadProgress);
+  useEffect(() => {
+    reloadRef.current = reload;
+    reloadProgressRef.current = reloadProgress;
+  });
+
   async function handleReanalyze(provider: AIProvider, model: string) {
     setReanalyzeBusy(true);
     setReanalyzeError(null);
@@ -1203,7 +1219,12 @@ export default function RunDetailPage({
   // source after a run finishes.
   useEffect(() => {
     const onVisible = () => {
-      if (document.visibilityState === "visible") reload();
+      // Read through the ref so we always invoke the LATEST reload —
+      // not the one that closed over `statusFilter="all"` on first
+      // render. Without this, returning to the tab after changing a
+      // filter would fetch unfiltered data and silently desync the
+      // table from the visibly-checked filter dropdown.
+      if (document.visibilityState === "visible") reloadRef.current();
     };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
@@ -1211,7 +1232,6 @@ export default function RunDetailPage({
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onVisible);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
 
   // Adaptive polling. The naive 2s interval pegged the API at 75% CPU
@@ -1244,10 +1264,13 @@ export default function RunDetailPage({
     // change). Drops per-tick server CPU + wire bytes by ~30–40% at
     // 1k+ domains while keeping the expensive columns fresh.
     const id = window.setInterval(() => {
-      reloadProgress();
+      // Read through the ref — same stale-closure fix as the
+      // visibility listener above. A filter change between polling
+      // ticks otherwise leaves the interval calling the OLD
+      // reloadProgress and silently desyncs the table.
+      reloadProgressRef.current();
     }, intervalMs);
     return () => window.clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId, run?.status, status?.reanalyzing]);
 
   if (error) {
@@ -1660,7 +1683,10 @@ const AVAILABILITY_FILTER_OPTIONS: { value: string; key: keyof TextsType["pages"
   { value: "registered", key: "filterAvailabilityRegistered" },
   { value: "unknown", key: "filterAvailabilityUnknown" },
   { value: "error", key: "filterAvailabilityError" },
-  { value: "no_verdict", key: "filterAvailabilityNoVerdict" },
+  // `no_verdict` option removed 2026-05-17 — was rarely useful (CR
+  // missing / failed / orphaned rows are a different shape than a real
+  // cascade verdict and you can't act on them from the filter). The
+  // bucket still exists in the rollup chip math.
 ];
 
 type TextsType = ReturnType<typeof useT>["t"];
