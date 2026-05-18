@@ -2041,6 +2041,20 @@ def _finish_run(run_id: int, success: bool, error: str) -> None:
         run = db.get(Run, run_id)
         if run is None:
             return
+        # Don't trample a user-intent state (2026-05-18 fix). Sequence:
+        # user clicks Pause → pause_run_now flips run.status='paused'
+        # and adds run_id to _PAUSED_RUNS. The in-flight per-domain
+        # workers exit at their next pause checkpoint, then
+        # process_run's asyncio.gather resolves and unconditionally
+        # called _finish_run(success=True) — which trample-wrote
+        # status='done' over the paused state. Subsequent
+        # /runs/{id}/resume then 409'd because it requires status=
+        # 'paused'. Symptom on run 109: 7 done + 32 still-running + 204
+        # pending RDs, yet run.status='done'. Same race applies to
+        # canceled (cancel_run_now flips to 'canceled'; if the worker
+        # finishes draining after that, we musn't reopen it).
+        if run.status in ("paused", "canceled"):
+            return
         run.status = "done" if success else "failed"
         run.finished_at = datetime.utcnow()
         if error:
