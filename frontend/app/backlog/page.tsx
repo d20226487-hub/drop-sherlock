@@ -516,6 +516,7 @@ export default function BacklogPage() {
   async function patchRow(
     id: number,
     patch: {
+      project?: string;
       comments?: string;
       desired_price?: number | null;
       max_price?: number | null;
@@ -761,7 +762,7 @@ export default function BacklogPage() {
           type="search"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder={t.pagination.searchPlaceholder}
+          placeholder={ts.searchPlaceholder}
           className="flex-1 min-w-[12rem] rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-3 py-1.5 outline-none"
         />
         <label className="flex items-center gap-2">
@@ -1039,6 +1040,7 @@ export default function BacklogPage() {
                   <th className="px-3 py-2 font-medium">
                     {ts.cols.availability}
                   </th>
+                  <th className="px-3 py-2 font-medium">{ts.cols.project}</th>
                   <th className="px-3 py-2 font-medium">{ts.cols.comments}</th>
                 </tr>
               </thead>
@@ -1115,6 +1117,15 @@ export default function BacklogPage() {
                           availability={availabilityByDomain[r.domain]}
                           busy={availabilityBusy.has(r.domain)}
                           onRecheck={() => recheckOne(r.domain)}
+                        />
+                      </td>
+                      <td className="px-3 py-2 align-top text-xs text-neutral-600 dark:text-neutral-400 max-w-[18rem]">
+                        <EditableTextCell
+                          value={r.project}
+                          multiline
+                          onSave={(v) =>
+                            patchRow(r.id, { project: String(v ?? "") })
+                          }
                         />
                       </td>
                       <td className="px-3 py-2 align-top text-xs text-neutral-600 dark:text-neutral-400 max-w-[24rem]">

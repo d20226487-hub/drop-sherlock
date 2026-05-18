@@ -122,6 +122,10 @@ def _migrate_sqlite_columns() -> None:
         # (the importer looks up by this column). Plain string UUID4
         # text; not a DB-native UUID type for SQLite portability.
         ("jobs", "export_uuid", "VARCHAR(36)"),
+        # Free-form per-row "Project" label on Backlog (added 2026-05-18).
+        # Sits next to `comments`; same edit affordances, no semantics
+        # enforced. NOT NULL via the "" default to match comments.
+        ("backlog_domains", "project", "TEXT DEFAULT ''"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding

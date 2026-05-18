@@ -56,18 +56,22 @@ AI_FIELD_TRIM: dict[str, list[str]] = {
     # is_dofollow / is_content / link_type flags that used to drive that
     # judgment were dropped from SELECT — see ahrefs_requests.py).
     "backlinks": [
+        # 2026-05-18: dropped traffic_domain + traffic (cost trim — see
+        # SELECT_FIELDS["backlinks"] in providers/ahrefs_requests.py).
         "url_from", "anchor", "snippet_left", "snippet_right", "url_to",
-        "domain_rating_source", "url_rating_source", "traffic_domain",
-        "traffic", "positions", "refdomains_source", "first_seen_link",
+        "domain_rating_source", "url_rating_source",
+        "positions", "refdomains_source", "first_seen_link",
         "last_seen", "title", "languages",
     ],
     # Refdomains: dropped is_spam (every returned row has is_spam=0 by
     # default non_spammy filter; sending the field added noise without
     # signal).
     "refdomains": [
+        # 2026-05-18: dropped positions_source_domain (cost trim — see
+        # SELECT_FIELDS["refdomains"] in providers/ahrefs_requests.py).
         "domain", "domain_rating", "dofollow_refdomains",
         "dofollow_linked_domains", "dofollow_links", "links_to_target",
-        "traffic_domain", "positions_source_domain", "new_links",
+        "traffic_domain", "new_links",
         "lost_links", "first_seen", "last_seen",
     ],
     # Anchors: `is_spam` deliberately omitted (2026-05-07). Ahrefs's per-row

@@ -93,6 +93,12 @@ class BacklogDomain(Base):
     status: Mapped[str] = mapped_column(String(32), default="backlog", index=True)
     registrar: Mapped[str] = mapped_column(String(128), default="", index=True)
     expiration_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    # Free-form per-row label (added 2026-05-18). Sits next to `comments`
+    # — same edit affordances, no semantic constraint. The user can drop
+    # a project / campaign / batch tag here to triage their backlog by
+    # context without inventing a structured taxonomy. Plain text, not
+    # indexed (no filter on it yet).
+    project: Mapped[str] = mapped_column(Text, default="")
     comments: Mapped[str] = mapped_column(Text, default="")
     desired_price: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
     max_price: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)

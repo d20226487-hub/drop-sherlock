@@ -2519,6 +2519,7 @@ export type RemoteBackupSetPayload = {
 
 
 export type BacklogRowPatch = {
+  project?: string;
   comments?: string;
   desired_price?: number | null;
   max_price?: number | null;
@@ -2534,6 +2535,7 @@ export type BacklogImportRow = {
   status?: BacklogStatus;
   registrar?: string;
   expiration_date?: string | null; // ISO YYYY-MM-DD
+  project?: string;
   comments?: string;
   desired_price?: number | null;
   max_price?: number | null;
@@ -2580,6 +2582,7 @@ export type BacklogRow = {
   status: BacklogStatus;
   registrar: string;
   expiration_date: string | null; // ISO YYYY-MM-DD
+  project: string;
   comments: string;
   desired_price: number | null;
   max_price: number | null;

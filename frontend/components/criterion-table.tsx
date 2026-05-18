@@ -41,12 +41,13 @@ const DEFAULT_COLUMNS: Record<string, string[]> = {
   // dropped is_dofollow / is_spam (no longer fetched — would render as
   // "—"). snippet/url_to are available via "Show raw row" but not
   // shown by default since they're long-text and crowd the table.
+  // 2026-05-18: dropped `traffic_domain` (no longer fetched on the
+  // backlinks endpoint for cost reduction).
   backlinks: [
     "url_from",
     "anchor",
     "domain_rating_source",
     "url_rating_source",
-    "traffic_domain",
     "refdomains_source",
     "first_seen_link",
   ],

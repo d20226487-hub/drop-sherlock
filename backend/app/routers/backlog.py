@@ -52,6 +52,7 @@ class BacklogRow(BaseModel):
     status: str
     registrar: str
     expiration_date: date | None
+    project: str
     comments: str
     desired_price: float | None
     max_price: float | None
@@ -121,6 +122,7 @@ class ImportRowIn(BaseModel):
     status: str | None = None
     registrar: str | None = Field(default=None, max_length=_IMPORT_MAX_REGISTRAR_LEN)
     expiration_date: date | None = None
+    project: str | None = Field(default=None, max_length=_IMPORT_MAX_COMMENTS_LEN)
     comments: str | None = Field(default=None, max_length=_IMPORT_MAX_COMMENTS_LEN)
     desired_price: float | None = None
     max_price: float | None = None
@@ -222,8 +224,21 @@ def _apply_backlog_filters(
     export, bulk-status-filtered, send-to-analyze) so a new filter only
     needs to be added in one place."""
     if search and search.strip():
+        # Search now spans domain + project + comments (2026-05-18).
+        # All three columns get the same case-insensitive substring
+        # match. SQLite `ilike` with a leading `%` can't use an index
+        # regardless of column, so OR-ing in two more text columns
+        # doesn't change the asymptotic cost — a single full scan with
+        # three predicates per row vs. one.
+        from sqlalchemy import or_
         needle = f"%{search.strip().lower()}%"
-        q = q.filter(BacklogDomain.domain.ilike(needle))
+        q = q.filter(
+            or_(
+                BacklogDomain.domain.ilike(needle),
+                BacklogDomain.project.ilike(needle),
+                BacklogDomain.comments.ilike(needle),
+            )
+        )
     if statuses:
         q = q.filter(BacklogDomain.status.in_(statuses))
     if registrars_filter:
@@ -588,6 +603,7 @@ def list_backlog(
                 status=r.status,
                 registrar=r.registrar,
                 expiration_date=r.expiration_date,
+                project=r.project,
                 comments=r.comments,
                 desired_price=r.desired_price,
                 max_price=r.max_price,
@@ -687,6 +703,7 @@ class UpdateRowIn(BaseModel):
     `{desired_price: null}` without nuking the other fields."""
     model_config = {"extra": "forbid"}
 
+    project: str | None = None
     comments: str | None = None
     desired_price: float | None = None
     max_price: float | None = None
@@ -707,6 +724,9 @@ def update_row(row_id: int, payload: UpdateRowIn, db: Session = Depends(get_db))
         # comments column is NOT NULL (defaults to ""), so a "clear" from
         # the UI lands as an empty string, not NULL.
         row.comments = data["comments"] or ""
+    if "project" in data:
+        # Same NOT-NULL story as comments — empty string, not NULL, on clear.
+        row.project = data["project"] or ""
     for k in ("desired_price", "max_price"):
         if k in data:
             v = data[k]
@@ -737,6 +757,7 @@ def update_row(row_id: int, payload: UpdateRowIn, db: Session = Depends(get_db))
         status=row.status,
         registrar=row.registrar,
         expiration_date=row.expiration_date,
+        project=row.project,
         comments=row.comments,
         desired_price=row.desired_price,
         max_price=row.max_price,
@@ -753,6 +774,7 @@ EXPORT_COLUMNS: list[str] = [
     "status",
     "registrar",
     "expiration_date",
+    "project",
     "comments",
     "desired_price",
     "max_price",
@@ -769,6 +791,7 @@ def _row_to_csv_values(r: BacklogDomain) -> list[str]:
         r.status,
         r.registrar or "",
         r.expiration_date.isoformat() if r.expiration_date else "",
+        r.project or "",
         r.comments or "",
         "" if r.desired_price is None else f"{r.desired_price:g}",
         "" if r.max_price is None else f"{r.max_price:g}",
@@ -1237,6 +1260,7 @@ def import_rows(payload: ImportIn, db: Session = Depends(get_db)) -> ImportResul
                 status=r.status or "backlog",
                 registrar=r.registrar or "",
                 expiration_date=r.expiration_date,
+                project=r.project or "",
                 comments=r.comments or "",
                 desired_price=r.desired_price,
                 max_price=r.max_price,

@@ -47,6 +47,7 @@ def _serialize_backlog_row(row: BacklogDomain) -> str:
         "expiration_date": (
             row.expiration_date.isoformat() if row.expiration_date else None
         ),
+        "project": row.project or "",
         "comments": row.comments or "",
         "desired_price": row.desired_price,
         "max_price": row.max_price,
@@ -140,6 +141,7 @@ def _restore_backlog_from_snapshot(
             expiration_date=(
                 date.fromisoformat(exp_raw) if exp_raw else None
             ),
+            project=data.get("project") or "",
             comments=data.get("comments") or "",
             desired_price=data.get("desired_price"),
             max_price=data.get("max_price"),

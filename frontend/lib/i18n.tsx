@@ -918,6 +918,7 @@ const messagesEn = {
         "Every domain you've analyzed. Each row's data comes from a manually-pinned run — pick a definitive run per domain (or pin an entire run from its detail page). Unpinned domains appear with empty cells until you choose a run.",
       empty: "No domains yet — kick off your first analysis on the Analyze page.",
       noMatch: "No domains match your filters.",
+      searchPlaceholder: "Search domain, pinned run, or note…",
       cols: {
         // 2026-05-17: row-number column for "I'm on row N" orientation.
         rowNumber: "#",
@@ -1950,6 +1951,7 @@ const messagesEn = {
       noMatch: "No domains match the current filters.",
       refresh: "Refresh",
       refreshing: "Refreshing…",
+      searchPlaceholder: "Search domain, project, or comment…",
       cols: {
         domain: "Domain",
         status: "Status",
@@ -1960,6 +1962,7 @@ const messagesEn = {
         registrar: "Source",
         expirationDate: "Expiration",
         availability: "Availability",
+        project: "Project",
         comments: "Comments",
         desiredPrice: "Desired $",
         maxPrice: "Max $",
@@ -2067,6 +2070,7 @@ const messagesEn = {
           status: "Status",
           registrar: "Registrar",
           expiration_date: "Expiration date",
+          project: "Project",
           comments: "Comments",
           desired_price: "Desired price",
           max_price: "Max price",
@@ -3039,6 +3043,7 @@ const messagesRu: Messages = {
         "Каждый проанализированный домен. Данные строки берутся из вручную зафиксированного запуска — выберите основной запуск на домен (или зафиксируйте весь запуск с его страницы). Незафиксированные домены показаны с пустыми ячейками, пока вы не выберете запуск.",
       empty: "Доменов пока нет — запустите первый анализ на странице Анализ.",
       noMatch: "Нет доменов, подходящих под фильтры.",
+      searchPlaceholder: "Поиск по домену, запуску или заметке…",
       cols: {
         // 2026-05-17: row-number column for "I'm on row N" orientation.
         rowNumber: "№",
@@ -4116,6 +4121,7 @@ const messagesRu: Messages = {
       noMatch: "Нет доменов, подходящих под текущие фильтры.",
       refresh: "Обновить",
       refreshing: "Обновление…",
+      searchPlaceholder: "Поиск по домену, проекту или комментарию…",
       cols: {
         domain: "Домен",
         status: "Статус",
@@ -4125,6 +4131,7 @@ const messagesRu: Messages = {
         registrar: "Источник",
         expirationDate: "Истечение",
         availability: "Доступность",
+        project: "Проект",
         comments: "Комментарии",
         desiredPrice: "Желаемая $",
         maxPrice: "Макс $",
@@ -4245,6 +4252,7 @@ const messagesRu: Messages = {
           status: "Статус",
           registrar: "Регистратор",
           expiration_date: "Дата истечения",
+          project: "Проект",
           comments: "Комментарии",
           desired_price: "Желаемая цена",
           max_price: "Макс. цена",

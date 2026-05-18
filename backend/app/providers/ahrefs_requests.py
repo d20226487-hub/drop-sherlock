@@ -54,8 +54,12 @@ SELECT_FIELDS: dict[str, list[str]] = {
         "last_seen",
         "domain_rating_source",
         "url_rating_source",
-        "traffic_domain",
-        "traffic",
+        # 2026-05-18: dropped `traffic_domain` and `traffic` for cost
+        # reduction. The AI verdict now weights DR / UR / refdomains_source
+        # / anchor + snippets / positions; raw traffic numbers were the
+        # most-expensive column group on this endpoint. Sort by these
+        # fields still works (Ahrefs allows ordering on non-selected
+        # columns), so the existing sort dropdown is unaffected.
         "positions",
         "refdomains_source",
         "anchor",
@@ -75,7 +79,11 @@ SELECT_FIELDS: dict[str, list[str]] = {
         "dofollow_refdomains",
         "dofollow_linked_domains",
         "traffic_domain",
-        "positions_source_domain",
+        # 2026-05-18: dropped `positions_source_domain` for cost
+        # reduction. `traffic_domain` is kept because the AI uses it
+        # as the primary signal of "real traffic on this source vs
+        # zero-traffic high-DR shell"; ranking-keyword count was a
+        # redundant secondary signal.
         "new_links",
         "lost_links",
         "dofollow_links",

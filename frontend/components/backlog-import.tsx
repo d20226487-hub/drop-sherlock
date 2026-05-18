@@ -20,6 +20,7 @@ type TargetField =
   | "status"
   | "registrar"
   | "expiration_date"
+  | "project"
   | "comments"
   | "desired_price"
   | "max_price";
@@ -30,6 +31,7 @@ const TARGET_FIELDS: TargetField[] = [
   "status",
   "registrar",
   "expiration_date",
+  "project",
   "comments",
   "desired_price",
   "max_price",
@@ -57,6 +59,8 @@ const HEADER_HINTS: { needle: string; field: TargetField }[] = [
   { needle: "registry", field: "registrar" },
   { needle: "desired", field: "desired_price" },
   { needle: "max", field: "max_price" },
+  { needle: "project", field: "project" },
+  { needle: "campaign", field: "project" },
   { needle: "comment", field: "comments" },
   { needle: "note", field: "comments" },
   { needle: "status", field: "status" },
@@ -221,6 +225,7 @@ export function BacklogImport({
             out.status = s as BacklogStatus;
           }
         } else if (target === "registrar") out.registrar = cell;
+        else if (target === "project") out.project = cell;
         else if (target === "comments") out.comments = cell;
         else if (target === "expiration_date") {
           const iso = parseDate(cell, dateFormat);

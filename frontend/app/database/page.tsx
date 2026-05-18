@@ -197,6 +197,97 @@ export default function DatabasePage() {
   const [waybackConfMin, setWaybackConfMin] = useState<number>(0);
   const [ahrefsConfMin, setAhrefsConfMin] = useState<number>(0);
 
+  // Persistent filters (2026-05-18). Each browser keeps its own copy in
+  // localStorage so two operators on the same /database page don't
+  // clobber each other's view (no per-user accounts here — basic auth
+  // is shared). Versioned key so a future filter-schema bump can drop
+  // stale blobs by changing the suffix instead of writing a migration.
+  //
+  // Pattern: hydrate AFTER mount (avoids SSR/CSR markup mismatch) and
+  // gate persist writes on `filtersHydrated` so the initial-default
+  // render doesn't overwrite a saved blob with empty state before
+  // hydration runs. Defensive Array.isArray / type checks per field
+  // mean a hand-edited or stale entry degrades gracefully.
+  const FILTERS_STORAGE_KEY = "dropSherlock.database.filters.v1";
+  const [filtersHydrated, setFiltersHydrated] = useState(false);
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(FILTERS_STORAGE_KEY);
+      if (raw) {
+        const v = JSON.parse(raw);
+        if (Array.isArray(v.verdicts)) setVerdicts(v.verdicts);
+        if (Array.isArray(v.waybackVerdicts)) setWaybackVerdicts(v.waybackVerdicts);
+        if (Array.isArray(v.whoisBands)) setWhoisBands(v.whoisBands);
+        if (Array.isArray(v.availabilityFilter)) setAvailabilityFilter(v.availabilityFilter);
+        if (Array.isArray(v.criteria)) setCriteria(v.criteria);
+        if (v.cache === "any" || v.cache === "cached" || v.cache === "fresh") setCache(v.cache);
+        if (v.notesFilter === "any" || v.notesFilter === "with" || v.notesFilter === "without") setNotesFilter(v.notesFilter);
+        if (v.pinFilter === "any" || v.pinFilter === "pinned" || v.pinFilter === "unpinned") setPinFilter(v.pinFilter);
+        if (Array.isArray(v.sourceFilter)) setSourceFilter(v.sourceFilter);
+        if (Array.isArray(v.languages)) setLanguages(v.languages);
+        if (Array.isArray(v.categories)) setCategories(v.categories);
+        if (typeof v.waybackConfMin === "number") setWaybackConfMin(v.waybackConfMin);
+        if (typeof v.ahrefsConfMin === "number") setAhrefsConfMin(v.ahrefsConfMin);
+      }
+    } catch {
+      // Corrupt / inaccessible localStorage — fall through to defaults.
+    }
+    setFiltersHydrated(true);
+  }, []);
+  // Debounced persist (2026-05-18, perf fix). The first version of this
+  // effect wrote to localStorage on EVERY filter change, which made
+  // slider drags + rapid multi-select toggles laggy: each tick paid
+  // for a JSON.stringify of all 13 fields + a synchronous setItem on
+  // top of the (already non-trivial) filtered/sorted recompute.
+  // Debouncing collapses any burst of changes into a single write
+  // 250ms after the user stops fiddling — invisible to the user
+  // (they're not reloading mid-drag) but takes the write off the hot
+  // path entirely.
+  useEffect(() => {
+    if (!filtersHydrated) return;
+    const id = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(
+          FILTERS_STORAGE_KEY,
+          JSON.stringify({
+            verdicts,
+            waybackVerdicts,
+            whoisBands,
+            availabilityFilter,
+            criteria,
+            cache,
+            notesFilter,
+            pinFilter,
+            sourceFilter,
+            languages,
+            categories,
+            waybackConfMin,
+            ahrefsConfMin,
+          }),
+        );
+      } catch {
+        // Quota exceeded / private mode — silently drop the write
+        // rather than break the filter UX.
+      }
+    }, 250);
+    return () => window.clearTimeout(id);
+  }, [
+    filtersHydrated,
+    verdicts,
+    waybackVerdicts,
+    whoisBands,
+    availabilityFilter,
+    criteria,
+    cache,
+    notesFilter,
+    pinFilter,
+    sourceFilter,
+    languages,
+    categories,
+    waybackConfMin,
+    ahrefsConfMin,
+  ]);
+
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -557,7 +648,8 @@ export default function DatabasePage() {
     sorted,
     (item, q) =>
       item.domain.toLowerCase().includes(q) ||
-      item.pinned_job_name.toLowerCase().includes(q),
+      item.pinned_job_name.toLowerCase().includes(q) ||
+      item.note.toLowerCase().includes(q),
     { initialPageSize: 50 },
   );
 
@@ -1217,7 +1309,7 @@ export default function DatabasePage() {
         )}
       </section>
 
-      <PaginationTopBar state={search} />
+      <PaginationTopBar state={search} searchPlaceholder={ts.searchPlaceholder} />
 
       {selected.size > 0 && (
         <div className="rounded-md border border-blue-300 dark:border-blue-900/60 bg-blue-50 dark:bg-blue-950/40 px-3 py-2 text-sm space-y-2">
@@ -1297,14 +1389,22 @@ export default function DatabasePage() {
               >
                 {bulkBanBusy ? ts.bulkBanBusy : ts.bulkBan(selected.size)}
               </button>
-              <button
-                type="button"
-                onClick={handleDeleteSelected}
-                disabled={deleting || sendingPillar !== null || bulkBacklogBusy}
-                className="text-xs px-3 py-1 rounded-md bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {deleting ? ts.deleting : ts.deleteSelected(selected.size)}
-              </button>
+              {/* Bulk-delete intentionally hidden 2026-05-18 pending the
+                  Trash redesign — Database cascading delete is the
+                  highest-blast-radius destructive action on the platform
+                  and needs the safety net before it can stay shipped. The
+                  handler + endpoint are deliberately left wired so this
+                  is a one-line revert when Trash lands. */}
+              {false && (
+                <button
+                  type="button"
+                  onClick={handleDeleteSelected}
+                  disabled={deleting || sendingPillar !== null || bulkBacklogBusy}
+                  className="text-xs px-3 py-1 rounded-md bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {deleting ? ts.deleting : ts.deleteSelected(selected.size)}
+                </button>
+              )}
             </div>
           </div>
           {bulkBacklogResult && (
