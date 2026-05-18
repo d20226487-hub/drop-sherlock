@@ -106,9 +106,10 @@ export default function AhrefsCriteriaDoc() {
           Сильнее DR на уровне страниц.
         </li>
         <li>
-          <code>traffic_domain</code>,{" "}
-          <code>traffic</code>, <code>positions</code> — реальный трафик
-          донора. Trafic &gt; vanity DR.
+          <code>positions</code> — сколько ключей в выдаче у{" "}
+          <em>страницы-донора</em>. Прокси «у страницы есть реальная
+          органическая видимость» — донор с нулевыми positions ведёт
+          себя как PBN.
         </li>
         <li>
           <code>anchor</code> — текст анкора. Распределение по строкам
@@ -127,7 +128,9 @@ export default function AhrefsCriteriaDoc() {
         </li>
         <li>
           <code>domain_rating_source</code> (DR) — авторитет домена-донора.
-          Вес <em>после</em> трафика.
+          Вес <em>после</em> <code>positions</code> и{" "}
+          <code>refdomains_source</code>: vanity DR с нулевыми позициями
+          и тонким собственным профилем = PBN.
         </li>
         <li>
           <code>refdomains_source</code> — у самого донора сколько входящих
@@ -150,7 +153,10 @@ export default function AhrefsCriteriaDoc() {
         <strong>High quality:</strong>
       </p>
       <ul>
-        <li>Реальный DR + реальный трафик у доноров.</li>
+        <li>
+          Реальный DR + страницы-доноры с реальными ранжирующими
+          позициями.
+        </li>
         <li>
           Естественный микс анкоров: бренд + URL + generic, без массового
           exact-match по коммерческим ключам.
@@ -173,8 +179,8 @@ export default function AhrefsCriteriaDoc() {
           Exact-match anchor stuffing на коммерческих терминах.
         </li>
         <li>
-          PBN-сигналы: похожие низкотрафные high-DR доноры с тонким
-          собственным профилем.
+          PBN-сигналы: похожие high-DR доноры с нулевыми{" "}
+          <code>positions</code> и тонким собственным профилем.
         </li>
       </ul>
 
@@ -193,8 +199,9 @@ export default function AhrefsCriteriaDoc() {
           <code>domain_rating</code> — DR донора.
         </li>
         <li>
-          <code>traffic_domain</code>, <code>positions_source_domain</code>{" "}
-          — органическая видимость донора.
+          <code>traffic_domain</code> — органический трафик донора.
+          Доноры с реальной видимостью сильнее zero-traffic high-DR
+          оболочек.
         </li>
         <li>
           <code>dofollow_links</code>, <code>dofollow_refdomains</code>,{" "}

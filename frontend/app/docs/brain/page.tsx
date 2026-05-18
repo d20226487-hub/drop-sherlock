@@ -192,7 +192,8 @@ assess_score: high_quality → 100, mixed → 60, low_quality → 20`}</code></p
           <strong>«Хочу строже к спам-сети»</strong> — отредактируйте{" "}
           <code>backlinks</code> или <code>refdomains</code>, усильте
           секцию rules: «'low_quality' if more than 30% of sources have DR
-          {" "}&gt;{" "}50 but traffic_domain &lt; 100».
+          {" "}&gt;{" "}50 but positions &lt; 5» (для backlinks) или «{" "}
+          traffic_domain &lt; 100» (для refdomains).
         </li>
         <li>
           <strong>«Хочу мягче к молодым доменам»</strong> — сдвиньте порог
