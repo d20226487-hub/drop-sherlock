@@ -155,21 +155,10 @@ async def submit_job(
         raise HTTPException(400, "at least one criterion must be enabled")
 
     # Normalize the spec so the persisted snapshot matches what the runner
-    # will iterate (cleaned domain list, original criteria + ai). Forgetting
-    # to pass ai= here was the bug that silently disabled AI verdicts even
-    # when the form correctly chose a provider.
-    norm_spec = AnalyzeSpec(
-        domains=cleaned_domains,
-        criteria=payload.spec.criteria,
-        ai=payload.spec.ai,
-        use_cache=payload.spec.use_cache,
-        cross_job_cache=payload.spec.cross_job_cache,
-        # Preserve the UI language the frontend sent. Without this, the
-        # field falls back to AnalyzeSpec's default ("en") and the runner
-        # never appends the RU output directive — every run would judge
-        # in English regardless of what the user picked.
-        lang=payload.spec.lang,
-    )
+    # will iterate. Use model_copy(update=) so EVERY spec field flows through
+    # automatically — `ai=`, `use_cache`, `lang`, and `check_availability`
+    # have each gone missing in a field-by-field rebuild here at some point.
+    norm_spec = payload.spec.model_copy(update={"domains": cleaned_domains})
     # Auto-enable wayback + V2 sampling when classify is on. Done AFTER
     # the empty-criteria guard above so a spec with ONLY classify on (and
     # everything else disabled) still passes — classify counts.

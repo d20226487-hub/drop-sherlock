@@ -771,16 +771,11 @@ async def rerun_job(
     if enabled_count == 0:
         raise HTTPException(400, "at least one criterion must be enabled")
 
-    norm_spec = AnalyzeSpec(
-        domains=cleaned,
-        criteria=payload.spec.criteria,
-        ai=payload.spec.ai,
-        use_cache=payload.spec.use_cache,
-        cross_job_cache=payload.spec.cross_job_cache,
-        # Preserve the UI language. Same fix as the /analyze/jobs path —
-        # without this, reruns silently fall back to lang="en".
-        lang=payload.spec.lang,
-    )
+    # Use model_copy(update=) so EVERY spec field flows through automatically.
+    # The field-by-field rebuild had silently dropped `check_availability` on
+    # rerun (and `ai=` / `use_cache` / `lang` before that). See the matching
+    # comment in routers/analyze.py.
+    norm_spec = payload.spec.model_copy(update={"domains": cleaned})
     # Auto-enable wayback + V2 sampling when classify is on.
     from .analyze import auto_enable_wayback_for_classify
     auto_enable_wayback_for_classify(norm_spec)
