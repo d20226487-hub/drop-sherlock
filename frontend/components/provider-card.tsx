@@ -4,19 +4,42 @@ import { useT } from "@/lib/i18n";
 import { api, ProviderStatus, TestResult } from "@/lib/api";
 import { ModelRegistryEditor } from "@/components/model-registry-editor";
 
-type FieldKey = "api_key" | "token" | "default_model";
+type FieldKey =
+  | "api_key"
+  | "token"
+  | "default_model"
+  | "service_account_json"
+  | "project_id"
+  | "location";
 
 const FIELDS_BY_PROVIDER: Record<string, FieldKey[]> = {
   ahrefs: ["api_key"],
   gemini: ["api_key", "default_model"],
   github_models: ["token", "default_model"],
   openrouter: ["api_key", "default_model"],
+  // Vertex AI auto-detects mode at call time: service_account_json wins
+  // when present (enterprise mode); api_key is the Vertex Express
+  // fallback. project_id + location are only consumed by the SA path.
+  vertex_ai: [
+    "api_key",
+    "service_account_json",
+    "project_id",
+    "location",
+    "default_model",
+  ],
 };
 
 const AI_PROVIDERS_FOR_MODELS = new Set([
   "gemini",
   "github_models",
   "openrouter",
+  "vertex_ai",
+]);
+
+// Fields that should render as a multi-line textarea rather than a
+// single-line input. Currently only the Vertex service-account JSON.
+const TEXTAREA_FIELDS: ReadonlySet<FieldKey> = new Set([
+  "service_account_json",
 ]);
 
 export function ProviderCard({
@@ -42,6 +65,9 @@ export function ProviderCard({
     api_key: "",
     token: "",
     default_model: "",
+    service_account_json: "",
+    project_id: "",
+    location: "",
   });
   const [busy, setBusy] = useState<"idle" | "saving" | "testing" | "clearing">(
     "idle",
@@ -60,6 +86,14 @@ export function ProviderCard({
     ts.providerHelp[status.provider as keyof typeof ts.providerHelp] || "";
 
   const headerStatus = (() => {
+    // Vertex AI is "configured" when EITHER the service-account JSON
+    // OR the API key is filled in — both auth modes count.
+    if (status.provider === "vertex_ai") {
+      const sa = status.fields["service_account_json"];
+      const ak = status.fields["api_key"];
+      const anyCred = (sa && sa.configured) || (ak && ak.configured);
+      return anyCred ? "configured" : "not_set";
+    }
     const isAi = status.provider !== "ahrefs";
     const credField: FieldKey = isAi
       ? status.provider === "github_models"
@@ -85,7 +119,14 @@ export function ProviderCard({
     try {
       const next = await api.updateProviderCreds(status.provider, payload);
       onChanged(next);
-      setDraft({ api_key: "", token: "", default_model: "" });
+      setDraft({
+        api_key: "",
+        token: "",
+        default_model: "",
+        service_account_json: "",
+        project_id: "",
+        location: "",
+      });
       setMessage({ kind: "ok", text: t.common.saved });
     } catch (e) {
       const err = e as Error;
@@ -152,7 +193,11 @@ export function ProviderCard({
       <div className="space-y-3">
         {fields.map((f) => {
           const current = status.fields[f];
-          const isSecret = f === "api_key" || f === "token";
+          const isSecret =
+            f === "api_key" ||
+            f === "token" ||
+            f === "service_account_json";
+          const isTextarea = TEXTAREA_FIELDS.has(f);
           // For AI providers, default_model is now a dropdown sourced from
           // the known-models registry — typing IDs by hand is the old flow.
           // The registry editor below the inputs is where you add models.
@@ -183,6 +228,18 @@ export function ProviderCard({
                     </option>
                   ))}
                 </select>
+              ) : isTextarea ? (
+                <textarea
+                  value={draft[f]}
+                  onChange={(e) =>
+                    setDraft((d) => ({ ...d, [f]: e.target.value }))
+                  }
+                  placeholder={ts.fieldPlaceholders[f]}
+                  rows={6}
+                  className="w-full rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-3 py-1.5 text-xs font-mono outline-none focus:ring-2 focus:ring-blue-500/40"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
               ) : (
                 <input
                   type={isSecret ? "password" : "text"}

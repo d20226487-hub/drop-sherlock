@@ -4,7 +4,12 @@ import Link from "next/link";
 import { useT } from "@/lib/i18n";
 import { api, AIProvider, AISpec, ProviderStatus } from "@/lib/api";
 
-const AI_PROVIDERS: AIProvider[] = ["gemini", "github_models", "openrouter"];
+const AI_PROVIDERS: AIProvider[] = [
+  "gemini",
+  "github_models",
+  "openrouter",
+  "vertex_ai",
+];
 
 type Status = {
   configured: boolean;
@@ -15,13 +20,23 @@ function readStatus(p: ProviderStatus): Status {
   // The credential field varies per provider — both api_key and token
   // count as "configured". `default_model` is plaintext.
   const fields = p.fields;
-  const credField =
-    p.provider === "github_models"
-      ? fields["token"]
-      : fields["api_key"];
+  // Vertex AI is configured if EITHER service-account JSON or API key
+  // is set. Other providers have a single credential field.
+  let configured = false;
+  if (p.provider === "vertex_ai") {
+    const sa = fields["service_account_json"];
+    const ak = fields["api_key"];
+    configured = !!(
+      (sa && sa.configured) || (ak && ak.configured)
+    );
+  } else {
+    const credField =
+      p.provider === "github_models" ? fields["token"] : fields["api_key"];
+    configured = !!(credField && credField.configured);
+  }
   const dm = fields["default_model"];
   return {
-    configured: !!(credField && credField.configured),
+    configured,
     default_model: dm && dm.configured && "value" in dm ? dm.value : null,
   };
 }

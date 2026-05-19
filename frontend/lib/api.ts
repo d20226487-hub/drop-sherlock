@@ -314,7 +314,11 @@ export type CriteriaSpec = {
   };
 };
 
-export type AIProvider = "gemini" | "github_models" | "openrouter";
+export type AIProvider =
+  | "gemini"
+  | "github_models"
+  | "openrouter"
+  | "vertex_ai";
 
 export type AISpec = {
   provider: AIProvider | null;

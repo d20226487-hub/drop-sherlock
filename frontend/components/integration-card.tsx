@@ -54,6 +54,26 @@ function summary(
         parts.push(`usage: ${usage ?? "?"}/${limit ?? "∞"}`);
       return parts.join(" · ") || null;
     }
+    case "vertex_ai": {
+      // Probe details surface (mode, model_count, default_model,
+      // optional project_id/location). Render a one-liner that makes
+      // the auth mode visible at a glance.
+      const mode = typeof d.mode === "string" ? d.mode : "";
+      const count = d.model_count;
+      const dm = d.default_model;
+      const project = typeof d.project_id === "string" ? d.project_id : "";
+      const location = typeof d.location === "string" ? d.location : "";
+      const parts: string[] = [];
+      if (mode === "service_account") {
+        parts.push("service account");
+        if (project && location) parts.push(`${project} · ${location}`);
+      } else if (mode === "express") {
+        parts.push("Express (API key)");
+      }
+      if (typeof count === "number") parts.push(`${count} models`);
+      if (typeof dm === "string" && dm) parts.push(`default: ${dm}`);
+      return parts.join(" · ") || null;
+    }
     case "ahrefs": {
       const raw = (d.raw || {}) as Record<string, unknown>;
       const plan = typeof raw.subscription === "string" ? raw.subscription : null;

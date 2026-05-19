@@ -86,6 +86,7 @@ const messagesEn = {
         gemini: "Google Gemini",
         github_models: "GitHub Models",
         openrouter: "OpenRouter",
+        vertex_ai: "Google Vertex AI",
         whoisfreaks: "WhoisFreaks",
       },
       whoisfreaksConfiguredHint:
@@ -1471,6 +1472,7 @@ const messagesEn = {
         gemini: "Google Gemini",
         github_models: "GitHub Models",
         openrouter: "OpenRouter",
+        vertex_ai: "Google Vertex AI",
       },
       providerHelp: {
         ahrefs:
@@ -1481,16 +1483,25 @@ const messagesEn = {
           "GitHub PAT with the `models:read` scope. Browse model IDs at github.com/marketplace/models.",
         openrouter:
           "OpenRouter API key. The default model is the slug shown on openrouter.ai/models, e.g. `anthropic/claude-3.5-sonnet`.",
+        vertex_ai:
+          "Google Vertex AI. Paste a service-account JSON for enterprise mode (uses your GCP project + region), OR paste only an API key for Vertex Express mode. The service-account JSON takes precedence when both are set.",
       },
       fieldLabels: {
         api_key: "API key",
         token: "Token",
         default_model: "Default model",
+        service_account_json: "Service-account JSON",
+        project_id: "Project ID",
+        location: "Location",
       },
       fieldPlaceholders: {
         api_key: "Paste API key…",
         token: "Paste token…",
         default_model: "e.g. gemini-2.5-flash",
+        service_account_json:
+          '{ "type": "service_account", "project_id": "...", "private_key": "...", "client_email": "...", ... }',
+        project_id: "my-gcp-project",
+        location: "us-central1",
       },
       savedSecret: (last4: string, length: number) =>
         `Saved: ••••${last4} (${length} chars)`,
@@ -2197,6 +2208,7 @@ const messagesRu: Messages = {
         gemini: "Google Gemini",
         github_models: "GitHub Models",
         openrouter: "OpenRouter",
+        vertex_ai: "Google Vertex AI",
         whoisfreaks: "WhoisFreaks",
       },
       whoisfreaksConfiguredHint:
@@ -3641,6 +3653,7 @@ const messagesRu: Messages = {
         gemini: "Google Gemini",
         github_models: "GitHub Models",
         openrouter: "OpenRouter",
+        vertex_ai: "Google Vertex AI",
       },
       providerHelp: {
         ahrefs:
@@ -3651,16 +3664,25 @@ const messagesRu: Messages = {
           "GitHub PAT со скоупом `models:read`. ID моделей — на github.com/marketplace/models.",
         openrouter:
           "Ключ OpenRouter API. Модель по умолчанию — слаг с openrouter.ai/models, напр. `anthropic/claude-3.5-sonnet`.",
+        vertex_ai:
+          "Google Vertex AI. Вставьте JSON сервис-аккаунта для enterprise-режима (использует ваш проект и регион GCP) ИЛИ только API-ключ для режима Vertex Express. JSON сервис-аккаунта имеет приоритет, если заданы оба.",
       },
       fieldLabels: {
         api_key: "API-ключ",
         token: "Токен",
         default_model: "Модель по умолчанию",
+        service_account_json: "JSON сервис-аккаунта",
+        project_id: "Project ID",
+        location: "Регион",
       },
       fieldPlaceholders: {
         api_key: "Вставьте API-ключ…",
         token: "Вставьте токен…",
         default_model: "напр. gemini-2.5-flash",
+        service_account_json:
+          '{ "type": "service_account", "project_id": "...", "private_key": "...", "client_email": "...", ... }',
+        project_id: "my-gcp-project",
+        location: "us-central1",
       },
       savedSecret: (last4, length) =>
         `Сохранено: ••••${last4} (${length} симв.)`,

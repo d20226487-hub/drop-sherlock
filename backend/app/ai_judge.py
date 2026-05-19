@@ -27,7 +27,7 @@ from .providers.base import ProviderConfigError, ProviderError
 log = logging.getLogger(__name__)
 
 # Provider IDs we accept on the Analyze form's `ai.provider` field.
-AI_PROVIDERS = {"gemini", "github_models", "openrouter"}
+AI_PROVIDERS = {"gemini", "github_models", "openrouter", "vertex_ai"}
 
 
 def parse_json_response(text: str) -> dict:
@@ -207,6 +207,142 @@ async def _judge_github_models(
     )
 
 
+# --- Vertex AI ---------------------------------------------------------------
+
+# Cached OAuth2 access token for the service-account path. Vertex tokens
+# are valid for ~1 hour; we refresh ~10 min early so a long-running batch
+# never trips a 401 mid-flight. Tuple shape: (token, epoch_seconds_expiry).
+# Keyed by the service-account `client_email` so swapping the SA JSON in
+# Settings doesn't keep serving a stale token from a previous identity.
+_vertex_token_cache: dict[str, tuple[str, float]] = {}
+
+
+def _mint_vertex_access_token(service_account_json: str) -> str:
+    """Mint a short-lived OAuth2 access token from a service-account
+    JSON, with a process-level cache. Synchronous (google-auth is sync);
+    cheap enough to call from an async path without offloading."""
+    import json as _json
+    import time as _time
+    try:
+        info = _json.loads(service_account_json)
+    except _json.JSONDecodeError as e:
+        raise ProviderConfigError(
+            f"Vertex AI: service_account_json is not valid JSON: {e}"
+        ) from e
+    client_email = info.get("client_email") or ""
+    cached = _vertex_token_cache.get(client_email)
+    now = _time.time()
+    if cached and cached[1] > now + 60:
+        return cached[0]
+    try:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
+    except ImportError as e:
+        raise ProviderConfigError(
+            "Vertex AI service-account mode requires google-auth — "
+            "rebuild the api container to install it."
+        ) from e
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    try:
+        creds.refresh(Request())
+    except Exception as e:  # noqa: BLE001 — surface OAuth2 errors as config issues
+        raise ProviderConfigError(
+            f"Vertex AI: failed to mint access token: {e}"
+        ) from e
+    token = creds.token or ""
+    if not token:
+        raise ProviderConfigError("Vertex AI: token mint returned empty token")
+    expiry = creds.expiry.timestamp() if creds.expiry else now + 3300
+    _vertex_token_cache[client_email] = (token, expiry)
+    return token
+
+
+async def _judge_vertex_ai(
+    *, system_prompt: str, user_message: str, model: str, timeout: float
+) -> tuple[str, dict[str, int]]:
+    """Vertex AI judge with two auth modes:
+
+    1. Service-account JSON (enterprise) — mints OAuth2 token, calls the
+       regional `aiplatform.googleapis.com` against a specific project.
+    2. API key only (Vertex Express) — uses `?key=` against the global
+       `aiplatform.googleapis.com` endpoint. Falls back to this when no
+       service-account JSON is configured.
+
+    Request/response body is the same Gemini shape Vertex accepts; we
+    reuse the parsing logic from `_judge_gemini`."""
+    creds = get_provider_creds("vertex_ai")
+    sa_json = (creds.get("service_account_json") or "").strip()
+    api_key = (creds.get("api_key") or "").strip()
+    body = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    if sa_json:
+        project_id = (creds.get("project_id") or "").strip()
+        location = (creds.get("location") or "").strip()
+        if not project_id:
+            raise ProviderConfigError(
+                "Vertex AI: project_id required when using service-account JSON"
+            )
+        if not location:
+            raise ProviderConfigError(
+                "Vertex AI: location required when using service-account JSON"
+            )
+        token = _mint_vertex_access_token(sa_json)
+        url = (
+            f"https://{location}-aiplatform.googleapis.com/v1/"
+            f"projects/{project_id}/locations/{location}/"
+            f"publishers/google/models/{model}:generateContent"
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.post(url, headers=headers, json=body)
+    elif api_key:
+        # Vertex Express Mode — global endpoint, no project/location.
+        url = (
+            "https://aiplatform.googleapis.com/v1/publishers/google/"
+            f"models/{model}:generateContent"
+        )
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.post(url, params={"key": api_key}, json=body)
+    else:
+        raise ProviderConfigError(
+            "Vertex AI: neither service_account_json nor api_key is set"
+        )
+    if r.status_code in (401, 403):
+        raise ProviderConfigError(
+            f"Vertex AI rejected credentials ({r.status_code}): {r.text[:300]}"
+        )
+    if r.status_code >= 400:
+        raise ProviderError(
+            f"Vertex AI returned {r.status_code}: {r.text[:300]}"
+        )
+    payload = r.json() or {}
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        raise ProviderError(f"Vertex AI returned no candidates: {payload}")
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts)
+    if not text:
+        raise ProviderError(f"Vertex AI candidate had no text: {payload}")
+    meta = payload.get("usageMetadata") or {}
+    usage = {
+        "input_tokens": int(meta.get("promptTokenCount") or 0),
+        "output_tokens": int(
+            meta.get("candidatesTokenCount")
+            or meta.get("outputTokenCount")
+            or 0
+        ),
+    }
+    return text, usage
+
+
 async def _judge_openrouter(
     *, system_prompt: str, user_message: str, model: str, timeout: float
 ) -> tuple[str, dict[str, int]]:
@@ -269,6 +405,13 @@ async def judge(
         )
     elif provider == "openrouter":
         text, usage = await _judge_openrouter(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            model=model,
+            timeout=timeout,
+        )
+    elif provider == "vertex_ai":
+        text, usage = await _judge_vertex_ai(
             system_prompt=system_prompt,
             user_message=user_message,
             model=model,

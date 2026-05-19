@@ -3,7 +3,12 @@ import { useEffect, useState } from "react";
 import { useT } from "@/lib/i18n";
 import { api, AIProvider, ProviderStatus } from "@/lib/api";
 
-const AI_PROVIDERS: AIProvider[] = ["gemini", "github_models", "openrouter"];
+const AI_PROVIDERS: AIProvider[] = [
+  "gemini",
+  "github_models",
+  "openrouter",
+  "vertex_ai",
+];
 
 type Status = {
   configured: boolean;
@@ -12,11 +17,23 @@ type Status = {
 
 function readStatus(p: ProviderStatus): Status {
   const fields = p.fields;
-  const credField =
-    p.provider === "github_models" ? fields["token"] : fields["api_key"];
+  // Vertex AI is configured when EITHER service-account JSON or API
+  // key is filled in; other providers have a single credential field.
+  let configured = false;
+  if (p.provider === "vertex_ai") {
+    const sa = fields["service_account_json"];
+    const ak = fields["api_key"];
+    configured = !!(
+      (sa && sa.configured) || (ak && ak.configured)
+    );
+  } else {
+    const credField =
+      p.provider === "github_models" ? fields["token"] : fields["api_key"];
+    configured = !!(credField && credField.configured);
+  }
   const dm = fields["default_model"];
   return {
-    configured: !!(credField && credField.configured),
+    configured,
     default_model: dm && dm.configured && "value" in dm ? dm.value : null,
   };
 }

@@ -56,6 +56,12 @@ class ProviderCredsIn(BaseModel):
     api_key: str | None = None
     token: str | None = None
     default_model: str | None = None
+    # Vertex AI (added 2026-05-19). `service_account_json` is the raw
+    # JSON paste; `project_id` and `location` are the two required
+    # plain-text fields that pair with it.
+    service_account_json: str | None = None
+    project_id: str | None = None
+    location: str | None = None
 
 
 @router.get("/")
@@ -164,6 +170,28 @@ def update_provider_creds(provider: str, payload: ProviderCredsIn):
             400,
             f"no valid fields for {provider}; expected one of {PROVIDER_FIELDS[provider]}",
         )
+    # Vertex AI: validate the service-account JSON shape on save so the
+    # user sees a clear error here rather than at first-judge time. Empty
+    # / None means "clear it" — only validate when there's actual content.
+    if provider == "vertex_ai" and valid.get("service_account_json"):
+        import json as _json
+        try:
+            parsed = _json.loads(valid["service_account_json"])
+        except _json.JSONDecodeError as e:
+            raise HTTPException(400, f"service_account_json is not valid JSON: {e}")
+        if not isinstance(parsed, dict):
+            raise HTTPException(400, "service_account_json must be a JSON object")
+        missing = [k for k in ("type", "private_key", "client_email") if not parsed.get(k)]
+        if missing:
+            raise HTTPException(
+                400,
+                f"service_account_json missing required fields: {', '.join(missing)}",
+            )
+        if parsed.get("type") != "service_account":
+            raise HTTPException(
+                400,
+                f"service_account_json: expected type='service_account', got {parsed.get('type')!r}",
+            )
     set_provider_creds(provider, valid)
     return provider_status(provider)
 

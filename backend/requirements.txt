@@ -31,3 +31,14 @@ cryptography==44.0.0
 # resolution; we need NS records + NXDOMAIN distinction, which need
 # dnspython. ~1 MB.
 dnspython==2.7.0
+# Vertex AI provider auth (added 2026-05-19). Pulled in to mint OAuth2
+# access tokens from a service-account JSON for the enterprise-mode
+# Vertex API. Pure-Python, no compile. Express-mode (?key=) doesn't
+# use this — only the SA path does, so the dependency is dormant until
+# the user actually pastes a service-account JSON.
+google-auth==2.36.0
+# Required by google-auth's `transport.requests` module — used by the
+# Vertex AI service-account path to refresh OAuth2 tokens. We only
+# touch `requests` through google-auth; Vertex itself is called via
+# httpx. ~150 KB, pure-Python.
+requests==2.32.3

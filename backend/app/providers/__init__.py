@@ -7,6 +7,7 @@ from .ahrefs import AhrefsClient
 from .gemini import GeminiClient
 from .github_models import GitHubModelsClient
 from .openrouter import OpenRouterClient
+from .vertex_ai import VertexAIClient
 from .wayback import WaybackClient
 
 _REGISTRY = {
@@ -14,6 +15,7 @@ _REGISTRY = {
     "gemini": GeminiClient,
     "github_models": GitHubModelsClient,
     "openrouter": OpenRouterClient,
+    "vertex_ai": VertexAIClient,
     "wayback": WaybackClient,
 }
 
@@ -34,6 +36,7 @@ __all__ = [
     "GeminiClient",
     "GitHubModelsClient",
     "OpenRouterClient",
+    "VertexAIClient",
     "WaybackClient",
     "get_provider",
 ]

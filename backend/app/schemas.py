@@ -303,7 +303,7 @@ class CriteriaSpec(BaseModel):
 # `provider` values match the keys in `app.ai_judge.AI_PROVIDERS` plus None,
 # which means "skip AI; only fetch Ahrefs data". `model` is an optional
 # override for the provider's default_model from Settings.
-AIProvider = Literal["gemini", "github_models", "openrouter"]
+AIProvider = Literal["gemini", "github_models", "openrouter", "vertex_ai"]
 
 
 class AISpec(BaseModel):

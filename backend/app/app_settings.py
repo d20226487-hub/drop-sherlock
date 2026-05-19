@@ -66,6 +66,18 @@ PROVIDER_FIELDS: dict[str, list[str]] = {
     "gemini": ["api_key", "default_model"],
     "github_models": ["token", "default_model"],
     "openrouter": ["api_key", "default_model"],
+    # Vertex AI (added 2026-05-19). Auto-detects mode at call time:
+    # if `service_account_json` is set → enterprise mode (mints OAuth2
+    # token, calls `{location}-aiplatform.googleapis.com` against the
+    # project), else if `api_key` is set → Vertex Express mode. Both
+    # are masked on read.
+    "vertex_ai": [
+        "api_key",
+        "service_account_json",
+        "project_id",
+        "location",
+        "default_model",
+    ],
     # Wayback CDX needs no creds — but surface it here so rate-limits and
     # status reporting flow through the same paths. Empty field list ⇒
     # status row shows "no fields", no test-credentials button.
@@ -91,7 +103,7 @@ _ENV_FALLBACK: dict[tuple[str, str], str] = {
 # Fields that are secrets and must be masked (last4 + length only) in any
 # response that goes to the browser. Non-secret fields (like `default_model`)
 # are echoed back in full.
-SECRET_FIELDS = {"api_key", "token", "password"}
+SECRET_FIELDS = {"api_key", "token", "password", "service_account_json"}
 
 
 # --- Low-level get/set --------------------------------------------------------
@@ -201,7 +213,7 @@ def provider_status(provider: str) -> dict:
 # Reanalyze pickers on run/domain/Database). Stored as a JSON array under
 # `known_models__<provider>` — Ahrefs is excluded (no model concept).
 
-AI_PROVIDERS_FOR_MODELS = ("gemini", "github_models", "openrouter")
+AI_PROVIDERS_FOR_MODELS = ("gemini", "github_models", "openrouter", "vertex_ai")
 
 
 def _models_key(provider: str) -> str:
@@ -297,6 +309,10 @@ _RATE_LIMIT_DEFAULTS: dict[str, dict[str, int]] = {
     "gemini": {"rpm": 60, "max_concurrent": 4, "retry_max": 3},
     "github_models": {"rpm": 30, "max_concurrent": 2, "retry_max": 3},
     "openrouter": {"rpm": 60, "max_concurrent": 4, "retry_max": 3},
+    # Vertex AI (added 2026-05-19). Same shape as Gemini — Vertex's
+    # per-region quota is generous on enterprise projects; user can
+    # tune down if their GCP project has stricter limits.
+    "vertex_ai": {"rpm": 60, "max_concurrent": 4, "retry_max": 3},
     # Wayback throttles aggressively if you fan out — it's a free
     # community service, not a paid quota. `max_concurrent=1` (single-
     # flight) added 2026-05-07 after a 35-domain batch cascaded into
