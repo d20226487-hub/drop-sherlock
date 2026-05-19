@@ -565,6 +565,73 @@ def list_domains(
             .all()
         }
 
+    # Fallback source for the Availability column (added 2026-05-18).
+    # Primary source is still the availability CR (so the column
+    # matches the Job-page chip math row-for-row, per the 2026-05-16
+    # rewire). But when NO availability Job has been run for a domain
+    # — only a per-row Recheck or bulk Recheck — there's no CR, and
+    # the column stayed empty even though `AvailabilityCheck` history
+    # and `BacklogDomain.expiration_date` were updated. User report
+    # 2026-05-18: rechecked boilerplus.com.ua on Backlog, expiry showed
+    # there but Database Availability stayed blank. Fix: when the CR-
+    # based extraction yields no status, fall back to the latest
+    # AvailabilityCheck row for that domain (mirroring what the Backlog
+    # page does via /availability/latest).
+    #
+    # Two queries instead of one: prefer the latest TERMINAL (available
+    # / registered) row per domain — that's the "stable answer" the
+    # cascade itself preserves across rate-limit retries — and only
+    # fall through to the latest-of-any-status row for domains that
+    # have never had a terminal answer. Same definitive-preferred
+    # semantic as /availability/latest + the Backlog filter.
+    from ..models import AvailabilityCheck
+    from sqlalchemy import and_, func as sqla_func
+    latest_av_by_domain: dict[str, AvailabilityCheck] = {}
+    if domain_keys:
+        term_sub = (
+            db.query(
+                AvailabilityCheck.domain.label("d"),
+                sqla_func.max(AvailabilityCheck.checked_at).label("max_t"),
+            )
+            .filter(AvailabilityCheck.domain.in_(domain_keys))
+            .filter(AvailabilityCheck.status.in_(("available", "registered")))
+            .group_by(AvailabilityCheck.domain)
+            .subquery()
+        )
+        for r in (
+            db.query(AvailabilityCheck)
+            .join(term_sub, and_(
+                AvailabilityCheck.domain == term_sub.c.d,
+                AvailabilityCheck.checked_at == term_sub.c.max_t,
+            ))
+            .all()
+        ):
+            latest_av_by_domain[r.domain] = r
+        # Fill in domains with no terminal answer using their latest
+        # overall row — gives the user 'unknown'/'error' visibility
+        # so the column reflects "we tried, here's what came back"
+        # rather than the misleading "blank = never checked" state.
+        missing = [d for d in domain_keys if d not in latest_av_by_domain]
+        if missing:
+            any_sub = (
+                db.query(
+                    AvailabilityCheck.domain.label("d"),
+                    sqla_func.max(AvailabilityCheck.checked_at).label("max_t"),
+                )
+                .filter(AvailabilityCheck.domain.in_(missing))
+                .group_by(AvailabilityCheck.domain)
+                .subquery()
+            )
+            for r in (
+                db.query(AvailabilityCheck)
+                .join(any_sub, and_(
+                    AvailabilityCheck.domain == any_sub.c.d,
+                    AvailabilityCheck.checked_at == any_sub.c.max_t,
+                ))
+                .all()
+            ):
+                latest_av_by_domain[r.domain] = r
+
     # Banned-domain lookup. Originally (Wave L, 2026-05-13) drove a
     # per-row "banned" badge but rows stayed visible. Revised
     # 2026-05-15: banned rows are now HIDDEN from the Database listing
@@ -1157,6 +1224,25 @@ def list_domains(
                             pass
         if av_src is not None:
             availability_checked_at = av_src[0].finished_at
+
+        # Fallback to latest AvailabilityCheck history row when no
+        # CR-based verdict was extracted (added 2026-05-18). Closes
+        # the gap where per-row Recheck / bulk Recheck on Backlog
+        # updated `AvailabilityCheck` + `BacklogDomain.expiration_date`
+        # but the Database Availability column stayed blank because no
+        # Availability Job had ever run for this domain. Same
+        # definitive-preferred semantic as the Backlog page's
+        # /availability/latest hydration: terminal answer wins; we
+        # fall through to overall-latest only when no terminal exists.
+        if not availability_status:
+            fallback = latest_av_by_domain.get(domain)
+            if fallback is not None:
+                availability_status = fallback.status
+                availability_provider = fallback.provider or ""
+                availability_registrar = fallback.registrar or ""
+                availability_expires_on = fallback.expires_on
+                availability_checked_at = fallback.checked_at
+                availability_statuses_seen.add(fallback.status)
 
         rows.append(DomainRow(
             domain=domain,
