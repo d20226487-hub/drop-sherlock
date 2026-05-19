@@ -380,6 +380,7 @@ function FilterRow({
     non_spammy?: boolean;
     noindex_exclude?: boolean;
     content_only?: boolean;
+    root_only?: boolean;
   };
   showNonSpammy: boolean;
   // Backlinks-only toggles: noindex-exclude + content-only. Hidden on
@@ -453,6 +454,18 @@ function FilterRow({
                 className={checkbox}
               />
               {ts.filterLabels.contentOnly}
+            </label>
+            <label
+              className="inline-flex items-center gap-1.5 cursor-pointer"
+              title={ts.filterLabels.rootOnlyHint}
+            >
+              <input
+                type="checkbox"
+                checked={!!filters.root_only}
+                onChange={(e) => set("root_only", e.target.checked)}
+                className={checkbox}
+              />
+              {ts.filterLabels.rootOnly}
             </label>
           </>
         )}
@@ -660,6 +673,20 @@ export function BacklinksCard({
                 className={checkbox}
               />
               {ts.filterLabels.contentOnly}
+            </label>
+            <label
+              className="inline-flex items-center gap-1.5 cursor-pointer"
+              title={ts.filterLabels.rootOnlyHint}
+            >
+              <input
+                type="checkbox"
+                checked={!!cfg.filters.root_only}
+                onChange={(e) =>
+                  setFilters({ root_only: e.target.checked })
+                }
+                className={checkbox}
+              />
+              {ts.filterLabels.rootOnly}
             </label>
             <label
               className="inline-flex items-center gap-1.5 cursor-pointer"

@@ -107,6 +107,17 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
         for off_default_key in ("noindex_exclude", "content_only"):
             if fdump.get(off_default_key) is False:
                 fdump.pop(off_default_key, None)
+        # `root_only` (added 2026-05-18, default-True). Same "drop
+        # when value is False" rule as the toggles above. When the
+        # user disables the toggle (False), the where clause omits
+        # `is_root_source` → behaves identically to pre-feature
+        # requests, so the hash MUST match pre-feature cache rows.
+        # When the toggle is at the default-True, the where clause
+        # adds `is_root_source=1` → fetches a strict subset; that
+        # MUST hash differently so a pre-feature cache row (which
+        # included subdomain backlinks) doesn't get served.
+        if fdump.get("root_only") is False:
+            fdump.pop("root_only", None)
         payload["filters"] = fdump
     sort = getattr(cfg, "sort", None)
     if sort is not None:

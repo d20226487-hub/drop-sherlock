@@ -31,6 +31,15 @@ class BacklinksFilters(BaseModel):
     # `is_content=1`). Without it the response includes footer / sidebar /
     # sitewide / comment / nav links too. Default-on.
     content_only: bool = True
+    # When True, drop backlinks whose REFERRING URL lives on a subdomain
+    # — keep only those whose referring URL is on a root domain. Maps to
+    # `is_root_source=1` in the where clause (added 2026-05-18). Default-on:
+    # subdomain backlinks are usually weaker editorial signal + much more
+    # likely to be a self-network footprint (one root × dozens of
+    # subdomains masquerading as diverse refdomains). User can disable
+    # per-run when they specifically want to study subdomain link
+    # patterns.
+    root_only: bool = True
     # ISO 639-1 language codes (e.g. ["en", "ru"]). Empty = no filter.
     # Each row's `languages` field is an array; we OR-match per code.
     languages: list[str] = Field(default_factory=list)

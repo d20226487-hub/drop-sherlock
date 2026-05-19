@@ -201,6 +201,12 @@ export type BacklinksFilters = {
   // When true, restrict to editorial in-content links only (`is_content=1`).
   // Without this, footer/sidebar/sitewide/comment placements come back too.
   content_only: boolean;
+  // When true, drop backlinks whose REFERRING URL is on a subdomain
+  // (`is_root_source=1`). Default-on at the schema level — see
+  // BacklinksFilters.root_only on the backend for the rationale.
+  // NOT to be confused with `domain_contains`, which filters the
+  // `root_name_source` string field for substring matches.
+  root_only: boolean;
   // ISO 639-1 language codes — empty = no filter, multi-value OR-matched.
   // `link_type=text` is hardcoded on every backlinks query (no UI toggle).
   languages: string[];

@@ -167,6 +167,9 @@ const messagesEn = {
         contentOnly: "Editorial / in-content links only",
         contentOnlyHint:
           "Restricts to article-body editorial links (is_content=1). Without this, footer / sidebar / sitewide / comment placements come back too.",
+        rootOnly: "Root-domain referrers only",
+        rootOnlyHint:
+          "Drops backlinks whose referring URL is on a subdomain (e.g. blog.example.com/path). Sends is_root_source=1. Subdomain backlinks tend to be self-network footprints + weaker editorial signal; uncheck this if you specifically want to study subdomain link patterns.",
       },
       backlinksSections: {
         defaults: "Defaults",
@@ -2280,6 +2283,9 @@ const messagesRu: Messages = {
         contentOnly: "Только редакционные / в-контенте",
         contentOnlyHint:
           "Ограничивает выдачу редакционными ссылками внутри статьи (is_content=1). Без этого попадают также футер / сайдбар / сквозные / комментарии.",
+        rootOnly: "Только доноры-корни (без поддоменов)",
+        rootOnlyHint:
+          "Убирает беклинки, у которых ссылающийся URL находится на поддомене (например blog.example.com/path). Отправляется is_root_source=1. Беклинки с поддоменов часто оказываются собственной сеткой и слабее редакционно; снимите галочку, если хотите изучать именно поддоменный паттерн ссылок.",
       },
       backlinksSections: {
         defaults: "По умолчанию",

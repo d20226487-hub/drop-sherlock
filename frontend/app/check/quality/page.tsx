@@ -34,6 +34,10 @@ const DEFAULT_CRITERIA: CriteriaSpec = {
       non_spammy: true,
       noindex_exclude: true,
       content_only: true,
+      // Default-on (2026-05-18). Drops subdomain-referring backlinks
+      // via `is_root_source=1`. See backend BacklinksFilters.root_only
+      // for rationale.
+      root_only: true,
       languages: [],
       domain_contains: [],
       dr_min: null,

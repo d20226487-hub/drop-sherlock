@@ -193,6 +193,17 @@ def _build_where(filters: object, criterion: str) -> dict | None:
     if criterion == "backlinks" and getattr(f, "content_only", False):
         clauses.append({"field": "is_content", "is": ["eq", 1]})
 
+    # Backlinks-only: "root-domain referring URLs only" toggle (added
+    # 2026-05-18). Drops backlinks whose REFERRING URL is on a subdomain
+    # (`is_root_source=0`). Default-on at the schema level — see
+    # BacklinksFilters.root_only for the rationale (subdomain backlinks
+    # tend to be self-network footprints + weaker editorial signal).
+    # NOT to be confused with `root_name_source`, which is the string
+    # field used by the domain_contains substring filter — different
+    # field, different intent.
+    if criterion == "backlinks" and getattr(f, "root_only", False):
+        clauses.append({"field": "is_root_source", "is": ["eq", 1]})
+
     # Languages (backlinks only — `languages` is a per-row array). One eq
     # clause per code, OR'd. Ahrefs's eq on an array column tests
     # membership, so this matches "row's languages array contains the code."
