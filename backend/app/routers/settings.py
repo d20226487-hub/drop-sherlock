@@ -95,6 +95,15 @@ def settings_root():
             "config": _wayback_auto_retry_for_root(),
             "defaults": _wayback_auto_retry_defaults_for_root(),
         },
+        # Post-run Availability auto-retry knobs (added 2026-05-18).
+        # Same shape as wayback_auto_retry plus a `retry_providers`
+        # whitelist (default ["rdap"]) so paid Domainr calls don't
+        # silently fire on a flaky burst run.
+        "availability_auto_retry": {
+            "config": _availability_auto_retry_for_root(),
+            "defaults": _availability_auto_retry_defaults_for_root(),
+            "allowed_providers": list(_AVAILABILITY_RETRY_PROVIDERS_TUP),
+        },
     }
 
 
@@ -110,6 +119,26 @@ def _wayback_auto_retry_for_root() -> dict:
 def _wayback_auto_retry_defaults_for_root() -> dict:
     from ..app_settings import DEFAULT_WAYBACK_AUTO_RETRY
     return DEFAULT_WAYBACK_AUTO_RETRY
+
+
+def _availability_auto_retry_for_root() -> dict:
+    from ..app_settings import get_availability_auto_retry_config
+    return get_availability_auto_retry_config()
+
+
+def _availability_auto_retry_defaults_for_root() -> dict:
+    from ..app_settings import DEFAULT_AVAILABILITY_AUTO_RETRY
+    # Deep-copy the list field so a frontend mutation can't poison
+    # the module-level default by reference.
+    out = dict(DEFAULT_AVAILABILITY_AUTO_RETRY)
+    out["retry_providers"] = list(DEFAULT_AVAILABILITY_AUTO_RETRY["retry_providers"])
+    return out
+
+
+# Imported here once so the /settings/ root + the typed endpoints below
+# share the same list. Inline import inside `_root` would also work but
+# this keeps the lookup constant-time.
+from ..app_settings import _AVAILABILITY_RETRY_PROVIDERS as _AVAILABILITY_RETRY_PROVIDERS_TUP
 
 
 @router.get("/providers")
@@ -335,6 +364,66 @@ def update_wayback_auto_retry_route(payload: WaybackAutoRetryIn):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"config": new_cfg, "defaults": DEFAULT_WAYBACK_AUTO_RETRY}
+
+
+# --- Availability auto-retry config ----------------------------------------
+# Sibling of the Wayback editor above. Adds `retry_providers` — a
+# whitelist of cascade providers whose terminal failure makes an RD
+# eligible for auto-retry. Default ["rdap"] keeps the feature auto-on
+# without firing paid Domainr / slow WHOIS calls behind the user's back.
+
+class AvailabilityAutoRetryIn(BaseModel):
+    enabled: bool | None = None
+    max_attempts: int | None = Field(default=None, ge=0)
+    initial_delay_sec: int | None = Field(default=None, ge=0)
+    backoff_multiplier: float | None = Field(default=None, ge=1.0)
+    # Optional whitelist override. Empty list is valid — it means "only
+    # auto-retry cascade-crashed (CR.status='failed') rows; skip every
+    # done+error row" — a legitimate "safest retries only" state.
+    retry_providers: list[str] | None = None
+
+
+@router.get("/availability-auto-retry")
+def get_availability_auto_retry_route():
+    from ..app_settings import (
+        DEFAULT_AVAILABILITY_AUTO_RETRY,
+        get_availability_auto_retry_config,
+    )
+    out_defaults = dict(DEFAULT_AVAILABILITY_AUTO_RETRY)
+    out_defaults["retry_providers"] = list(
+        DEFAULT_AVAILABILITY_AUTO_RETRY["retry_providers"],
+    )
+    return {
+        "config": get_availability_auto_retry_config(),
+        "defaults": out_defaults,
+        "allowed_providers": list(_AVAILABILITY_RETRY_PROVIDERS_TUP),
+    }
+
+
+@router.put("/availability-auto-retry")
+def update_availability_auto_retry_route(payload: AvailabilityAutoRetryIn):
+    from ..app_settings import (
+        DEFAULT_AVAILABILITY_AUTO_RETRY,
+        set_availability_auto_retry_config,
+    )
+    raw = payload.model_dump(exclude_unset=True)
+    # Strip Nones but PRESERVE empty lists — retry_providers=[] is a
+    # meaningful "skip every done+error row" state, distinct from
+    # "field absent" (no change to retry_providers).
+    raw = {k: v for k, v in raw.items() if v is not None}
+    try:
+        new_cfg = set_availability_auto_retry_config(raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    out_defaults = dict(DEFAULT_AVAILABILITY_AUTO_RETRY)
+    out_defaults["retry_providers"] = list(
+        DEFAULT_AVAILABILITY_AUTO_RETRY["retry_providers"],
+    )
+    return {
+        "config": new_cfg,
+        "defaults": out_defaults,
+        "allowed_providers": list(_AVAILABILITY_RETRY_PROVIDERS_TUP),
+    }
 
 
 @router.put("/scoring")

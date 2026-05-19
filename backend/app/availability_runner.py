@@ -336,3 +336,218 @@ async def process_availability_run(run_id: int) -> None:
             db.commit()
     finally:
         db.close()
+
+    # 4. Schedule the auto-retry watcher (added 2026-05-18). Symmetric
+    # with `schedule_wayback_auto_retry` at the end of `process_run`:
+    # no-op when the Settings toggle is off, when the attempt budget
+    # is 0, or when nothing failed. We call it unconditionally so the
+    # wiring stays tight — all gating lives inside the scheduler.
+    schedule_availability_auto_retry(run_id)
+
+
+# --- Availability auto-retry watcher (added 2026-05-18) --------------------
+#
+# Mirror of `tasks._wayback_auto_retry_loop`: after the run finalizes,
+# sleep / scan / retry on a backoff schedule until either every
+# failure resolves or the attempt budget is exhausted. Lives next to
+# `process_availability_run` so the runner + retry loop share the
+# same imports + module-level concurrency caps.
+#
+# Scope (locked 2026-05-18 with user):
+#   - CR.status='failed' (cascade runner crashed) → always retry
+#   - CR.status='done' + verdict.status='error' AND
+#     verdict.provider in cfg.retry_providers → retry
+#   - CR.status='done' + verdict.status='unknown' → SKIP
+#   - CR.status='done' + verdict.status='error' AND
+#     verdict.provider NOT in cfg.retry_providers → SKIP
+#
+# Default retry_providers is ["rdap"] — user uses RDAP almost
+# exclusively + RDAP is free, so the feature is auto-on without
+# risking surprise Domainr bills.
+
+# Process-level guard against double-scheduling. Shared with
+# tasks._AUTO_RETRY_RUNS by intent but kept separate so a Wayback +
+# Availability run could in principle both be retrying simultaneously
+# (different run_ids — set membership wouldn't collide anyway, but a
+# separate set keeps the ownership clear).
+_AVAILABILITY_AUTO_RETRY_RUNS: set[int] = set()
+
+
+def is_availability_auto_retry_active(run_id: int) -> bool:
+    return run_id in _AVAILABILITY_AUTO_RETRY_RUNS
+
+
+def schedule_availability_auto_retry(run_id: int) -> None:
+    """Spawn the auto-retry watcher for `run_id` if Settings allow it.
+    Idempotent — does nothing when an auto-retry loop is already in
+    flight for this run."""
+    if run_id in _AVAILABILITY_AUTO_RETRY_RUNS:
+        return
+    try:
+        from .app_settings import get_availability_auto_retry_config
+        cfg = get_availability_auto_retry_config()
+    except Exception:  # noqa: BLE001
+        log.exception("could not read availability_auto_retry config")
+        return
+    if not cfg.get("enabled") or int(cfg.get("max_attempts", 0)) <= 0:
+        return
+    _AVAILABILITY_AUTO_RETRY_RUNS.add(run_id)
+    # Fire-and-forget; the loop's `finally` removes the run_id.
+    asyncio.create_task(_availability_auto_retry_loop(run_id, dict(cfg)))
+
+
+def _collect_availability_retry_candidates(
+    run_id: int, retry_providers: list[str],
+) -> list[int]:
+    """Return the list of RunDomain ids on `run_id` worth retrying per
+    the scope rules in the module docstring. Reads each candidate's CR
+    once; no expensive joins."""
+    out: list[int] = []
+    retry_set = set(retry_providers)
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return out
+        for rd in run.domains:
+            if rd.status == "canceled":
+                continue
+            # Find the availability CR for this rd (1:1 in practice; the
+            # cascade only writes one per rd per run).
+            av_cr: CriterionResult | None = None
+            for cr in rd.results:
+                if cr.criterion == "availability":
+                    av_cr = cr
+                    break
+            if av_cr is None:
+                continue
+            if av_cr.status == "failed":
+                # Cascade crashed — runner-level error. Always
+                # retryable; provider whitelist doesn't apply (we
+                # don't know which provider was in flight when the
+                # runner died).
+                out.append(rd.id)
+                continue
+            if av_cr.status != "done":
+                # pending / running — leave it; either it's still
+                # in flight (shouldn't happen post-finalize) or
+                # something pathological is going on.
+                continue
+            # status='done': inspect the verdict.
+            if not av_cr.data_json:
+                continue
+            try:
+                body = json.loads(av_cr.data_json)
+            except json.JSONDecodeError:
+                continue
+            verdict = body.get("verdict") if isinstance(body, dict) else None
+            if not isinstance(verdict, dict):
+                continue
+            v_status = verdict.get("status")
+            v_provider = verdict.get("provider")
+            if v_status != STATUS_ERROR:
+                # 'available' / 'registered' — terminal success.
+                # 'unknown' — terminal-not-actionable; skip.
+                continue
+            if not isinstance(v_provider, str) or v_provider not in retry_set:
+                continue
+            out.append(rd.id)
+        return out
+    finally:
+        db.close()
+
+
+def _read_run_status_for_retry(run_id: int) -> str | None:
+    """Cheap status read used by the retry loop's pause/cancel/re-run
+    bail-out. Returns None if the run row vanished (deleted between
+    sleep ticks)."""
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        return run.status if run is not None else None
+    finally:
+        db.close()
+
+
+async def _availability_auto_retry_loop(run_id: int, cfg: dict) -> None:
+    """Sleep / collect candidates / dispatch retries / repeat until
+    budget hit or no candidates remain. Caller guarantees the Settings
+    toggle is on, max_attempts > 0, and this run isn't already being
+    auto-retried."""
+    try:
+        delay = float(cfg.get("initial_delay_sec", 60))
+        multiplier = float(cfg.get("backoff_multiplier", 2.0))
+        max_attempts = int(cfg.get("max_attempts", 2))
+        retry_providers = list(cfg.get("retry_providers") or [])
+        for _attempt in range(max_attempts):
+            await asyncio.sleep(max(0.0, delay))
+            delay *= multiplier
+
+            # Bail if the user re-ran / canceled / paused this run
+            # while we were sleeping — they're driving now, get out
+            # of the way. Mirrors the wayback loop's check.
+            cur_status = _read_run_status_for_retry(run_id)
+            if cur_status not in ("done", "failed"):
+                return
+
+            # Skip RDs already being worked on by a manual retry —
+            # avoids racing the in-flight workers + double-writing.
+            # Import lazily to avoid the tasks↔availability_runner
+            # cycle at module load time.
+            from .tasks import _REANALYZING_RUN_DOMAINS
+
+            candidates = _collect_availability_retry_candidates(
+                run_id, retry_providers,
+            )
+            if not candidates:
+                return
+            candidates = [
+                rd_id for rd_id in candidates
+                if not _REANALYZING_RUN_DOMAINS.is_active(rd_id)
+            ]
+            if not candidates:
+                continue
+
+            # Build a fresh spec to hand the per-RD retry plumbing.
+            # The availability branch of `_retry_failed_run_domain`
+            # only reads `spec.criteria.availability.enabled` — but
+            # we have to satisfy AnalyzeSpec's required `domains`
+            # field with something, so we re-use the run's own spec.
+            from .schemas import AnalyzeSpec
+            db_spec = SessionLocal()
+            try:
+                run = db_spec.get(Run, run_id)
+                if run is None:
+                    return
+                try:
+                    spec = AnalyzeSpec.model_validate(
+                        json.loads(run.spec_json or "{}"),
+                    )
+                except Exception:  # noqa: BLE001
+                    return
+            finally:
+                db_spec.close()
+
+            # Force use_cache=False so a stale cached row doesn't get
+            # served back instead of re-running the cascade. (The
+            # availability pillar's cascade already forces this on the
+            # main path; this is belt-and-suspenders for the retry.)
+            spec.use_cache = False
+
+            from .tasks import _retry_failed_run_domain
+            tasks: list[asyncio.Task] = []
+            for rd_id in candidates:
+                t = asyncio.create_task(
+                    _retry_failed_run_domain(
+                        rd_id, ["availability"], spec, track_set=True,
+                    ),
+                )
+                _REANALYZING_RUN_DOMAINS.add_task(rd_id, t)
+                tasks.append(t)
+            await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "availability auto-retry loop crashed for run %s", run_id,
+        )
+    finally:
+        _AVAILABILITY_AUTO_RETRY_RUNS.discard(run_id)

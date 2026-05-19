@@ -1505,6 +1505,64 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
+  // Post-run Availability auto-retry config (added 2026-05-18). Sibling
+  // of the Wayback toggle above, with an extra `retry_providers` list
+  // — only RDs whose terminal failing provider is in this set get
+  // auto-retried. Default ["rdap"] keeps RDAP-only (free) retries on
+  // and paid Domainr / slow WHOIS retries opt-in.
+  getAvailabilityAutoRetry: () =>
+    request<{
+      config: {
+        enabled: boolean;
+        max_attempts: number;
+        initial_delay_sec: number;
+        backoff_multiplier: number;
+        retry_providers: string[];
+      };
+      defaults: {
+        enabled: boolean;
+        max_attempts: number;
+        initial_delay_sec: number;
+        backoff_multiplier: number;
+        retry_providers: string[];
+      };
+      // Whitelist the UI uses to render the checkbox set. Server-
+      // side validation enforces the same list; UI just mirrors it
+      // so a stale frontend can't request a value the backend will
+      // 400 on.
+      allowed_providers: string[];
+    }>(`/settings/availability-auto-retry`),
+
+  updateAvailabilityAutoRetry: (
+    patch: Partial<{
+      enabled: boolean;
+      max_attempts: number;
+      initial_delay_sec: number;
+      backoff_multiplier: number;
+      retry_providers: string[];
+    }>,
+  ) =>
+    request<{
+      config: {
+        enabled: boolean;
+        max_attempts: number;
+        initial_delay_sec: number;
+        backoff_multiplier: number;
+        retry_providers: string[];
+      };
+      defaults: {
+        enabled: boolean;
+        max_attempts: number;
+        initial_delay_sec: number;
+        backoff_multiplier: number;
+        retry_providers: string[];
+      };
+      allowed_providers: string[];
+    }>(`/settings/availability-auto-retry`, {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
+
   // Per-Job export bundle download URL. Native `<a download>` consumes
   // this — the response is a gzipped JSON tree (Job + Run + RunDomain
   // + CriterionResult + JobCriterionPin) the user can import on

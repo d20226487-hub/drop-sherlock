@@ -5,6 +5,7 @@ import { api, ProviderStatus, RateLimits, SettingsPayload } from "@/lib/api";
 import { ProviderCard } from "@/components/provider-card";
 import { WaybackClassifyEditor } from "@/components/wayback-classify-editor";
 import { WaybackAutoRetryEditor } from "@/components/wayback-auto-retry-editor";
+import { AvailabilityAutoRetryEditor } from "@/components/availability-auto-retry-editor";
 import { RateLimitsTable } from "@/components/rate-limits-table";
 import { ClassifyContextEditor } from "@/components/classify-context-editor";
 import { PromptEditors } from "@/components/prompt-editors";
@@ -215,6 +216,14 @@ export default function SettingsPage() {
 
           {tab === "availability" && (
             <div className="space-y-8">
+              {/* Auto-retry sits above the cascade-order editor for the
+                  same reason it does on Wayback — it's the toggle the
+                  user is most likely to reach for after a flaky burst
+                  run. Mirrors the Wayback tab's layout exactly. */}
+              <section className="space-y-4">
+                <h2 className="text-lg font-semibold">Auto-retry</h2>
+                <AvailabilityAutoRetryEditor />
+              </section>
               <AvailabilityEditor />
             </div>
           )}
