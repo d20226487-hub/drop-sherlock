@@ -761,11 +761,23 @@ export default function RunDetailPage({
   // confusing. Rolled back 2026-05-17: backend `limit=0` returns every
   // row in a single request, and the existing client-side
   // PaginationBottomBar handles in-page navigation as it always did.
-  // Trade-off: if a future run grows past ~10k rows the single fetch may
-  // get heavy — add server pagination back behind a clear single-paginator
-  // UI when that actually bites.
+  //
+  // 2026-05-18: the rollback's "if a future run grows past ~10k rows the
+  // single fetch may get heavy" warning came true on an 11,840-domain
+  // availability run (240% CPU, occasional system freezes). Split the
+  // policy: the INITIAL load via `reload()` still pulls everything
+  // (the table needs the full dataset so client-side pagination /
+  // filtering / search keep working with no UX change), but the
+  // per-2s `reloadProgress()` poll now ships a bounded window
+  // (`POLL_WINDOW_LIMIT` rows max) keyed off the visible page —
+  // see pollWindowRef + the syncing useEffect after search hook init.
+  // Cuts per-tick payload from ~26k rows to ~200 on the offending run.
   const SERVER_PAGE_LIMIT = 0;
   const serverOffset = 0;
+  // Cap on rows the slim poll asks for per tick. 200 covers the common
+  // PAGE_SIZE_OPTIONS (20/50/100) with headroom; on a user who jumps
+  // pageSize to 100 we still send only ~2 pages worth per tick.
+  const POLL_WINDOW_LIMIT = 200;
   // Status filter declaration hoisted up here so `reload()` below can
   // pass it to the backend. Originally lived deeper in the file next to
   // the other table filters; moved 2026-05-16 to break the TDZ on the
@@ -779,6 +791,12 @@ export default function RunDetailPage({
   const [availabilityFilter, setAvailabilityFilter] = useState<string[]>([]);
 
   async function reload() {
+    // Stamp the debounce timer up-front (not on success) so a hung
+    // request doesn't let the slim path queue up a second concurrent
+    // full reload behind it. Any reload — manual Refresh, mount-time,
+    // reanalyze trigger, or the auto-fire from `reloadProgress` —
+    // resets the 5s cooldown the slim path checks before re-firing.
+    lastFullReloadRef.current = Date.now();
     try {
       const opts = {
         limit: SERVER_PAGE_LIMIT,
@@ -815,9 +833,17 @@ export default function RunDetailPage({
   // + `cost` still come from their own slim endpoints.
   async function reloadProgress() {
     try {
+      // Windowed slim poll (2026-05-18, Option A perf fix). Pulls only
+      // the visible page's worth of rows instead of all 11k+ — see
+      // pollWindowRef declaration above for rationale. The merge logic
+      // below is keyed on rd.id, so missing rows just stay at whatever
+      // value they had from the last full reload — fine, since they're
+      // not visible right now. When the user navigates to a different
+      // page, the syncing effect updates the ref and the next tick
+      // covers that window.
       const opts = {
-        limit: SERVER_PAGE_LIMIT,
-        offset: serverOffset,
+        limit: pollWindowRef.current.limit,
+        offset: pollWindowRef.current.offset,
         status:
           statusFilter !== "all" && typeof statusFilter === "string"
             ? statusFilter
@@ -888,10 +914,19 @@ export default function RunDetailPage({
         return { ...prev, status: p.status, domains: nextDomains };
       });
       if (needsFullReload) {
-        // Fire-and-forget — the full /runs/{id} fetch refreshes
-        // the expensive columns. Failures fall back to "stay stale";
-        // the next tick re-detects.
-        void reload();
+        // Debounced fire-and-forget (Option D, 2026-05-18). Each
+        // detected transition USED to fire its own full /runs/{id}
+        // (11k rows on the offending availability run), so a 40-
+        // transition/sec window meant a full reload almost every
+        // poll tick. Now: skip if a reload (auto OR manual) ran
+        // within the last 5s — `lastFullReloadRef` is stamped
+        // inside `reload()` itself. Failures + skipped fires both
+        // resolve at the next slim tick that still sees a
+        // transition; user just gets the heavy refresh ≤5s later
+        // than the strict edge.
+        if (Date.now() - lastFullReloadRef.current >= 5000) {
+          void reload();
+        }
       }
     } catch (e) {
       setError((e as Error).message);
@@ -913,6 +948,27 @@ export default function RunDetailPage({
     reloadRef.current = reload;
     reloadProgressRef.current = reloadProgress;
   });
+  // Polling window — read by `reloadProgress`, written by the
+  // search-state syncing effect declared after `usePaginatedSearch`
+  // below. Default offset=0 covers the first page before the user
+  // touches pagination (and is the right answer when the user is
+  // sitting on page 1, which is the common case mid-run).
+  const pollWindowRef = useRef<{ limit: number; offset: number }>({
+    limit: POLL_WINDOW_LIMIT,
+    offset: 0,
+  });
+  // Debounce timestamp for the auto-fired full /runs/{id} reload from
+  // the transition-detection branch of `reloadProgress`. Updated by
+  // `reload()` itself, so manual Refresh + initial mount + reanalyze
+  // all reset the cooldown — the only thing it gates is the cascade
+  // of full reloads that the slim path triggers per detected
+  // transition (which on a 40-transition/sec run was hammering the
+  // backend with a full 11k-row fetch on every tick). 5s is generous:
+  // status counts (header bar) refresh every 2s via the slim path
+  // anyway; the only thing waiting on the full reload is the
+  // expensive columns (lang/theme/final), which don't need
+  // sub-5s freshness.
+  const lastFullReloadRef = useRef<number>(0);
 
   async function handleReanalyze(provider: AIProvider, model: string) {
     setReanalyzeBusy(true);
@@ -1658,6 +1714,8 @@ export default function RunDetailPage({
         setAvailabilityFilter={setAvailabilityFilter}
         totalCount={run.total_count ?? run.domains.length}
         filteredCount={run.filtered_count ?? run.domains.length}
+        pollWindowRef={pollWindowRef}
+        pollWindowLimit={POLL_WINDOW_LIMIT}
       />
     </div>
   );
@@ -1800,6 +1858,12 @@ function DomainsSection({
   // count under the filter row.
   totalCount,
   filteredCount,
+  // Parent-owned ref that the slim-poll loop reads to scope its
+  // limit/offset to the user's currently-visible client page (perf
+  // fix, 2026-05-18). We write into ref.current whenever the search
+  // hook's page/pageSize change — see useEffect below `usePaginatedSearch`.
+  pollWindowRef,
+  pollWindowLimit,
 }: {
   domains: RunDomainProgress[];
   jobId: number;
@@ -1813,6 +1877,8 @@ function DomainsSection({
   setAvailabilityFilter: (v: string[]) => void;
   totalCount: number;
   filteredCount: number;
+  pollWindowRef: React.MutableRefObject<{ limit: number; offset: number }>;
+  pollWindowLimit: number;
 }) {
   const { t } = useT();
   const ts = t.pages.jobs.run;
@@ -1931,6 +1997,21 @@ function DomainsSection({
     [],
   );
   const search = usePaginatedSearch<RunDomainProgress>(filtered, matchDomain);
+
+  // Sync the slim-poll window with whichever client-side page the
+  // user is currently looking at (Option A, 2026-05-18). Cap at
+  // pollWindowLimit so a user who picks pageSize=100 doesn't
+  // accidentally re-enable a 10k-row poll by jumping to the last
+  // page. Offset is over backend-ordered rows; if the user has a
+  // client-side search active, the offset is approximate (the
+  // backend can't know about the client filter), but the merge is
+  // by id so any overlap still refreshes the user's visible rows.
+  useEffect(() => {
+    pollWindowRef.current = {
+      limit: Math.min(search.pageSize, pollWindowLimit),
+      offset: Math.max(0, (search.page - 1) * search.pageSize),
+    };
+  }, [search.page, search.pageSize, pollWindowRef, pollWindowLimit]);
 
   // Page-level select-all checkbox covers the currently-visible page
   // (post-filter, post-search, post-paginate). Cross-page bulk select
