@@ -49,6 +49,19 @@ async def check_one(payload: CheckIn) -> CheckOut:
     result = await check_availability_async(
         domain, use_cache=payload.use_cache,
     )
+    # Approach-1↔approach-2 bridge (extended 2026-05-18 to cover the
+    # ad-hoc Recheck endpoints — previously only the dedicated
+    # Availability Job runner called this, so per-row Recheck button
+    # clicks updated the Database/Backlog Availability column but left
+    # the Backlog Истечение column empty). Same semantics as the Job
+    # path: idempotent, ban-aware, only writes when there's actually
+    # new info, creates a row with status='analyzed' if the domain
+    # isn't in Backlog yet.
+    if result.expires_on is not None:
+        from ..availability.backlog_upsert import upsert_backlog_expiration
+        upsert_backlog_expiration(
+            result.domain, result.expires_on, result.registrar,
+        )
     return CheckOut(
         domain=result.domain,
         status=result.status,
@@ -119,6 +132,18 @@ async def bulk_check(payload: BulkCheckIn) -> BulkCheckOut:
         )
         for r in results
     ]
+    # Mirror the /check endpoint: write expires_on back to BacklogDomain
+    # for every result that carries one (added 2026-05-18). The bulk
+    # Recheck button on Backlog used to refresh the Availability column
+    # but leave Истечение empty. Sequential upserts here — each call
+    # opens its own short-lived session, and at typical bulk-recheck
+    # sizes (tens to low hundreds) the per-row cost is negligible
+    # compared to the cascade HTTP latency the user already waited
+    # through above.
+    from ..availability.backlog_upsert import upsert_backlog_expiration
+    for r in results:
+        if r.expires_on is not None:
+            upsert_backlog_expiration(r.domain, r.expires_on, r.registrar)
     return BulkCheckOut(checked=len(items), items=items)
 
 
