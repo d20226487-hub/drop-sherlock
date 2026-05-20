@@ -126,6 +126,14 @@ class ImportRowIn(BaseModel):
     comments: str | None = Field(default=None, max_length=_IMPORT_MAX_COMMENTS_LEN)
     desired_price: float | None = None
     max_price: float | None = None
+    # Ahrefs DR captured at import (added 2026-05-20). Storage-only;
+    # not surfaced in any UI yet. Reserved for a future "rows we want
+    # to order" export. Nullable; the importer drops invalid /
+    # out-of-range values to None at the frontend.
+    ahrefs_dr: float | None = None
+    # Domain age in years captured at import (added 2026-05-20). Same
+    # storage-only contract as ahrefs_dr.
+    domain_age_years: float | None = None
 
 
 class ImportIn(BaseModel):
@@ -1264,6 +1272,8 @@ def import_rows(payload: ImportIn, db: Session = Depends(get_db)) -> ImportResul
                 comments=r.comments or "",
                 desired_price=r.desired_price,
                 max_price=r.max_price,
+                ahrefs_dr=r.ahrefs_dr,
+                domain_age_years=r.domain_age_years,
             )
         )
         inserted += 1

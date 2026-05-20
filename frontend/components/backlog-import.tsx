@@ -23,7 +23,15 @@ type TargetField =
   | "project"
   | "comments"
   | "desired_price"
-  | "max_price";
+  | "max_price"
+  // Ahrefs DR (added 2026-05-20). Storage-only: nothing renders it in
+  // the Backlog / Database UI; the field exists so an upload that
+  // includes a DR column can carry that value into the DB for a future
+  // procurement / order-list export.
+  | "ahrefs_dr"
+  // Domain age in years (added 2026-05-20). Same storage-only contract
+  // as ahrefs_dr.
+  | "domain_age_years";
 
 const TARGET_FIELDS: TargetField[] = [
   "skip",
@@ -35,6 +43,8 @@ const TARGET_FIELDS: TargetField[] = [
   "comments",
   "desired_price",
   "max_price",
+  "ahrefs_dr",
+  "domain_age_years",
 ];
 
 const DATE_FORMAT_OPTIONS: DateFormat[] = [
@@ -64,6 +74,19 @@ const HEADER_HINTS: { needle: string; field: TargetField }[] = [
   { needle: "comment", field: "comments" },
   { needle: "note", field: "comments" },
   { needle: "status", field: "status" },
+  // Ahrefs DR auto-map — needs to fire BEFORE the "domain" / "name"
+  // hints below, because "domain rating" contains "domain" as a
+  // substring and would otherwise win.
+  { needle: "ahrefs dr", field: "ahrefs_dr" },
+  { needle: "domain rating", field: "ahrefs_dr" },
+  { needle: "domain_rating", field: "ahrefs_dr" },
+  { needle: "dr", field: "ahrefs_dr" },
+  // Domain age auto-map — same ordering reason: "domain age" contains
+  // "domain" so age hints must precede the bare "domain" needle.
+  { needle: "domain age", field: "domain_age_years" },
+  { needle: "domain_age", field: "domain_age_years" },
+  { needle: "site age", field: "domain_age_years" },
+  { needle: "age", field: "domain_age_years" },
   { needle: "domain", field: "domain" },
   { needle: "name", field: "domain" },
 ];
@@ -87,6 +110,32 @@ function parsePrice(raw: string): number | null {
   if (!cleaned) return null;
   const n = parseFloat(cleaned);
   return Number.isFinite(n) ? n : null;
+}
+
+// Ahrefs DR (Domain Rating). Same input shape as price (numeric, may
+// have stray symbols / commas) but constrained to 0–100. Out-of-range
+// or unparseable cells become null — the importer treats DR as
+// optional metadata and won't fail the row.
+function parseDr(raw: string): number | null {
+  const cleaned = raw.replace(/[^\d.,-]/g, "").replace(/,/g, ".");
+  if (!cleaned) return null;
+  const n = parseFloat(cleaned);
+  if (!Number.isFinite(n)) return null;
+  if (n < 0 || n > 100) return null;
+  return n;
+}
+
+// Domain age in years. Float (Spamzilla / Ahrefs / ExpiredDomains.net
+// surface decimals like "5.2"). Sanity bounds 0–100: rejects negative
+// noise and >100 "thousand-of-days-misread-as-years" outliers while
+// staying generous enough for any real domain.
+function parseAge(raw: string): number | null {
+  const cleaned = raw.replace(/[^\d.,-]/g, "").replace(/,/g, ".");
+  if (!cleaned) return null;
+  const n = parseFloat(cleaned);
+  if (!Number.isFinite(n)) return null;
+  if (n < 0 || n > 100) return null;
+  return n;
 }
 
 export function BacklogImport({
@@ -234,6 +283,10 @@ export function BacklogImport({
           out.desired_price = parsePrice(cell);
         } else if (target === "max_price") {
           out.max_price = parsePrice(cell);
+        } else if (target === "ahrefs_dr") {
+          out.ahrefs_dr = parseDr(cell);
+        } else if (target === "domain_age_years") {
+          out.domain_age_years = parseAge(cell);
         }
       }
       // Apply defaults for unmapped fields.

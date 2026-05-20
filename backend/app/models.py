@@ -102,6 +102,22 @@ class BacklogDomain(Base):
     comments: Mapped[str] = mapped_column(Text, default="")
     desired_price: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
     max_price: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    # Ahrefs DR (Domain Rating, 0-100) captured at backlog-import time
+    # (added 2026-05-20). Stored only — NOT surfaced on the Backlog UI
+    # or the Database UI for now; reserved for a future export of "rows
+    # we want to order" where DR is a procurement signal. Nullable +
+    # not indexed (no filter/sort planned yet). Float (not Int) because
+    # Ahrefs occasionally returns fractional DR via the API even though
+    # the UI rounds it.
+    ahrefs_dr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Domain age in years (added 2026-05-20). Same storage-only
+    # contract as ahrefs_dr — no UI surface yet; reserved for the same
+    # future procurement export. Float because Spamzilla / Ahrefs /
+    # ExpiredDomains.net all surface fractional ages (e.g. "5.2"); the
+    # importer's parser sanity-rejects values <0 or >100 to drop
+    # malformed cells. Column name encodes the unit so future "X age"
+    # fields don't collide.
+    domain_age_years: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow

@@ -126,6 +126,12 @@ def _migrate_sqlite_columns() -> None:
         # Sits next to `comments`; same edit affordances, no semantics
         # enforced. NOT NULL via the "" default to match comments.
         ("backlog_domains", "project", "TEXT DEFAULT ''"),
+        # Ahrefs DR captured at import time (added 2026-05-20). Storage-
+        # only; not surfaced in any UI yet. Nullable Float.
+        ("backlog_domains", "ahrefs_dr", "REAL"),
+        # Domain age in years captured at import time (added 2026-05-20).
+        # Same storage-only contract as ahrefs_dr.
+        ("backlog_domains", "domain_age_years", "REAL"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding

@@ -2607,6 +2607,14 @@ export type BacklogImportRow = {
   comments?: string;
   desired_price?: number | null;
   max_price?: number | null;
+  // Ahrefs DR (0-100) captured at import (added 2026-05-20).
+  // Storage-only — not surfaced in the Backlog page or Database page
+  // UI yet; reserved for a future order-list export. Numeric; the
+  // importer's parser drops malformed cells to null.
+  ahrefs_dr?: number | null;
+  // Domain age in years (added 2026-05-20). Same storage-only
+  // contract as ahrefs_dr.
+  domain_age_years?: number | null;
 };
 
 export type BacklogImportResult = {
