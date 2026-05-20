@@ -36,6 +36,7 @@ from ..db import SessionLocal, get_db
 from ..models import (
     CriterionResult,
     DomainNote,
+    DomainShare,
     Job,
     JobCriterionPin,
     Run,
@@ -212,6 +213,28 @@ class DomainRow(BaseModel):
     # feeds). Empty when the domain has no backlog row or the import didn't
     # carry a registrar string.
     backlog_registrar: str = ""
+    # Backlog Ahrefs DR + domain age (added 2026-05-20). Captured at CSV
+    # import time on the Backlog page; surfaced HERE so the Database row
+    # can render them as small sub-line chips under the domain name. Both
+    # null when the domain has no backlog row OR the imported CSV didn't
+    # carry a value for that field. Kept on the row payload (not behind a
+    # lazy lookup) because they're already on the joined BacklogDomain
+    # row that hydrates `backlog_registrar` — zero extra cost.
+    backlog_ahrefs_dr: float | None = None
+    backlog_domain_age_years: float | None = None
+    # Backlog expiration date (added 2026-05-20, Apruv export). Surfaced
+    # from the same joined BacklogDomain row so the Apruv-export CSV
+    # column-picker can offer it without a second lookup. Null when no
+    # backlog row OR the import / availability cascade hasn't populated
+    # it yet.
+    backlog_expiration_date: date | None = None
+    # Procurement price bracket from the BacklogDomain row (added
+    # 2026-05-20, Apruv export). `desired_price` is the ideal (low-end)
+    # bid; `max_price` is the absolute ceiling above which the operator
+    # walks away. Null when the import didn't carry a value. Same join
+    # as the other backlog_* fields — zero extra cost.
+    backlog_desired_price: float | None = None
+    backlog_max_price: float | None = None
     # Ban-list flag (added 2026-05-13 wave L). True when this domain is
     # on the ban list — drives the "banned" badge on Database rows.
     # Banning is orthogonal to pin/backlog status: a row can be both
@@ -762,6 +785,19 @@ def list_domains(
                 backlog_id=backlog_row.id if backlog_row else None,
                 backlog_status=backlog_row.status if backlog_row else None,
                 backlog_registrar=(backlog_row.registrar or "") if backlog_row else "",
+                backlog_ahrefs_dr=backlog_row.ahrefs_dr if backlog_row else None,
+                backlog_domain_age_years=(
+                    backlog_row.domain_age_years if backlog_row else None
+                ),
+                backlog_expiration_date=(
+                    backlog_row.expiration_date if backlog_row else None
+                ),
+                backlog_desired_price=(
+                    backlog_row.desired_price if backlog_row else None
+                ),
+                backlog_max_price=(
+                    backlog_row.max_price if backlog_row else None
+                ),
             ))
             if backlog_row and backlog_row.registrar:
                 sources_seen.add(backlog_row.registrar)
@@ -1299,6 +1335,19 @@ def list_domains(
             backlog_id=backlog_row.id if backlog_row else None,
             backlog_status=backlog_row.status if backlog_row else None,
             backlog_registrar=(backlog_row.registrar or "") if backlog_row else "",
+            backlog_ahrefs_dr=backlog_row.ahrefs_dr if backlog_row else None,
+            backlog_domain_age_years=(
+                backlog_row.domain_age_years if backlog_row else None
+            ),
+            backlog_expiration_date=(
+                backlog_row.expiration_date if backlog_row else None
+            ),
+            backlog_desired_price=(
+                backlog_row.desired_price if backlog_row else None
+            ),
+            backlog_max_price=(
+                backlog_row.max_price if backlog_row else None
+            ),
         ))
         if backlog_row and backlog_row.registrar:
             sources_seen.add(backlog_row.registrar)
@@ -2017,3 +2066,180 @@ def bulk_set_backlog_status(
         skipped_banned=skipped_banned,
         status=payload.status,
     )
+
+
+# --- Apruv export: batch share-link resolution ----------------------------
+#
+# The Database page's "Apruv" bulk-action ships approver-ready CSV exports.
+# Each selected domain needs a deep-link to its per-domain analysis page —
+# this endpoint takes the domain list and returns one share token per domain.
+#
+# Resolution policy (locked 2026-05-20):
+#   1. Pinned RunDomain wins (it's the canonical "this is the run I stand
+#      behind" choice on the Database row). If multiple criteria are
+#      pinned to different rds, we use the most-recent rd among them.
+#   2. Fallback: the most-recent analyzed RunDomain for the domain
+#      (finished_at desc), regardless of which Job. Matches the same
+#      "latest wins" pattern other Database surfaces use.
+#   3. No RunDomain at all (pure backlog-only domain): item is returned
+#      with token=null and an error_message, so the FE can render the
+#      Share-URL column as empty without failing the whole export.
+#
+# Reuse policy: prefer an existing active (non-revoked, non-expired)
+# DomainShare for the resolved RunDomain. Only mints a fresh token when
+# no active share exists. Keeps the /shares management page from
+# bloating when an operator re-exports the same domains weekly.
+
+class ApruvShareLinkItemIn(BaseModel):
+    domain: str
+
+
+class ApruvShareLinksIn(BaseModel):
+    """Batch request: one item per selected domain, plus a default
+    expiry for any freshly-minted share tokens."""
+    items: list[ApruvShareLinkItemIn] = Field(default_factory=list)
+    # Default 30 days per the locked decision. 0 = never expires; the
+    # FE will surface this trade-off in the dialog copy.
+    expires_in_days: int = 30
+
+
+class ApruvShareLinkItemOut(BaseModel):
+    domain: str
+    # null when no run-domain was resolvable (pure backlog row). The FE
+    # renders this row's Share URL cell as empty + a "no analysis yet"
+    # note in the export summary.
+    run_domain_id: int | None = None
+    token: str | None = None
+    share_url: str | None = None  # absolute path the FE composes against origin
+    expires_at: datetime | None = None
+    reused: bool = False
+    error: str = ""
+
+
+class ApruvShareLinksOut(BaseModel):
+    items: list[ApruvShareLinkItemOut]
+
+
+def _resolve_share_target_rd(db: Session, domain: str) -> RunDomain | None:
+    """Pick the RunDomain to share for `domain` per the locked policy:
+    pinned wins, else most-recent analyzed RunDomain (finished_at desc).
+    Returns None when no analyzed rd exists at all.
+
+    `JobCriterionPin` is keyed at the (job, criterion, run) level — NOT
+    (job, criterion, run-domain). So "pinned" means: there's a run-domain
+    for this `domain` whose `run_id` is referenced by ANY JobCriterionPin
+    row. We join through Run to find such a match, then fall back to the
+    plain most-recent rd when no pin overlaps.
+    """
+    # 1. Pinned: a JobCriterionPin references this rd's run.
+    pinned = (
+        db.query(RunDomain)
+        .join(JobCriterionPin, JobCriterionPin.run_id == RunDomain.run_id)
+        .filter(RunDomain.domain == domain)
+        .order_by(RunDomain.finished_at.desc().nullslast(), RunDomain.id.desc())
+        .first()
+    )
+    if pinned is not None:
+        return pinned
+    # 2. Fallback: most-recent finished rd for this domain.
+    return (
+        db.query(RunDomain)
+        .filter(RunDomain.domain == domain)
+        .order_by(RunDomain.finished_at.desc().nullslast(), RunDomain.id.desc())
+        .first()
+    )
+
+
+def _find_active_share(db: Session, run_domain_id: int) -> DomainShare | None:
+    """Most-recent non-revoked, non-expired share for this rd. The FE
+    reuses this URL when present so re-exports don't multiply tokens."""
+    now = datetime.utcnow()
+    return (
+        db.query(DomainShare)
+        .filter(DomainShare.run_domain_id == run_domain_id)
+        .filter(DomainShare.revoked_at.is_(None))
+        .filter(
+            (DomainShare.expires_at.is_(None)) | (DomainShare.expires_at > now)
+        )
+        .order_by(DomainShare.created_at.desc())
+        .first()
+    )
+
+
+@router.post("/approve-share-links", response_model=ApruvShareLinksOut)
+def approve_share_links(
+    payload: ApruvShareLinksIn,
+    db: Session = Depends(get_db),
+) -> ApruvShareLinksOut:
+    """Resolve one share token per selected Database-page domain for
+    the Apruv export. See the policy comment block above for the full
+    contract."""
+    import secrets
+    from datetime import timedelta
+
+    # Caller-controlled expiry. 0 = never expires (matches the existing
+    # /shares endpoint contract). Clamp to a sane upper bound so a typo
+    # can't create a 100-year share by accident.
+    if payload.expires_in_days < 0 or payload.expires_in_days > 3650:
+        raise HTTPException(
+            400,
+            f"expires_in_days must be in [0, 3650]; got {payload.expires_in_days}",
+        )
+
+    out: list[ApruvShareLinkItemOut] = []
+    for item in payload.items:
+        domain = (item.domain or "").strip().lower()
+        if not domain:
+            out.append(ApruvShareLinkItemOut(
+                domain=item.domain or "",
+                error="empty domain",
+            ))
+            continue
+        rd = _resolve_share_target_rd(db, domain)
+        if rd is None:
+            out.append(ApruvShareLinkItemOut(
+                domain=domain,
+                error="no analyzed RunDomain for this domain — pure backlog row",
+            ))
+            continue
+        # Reuse policy first.
+        share = _find_active_share(db, rd.id)
+        reused = share is not None
+        if share is None:
+            # Mint a new token with the requested expiry.
+            expires_at: datetime | None = None
+            if payload.expires_in_days > 0:
+                expires_at = datetime.utcnow() + timedelta(
+                    days=payload.expires_in_days,
+                )
+            # 32 bytes urlsafe == 256 bits — same shape as the existing
+            # /shares endpoint; collision retry loop for paranoia.
+            for _ in range(5):
+                token = secrets.token_urlsafe(32)
+                if db.get(DomainShare, token) is None:
+                    break
+            else:
+                out.append(ApruvShareLinkItemOut(
+                    domain=domain,
+                    error="could not allocate a unique share token",
+                ))
+                continue
+            share = DomainShare(
+                token=token,
+                run_domain_id=rd.id,
+                note="apruv-export",
+                expires_at=expires_at,
+                created_ip="",  # not surfaced; batch endpoint, no per-row source
+            )
+            db.add(share)
+            db.flush()  # so share.created_at is set for the response
+        out.append(ApruvShareLinkItemOut(
+            domain=domain,
+            run_domain_id=rd.id,
+            token=share.token,
+            share_url=f"/share/{share.token}",
+            expires_at=share.expires_at,
+            reused=reused,
+        ))
+    db.commit()
+    return ApruvShareLinksOut(items=out)

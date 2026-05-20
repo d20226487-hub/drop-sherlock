@@ -969,6 +969,54 @@ const messagesEn = {
           return `${parts.join(" · ")} (status = ${status}).`;
         },
       },
+      // Apruv export (added 2026-05-20). Bulk action that builds a CSV
+      // for an approver, including auto-generated share URLs per row.
+      apruv: {
+        button: (n: number) => `Apruv (${n})`,
+        buttonHint:
+          "Export selected rows as a CSV for an approver, with auto-generated share URLs the approver can open without logging in.",
+        modalTitle: "Apruv export",
+        modalHelp: (n: number) =>
+          `${n} selected row${n === 1 ? "" : "s"} will be exported. Pick the columns to include. A share URL is auto-generated for each row so the approver can open the analysis page without logging in.`,
+        expiryLabel: "Share-link expiry",
+        expiry7: "7 days",
+        expiry30: "30 days",
+        expiry90: "90 days",
+        expiryNever: "Never expires",
+        columnsLabel: "Columns to include",
+        mandatoryHint:
+          "Domain and Share URL are always included.",
+        cols: {
+          domain: "Domain",
+          share_url: "Share URL",
+          backlog_status: "Status",
+          backlog_registrar: "Source",
+          backlog_expiration_date: "Expiration date",
+          backlog_desired_price: "Desired price",
+          backlog_max_price: "Max price",
+          backlog_ahrefs_dr: "Ahrefs DR",
+          backlog_domain_age_years: "Age (years)",
+          final_score: "Ahrefs score",
+          final_confidence: "Confidence",
+          wayback_verdict: "Wayback verdict",
+          wayback_confidence: "Wayback confidence",
+          whois_band: "Whois band",
+          primary_language: "Language",
+          primary_theme: "Theme",
+          category: "Category",
+          note: "Notes",
+          ai_provider: "AI provider",
+          ai_model: "AI model",
+        },
+        cancel: "Cancel",
+        close: "Close",
+        exportCsv: "Export CSV",
+        exporting: "Exporting…",
+        resultSummary: (inserted: number, skipped: number) =>
+          skipped === 0
+            ? `Downloaded ${inserted} row${inserted === 1 ? "" : "s"}.`
+            : `Downloaded ${inserted} row${inserted === 1 ? "" : "s"} · skipped ${skipped} (no share URL).`,
+      },
       // Ban-list bulk action + per-row badge (added 2026-05-13 wave L).
       bulkBan: (n: number) => `Add ${n} to Ban List`,
       bulkBanBusy: "Adding…",
@@ -1060,6 +1108,12 @@ const messagesEn = {
         sourceLabel: "Source",
         sourceAny: "Any source",
         sourceSearchPlaceholder: "Search sources…",
+        // Backlog-status filter (2026-05-20) — sits right after Source
+        // on the Database page filter row. Chip labels for individual
+        // statuses come from t.pages.backlog.statusLabels (shared
+        // vocabulary across pages).
+        statusLabel: "Status",
+        statusAny: "Any status",
         minRecords: "Min records",
         minRecordsHelp:
           "Minimum row count in the chosen criterion (latest run).",
@@ -3109,6 +3163,61 @@ const messagesRu: Messages = {
           return `${parts.join(" · ")} (статус = ${status}).`;
         },
       },
+      // Apruv export (added 2026-05-20) — см. EN.
+      apruv: {
+        button: (n) => `Апрув (${n})`,
+        buttonHint:
+          "Экспортировать выбранные строки в CSV для согласующего, с автоматически сгенерированными ссылками-шарингами, которые согласующий открывает без авторизации.",
+        modalTitle: "Апрув-экспорт",
+        modalHelp: (n) => {
+          const last2 = n % 100;
+          const last = n % 10;
+          let word = "строк";
+          if (last2 < 11 || last2 > 14) {
+            if (last === 1) word = "строка";
+            else if (last >= 2 && last <= 4) word = "строки";
+          }
+          return `Будет экспортировано ${n} ${word}. Выберите колонки. Для каждой строки автоматически создаётся ссылка-шаринг, чтобы согласующий открыл страницу анализа без авторизации.`;
+        },
+        expiryLabel: "Срок действия ссылки",
+        expiry7: "7 дней",
+        expiry30: "30 дней",
+        expiry90: "90 дней",
+        expiryNever: "Бессрочно",
+        columnsLabel: "Колонки в экспорте",
+        mandatoryHint:
+          "Домен и Share URL включены всегда.",
+        cols: {
+          domain: "Домен",
+          share_url: "Ссылка-шаринг",
+          backlog_status: "Статус",
+          backlog_registrar: "Источник",
+          backlog_expiration_date: "Дата истечения",
+          backlog_desired_price: "Желаемая цена",
+          backlog_max_price: "Макс. цена",
+          backlog_ahrefs_dr: "Ahrefs DR",
+          backlog_domain_age_years: "Возраст (лет)",
+          final_score: "Ahrefs-балл",
+          final_confidence: "Уверенность",
+          wayback_verdict: "Вердикт Wayback",
+          wayback_confidence: "Уверенность Wayback",
+          whois_band: "Whois-полоса",
+          primary_language: "Язык",
+          primary_theme: "Тема",
+          category: "Категория",
+          note: "Заметки",
+          ai_provider: "AI-провайдер",
+          ai_model: "AI-модель",
+        },
+        cancel: "Отмена",
+        close: "Закрыть",
+        exportCsv: "Экспорт CSV",
+        exporting: "Экспорт…",
+        resultSummary: (inserted, skipped) =>
+          skipped === 0
+            ? `Скачано строк: ${inserted}.`
+            : `Скачано строк: ${inserted} · пропущено: ${skipped} (нет ссылки-шаринга).`,
+      },
       bulkBan: (n) => `В бан-лист (${n})`,
       bulkBanBusy: "Добавление…",
       bulkBanHint:
@@ -3198,6 +3307,9 @@ const messagesRu: Messages = {
         sourceLabel: "Источник",
         sourceAny: "Любой источник",
         sourceSearchPlaceholder: "Поиск источников…",
+        // Backlog-status filter (2026-05-20) — см. EN.
+        statusLabel: "Статус",
+        statusAny: "Любой статус",
         minRecords: "Мин. записей",
         minRecordsHelp:
           "Минимальное число строк в выбранном критерии (последний запуск).",

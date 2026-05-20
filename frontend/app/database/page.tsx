@@ -6,6 +6,8 @@ import { useT } from "@/lib/i18n";
 import {
   api,
   AvailabilityStatus,
+  BACKLOG_STATUSES,
+  BacklogStatus,
   DatabaseDomainList,
   DatabaseDomainRow,
 } from "@/lib/api";
@@ -179,6 +181,17 @@ export default function DatabasePage() {
   // Same vocabulary as the Backlog page's Source filter; backend
   // populates `filter_options.sources` with the distinct universe.
   const [sourceFilter, setSourceFilter] = useState<string[]>([]);
+  // Backlog-status filter (2026-05-20) — multi-select on
+  // BacklogDomain.status, surfaced from the joined row that already
+  // hydrates `backlog_status` on every DomainRow. Vocabulary reused
+  // verbatim from BACKLOG_STATUSES so the chip labels stay 1:1 with
+  // the Backlog page filter (per the locked "chip/filter vocab lines
+  // up 1:1" rule). Empty selection = no constraint; otherwise a row
+  // passes only when its `backlog_status` is in the selected set.
+  // Rows whose domain has no BacklogDomain attached (backlog_status
+  // null) are excluded whenever this filter has values selected —
+  // those rows have no status to match.
+  const [statusFilter, setStatusFilter] = useState<BacklogStatus[]>([]);
   // wayback_classify filters (added 2026-05-09).
   const [languages, setLanguages] = useState<string[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
@@ -224,6 +237,17 @@ export default function DatabasePage() {
         if (v.notesFilter === "any" || v.notesFilter === "with" || v.notesFilter === "without") setNotesFilter(v.notesFilter);
         if (v.pinFilter === "any" || v.pinFilter === "pinned" || v.pinFilter === "unpinned") setPinFilter(v.pinFilter);
         if (Array.isArray(v.sourceFilter)) setSourceFilter(v.sourceFilter);
+        if (Array.isArray(v.statusFilter)) {
+          // Defensive: drop any persisted value that isn't a known
+          // BacklogStatus, so a stale blob from a future migration
+          // can't poison the filter state.
+          setStatusFilter(
+            v.statusFilter.filter((s: unknown): s is BacklogStatus =>
+              typeof s === "string" &&
+              (BACKLOG_STATUSES as readonly string[]).includes(s),
+            ),
+          );
+        }
         if (Array.isArray(v.languages)) setLanguages(v.languages);
         if (Array.isArray(v.categories)) setCategories(v.categories);
         if (typeof v.waybackConfMin === "number") setWaybackConfMin(v.waybackConfMin);
@@ -259,6 +283,7 @@ export default function DatabasePage() {
             notesFilter,
             pinFilter,
             sourceFilter,
+            statusFilter,
             languages,
             categories,
             waybackConfMin,
@@ -282,6 +307,7 @@ export default function DatabasePage() {
     notesFilter,
     pinFilter,
     sourceFilter,
+    statusFilter,
     languages,
     categories,
     waybackConfMin,
@@ -539,6 +565,18 @@ export default function DatabasePage() {
       ) {
         return false;
       }
+      // Backlog status filter — narrow to rows whose attached
+      // BacklogDomain.status is in the selected set. Rows with no
+      // backlog row (backlog_status null) are excluded as soon as ANY
+      // status is selected (they have nothing to match against).
+      if (statusFilter.length > 0) {
+        if (
+          r.backlog_status == null ||
+          !statusFilter.includes(r.backlog_status)
+        ) {
+          return false;
+        }
+      }
       if (!matchVerdict(r)) return false;
       if (!matchWayback(r)) return false;
       if (!matchWhois(r)) return false;
@@ -585,6 +623,7 @@ export default function DatabasePage() {
     data,
     pinFilter,
     sourceFilter,
+    statusFilter,
     verdicts,
     waybackVerdicts,
     whoisBands,
@@ -787,6 +826,56 @@ export default function DatabasePage() {
     }
   }
 
+  // Apruv export (added 2026-05-20). Opens a modal where the user picks
+  // which columns to include in a CSV destined for an approver, and
+  // ships one auto-generated share URL per row so the approver can
+  // open each domain's analysis page WITHOUT basic-auth. Backend
+  // endpoint POST /database/approve-share-links handles the
+  // pin>most-recent resolution + share token reuse policy. Modal
+  // closes on Cancel or after a successful download.
+  const [apruvOpen, setApruvOpen] = useState(false);
+  const [apruvBusy, setApruvBusy] = useState(false);
+  const [apruvExpiresDays, setApruvExpiresDays] = useState<number>(30);
+  // Per-column inclusion. Domain + share_url are always on; the rest
+  // are user-toggleable. Defaults flag the procurement signals an
+  // approver typically wants at a glance (expiry / DR / age / score
+  // / bucket / source / notes).
+  // Order matches the CSV output (and the picker layout — they're
+  // kept in lockstep so the visual sequence in the modal mirrors what
+  // the approver sees in the file). Top block = the 12 procurement
+  // signals the user prioritised on 2026-05-20; "extras" below stay
+  // available but default off. `final_bucket` (verdict) was dropped
+  // 2026-05-20 — the numeric `final_score` already conveys verdict.
+  const APRUV_COLUMN_DEFAULTS: Record<string, boolean> = {
+    backlog_status: true,
+    backlog_registrar: true,
+    primary_theme: true,
+    final_score: true,
+    backlog_ahrefs_dr: true,
+    backlog_domain_age_years: true,
+    backlog_desired_price: true,
+    backlog_max_price: true,
+    backlog_expiration_date: true,
+    note: true,
+    // Extras — off by default.
+    final_confidence: false,
+    wayback_verdict: false,
+    wayback_confidence: false,
+    whois_band: false,
+    primary_language: false,
+    category: false,
+    ai_provider: false,
+    ai_model: false,
+  };
+  const [apruvColumns, setApruvColumns] = useState<Record<string, boolean>>(
+    APRUV_COLUMN_DEFAULTS,
+  );
+  const [apruvResult, setApruvResult] = useState<{
+    inserted: number;
+    skipped: number;
+    skipped_reasons: string[];
+  } | null>(null);
+
   // Bulk-ban (added 2026-05-13 wave L). Sends the selected rows to the
   // ban list via the /database/domains/bulk-ban endpoint, which reuses
   // the same normalization as the rest of the app. Existing
@@ -824,6 +913,107 @@ export default function DatabasePage() {
     }
   }
 
+  // Apruv export handler — composes a CSV from (a) user-selected
+  // columns on the local DatabaseDomainRow data + (b) auto-generated
+  // share URLs minted by the backend. Always emits `domain` + `share_url`
+  // as the leading two columns even when neither is in the picker; both
+  // are conceptually mandatory for an approver export.
+  async function handleApruvExport() {
+    if (selected.size === 0 || apruvBusy) return;
+    setApruvBusy(true);
+    setApruvResult(null);
+    try {
+      const domains = Array.from(selected);
+      // Map domain -> DatabaseDomainRow from current page data so the
+      // column getters have something to read from. Pure backlog rows
+      // (no analyzed run) won't be in `data.rows` but we still want
+      // to include them in the CSV with empty cells — they'll have a
+      // share-link error from the backend.
+      const rowByDomain = new Map<string, DatabaseDomainRow>();
+      for (const r of data?.rows ?? []) rowByDomain.set(r.domain, r);
+
+      const linkResp = await api.approveShareLinks(domains, apruvExpiresDays);
+      const linkByDomain = new Map<string, typeof linkResp.items[number]>();
+      for (const it of linkResp.items) linkByDomain.set(it.domain, it);
+
+      // Column catalog — order matches the modal listing AND the CSV
+      // output (kept in lockstep so the approver sees the same column
+      // sequence in the file as the operator picked in the modal).
+      // `domain` (slot 1) and `share_url` (slot 5) are emitted
+      // unconditionally; everything else is gated on `apruvColumns[key]`.
+      // The first 12 entries below are the 2026-05-20 procurement order;
+      // the trailing "extras" remain available but default off.
+      // `final_bucket` (verdict) intentionally absent — `final_score`
+      // already conveys the verdict numerically.
+      const allColumns: { key: string; header: string; get: (r: DatabaseDomainRow | undefined, domain: string) => string | number }[] = [
+        { key: "domain", header: "domain", get: (_r, d) => d },
+        { key: "backlog_status", header: "status", get: (r) => r?.backlog_status || "" },
+        { key: "backlog_registrar", header: "source", get: (r) => r?.backlog_registrar || "" },
+        { key: "primary_theme", header: "theme", get: (r) => r?.primary_theme || "" },
+        {
+          key: "share_url",
+          header: "share_url",
+          get: (_r, d) => {
+            const it = linkByDomain.get(d);
+            if (!it || !it.share_url) return "";
+            return `${window.location.origin}${it.share_url}`;
+          },
+        },
+        { key: "final_score", header: "ahrefs_score", get: (r) => r?.final_score ?? "" },
+        { key: "backlog_ahrefs_dr", header: "ahrefs_dr", get: (r) => r?.backlog_ahrefs_dr ?? "" },
+        { key: "backlog_domain_age_years", header: "age_years", get: (r) => r?.backlog_domain_age_years ?? "" },
+        { key: "backlog_desired_price", header: "desired_price", get: (r) => r?.backlog_desired_price ?? "" },
+        { key: "backlog_max_price", header: "max_price", get: (r) => r?.backlog_max_price ?? "" },
+        { key: "backlog_expiration_date", header: "expiration_date", get: (r) => r?.backlog_expiration_date || "" },
+        { key: "note", header: "note", get: (r) => r?.note || "" },
+        // Extras (below the user's prioritised top-12).
+        { key: "final_confidence", header: "confidence", get: (r) => r?.final_confidence ?? "" },
+        { key: "wayback_verdict", header: "wayback_verdict", get: (r) => r?.wayback_assessment || "" },
+        { key: "wayback_confidence", header: "wayback_confidence", get: (r) => r?.wayback_confidence ?? "" },
+        { key: "whois_band", header: "whois_band", get: (r) => r?.whois_band || "" },
+        { key: "primary_language", header: "language", get: (r) => r?.primary_language || "" },
+        { key: "category", header: "category", get: (r) => r?.category || "" },
+        { key: "ai_provider", header: "ai_provider", get: (r) => r?.ai_provider || "" },
+        { key: "ai_model", header: "ai_model", get: (r) => r?.ai_model || "" },
+      ];
+
+      // domain + share_url always; everything else gated by the picker.
+      const activeColumns = allColumns.filter(
+        (c) =>
+          c.key === "domain" ||
+          c.key === "share_url" ||
+          apruvColumns[c.key],
+      );
+
+      // Build CSV with the existing toCsv helper. The helper expects a
+      // CsvColumn<T> shape; we adapt by passing a stub T = string (the
+      // domain) and reading the per-row data via the Map.
+      const csvCols: CsvColumn<string>[] = activeColumns.map((c) => ({
+        header: c.header,
+        get: (domain: string) => c.get(rowByDomain.get(domain), domain),
+      }));
+      const csv = toCsv(domains, csvCols);
+      downloadBlob(csv, csvFilename(`drop-sherlock-apruv`));
+
+      const skipped = linkResp.items.filter((i) => !i.token);
+      setApruvResult({
+        inserted: linkResp.items.length - skipped.length,
+        skipped: skipped.length,
+        skipped_reasons: skipped.map((i) => `${i.domain}: ${i.error}`),
+      });
+      // Keep the modal open so the user sees the result summary; they
+      // close it manually via Cancel/Close.
+    } catch (e) {
+      setApruvResult({
+        inserted: 0,
+        skipped: 0,
+        skipped_reasons: [(e as Error).message || "Apruv export failed"],
+      });
+    } finally {
+      setApruvBusy(false);
+    }
+  }
+
   function clearFilters() {
     setVerdicts([]);
     setWaybackVerdicts([]);
@@ -836,6 +1026,7 @@ export default function DatabasePage() {
     setNotesFilter("any");
     setPinFilter("any");
     setSourceFilter([]);
+    setStatusFilter([]);
     setWaybackConfMin(0);
     setAhrefsConfMin(0);
   }
@@ -971,6 +1162,7 @@ export default function DatabasePage() {
     notesFilter !== "any" ||
     pinFilter !== "any" ||
     sourceFilter.length > 0 ||
+    statusFilter.length > 0 ||
     waybackConfMin > 0 ||
     ahrefsConfMin > 0;
 
@@ -1083,6 +1275,35 @@ export default function DatabasePage() {
             disabled={(opts.sources ?? []).length === 0}
             searchable
             searchPlaceholder={ts.filters.sourceSearchPlaceholder}
+          />
+
+          {/* Backlog-status filter (2026-05-20) — positioned right after
+              Source per the user request. Options come from the shared
+              BACKLOG_STATUSES vocabulary so chips line up 1:1 with the
+              Backlog page filter; labels reuse t.pages.backlog.statusLabels
+              so a future relabel propagates to both surfaces without
+              duplication.
+
+              "backlog" and "banned" are deliberately omitted from the
+              dropdown per the 2026-05-20 follow-up: on the Database
+              page, "backlog" is the default no-decision state (filtering
+              to it would just hide every triaged row), and banned
+              domains already have a distinct visual treatment + their
+              own "is_banned" badge so the user doesn't need a status
+              re-filter for them. The vocabulary still LIVES in
+              BACKLOG_STATUSES so a stale persisted value isn't lost —
+              it's just not in the picker. */}
+          <MultiSelectFilter
+            label={ts.filters.statusLabel}
+            anyLabel={ts.filters.statusAny}
+            value={statusFilter}
+            onChange={(next) => setStatusFilter(next as BacklogStatus[])}
+            options={BACKLOG_STATUSES
+              .filter((s) => s !== "backlog" && s !== "banned")
+              .map((s) => ({
+                value: s,
+                label: t.pages.backlog.statusLabels[s],
+              }))}
           />
 
           <MultiSelectFilter
@@ -1389,6 +1610,29 @@ export default function DatabasePage() {
               >
                 {bulkBanBusy ? ts.bulkBanBusy : ts.bulkBan(selected.size)}
               </button>
+              {/* Apruv export (2026-05-20). Opens a column-picker modal
+                  + auto-generates approver-ready share URLs. Emerald to
+                  read as a positive action (vs. the rose Ban / amber
+                  Order). Disabled mid-batch to avoid double-export
+                  races. */}
+              <button
+                type="button"
+                onClick={() => {
+                  setApruvResult(null);
+                  setApruvOpen(true);
+                }}
+                disabled={
+                  deleting ||
+                  sendingPillar !== null ||
+                  bulkBacklogBusy ||
+                  bulkBanBusy ||
+                  apruvBusy
+                }
+                title={ts.apruv.buttonHint}
+                className="text-xs px-3 py-1 rounded-md bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+              >
+                {ts.apruv.button(selected.size)}
+              </button>
               {/* Bulk-delete intentionally hidden 2026-05-18 pending the
                   Trash redesign — Database cascading delete is the
                   highest-blast-radius destructive action on the platform
@@ -1599,6 +1843,186 @@ export default function DatabasePage() {
       )}
 
       <PaginationBottomBar state={search} />
+
+      {/* Apruv export modal (added 2026-05-20). Inline conditional so the
+          markup lives next to the state that drives it; the page already
+          has too many top-level sections to justify pulling this into a
+          dedicated component. Reuses native dialog semantics via aria
+          attributes — no extra portal library. */}
+      {apruvOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="apruv-modal-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
+          onClick={() => !apruvBusy && setApruvOpen(false)}
+        >
+          <div
+            className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-lg border dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 space-y-4 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 id="apruv-modal-title" className="text-lg font-semibold">
+                  {ts.apruv.modalTitle}
+                </h2>
+                <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1">
+                  {ts.apruv.modalHelp(selected.size)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => !apruvBusy && setApruvOpen(false)}
+                disabled={apruvBusy}
+                className="text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 disabled:opacity-50"
+                aria-label={ts.apruv.close}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Expiry selector — 4 canned options. Stored as number of
+                days (0 = never expires per the backend contract). */}
+            <div className="space-y-1">
+              <label className="block text-xs font-medium text-neutral-700 dark:text-neutral-300">
+                {ts.apruv.expiryLabel}
+              </label>
+              <select
+                value={apruvExpiresDays}
+                onChange={(e) =>
+                  setApruvExpiresDays(parseInt(e.target.value, 10) || 0)
+                }
+                disabled={apruvBusy}
+                className="w-full rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-3 py-1.5 text-sm"
+              >
+                <option value={7}>{ts.apruv.expiry7}</option>
+                <option value={30}>{ts.apruv.expiry30}</option>
+                <option value={90}>{ts.apruv.expiry90}</option>
+                <option value={0}>{ts.apruv.expiryNever}</option>
+              </select>
+            </div>
+
+            {/* Column picker. Domain + share_url are listed at the top
+                as locked-on rows so the user understands they always
+                ship; the rest are toggle checkboxes. */}
+            <div className="space-y-2">
+              <label className="block text-xs font-medium text-neutral-700 dark:text-neutral-300">
+                {ts.apruv.columnsLabel}
+              </label>
+              <div className="grid grid-cols-2 gap-1.5 text-sm rounded-md border dark:border-neutral-800 p-3 bg-neutral-50 dark:bg-neutral-900/60">
+                <div className="flex items-center gap-2 col-span-2 text-xs text-neutral-500 dark:text-neutral-400 italic">
+                  {ts.apruv.mandatoryHint}
+                </div>
+                {/* Single ordered iteration so the picker order = CSV
+                    order = the order the user negotiated 2026-05-20.
+                    `locked: true` rows render as disabled-but-checked
+                    (domain @ slot 1, share_url @ slot 5). */}
+                {(
+                  [
+                    { key: "domain", locked: true },
+                    { key: "backlog_status", locked: false },
+                    { key: "backlog_registrar", locked: false },
+                    { key: "primary_theme", locked: false },
+                    { key: "share_url", locked: true },
+                    { key: "final_score", locked: false },
+                    { key: "backlog_ahrefs_dr", locked: false },
+                    { key: "backlog_domain_age_years", locked: false },
+                    { key: "backlog_desired_price", locked: false },
+                    { key: "backlog_max_price", locked: false },
+                    { key: "backlog_expiration_date", locked: false },
+                    { key: "note", locked: false },
+                    // Extras (off by default).
+                    { key: "final_confidence", locked: false },
+                    { key: "wayback_verdict", locked: false },
+                    { key: "wayback_confidence", locked: false },
+                    { key: "whois_band", locked: false },
+                    { key: "primary_language", locked: false },
+                    { key: "category", locked: false },
+                    { key: "ai_provider", locked: false },
+                    { key: "ai_model", locked: false },
+                  ] as const
+                ).map(({ key, locked }) => (
+                  <label
+                    key={key}
+                    className={
+                      locked
+                        ? "flex items-center gap-2 opacity-60"
+                        : "flex items-center gap-2 cursor-pointer hover:text-neutral-900 dark:hover:text-neutral-100"
+                    }
+                  >
+                    <input
+                      type="checkbox"
+                      checked={locked ? true : !!apruvColumns[key]}
+                      disabled={locked || apruvBusy}
+                      onChange={(e) =>
+                        !locked &&
+                        setApruvColumns((prev) => ({
+                          ...prev,
+                          [key]: e.target.checked,
+                        }))
+                      }
+                    />
+                    <span>
+                      {ts.apruv.cols[key as keyof typeof ts.apruv.cols] || key}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* Result summary surfaces after the download completes;
+                tells the user how many rows shipped vs. how many were
+                skipped (pure backlog rows with no analyzed rd). */}
+            {apruvResult && (
+              <div
+                className={`text-sm rounded-md px-3 py-2 ${
+                  apruvResult.skipped === 0 && apruvResult.inserted > 0
+                    ? "bg-emerald-50 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300"
+                    : "bg-amber-50 text-amber-900 dark:bg-amber-900/30 dark:text-amber-200"
+                }`}
+              >
+                <div>
+                  {ts.apruv.resultSummary(
+                    apruvResult.inserted,
+                    apruvResult.skipped,
+                  )}
+                </div>
+                {apruvResult.skipped_reasons.length > 0 && (
+                  <ul className="mt-1 list-disc list-inside text-xs">
+                    {apruvResult.skipped_reasons.slice(0, 6).map((r, i) => (
+                      <li key={i}>{r}</li>
+                    ))}
+                    {apruvResult.skipped_reasons.length > 6 && (
+                      <li>
+                        +{apruvResult.skipped_reasons.length - 6} more…
+                      </li>
+                    )}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t dark:border-neutral-800">
+              <button
+                type="button"
+                onClick={() => setApruvOpen(false)}
+                disabled={apruvBusy}
+                className="text-sm px-3 py-1.5 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+              >
+                {apruvResult ? ts.apruv.close : ts.apruv.cancel}
+              </button>
+              <button
+                type="button"
+                onClick={handleApruvExport}
+                disabled={apruvBusy || selected.size === 0}
+                className="text-sm px-3 py-1.5 rounded-md bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+              >
+                {apruvBusy ? ts.apruv.exporting : ts.apruv.exportCsv}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1929,6 +2353,46 @@ function DomainListRow({
           >
             {ts.bannedBadge}
           </span>
+        )}
+        {/* Backlog-imported metadata chips (added 2026-05-20). DR + Age
+            come from BacklogDomain.ahrefs_dr / .domain_age_years —
+            populated only when the user mapped those columns during
+            CSV import. Each chip renders independently of the other;
+            the whole sub-line is omitted when both are null. */}
+        {(row.backlog_ahrefs_dr != null ||
+          row.backlog_domain_age_years != null) && (
+          <div className="mt-1 flex flex-wrap gap-1.5 text-[10px] leading-none">
+            {row.backlog_ahrefs_dr != null && (
+              <span
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-200 bg-neutral-50 text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300"
+                title="Ahrefs DR (Domain Rating) imported from the backlog CSV"
+              >
+                <span className="font-medium uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
+                  DR
+                </span>
+                <span className="tabular-nums">
+                  {Number.isInteger(row.backlog_ahrefs_dr)
+                    ? row.backlog_ahrefs_dr
+                    : row.backlog_ahrefs_dr.toFixed(1)}
+                </span>
+              </span>
+            )}
+            {row.backlog_domain_age_years != null && (
+              <span
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-200 bg-neutral-50 text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300"
+                title="Domain age (years) imported from the backlog CSV"
+              >
+                <span className="font-medium uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
+                  Age
+                </span>
+                <span className="tabular-nums">
+                  {Number.isInteger(row.backlog_domain_age_years)
+                    ? `${row.backlog_domain_age_years}y`
+                    : `${row.backlog_domain_age_years.toFixed(1)}y`}
+                </span>
+              </span>
+            )}
+          </div>
         )}
       </td>
       <td className="px-3 py-2 align-top">

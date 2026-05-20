@@ -1056,6 +1056,23 @@ export type DatabaseDomainRow = {
   // Same data shown as the "Source" column on the Backlog page. Empty
   // when the domain has no backlog row or no registrar was captured.
   backlog_registrar?: string;
+  // Ahrefs DR + domain age (years) captured at backlog-import time
+  // (added 2026-05-20). Rendered as small chips under the domain name
+  // on the Database page. Either field independently null when the
+  // backlog row has no value for it; both null when the domain has no
+  // backlog row at all.
+  backlog_ahrefs_dr?: number | null;
+  backlog_domain_age_years?: number | null;
+  // Expiration date from the BacklogDomain row (added 2026-05-20).
+  // Surfaced so the Apruv-export CSV column-picker can include it
+  // without an extra fetch. ISO YYYY-MM-DD, null when no backlog row.
+  backlog_expiration_date?: string | null;
+  // Procurement price bracket from the BacklogDomain row (added
+  // 2026-05-20, Apruv export). `desired_price` = low-end / ideal bid;
+  // `max_price` = absolute ceiling. Null when the import didn't
+  // populate a value.
+  backlog_desired_price?: number | null;
+  backlog_max_price?: number | null;
   // Ban-list flag (added 2026-05-13 wave L). True when the domain is
   // on the ban list. The row stays visible per design call (i) — the
   // UI renders a small "banned" badge in the domain cell.
@@ -1157,6 +1174,36 @@ export const api = {
     }>("/database/domains/delete", {
       method: "POST",
       body: JSON.stringify({ domains }),
+    }),
+
+  // Apruv export — batch-resolve share tokens for a set of selected
+  // Database-page domains. The backend resolves each domain's target
+  // RunDomain (pinned wins, else most-recent finished), reuses any
+  // existing active share for that rd, and only mints a fresh token
+  // when no active share exists. `expires_in_days=0` means never
+  // expires. Returned items align with the request order; rows that
+  // couldn't resolve (pure backlog rows) come back with token=null
+  // and a populated `error` string.
+  approveShareLinks: (
+    domains: string[],
+    expiresInDays: number,
+  ) =>
+    request<{
+      items: {
+        domain: string;
+        run_domain_id: number | null;
+        token: string | null;
+        share_url: string | null;
+        expires_at: string | null;
+        reused: boolean;
+        error: string;
+      }[];
+    }>("/database/approve-share-links", {
+      method: "POST",
+      body: JSON.stringify({
+        items: domains.map((d) => ({ domain: d })),
+        expires_in_days: expiresInDays,
+      }),
     }),
 
   putDomainNote: (domain: string, note: string) =>
