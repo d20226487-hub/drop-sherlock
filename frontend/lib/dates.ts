@@ -77,7 +77,15 @@ export function parseDate(raw: string, format: DateFormat): string | null {
   if (!s) return null;
 
   if (format === "iso" || format === "auto") {
-    const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s);
+    // Accept either a bare date (`2026-06-12`) or an ISO-8601 datetime
+    // with a time portion + optional timezone (`2026-06-12T15:00:00Z`,
+    // `2026-06-12T15:00:00.123+02:00`, `2026-06-12 15:00:00`). The
+    // datetime variant shows up in RDAP / WHOIS / API exports — we
+    // care only about the calendar date because the backlog stores
+    // dates, not timestamps, so we strip the time component on parse.
+    // The optional trailer is constrained to `[T ]\d{2}:...` so we
+    // don't accidentally accept random garbage after a valid date.
+    const m = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/.exec(s);
     if (m) {
       const iso = buildIso(+m[1], +m[2], +m[3]);
       if (iso) return iso;
