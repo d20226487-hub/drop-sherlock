@@ -172,6 +172,14 @@ class DomainRow(BaseModel):
     whois_transferred_confidence: float | None = None
     whois_summary: str = ""
     whois_band: str = ""
+    # Deterministic ownership-cycle counter from the whois diff (added
+    # 2026-05-21). 1 = no drop evidence (likely original owner); 2 =
+    # domain dropped once; 3+ = passed through multiple hands. Computed
+    # in whois_history/diff._estimate_ownership_cycles from the HARD
+    # signals only (creation_date changes, else coverage gaps). Null
+    # when the domain has no whois CR or the CR has empty data_json.
+    # See also the `whois_cycles_min` query param for filtering.
+    whois_ownership_cycles: int | None = None
     # Domain-availability verdict (added 2026-05-16) — sourced from the
     # aux availability source's CR `data_json.verdict` so the column
     # agrees with the Job-page chip math. Pre-2026-05-16 the column
@@ -1189,6 +1197,7 @@ def list_domains(
         whois_transferred_confidence: float | None = None
         whois_summary = ""
         whois_band = ""
+        whois_ownership_cycles: int | None = None
         whois_src = aux_sources.get("whois_history")
         whois_cr = (
             crs_by_rd.get(whois_src[0].id, {}).get("whois_history")
@@ -1211,6 +1220,43 @@ def list_domains(
                 s = wh_parsed.get("summary")
                 if isinstance(s, str):
                     whois_summary = s
+        # Pull `ownership_cycles` from the deterministic diff payload
+        # (data_json.diff.ownership_cycles, set by whois_history/diff.py).
+        # Legacy CRs from before 2026-05-21 don't have the explicit
+        # field — fall back to recomputing on the fly from the same
+        # underlying signals already in the diff so old whois runs
+        # surface a count immediately without needing a re-analyze.
+        if whois_cr is not None and whois_cr.data_json:
+            try:
+                wh_data = json.loads(whois_cr.data_json)
+            except json.JSONDecodeError:
+                wh_data = None
+            diff = ((wh_data or {}).get("diff") or {}) if isinstance(
+                wh_data, dict
+            ) else {}
+            cycles = diff.get("ownership_cycles") if isinstance(
+                diff, dict
+            ) else None
+            # Always recompute on read via `compute_cycles_from_diff_dict`
+            # rather than trusting `diff.ownership_cycles`. The helper
+            # applies newer corrective signals (notably the post-dating
+            # check landed 2026-05-23 that catches drops missed by the
+            # original creation_date-changes-only formula) so existing
+            # CRs surface a correct count without a paid re-fetch.
+            # max() preserves any stored value that's larger than the
+            # recomputed one — defensive against future formula tweaks
+            # that might be more conservative than what produced the
+            # stored data.
+            from ..whois_history.diff import compute_cycles_from_diff_dict
+            recomputed = compute_cycles_from_diff_dict(diff) if isinstance(
+                diff, dict
+            ) else None
+            if recomputed is not None and isinstance(cycles, int) and 1 <= cycles <= 10:
+                whois_ownership_cycles = max(cycles, recomputed)
+            elif recomputed is not None:
+                whois_ownership_cycles = recomputed
+            elif isinstance(cycles, int) and 1 <= cycles <= 10:
+                whois_ownership_cycles = cycles
         whois_band = _whois_band(whois_dropped_confidence)
         if whois_band:
             whois_bands_seen.add(whois_band)
@@ -1321,6 +1367,7 @@ def list_domains(
             whois_transferred_confidence=whois_transferred_confidence,
             whois_summary=whois_summary,
             whois_band=whois_band,
+            whois_ownership_cycles=whois_ownership_cycles,
             availability_status=availability_status,
             availability_provider=availability_provider,
             availability_registrar=availability_registrar,
@@ -2243,3 +2290,107 @@ def approve_share_links(
         ))
     db.commit()
     return ApruvShareLinksOut(items=out)
+
+
+# --- One-click quick-share for the Database page (added 2026-05-24) -------
+# UX: per-row link icon on /database. Single round-trip:
+#   1. Resolve the canonical RunDomain for `domain` (pinned wins, else
+#      most-recent finished) via `_resolve_share_target_rd`.
+#   2. Reuse the most-recent active share for that rd if one exists
+#      (`_find_active_share`) — so re-clicking the icon doesn't multiply
+#      tokens for the same domain.
+#   3. Otherwise mint a new token with the operator's configured default
+#      expiry (`app_settings.get_share_defaults()`). The default ships as
+#      `default_expires_in_days=0` (never expires) — operator changes it
+#      on the /shares page.
+#
+# Returns the share URL path (`/share/<token>`); FE composes against
+# window.location.origin and copies to clipboard.
+
+class QuickShareIn(BaseModel):
+    domain: str
+
+
+class QuickShareOut(BaseModel):
+    domain: str
+    # NULL when no analyzed RunDomain exists for this domain — pure
+    # backlog rows or domains that were deleted from runs. FE renders a
+    # toast explaining there's nothing to share yet.
+    run_domain_id: int | None = None
+    token: str | None = None
+    share_url: str | None = None
+    expires_at: datetime | None = None
+    # True when an existing active share was reused instead of minting
+    # a fresh token. FE can adjust the toast wording ("Copied existing
+    # link" vs "Created and copied new link").
+    reused: bool = False
+    error: str = ""
+
+
+@router.post("/quick-share", response_model=QuickShareOut)
+def quick_share(
+    payload: QuickShareIn,
+    db: Session = Depends(get_db),
+) -> QuickShareOut:
+    """One-click share for a Database-page row. Uses the configured
+    `share_defaults.default_expires_in_days` for new tokens.
+
+    Returns a structured error in the response body (HTTP 200) rather
+    than throwing for the no-analyzed-rd case — the FE wants to render
+    a polite toast, not an exception splash."""
+    import secrets
+    from datetime import timedelta
+    from .. import app_settings
+    from ..models import DomainShare
+
+    domain = (payload.domain or "").strip().lower()
+    if not domain:
+        return QuickShareOut(domain=payload.domain or "", error="empty domain")
+
+    rd = _resolve_share_target_rd(db, domain)
+    if rd is None:
+        return QuickShareOut(
+            domain=domain,
+            error="no analyzed RunDomain for this domain yet",
+        )
+
+    # Reuse first — operator hits the icon repeatedly when sending links
+    # to multiple recipients; minting a fresh token each time would
+    # multiply rows on /shares for no operator benefit.
+    share = _find_active_share(db, rd.id)
+    reused = share is not None
+    if share is None:
+        cfg = app_settings.get_share_defaults()
+        days = int(cfg.get("default_expires_in_days") or 0)
+        expires_at: datetime | None = None
+        if days > 0:
+            expires_at = datetime.utcnow() + timedelta(days=days)
+        for _ in range(5):
+            token = secrets.token_urlsafe(24)
+            if db.get(DomainShare, token) is None:
+                break
+        else:
+            return QuickShareOut(
+                domain=domain,
+                run_domain_id=rd.id,
+                error="could not allocate a unique share token",
+            )
+        share = DomainShare(
+            token=token,
+            run_domain_id=rd.id,
+            note="quick-share (Database)",
+            expires_at=expires_at,
+            created_ip="",
+        )
+        db.add(share)
+        db.commit()
+        db.refresh(share)
+
+    return QuickShareOut(
+        domain=domain,
+        run_domain_id=rd.id,
+        token=share.token,
+        share_url=f"/share/{share.token}",
+        expires_at=share.expires_at,
+        reused=reused,
+    )

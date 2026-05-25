@@ -56,11 +56,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from datetime import date, datetime
 from typing import Any
 
 import httpx
 
+from ...app_settings import get_rate_limits
 from ...limits import limit
 from ..base import WhoisProvider, WhoisProviderError, WhoisRecord
 
@@ -74,9 +76,27 @@ _API_BASE = "https://api.whoisfreaks.com/v1.0/whois"
 # long-lived domains can hit 5-10s.
 _TIMEOUT_SECONDS = 30.0
 
-# Retry policy. WhoisFreaks occasionally 5xxs under load; one retry
-# with backoff is usually enough.
+# Retry policy. WhoisFreaks occasionally 5xxs under load AND 429s when
+# the rate-limit bucket overruns (e.g. settings just changed, or upstream
+# Cloudflare's own sliding window kicks in for paid plans even when our
+# local token bucket says we're under budget). Both get retried with
+# jittered exponential backoff — see `_backoff` and the retry loop in
+# `WhoisFreaksProvider.fetch_history`. The actual retry count is read
+# from rate-limit settings at call time (Settings → Whois History →
+# Rate limits → retry_max) — `_MAX_RETRIES` here is only a fallback for
+# tests that bypass the rate-limit config.
 _MAX_RETRIES = 2
+
+
+def _backoff(attempt: int) -> float:
+    """Jittered exponential backoff matching the Wayback retry pattern
+    (see `providers/wayback.py:_backoff`). Cap at 30s so a 429 storm
+    can't park the runner indefinitely. Jitter spreads concurrent
+    retries from the same fan-out batch — avoids thundering-herd on
+    the first refill tick of the rate-limit bucket."""
+    base = min(30.0, 2 ** attempt)
+    jitter = random.uniform(0.75, 1.25)
+    return base * jitter
 
 
 def _parse_date(s: Any) -> date | None:
@@ -372,64 +392,128 @@ class WhoisFreaksProvider(WhoisProvider):
             "whois": "historical",
             "domainName": domain,
         }
+        # Read retry budget from the user-configurable rate-limit settings
+        # at CALL time (not construction). This means changing Settings →
+        # Whois History → Rate limits → retry_max takes effect on the
+        # next request without restarting the runner or rebuilding the
+        # provider. Falls back to the module constant for tests that
+        # bypass the DB layer.
+        try:
+            retry_max = int(get_rate_limits("whoisfreaks").get(
+                "retry_max", self._max_retries,
+            ))
+        except Exception:  # noqa: BLE001
+            # Tests / contexts without DB access — use the constructor's
+            # value. Same pattern as wayback's catch.
+            retry_max = self._max_retries
         last_err: Exception | None = None
-        for attempt in range(self._max_retries + 1):
+        last_status: int | None = None
+        last_body: str = ""
+        for attempt in range(retry_max + 1):
             try:
                 # Gate every HTTP request through the per-provider
                 # rate limiter (token bucket + concurrency semaphore).
-                # User-configurable in Settings → Whois History → Rate
-                # limits — see `_RATE_LIMIT_DEFAULTS["whoisfreaks"]`
-                # for the defaults. Wrapping the request (not the
-                # whole retry loop) ensures retries also pay the rate
-                # cost, preventing a retry burst from re-triggering
-                # the 429 we just bounced off of.
+                # Wrapping the request (not the whole retry loop)
+                # ensures retries also pay the rate cost, preventing a
+                # retry burst from re-triggering the 429 we just
+                # bounced off of. With burst=1 (set in limits.py for
+                # whoisfreaks), each retry waits the full inter-request
+                # spacing before firing.
                 async with limit("whoisfreaks"):
                     async with httpx.AsyncClient(timeout=self._timeout) as client:
                         resp = await client.get(_API_BASE, params=params)
-                # WhoisFreaks puts auth errors in HTTP 200 + status:false
-                # AND uses 401/403 for the same thing depending on
-                # endpoint version. Map both to WhoisProviderError.
-                if resp.status_code in (401, 403):
-                    raise WhoisProviderError(
-                        f"WhoisFreaks auth failed (HTTP {resp.status_code}) "
-                        f"— check the API key in Settings → Whois History"
-                    )
-                if resp.status_code in (429,):
-                    raise WhoisProviderError(
-                        "WhoisFreaks rate-limited (HTTP 429) — slow the "
-                        "request rate or upgrade the plan"
-                    )
-                if resp.status_code >= 500:
-                    # Retryable
-                    raise httpx.HTTPStatusError(
-                        f"server error {resp.status_code}",
-                        request=resp.request,
-                        response=resp,
-                    )
-                if resp.status_code != 200:
-                    raise WhoisProviderError(
-                        f"WhoisFreaks HTTP {resp.status_code}: "
-                        f"{resp.text[:200]}"
-                    )
-                body = resp.json()
-                records = parse_response(body)
-                if max_records and len(records) > max_records:
-                    # Keep the NEWEST `max_records` since most-recent
-                    # snapshots have the strongest drop signals (recent
-                    # creation_date change, recent pendingDelete status).
-                    records = records[-max_records:]
-                return records
-            except WhoisProviderError:
-                # Non-retryable provider errors propagate immediately.
-                raise
             except (httpx.HTTPError, ValueError) as e:
+                # Network-level failures — retry with backoff. Matches
+                # Wayback's retry-on-network-exception path.
                 last_err = e
-                if attempt < self._max_retries:
-                    # Exponential backoff capped at 5s.
-                    await asyncio.sleep(min(0.5 * (2 ** attempt), 5.0))
+                if attempt < retry_max:
+                    log.info(
+                        "WhoisFreaks network error on %s (attempt %d/%d): "
+                        "%s — retrying", domain, attempt + 1, retry_max + 1, e,
+                    )
+                    await asyncio.sleep(_backoff(attempt))
                     continue
-                break
+                raise WhoisProviderError(
+                    f"WhoisFreaks fetch failed after {retry_max + 1} "
+                    f"attempts: {type(e).__name__}: {e}"
+                ) from e
+
+            # WhoisFreaks puts auth errors in HTTP 200 + status:false
+            # AND uses 401/403 for the same thing depending on
+            # endpoint version. Map both to WhoisProviderError. No
+            # retry — a bad key won't fix itself.
+            if resp.status_code in (401, 403):
+                raise WhoisProviderError(
+                    f"WhoisFreaks auth failed (HTTP {resp.status_code}) "
+                    f"— check the API key in Settings → Whois History"
+                )
+            # 429 and 5xx both go through the retry path. 429 used to
+            # raise immediately, but the rate-limit bucket can still
+            # overrun in real scenarios (Cloudflare's own sliding window
+            # on paid plans, a settings change mid-flight, multi-process
+            # contention on shared keys) — retrying with jittered
+            # backoff gives the upstream window time to roll forward.
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                last_status = resp.status_code
+                last_body = resp.text[:200] if resp.text else ""
+                if attempt < retry_max:
+                    log.info(
+                        "WhoisFreaks HTTP %d on %s (attempt %d/%d) — "
+                        "retrying after backoff",
+                        resp.status_code, domain, attempt + 1, retry_max + 1,
+                    )
+                    await asyncio.sleep(_backoff(attempt))
+                    continue
+                # Retries exhausted — surface a clear, actionable error
+                # with the specific status code so the operator knows
+                # whether to bump rate limits (429) or check provider
+                # health (5xx).
+                if resp.status_code == 429:
+                    raise WhoisProviderError(
+                        f"WhoisFreaks rate-limited (HTTP 429) after "
+                        f"{retry_max + 1} attempts — lower the rpm in "
+                        f"Settings → Whois History → Rate limits or "
+                        f"upgrade the plan"
+                    )
+                raise WhoisProviderError(
+                    f"WhoisFreaks returned {resp.status_code} after "
+                    f"{retry_max + 1} attempts: {last_body}"
+                )
+            # Other non-200s (uncommon — 400-class for malformed
+            # domain, etc.) — fail immediately, retry won't help.
+            if resp.status_code != 200:
+                raise WhoisProviderError(
+                    f"WhoisFreaks HTTP {resp.status_code}: "
+                    f"{resp.text[:200]}"
+                )
+            try:
+                body = resp.json()
+            except ValueError as e:
+                # 200 with malformed JSON — treat as transient like
+                # wayback does with empty responses. Retry once more if
+                # budget allows; otherwise surface.
+                last_err = e
+                if attempt < retry_max:
+                    log.info(
+                        "WhoisFreaks 200 with bad JSON on %s (attempt "
+                        "%d/%d) — retrying", domain, attempt + 1, retry_max + 1,
+                    )
+                    await asyncio.sleep(_backoff(attempt))
+                    continue
+                raise WhoisProviderError(
+                    f"WhoisFreaks returned non-JSON body after "
+                    f"{retry_max + 1} attempts: {resp.text[:200]}"
+                ) from e
+            records = parse_response(body)
+            if max_records and len(records) > max_records:
+                # Keep the NEWEST `max_records` since most-recent
+                # snapshots have the strongest drop signals (recent
+                # creation_date change, recent pendingDelete status).
+                records = records[-max_records:]
+            return records
+        # Loop exits via continue/return/raise; this is unreachable but
+        # mypy + defensive coding both like the explicit fallback.
         raise WhoisProviderError(
-            f"WhoisFreaks fetch failed after {self._max_retries + 1} attempts: "
-            f"{last_err}"
+            f"WhoisFreaks fetch failed after {retry_max + 1} attempts "
+            f"(last_status={last_status}, last_err={last_err!r})"
         )

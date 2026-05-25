@@ -123,6 +123,186 @@ function ConfidenceSlider({
   );
 }
 
+// One-click copy-to-clipboard button next to every Database table
+// domain (added 2026-05-23). 14×14 icon button; shows a 1.2s green
+// flash on success, falls back to a red flash on the (rare) clipboard
+// failure. navigator.clipboard.writeText is preferred; legacy fallback
+// via a hidden textarea + document.execCommand("copy") covers
+// sandboxed iframes / non-secure contexts (matches the ResultsTable
+// clipboard pattern from the Tools pages).
+function CopyDomainButton({ domain }: { domain: string }) {
+  const [state, setState] = useState<"idle" | "ok" | "err">("idle");
+  async function copy(e: React.MouseEvent) {
+    // The button sits inside the same cell as the domain Link; without
+    // stopPropagation a click on the icon would also navigate.
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(domain);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = domain;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+        } finally {
+          ta.remove();
+        }
+      }
+      setState("ok");
+    } catch {
+      setState("err");
+    }
+    window.setTimeout(() => setState("idle"), 1200);
+  }
+  const tone =
+    state === "ok"
+      ? "text-emerald-600 dark:text-emerald-400"
+      : state === "err"
+        ? "text-rose-600 dark:text-rose-400"
+        : "text-neutral-300 dark:text-neutral-600 hover:text-blue-600 dark:hover:text-blue-400";
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      title={state === "ok" ? "Copied!" : `Copy ${domain}`}
+      aria-label={`Copy ${domain}`}
+      className={`shrink-0 leading-none px-0.5 align-baseline transition-colors ${tone}`}
+    >
+      {/* Two-square clipboard glyph; small enough to slot beside the
+          domain text without nudging the verdict pills downstream. */}
+      {state === "ok" ? "✓" : "⧉"}
+    </button>
+  );
+}
+
+// One-click view-only share icon next to every Database table domain
+// (added 2026-05-24). Mirrors CopyDomainButton's gesture model
+// (stopPropagation so click-on-icon doesn't navigate, brief flash
+// feedback) but the backend call is a quick-share round-trip:
+//   1. POST /database/quick-share { domain }
+//   2. Server resolves rd (pinned → latest), reuses or mints a share
+//      with the operator-configured default expiry.
+//   3. Response URL is copied to the clipboard.
+//
+// Self-contained micro-toast — floats above the button for ~2.5s on
+// every outcome so the operator sees "Copied" / "Reused" / "No analysis
+// yet" without us having to plumb toast state through the row tree.
+function QuickShareButton({ domain }: { domain: string }) {
+  const { t } = useT();
+  const ts = t.pages.database.quickShare;
+  const [state, setState] = useState<"idle" | "busy" | "ok" | "err">("idle");
+  const [toast, setToast] = useState<{ msg: string; tone: "ok" | "err" } | null>(
+    null,
+  );
+
+  async function copyToClipboard(url: string): Promise<boolean> {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(url);
+        return true;
+      }
+      // Sandboxed-iframe / non-secure-context fallback.
+      const ta = document.createElement("textarea");
+      ta.value = url;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        return true;
+      } finally {
+        ta.remove();
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  function showToast(msg: string, tone: "ok" | "err") {
+    setToast({ msg, tone });
+    window.setTimeout(() => setToast(null), 2500);
+  }
+
+  async function handle(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (state === "busy") return;
+    setState("busy");
+    try {
+      const r = await api.databaseQuickShare(domain);
+      if (r.error || !r.share_url) {
+        const msg = r.error.includes("no analyzed RunDomain")
+          ? ts.noRd
+          : `${ts.failed}: ${r.error || "unknown"}`;
+        showToast(msg, "err");
+        setState("err");
+      } else {
+        const url = `${window.location.origin}${r.share_url}`;
+        const ok = await copyToClipboard(url);
+        if (ok) {
+          showToast(r.reused ? ts.copiedReused : ts.copiedNew, "ok");
+          setState("ok");
+        } else {
+          showToast(`${ts.copyFailed} ${url}`, "err");
+          setState("err");
+        }
+      }
+    } catch (err) {
+      showToast(
+        `${ts.failed}: ${err instanceof Error ? err.message : String(err)}`,
+        "err",
+      );
+      setState("err");
+    }
+    window.setTimeout(() => setState("idle"), 1500);
+  }
+
+  const tone =
+    state === "ok"
+      ? "text-emerald-600 dark:text-emerald-400"
+      : state === "err"
+        ? "text-rose-600 dark:text-rose-400"
+        : state === "busy"
+          ? "text-blue-500 dark:text-blue-400"
+          : "text-neutral-300 dark:text-neutral-600 hover:text-blue-600 dark:hover:text-blue-400";
+
+  return (
+    <span className="relative inline-flex">
+      <button
+        type="button"
+        onClick={handle}
+        title={state === "busy" ? ts.copying : ts.iconTitle}
+        aria-label={ts.iconTitle}
+        className={`shrink-0 leading-none px-0.5 align-baseline transition-colors ${tone}`}
+      >
+        {/* Link/chain glyph — distinct from the clipboard glyph next to
+            it so the operator can tell the two actions apart. ✓ on
+            success mirrors CopyDomainButton's success feedback. */}
+        {state === "ok" ? "✓" : state === "busy" ? "…" : "🔗"}
+      </button>
+      {toast && (
+        <span
+          role="status"
+          className={
+            "absolute left-1/2 -translate-x-1/2 -top-7 z-10 whitespace-nowrap text-[10px] px-2 py-0.5 rounded shadow-sm border " +
+            (toast.tone === "ok"
+              ? "bg-emerald-50 dark:bg-emerald-950/80 border-emerald-300 dark:border-emerald-700 text-emerald-800 dark:text-emerald-200"
+              : "bg-rose-50 dark:bg-rose-950/80 border-rose-300 dark:border-rose-700 text-rose-800 dark:text-rose-200")
+          }
+        >
+          {toast.msg}
+        </span>
+      )}
+    </span>
+  );
+}
+
 const CRITERIA_KEYS = [
   "backlinks",
   "refdomains",
@@ -174,9 +354,12 @@ export default function DatabasePage() {
   // category / pin / cache / notes / criteria multi-select doing the
   // actual narrowing work.
   const [criteria, setCriteria] = useState<CriterionKey[]>([]);
-  const [cache, setCache] = useState<CacheFilter>("any");
+  // Cache filter + Pin filter UI removed 2026-05-23 (user-requested
+  // simplification). State variables NOT re-declared — anything that
+  // referenced `cache` or `pinFilter` was scrubbed from the predicate
+  // + filtersActive + reset paths. localStorage still reads the
+  // legacy keys (defensively) but no UI exposes them.
   const [notesFilter, setNotesFilter] = useState<NotesFilter>("any");
-  const [pinFilter, setPinFilter] = useState<PinFilter>("any");
   // Source filter (2026-05-17) — multi-select on BacklogDomain.registrar.
   // Same vocabulary as the Backlog page's Source filter; backend
   // populates `filter_options.sources` with the distinct universe.
@@ -195,6 +378,15 @@ export default function DatabasePage() {
   // wayback_classify filters (added 2026-05-09).
   const [languages, setLanguages] = useState<string[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
+  // Whois ownership-cycles filter (added 2026-05-21). 0 = off; >=1
+  // shows only rows where the deterministic cycle counter from the
+  // whois diff is >= the selected value. Use 2 to focus on domains
+  // that definitely dropped at least once, 3+ to find "multi-hand"
+  // domains (passed through multiple drop hunters before this auction).
+  // Rows with no whois CR have whois_ownership_cycles=null and are
+  // excluded as soon as the filter is > 0 (can't satisfy a threshold
+  // they have no data for).
+  const [whoisCyclesMax, setWhoisCyclesMax] = useState<number>(0);
   // Confidence thresholds (added 2026-05-13; iterated to slider UX
   // 2026-05-15). 0 = "no filter". Rows with null confidence (no
   // verdict, partial final stub, etc.) are excluded when the min is
@@ -209,6 +401,19 @@ export default function DatabasePage() {
   // the current threshold as a %.
   const [waybackConfMin, setWaybackConfMin] = useState<number>(0);
   const [ahrefsConfMin, setAhrefsConfMin] = useState<number>(0);
+  // Max price range filter (added 2026-05-23, iterated to a paired
+  // min/max input the same day after the slider proved unusable — a
+  // step-50 slider can't express "between $1 and $20" cleanly, which
+  // is the actual procurement question on most drop auctions). Both
+  // values are independent USD numbers; 0 (or NaN) means "no bound
+  // on that side". Predicate: row passes when
+  //   (min === 0 OR row.backlog_max_price >= min) AND
+  //   (max === 0 OR row.backlog_max_price <= max).
+  // Rows without a backlog row OR without max_price set are excluded
+  // when EITHER bound is non-zero — null can't satisfy a numeric
+  // comparison.
+  const [maxPriceMin, setMaxPriceMin] = useState<number>(0);
+  const [maxPriceMax, setMaxPriceMax] = useState<number>(0);
 
   // Persistent filters (2026-05-18). Each browser keeps its own copy in
   // localStorage so two operators on the same /database page don't
@@ -233,9 +438,9 @@ export default function DatabasePage() {
         if (Array.isArray(v.whoisBands)) setWhoisBands(v.whoisBands);
         if (Array.isArray(v.availabilityFilter)) setAvailabilityFilter(v.availabilityFilter);
         if (Array.isArray(v.criteria)) setCriteria(v.criteria);
-        if (v.cache === "any" || v.cache === "cached" || v.cache === "fresh") setCache(v.cache);
+        // `v.cache` and `v.pinFilter` may exist in legacy blobs; ignored
+        // (both filters removed 2026-05-23).
         if (v.notesFilter === "any" || v.notesFilter === "with" || v.notesFilter === "without") setNotesFilter(v.notesFilter);
-        if (v.pinFilter === "any" || v.pinFilter === "pinned" || v.pinFilter === "unpinned") setPinFilter(v.pinFilter);
         if (Array.isArray(v.sourceFilter)) setSourceFilter(v.sourceFilter);
         if (Array.isArray(v.statusFilter)) {
           // Defensive: drop any persisted value that isn't a known
@@ -252,6 +457,33 @@ export default function DatabasePage() {
         if (Array.isArray(v.categories)) setCategories(v.categories);
         if (typeof v.waybackConfMin === "number") setWaybackConfMin(v.waybackConfMin);
         if (typeof v.ahrefsConfMin === "number") setAhrefsConfMin(v.ahrefsConfMin);
+        if (
+          typeof v.whoisCyclesMax === "number" &&
+          v.whoisCyclesMax >= 0 &&
+          v.whoisCyclesMax <= 10
+        ) {
+          setWhoisCyclesMax(v.whoisCyclesMax);
+        }
+        // 2026-05-23: a legacy blob carries `whoisCyclesMin` (the
+        // pre-flip ">= N" encoding). The semantic flipped to "< N" —
+        // re-using the old value would invert what the user expected.
+        // Deliberately ignore the legacy field; the filter resets to
+        // "any" on first reload post-flip. Same logic for
+        // `cache` / `pinFilter` legacy fields above.
+        if (
+          typeof v.maxPriceMin === "number" &&
+          v.maxPriceMin >= 0 &&
+          v.maxPriceMin <= 1_000_000
+        ) {
+          setMaxPriceMin(v.maxPriceMin);
+        }
+        if (
+          typeof v.maxPriceMax === "number" &&
+          v.maxPriceMax >= 0 &&
+          v.maxPriceMax <= 1_000_000
+        ) {
+          setMaxPriceMax(v.maxPriceMax);
+        }
       }
     } catch {
       // Corrupt / inaccessible localStorage — fall through to defaults.
@@ -279,15 +511,16 @@ export default function DatabasePage() {
             whoisBands,
             availabilityFilter,
             criteria,
-            cache,
             notesFilter,
-            pinFilter,
             sourceFilter,
             statusFilter,
             languages,
             categories,
             waybackConfMin,
             ahrefsConfMin,
+            whoisCyclesMax,
+            maxPriceMin,
+            maxPriceMax,
           }),
         );
       } catch {
@@ -303,15 +536,16 @@ export default function DatabasePage() {
     whoisBands,
     availabilityFilter,
     criteria,
-    cache,
     notesFilter,
-    pinFilter,
     sourceFilter,
     statusFilter,
     languages,
     categories,
     waybackConfMin,
     ahrefsConfMin,
+    whoisCyclesMax,
+    maxPriceMin,
+    maxPriceMax,
   ]);
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -335,6 +569,11 @@ export default function DatabasePage() {
   // verdictSort — clicking one clears the other so the table has a
   // single active sort signal.
   const [whoisSort, setWhoisSort] = useState<"asc" | "desc" | null>(null);
+  // Max-price sort (added 2026-05-23). Cycles asc (cheapest first —
+  // most operators' default scan direction) → desc → null. Mutually
+  // exclusive with the other two sort signals; clicking it clears
+  // them so the table has one active sort at a time.
+  const [maxPriceSort, setMaxPriceSort] = useState<"asc" | "desc" | null>(null);
 
   // Send-to-pillar state (replaces the old "Reanalyze" bulk picker
   // 2026-05-18). Tracks which pillar dispatch is currently in flight
@@ -557,8 +796,12 @@ export default function DatabasePage() {
       });
     }
     return data.rows.filter((r) => {
-      if (pinFilter === "pinned" && !r.is_pinned) return false;
-      if (pinFilter === "unpinned" && r.is_pinned) return false;
+      // Pin filter + Cache filter REMOVED 2026-05-23 (user-requested
+      // simplification): pinning is a one-shot setup gesture, not a
+      // recurring filter; cache state changes too fast to filter
+      // against. Predicate logic kept stripped to reduce reader
+      // confusion — localStorage hydrates the legacy values but the UI
+      // doesn't read them.
       if (
         sourceFilter.length > 0 &&
         !sourceFilter.includes(r.backlog_registrar || "")
@@ -602,6 +845,46 @@ export default function DatabasePage() {
           return false;
         }
       }
+      // Whois ownership-cycles threshold. Flipped 2026-05-23 from
+      // ">= N" semantics to "< N" semantics per user request — when
+      // scanning drop-domain lists, the operator's question is "which
+      // ones probably never dropped?" (clean history → less competition,
+      // less prior-owner baggage), not "which ones definitely dropped?".
+      // Dropdown values now read "any / <2 / <3 / <4 / <5" and the
+      // numeric encoding maps:
+      //   0 → off
+      //   1 → cycles < 1   (impossible: every analyzed domain has
+      //                     cycles >= 1; effectively "no rows" but
+      //                     surfaces if the data ever exposes 0)
+      //   2 → cycles < 2  (= 1, "never dropped" — most common pick)
+      //   3 → cycles < 3  (no drop OR one drop)
+      //   4 → cycles < 4
+      //   5 → cycles < 5
+      // Rows without whois data (cycles=null) are excluded under any
+      // active filter — null can't satisfy a numeric comparison.
+      if (whoisCyclesMax > 0) {
+        if (typeof r.whois_ownership_cycles !== "number") {
+          return false;
+        }
+        if (r.whois_ownership_cycles >= whoisCyclesMax) {
+          return false;
+        }
+      }
+      // Max price range filter (slider → min/max pair 2026-05-23).
+      // Each bound is independently optional: 0 means "no bound on
+      // that side". When either is set, rows without a backlog
+      // max_price are excluded (no data can't satisfy the bound).
+      if (maxPriceMin > 0 || maxPriceMax > 0) {
+        if (typeof r.backlog_max_price !== "number") {
+          return false;
+        }
+        if (maxPriceMin > 0 && r.backlog_max_price < maxPriceMin) {
+          return false;
+        }
+        if (maxPriceMax > 0 && r.backlog_max_price > maxPriceMax) {
+          return false;
+        }
+      }
       // "Any criterion" semantics: a row passes if at least one of the
       // selected criteria is enabled. The pre-2026-05-17 `minRecords`
       // companion was dropped along with the input — operators filter
@@ -613,15 +896,13 @@ export default function DatabasePage() {
         });
         if (!anyMatch) return false;
       }
-      if (cache === "cached" && !r.any_cached) return false;
-      if (cache === "fresh" && r.any_cached) return false;
+      // Cache filter REMOVED 2026-05-23 (user-requested simplification).
       if (notesFilter === "with" && !r.note) return false;
       if (notesFilter === "without" && r.note) return false;
       return true;
     });
   }, [
     data,
-    pinFilter,
     sourceFilter,
     statusFilter,
     verdicts,
@@ -631,10 +912,12 @@ export default function DatabasePage() {
     languages,
     categories,
     criteria,
-    cache,
     notesFilter,
     waybackConfMin,
     ahrefsConfMin,
+    whoisCyclesMax,
+    maxPriceMin,
+    maxPriceMax,
   ]);
 
   const sorted = useMemo<DatabaseDomainRow[]>(() => {
@@ -680,8 +963,29 @@ export default function DatabasePage() {
         return (ra - rb) * dir;
       });
     }
+    if (maxPriceSort) {
+      // Max-price sort (added 2026-05-23): rows WITH a backlog
+      // max_price on top, rest sink to the bottom. Same priced-then-
+      // unpriced shape as the verdict + whois sorts so the operator
+      // never has to scroll past null cells to find sortable data.
+      // Ascending = cheapest first (the procurement default).
+      const dir = maxPriceSort === "asc" ? 1 : -1;
+      function priced(r: DatabaseDomainRow): boolean {
+        return typeof r.backlog_max_price === "number";
+      }
+      return [...filtered].sort((a, b) => {
+        const aP = priced(a);
+        const bP = priced(b);
+        if (aP !== bP) return aP ? -1 : 1;
+        if (!aP && !bP) return a.domain.localeCompare(b.domain);
+        const ra = a.backlog_max_price as number;
+        const rb = b.backlog_max_price as number;
+        if (ra === rb) return a.domain.localeCompare(b.domain);
+        return (ra - rb) * dir;
+      });
+    }
     return filtered;
-  }, [filtered, verdictSort, whoisSort]);
+  }, [filtered, verdictSort, whoisSort, maxPriceSort]);
 
   const search = usePaginatedSearch<DatabaseDomainRow>(
     sorted,
@@ -1022,13 +1326,15 @@ export default function DatabasePage() {
     setLanguages([]);
     setCategories([]);
     setCriteria([]);
-    setCache("any");
+    // setCache + setPinFilter removed (controls deleted 2026-05-23).
     setNotesFilter("any");
-    setPinFilter("any");
     setSourceFilter([]);
     setStatusFilter([]);
     setWaybackConfMin(0);
     setAhrefsConfMin(0);
+    setWhoisCyclesMax(0);
+    setMaxPriceMin(0);
+    setMaxPriceMax(0);
   }
 
   const csvColumns = useMemo<CsvColumn<DatabaseDomainRow>[]>(
@@ -1158,13 +1464,14 @@ export default function DatabasePage() {
     languages.length > 0 ||
     categories.length > 0 ||
     criteria.length > 0 ||
-    cache !== "any" ||
     notesFilter !== "any" ||
-    pinFilter !== "any" ||
     sourceFilter.length > 0 ||
     statusFilter.length > 0 ||
     waybackConfMin > 0 ||
-    ahrefsConfMin > 0;
+    ahrefsConfMin > 0 ||
+    whoisCyclesMax > 0 ||
+    maxPriceMin > 0 ||
+    maxPriceMax > 0;
 
   if (error) {
     return (
@@ -1461,15 +1768,9 @@ export default function DatabasePage() {
             }))}
           />
 
-          <select
-            value={cache}
-            onChange={(e) => setCache(e.target.value as CacheFilter)}
-            className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none"
-          >
-            <option value="any">{ts.filters.cacheAny}</option>
-            <option value="cached">{ts.filters.cacheCached}</option>
-            <option value="fresh">{ts.filters.cacheFresh}</option>
-          </select>
+          {/* Cache filter + Pin filter REMOVED 2026-05-23 (user-
+              requested simplification). See filter-state comments
+              near the useState declarations for rationale. */}
 
           <select
             value={notesFilter}
@@ -1479,19 +1780,6 @@ export default function DatabasePage() {
             <option value="any">{ts.filters.notesAny}</option>
             <option value="with">{ts.filters.notesWith}</option>
             <option value="without">{ts.filters.notesWithout}</option>
-          </select>
-
-          {/* Pin filter (2026-05-17) — moved here from the top of the
-              grid to sit next to the confidence sliders. Used during
-              deep triage, not high-level scoping. */}
-          <select
-            value={pinFilter}
-            onChange={(e) => setPinFilter(e.target.value as PinFilter)}
-            className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none"
-          >
-            <option value="any">{ts.filters.pinAny}</option>
-            <option value="pinned">{ts.filters.pinPinned}</option>
-            <option value="unpinned">{ts.filters.pinUnpinned}</option>
           </select>
 
           <ConfidenceSlider
@@ -1508,6 +1796,109 @@ export default function DatabasePage() {
             value={ahrefsConfMin}
             onChange={setAhrefsConfMin}
           />
+          {/* Whois ownership-cycles filter. Flipped 2026-05-23 from
+              ">= N" to "< N" semantics — drop-hunter mental model is
+              "show me freshest history" (low cycle count), not
+              "show me reused" (high count). Discrete dropdown
+              because the values are integer thresholds with a hard
+              semantic per step.
+
+              `min-w-0` on the wrapper + the select keep the cell from
+              expanding past its grid track when an option label is
+              long ("< 5 (at most 3 drops)"). Without it the select's
+              intrinsic content width pushed into the adjacent
+              Max-price slider cell at narrower viewports. */}
+          <div
+            className="flex items-center gap-2 min-w-0"
+            title={ts.filters.whoisCyclesMaxHelp}
+          >
+            <label className="text-neutral-700 dark:text-neutral-300 whitespace-nowrap shrink-0">
+              {ts.filters.whoisCyclesMax}
+            </label>
+            <select
+              value={whoisCyclesMax}
+              onChange={(e) =>
+                setWhoisCyclesMax(parseInt(e.target.value, 10) || 0)
+              }
+              className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 outline-none min-w-0 flex-1"
+            >
+              <option value={0}>{ts.filters.whoisCyclesAny}</option>
+              <option value={2}>{ts.filters.whoisCyclesLt2}</option>
+              <option value={3}>{ts.filters.whoisCyclesLt3}</option>
+              <option value={4}>{ts.filters.whoisCyclesLt4}</option>
+              <option value={5}>{ts.filters.whoisCyclesLt5}</option>
+            </select>
+          </div>
+
+          {/* Max price range — paired number inputs (replaced the
+              step-50 slider 2026-05-23 same day, after the slider
+              proved unusable for $1-$20 ranges). Either bound is
+              optional; empty == 0 == "no bound on that side". The
+              `inputMode="decimal"` hint surfaces a numeric keypad on
+              mobile without forcing strict integer typing.
+
+              `min-w-0` on the wrapper lets the cell shrink in the
+              grid without overflowing into the adjacent cell — the
+              two number inputs handle their own widths via w-20.
+
+              On <button> "Clear": acts only when ANY bound is set, so
+              when filter is inactive the affordance disappears (no
+              redundant "Clear nothing" gesture). */}
+          <div
+            className="flex items-center gap-2 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm min-w-0"
+            title={ts.filters.maxPriceMaxHelp}
+          >
+            <span className="text-xs text-neutral-500 dark:text-neutral-400 shrink-0">
+              {ts.filters.maxPriceRange}
+            </span>
+            <span className="text-xs text-neutral-400 dark:text-neutral-500 shrink-0">
+              $
+            </span>
+            <input
+              type="number"
+              inputMode="decimal"
+              min={0}
+              step="any"
+              placeholder={ts.filters.maxPriceMinPlaceholder}
+              value={maxPriceMin || ""}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setMaxPriceMin(Number.isFinite(v) && v > 0 ? v : 0);
+              }}
+              aria-label={ts.filters.maxPriceMinAria}
+              className="w-20 min-w-0 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-xs font-mono outline-none focus:ring-1 focus:ring-blue-500/40"
+            />
+            <span className="text-xs text-neutral-400 dark:text-neutral-500 shrink-0">
+              –
+            </span>
+            <input
+              type="number"
+              inputMode="decimal"
+              min={0}
+              step="any"
+              placeholder={ts.filters.maxPriceMaxPlaceholder}
+              value={maxPriceMax || ""}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setMaxPriceMax(Number.isFinite(v) && v > 0 ? v : 0);
+              }}
+              aria-label={ts.filters.maxPriceMaxAria}
+              className="w-20 min-w-0 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-xs font-mono outline-none focus:ring-1 focus:ring-blue-500/40"
+            />
+            {(maxPriceMin > 0 || maxPriceMax > 0) && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMaxPriceMin(0);
+                  setMaxPriceMax(0);
+                }}
+                aria-label={ts.filters.maxPriceClearAria}
+                className="text-xs text-neutral-400 hover:text-rose-600 dark:hover:text-rose-400 leading-none px-0.5 shrink-0"
+              >
+                ×
+              </button>
+            )}
+          </div>
         </div>
         {/* Filtered count under the filter grid (added 2026-05-15).
             Only renders when filters are active — when nothing is
@@ -1733,6 +2124,7 @@ export default function DatabasePage() {
                     type="button"
                     onClick={() => {
                       setWhoisSort(null);
+                      setMaxPriceSort(null);
                       setVerdictSort((cur) =>
                         cur === "desc" ? "asc" : cur === "asc" ? null : "desc",
                       );
@@ -1755,6 +2147,7 @@ export default function DatabasePage() {
                     type="button"
                     onClick={() => {
                       setVerdictSort(null);
+                      setMaxPriceSort(null);
                       // Whois cycle starts with asc (stable on top — the
                       // "good first" direction for drop-confidence).
                       setWhoisSort((cur) =>
@@ -1782,11 +2175,36 @@ export default function DatabasePage() {
                     user reads "what ran" then "what stage it's in". */}
                 <th className="px-3 py-2 font-medium">{ts.cols.criteria}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.backlog}</th>
-                {/* Column-group C — identity + my own state (Source,
-                    Availability, Note). Pinned to the end 2026-05-18 so
-                    the AI signals + workflow state stay leftmost; the
-                    triage-record fields trail the row. */}
-                <th className="px-3 py-2 font-medium">{ts.cols.source}</th>
+                {/* Column-group C — identity + my own state. Source
+                    column replaced 2026-05-23 by Max price (drop-hunter
+                    procurement signal more useful at-a-glance than the
+                    registrar string the source was showing). Source
+                    info still available in CSV export. Sortable —
+                    asc (cheapest first) is the most natural default
+                    for procurement scanning. */}
+                <th className="px-3 py-2 font-medium text-right">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVerdictSort(null);
+                      setWhoisSort(null);
+                      setMaxPriceSort((cur) =>
+                        cur === "asc" ? "desc" : cur === "desc" ? null : "asc",
+                      );
+                    }}
+                    className="inline-flex items-center gap-1 hover:text-blue-600 dark:hover:text-blue-400"
+                    title={ts.cols.maxPriceSortHint}
+                  >
+                    {ts.cols.maxPrice}
+                    <span className="text-xs opacity-70 w-3 inline-block text-left">
+                      {maxPriceSort === "asc"
+                        ? "↑"
+                        : maxPriceSort === "desc"
+                          ? "↓"
+                          : ""}
+                    </span>
+                  </button>
+                </th>
                 <th className="px-3 py-2 font-medium">{ts.cols.availability}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.note}</th>
               </tr>
@@ -2334,18 +2752,32 @@ function DomainListRow({
         {rowNumber}
       </td>
       <td className="px-3 py-2 align-top">
-        {domainHref ? (
-          <Link
-            href={domainHref}
-            className="font-mono text-blue-700 dark:text-blue-300 hover:text-blue-900 dark:hover:text-blue-200 hover:underline break-all"
-          >
-            {row.domain}
-          </Link>
-        ) : (
-          <span className="font-mono text-neutral-700 dark:text-neutral-300 break-all">
-            {row.domain}
-          </span>
-        )}
+        <span className="inline-flex items-baseline gap-1.5 max-w-full">
+          {domainHref ? (
+            <Link
+              href={domainHref}
+              className="font-mono text-blue-700 dark:text-blue-300 hover:text-blue-900 dark:hover:text-blue-200 hover:underline break-all"
+            >
+              {row.domain}
+            </Link>
+          ) : (
+            <span className="font-mono text-neutral-700 dark:text-neutral-300 break-all">
+              {row.domain}
+            </span>
+          )}
+          {/* One-click copy (added 2026-05-23). The Link wraps just
+              the text so a click-on-text still navigates; the copy
+              affordance is a separate sibling button so the gestures
+              stay unambiguous. The button is dim by default and
+              brightens on row hover — discoverable but not visually
+              competing with the verdict pills. */}
+          <CopyDomainButton domain={row.domain} />
+          {/* One-click view-only share link (added 2026-05-24). Same
+              dim-by-default, brighten-on-hover treatment as the copy
+              icon, slotted next to it so the two cell-level actions
+              are visually grouped. */}
+          <QuickShareButton domain={row.domain} />
+        </span>
         {row.is_banned && (
           <span
             className="ml-2 inline-block text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300"
@@ -2819,12 +3251,15 @@ function DomainListRow({
           onUpdated={onBacklogUpdated}
         />
       </td>
-      {/* Identity / triage-record trailing group (Source → Availability
-          → Note). Pinned to the row end 2026-05-18 — domain + AI verdicts
-          + workflow state read left-to-right, then the operator's own
-          metadata trails. */}
-      <td className="px-3 py-2 align-top text-xs text-neutral-700 dark:text-neutral-300">
-        {row.backlog_registrar || (
+      {/* Identity / triage-record trailing group (Max price →
+          Availability → Note). 2026-05-23: Source column replaced
+          by Max price — same join (BacklogDomain) so no extra
+          fetch cost. Right-aligned numeric. Dim when no price set
+          on the backlog row (or no backlog row at all). */}
+      <td className="px-3 py-2 align-top text-xs text-right tabular-nums text-neutral-700 dark:text-neutral-300">
+        {typeof row.backlog_max_price === "number" ? (
+          `$${row.backlog_max_price.toLocaleString()}`
+        ) : (
           <span className="text-neutral-400 dark:text-neutral-500">—</span>
         )}
       </td>

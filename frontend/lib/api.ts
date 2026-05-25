@@ -479,6 +479,16 @@ export type RunSummaryDomain = {
       language?: string;
       category?: string;
       drift_detected?: boolean;
+      // whois_history-only fields. Backend populates these only for the
+      // `whois_history` criterion entry. `band` is "" when no
+      // dropped_confidence was parseable; one of dropped / mixed /
+      // insufficient / stable otherwise — same vocabulary as the
+      // Database page.
+      dropped_confidence?: number | null;
+      transferred_confidence?: number | null;
+      band?: string;
+      ownership_cycles?: number | null;
+      summary?: string;
     }
   >;
   final_summary: string | null;
@@ -1027,6 +1037,15 @@ export type DatabaseDomainRow = {
   whois_transferred_confidence: number | null;
   whois_summary: string;
   whois_band: string;
+  // Deterministic count of distinct registration cycles (added
+  // 2026-05-21). 1 = original owner / insufficient history; 2 = one
+  // confirmed drop; 3+ = passed through multiple hands ("the domain
+  // was already grabbed by an earlier drop hunter and re-listed").
+  // Computed conservatively from creation_date_changes (primary) or
+  // coverage_gaps_days (fallback). See whois_history/diff.py:
+  // _estimate_ownership_cycles. Capped at 10. Null when there's no
+  // whois CR or its data_json is empty.
+  whois_ownership_cycles: number | null;
   // Domain-availability verdict (added 2026-05-16) — sourced from the
   // aux availability CR (same data the Job-page chip math reads).
   // Replaces the prior `/availability/latest` cache hydration so the
@@ -1817,6 +1836,22 @@ export const api = {
       { method: "POST", body: JSON.stringify(ai || {}) },
     ),
 
+  // Force-cancel an in-flight Retry-failed dispatch (added 2026-05-24).
+  // The standard cancel endpoint short-circuits on terminal runs (which
+  // retry-failed always runs against), so this is the only path to stop
+  // a runaway retry. Returns counts of cancelled tasks + flipped RDs.
+  cancelRetryFailedRun: (runId: number) =>
+    request<{
+      id: number;
+      found: boolean;
+      canceled_tasks: number;
+      flipped_rds: number;
+      status: string;
+    }>(
+      `/runs/${runId}/cancel-retry-failed`,
+      { method: "POST" },
+    ),
+
   // Scoped retry — pick exact RDs + (optional) criterion allow-list.
   // Drives the Run-page filter + multi-select + bulk-retry flow
   // (added 2026-05-12).
@@ -2408,6 +2443,57 @@ export const api = {
   revokeAllActiveShares: () =>
     request<{ revoked: number }>("/shares", { method: "DELETE" }),
 
+  // --- Activate + hard-delete (added 2026-05-24) ---
+  activateShare: (token: string) =>
+    request<ShareRecord>(
+      `/shares/${encodeURIComponent(token)}/activate`,
+      { method: "POST" },
+    ),
+  hardDeleteShare: (token: string) =>
+    request<{ deleted: number; token: string }>(
+      `/shares/${encodeURIComponent(token)}/hard`,
+      { method: "DELETE" },
+    ),
+  // Empty `tokens` → delete every currently-revoked row (nuclear).
+  // Non-empty `tokens` → only delete those tokens IF revoked.
+  deleteRevokedShares: (tokens: string[] = []) =>
+    request<{ deleted: number }>("/shares/delete-revoked", {
+      method: "POST",
+      body: JSON.stringify({ tokens }),
+    }),
+
+  // --- Share defaults (added 2026-05-24) ---
+  getShareSettings: () =>
+    request<ShareSettings>("/shares/settings"),
+  updateShareSettings: (patch: { default_expires_in_days?: number }) =>
+    request<ShareSettings>("/shares/settings", {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
+  resetShareSettings: () =>
+    request<ShareSettings>("/shares/settings", { method: "DELETE" }),
+
+  // --- Database 1-click quick-share (added 2026-05-24) ---
+  // Returns an error string in the response body when the domain has
+  // no analyzed RunDomain yet — callers should check `error` before
+  // composing the share URL.
+  databaseQuickShare: (domain: string) =>
+    request<QuickShareResult>("/database/quick-share", {
+      method: "POST",
+      body: JSON.stringify({ domain }),
+    }),
+
+  // --- Domain-page 1-click quick-share (added 2026-05-24) ---
+  // Sibling of databaseQuickShare keyed by run_domain_id (the Domain
+  // page already knows EXACTLY which rd it's looking at — no
+  // domain → pinned-rd resolution needed). Same reuse-or-mint
+  // semantics; same response shape.
+  quickShareForRd: (runDomainId: number) =>
+    request<QuickShareResult>("/shares/quick", {
+      method: "POST",
+      body: JSON.stringify({ run_domain_id: runDomainId }),
+    }),
+
   // Public-view fetch — used by the /share/[token] page. Bypasses the
   // basic-auth gate because Caddy whitelists /api/public/* for the
   // token-only access path. We still go through the standard `request`
@@ -2543,6 +2629,26 @@ export type ShareRecord = {
   view_count: number;
   last_viewed_at: string | null;
   is_active: boolean;
+};
+
+// Effective share defaults blob — `defaults` echoes the shipped values
+// so the FE can render a "Reset to default" affordance without a
+// separate round-trip.
+export type ShareSettings = {
+  default_expires_in_days: number;
+  defaults: { default_expires_in_days: number };
+};
+
+// `POST /database/quick-share` response. `error` is non-empty when the
+// domain has no analyzed RunDomain or token allocation failed.
+export type QuickShareResult = {
+  domain: string;
+  run_domain_id: number | null;
+  token: string | null;
+  share_url: string | null;
+  expires_at: string | null;
+  reused: boolean;
+  error: string;
 };
 
 // Same shape as RunDomainDetail minus operator-only fields. We type it

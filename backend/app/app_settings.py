@@ -839,6 +839,84 @@ def set_wayback_auto_retry_config(cfg: dict) -> dict:
     return current
 
 
+# --- Share defaults (added 2026-05-24) -------------------------------------
+# Operator-configurable defaults for newly-minted share tokens. Today only
+# `default_expires_in_days` lives here; future toggles (default note
+# template, max-views cap, etc.) can extend the same JSON blob.
+#
+# `default_expires_in_days = 0` (the shipped default) means "never expires".
+# The /shares router uses this when the FE doesn't pass an explicit value,
+# and the Database page's 1-click share icon uses it silently — those calls
+# always rely on the configured default so the operator has one knob.
+#
+# Hard cap at 10 years (3650 days) mirrors the per-request validation on
+# `POST /shares` and `POST /database/approve-share-links` so a misconfigured
+# Setting can't mint a 100-year share by accident.
+_SHARE_DEFAULTS_KEY = "share_defaults"
+DEFAULT_SHARE_DEFAULTS = {
+    "default_expires_in_days": 0,  # 0 = never expires (forever).
+}
+_SHARE_MAX_EXPIRES_DAYS = 3650
+
+
+def get_share_defaults() -> dict:
+    """DB override merged onto defaults. Always returns the full shape so
+    callers don't have to defend against partial dicts."""
+    db = SessionLocal()
+    try:
+        raw = _get(db, _SHARE_DEFAULTS_KEY) or ""
+    finally:
+        db.close()
+    out = dict(DEFAULT_SHARE_DEFAULTS)
+    if not raw:
+        return out
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return out
+    if not isinstance(parsed, dict):
+        return out
+    if isinstance(parsed.get("default_expires_in_days"), int):
+        out["default_expires_in_days"] = max(
+            0, min(parsed["default_expires_in_days"], _SHARE_MAX_EXPIRES_DAYS),
+        )
+    return out
+
+
+def set_share_defaults(cfg: dict) -> dict:
+    """Merge `cfg` over the current defaults + persist. Returns the
+    effective post-merge value (so the API response can echo what
+    actually got saved)."""
+    if not isinstance(cfg, dict):
+        raise ValueError("share defaults must be a dict")
+    current = get_share_defaults()
+    if "default_expires_in_days" in cfg:
+        if not isinstance(cfg["default_expires_in_days"], int):
+            raise ValueError("default_expires_in_days must be an integer")
+        current["default_expires_in_days"] = max(
+            0, min(cfg["default_expires_in_days"], _SHARE_MAX_EXPIRES_DAYS),
+        )
+    db = SessionLocal()
+    try:
+        _set(db, _SHARE_DEFAULTS_KEY, json.dumps(current))
+    finally:
+        db.close()
+    return current
+
+
+def reset_share_defaults() -> dict:
+    """Clear the override → next read returns shipped defaults. Sets the
+    blob to empty rather than deleting the row since `get_share_defaults`
+    treats empty as "fall through to defaults" (mirrors the pattern used
+    everywhere else in this module — there's no `_delete` helper)."""
+    db = SessionLocal()
+    try:
+        _set(db, _SHARE_DEFAULTS_KEY, "")
+    finally:
+        db.close()
+    return dict(DEFAULT_SHARE_DEFAULTS)
+
+
 # --- Availability auto-retry (added 2026-05-18) -----------------------------
 # Mirrors the Wayback post-run watcher but for the Availability cascade.
 # Behavioural twist: the cascade has multiple providers and they don't all

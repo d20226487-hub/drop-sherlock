@@ -12,7 +12,7 @@
 import Link from "next/link";
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { api } from "@/lib/api";
+import { api, AnalyzeSpec } from "@/lib/api";
 import { useT } from "@/lib/i18n";
 import { DomainInput } from "@/components/domain-input";
 import { BACKLOG_HANDOFF_KEY } from "@/lib/backlog-handoff";
@@ -44,6 +44,44 @@ function CheckAvailabilityForm() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [bannedSkipped, setBannedSkipped] = useState<string[]>([]);
+
+  // Rerun mode (added 2026-05-21) — see /check/whois-history for the
+  // full pattern. Availability has no AI selector, so we only prefill
+  // the domain list from the source spec.
+  const rerunJobId = (() => {
+    const v = searchParams?.get("rerun");
+    if (!v) return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  })();
+  const [rerunJobName, setRerunJobName] = useState<string | null>(null);
+  const [rerunSourceSpec, setRerunSourceSpec] = useState<AnalyzeSpec | null>(
+    null,
+  );
+
+  useEffect(() => {
+    if (rerunJobId === null) {
+      setRerunJobName(null);
+      setRerunSourceSpec(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getJobSpec(rerunJobId)
+      .then((r) => {
+        if (cancelled) return;
+        setRerunJobName(r.name || `Job #${rerunJobId}`);
+        setRerunSourceSpec(r.spec);
+        setDomainText((r.spec.domains || []).join("\n"));
+      })
+      .catch(() => {
+        router.replace("/check/availability");
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rerunJobId]);
 
   // Backlog → Check handoff drain. Same shape Whois + Quality use.
   useEffect(() => {
@@ -79,15 +117,35 @@ function CheckAvailabilityForm() {
     setError(null);
     setBannedSkipped([]);
     try {
-      const r = await api.submitAvailabilityJob({
-        domains: cleanedDomains,
-        name: name.trim() || undefined,
-        notes: notes.trim() || undefined,
-      });
-      if (r.skipped_banned.length > 0) {
-        setBannedSkipped(r.skipped_banned);
+      let jobId: number;
+      let runId: number;
+      let skippedBanned: string[] = [];
+      if (rerunJobId !== null && rerunSourceSpec !== null) {
+        // Rerun path: add a new Run to the existing Job using the
+        // shared /jobs/{id}/rerun endpoint. Carry the source spec
+        // verbatim (criteria.availability.enabled is already True) and
+        // overlay the user-editable domain list.
+        const spec: AnalyzeSpec = {
+          ...rerunSourceSpec,
+          domains: cleanedDomains,
+        };
+        const r = await api.rerunJob(rerunJobId, spec);
+        jobId = r.job_id;
+        runId = r.run_id;
+      } else {
+        const r = await api.submitAvailabilityJob({
+          domains: cleanedDomains,
+          name: name.trim() || undefined,
+          notes: notes.trim() || undefined,
+        });
+        jobId = r.job_id;
+        runId = r.run_id;
+        skippedBanned = r.skipped_banned;
       }
-      router.push(`/jobs/${r.job_id}/runs/${r.run_id}`);
+      if (skippedBanned.length > 0) {
+        setBannedSkipped(skippedBanned);
+      }
+      router.push(`/jobs/${jobId}/runs/${runId}`);
     } catch (e) {
       let msg = e instanceof Error ? e.message : String(e);
       try {
@@ -120,6 +178,30 @@ function CheckAvailabilityForm() {
           {ts.pipelineHint}
         </p>
       </div>
+
+      {rerunJobId !== null && rerunJobName !== null && (
+        <div className="rounded-md border border-blue-300 dark:border-blue-900/60 bg-blue-50 dark:bg-blue-950/40 px-3 py-2 text-sm">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <span className="font-semibold text-blue-900 dark:text-blue-100">
+                {ts.rerunBannerTitle}:
+              </span>{" "}
+              <span className="text-blue-800 dark:text-blue-200">
+                {rerunJobName}
+              </span>
+            </div>
+            <Link
+              href="/check/availability"
+              className="text-xs text-blue-700 dark:text-blue-300 hover:underline"
+            >
+              {ts.rerunBannerCancel}
+            </Link>
+          </div>
+          <p className="text-xs text-blue-800/80 dark:text-blue-200/80 mt-1">
+            {ts.rerunBannerHelp}
+          </p>
+        </div>
+      )}
 
       <DomainInput value={domainText} onChange={setDomainText} />
 

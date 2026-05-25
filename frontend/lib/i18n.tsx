@@ -610,6 +610,17 @@ const messagesEn = {
           `Retry dispatched — ${criteria} criteria across ${domains} domain${domains === 1 ? "" : "s"}. Waiting for workers to start…`,
         retryFailedNone: "No failed criteria to retry.",
         retryFailedFailed: "Retry failed",
+        // Cancel-retry (added 2026-05-24). Only rendered while a
+        // Retry-failed dispatch is in flight.
+        cancelRetry: "Cancel retry",
+        cancelRetryBusy: "Canceling…",
+        cancelRetryHint:
+          "Stop the in-flight Retry-failed dispatch. Cancels worker tasks AND resets RDs left stuck in 'running' state.",
+        cancelRetryConfirm:
+          "Cancel the in-flight retry? Any work already done is preserved; in-flight criteria are aborted mid-fetch and RDs left in 'running' status are flipped to a sane terminal state.",
+        cancelRetryDone: (canceled: number, flipped: number) =>
+          `Retry canceled — ${canceled} task${canceled === 1 ? "" : "s"} aborted, ${flipped} RD${flipped === 1 ? "" : "s"} reset.`,
+        cancelRetryFailed: "Cancel retry failed",
         // Filter + multi-select + bulk-retry (added 2026-05-12).
         filterStatusLabel: "Status",
         filterStatusAll: "all",
@@ -727,8 +738,23 @@ const messagesEn = {
           wayback: "Wayback",
           wayback_classify: "Classify",
           theme: "Theme",
+          whois_history: "Whois",
           final: "Final",
         },
+        // Per-band labels for the whois_history column. Distinct vocab
+        // from labelWhois (which collapses to 3 buckets for rollup
+        // chips) — Compare needs the 4-way distinction so "insufficient"
+        // doesn't get hidden under "stable".
+        whoisBand: {
+          dropped: "dropped",
+          mixed: "drift suspected",
+          insufficient: "insufficient history",
+          stable: "stable",
+        },
+        // Suffix shown next to the band chip when ownership_cycles > 1.
+        // Hidden when N == 1 (no drop ever happened) to keep stable
+        // rows uncluttered.
+        whoisCycles: (n: number) => `× ${n} cycles`,
         legendDiff: "Different",
         legendSame: "Same",
         legendOnlyA: "Only in A",
@@ -927,8 +953,14 @@ const messagesEn = {
         // 2026-05-17: row-number column for "I'm on row N" orientation.
         rowNumber: "#",
         domain: "Domain",
-        // 2026-05-17: mirrors the Backlog page's renamed Source column.
+        // 2026-05-23: Source column replaced by Max price (the
+        // procurement signal is more useful at a glance than the
+        // registrar string). `source` key kept for CSV export labels
+        // that still surface it.
         source: "Source",
+        maxPrice: "Max $",
+        maxPriceSortHint:
+          "Click to sort by Max price. Asc (cheapest first) → desc → default. Rows without a backlog max_price always sink to the bottom.",
         verdict: "Ahrefs",
         verdictSortHint:
           "Click to sort by score. Cycles desc → asc → default. Partial / no-verdict rows always sink to the bottom.",
@@ -946,6 +978,20 @@ const messagesEn = {
         runs: "Runs",
         pin: "Pinned run",
         backlog: "Backlog",
+      },
+      // 2026-05-24: per-row 1-click share icon. Resolves the domain's
+      // canonical RunDomain (pinned → latest), reuses the most recent
+      // active share for it, or mints a new one with the configured
+      // default expiry. Result URL is copied to clipboard with a toast.
+      quickShare: {
+        iconTitle:
+          "Copy a view-only share link for this domain (1-click). Manages duration in Shares → Default settings.",
+        copying: "Generating link…",
+        copiedNew: "Share link created and copied.",
+        copiedReused: "Existing share link copied.",
+        copyFailed: "Could not copy — paste manually:",
+        noRd: "No analyzed run for this domain yet — share is unavailable.",
+        failed: "Quick-share failed",
       },
       backlogActions: {
         order: "Order",
@@ -1124,6 +1170,30 @@ const messagesEn = {
         ahrefsConfMinHelp:
           "Slider: minimum Ahrefs Final Assessment confidence. Drag to set the threshold; all the way left = off. Rows without a final (or with a partial) are hidden once the threshold is above zero.",
         confSliderOff: "off",
+        // Whois ownership-cycles filter. 2026-05-23: semantic flipped
+        // from ">= N" (find dropped) to "< N" (find clean history) —
+        // drop hunter's primary question is "which look freshest".
+        // Key name kept as `whoisCyclesMax` since the value is now
+        // an upper bound.
+        whoisCyclesMax: "Whois cycles",
+        whoisCyclesMaxHelp:
+          "Filter by number of whois ownership cycles. <2 = the domain has never dropped (cycle = 1, immutable creation_date observed); <3 = at most one drop; <5 = at most three. Lower is cleaner history. Rows without whois analysis are hidden once any filter is active.",
+        whoisCyclesAny: "Any",
+        whoisCyclesLt2: "< 2 (never dropped)",
+        whoisCyclesLt3: "< 3 (at most 1 drop)",
+        whoisCyclesLt4: "< 4 (at most 2 drops)",
+        whoisCyclesLt5: "< 5 (at most 3 drops)",
+        // Max price range filter (paired inputs, replaced step-50
+        // slider 2026-05-23 same day). Two independent USD bounds;
+        // either or both can be empty.
+        maxPriceRange: "Max $",
+        maxPriceMaxHelp:
+          "Keep only rows whose backlog Max price falls within this USD range. Leave either field blank for an open-ended bound. Rows without a backlog row or without a max_price set are hidden once either bound is filled (no price to compare against).",
+        maxPriceMinPlaceholder: "from",
+        maxPriceMaxPlaceholder: "to",
+        maxPriceMinAria: "Max price lower bound (USD)",
+        maxPriceMaxAria: "Max price upper bound (USD)",
+        maxPriceClearAria: "Clear Max price filter",
         clear: "Clear filters",
         matchedCount: (filtered: number, total: number) =>
           `Filtered: ${filtered} of ${total} domain${total === 1 ? "" : "s"}`,
@@ -1797,6 +1867,44 @@ const messagesEn = {
       copy: "Copy link",
       open: "Open",
       revoke: "Revoke",
+      // --- Added 2026-05-24: Delete + Activate + Settings panel ---
+      activate: "Activate",
+      activateConfirm:
+        "Activate this share again? The recipient regains access (if it isn't past its expiry). The audit trail is preserved.",
+      hardDelete: "Delete",
+      hardDeleteConfirm:
+        "Hard-delete this share row? The audit trail (view count, created IP) is lost. Use Revoke instead if you want to keep the trail.",
+      deleteRevoked: "Delete revoked",
+      deleteRevokedConfirm: (n: number) =>
+        n > 0
+          ? `Hard-delete all ${n} currently-revoked share${n === 1 ? "" : "s"}? Audit trail is lost. Active shares are untouched.`
+          : "Hard-delete every currently-revoked share row? Audit trail is lost. Active shares are untouched.",
+      deleteRevokedHint:
+        "Permanently remove every revoked share row. Audit trail (view count, IP) is lost. Active shares are untouched.",
+      deleteRevokedDone: (n: number) =>
+        `Deleted ${n} revoked share${n === 1 ? "" : "s"}.`,
+      deleteRevokedFailed: "Delete revoked failed",
+      hardDeleteFailed: "Delete failed",
+      activateFailed: "Activate failed",
+      // Settings panel — collapsible, default open=false.
+      settings: {
+        title: "Default settings",
+        toggle: "Default settings",
+        intro:
+          "Defaults applied to newly-minted share links. Set 0 to default to forever (no expiry).",
+        defaultExpiresLabel: "Default expiry (days)",
+        defaultExpiresHint:
+          "Applied when no expiry is picked. 0 = never expires (recommended for internal links). Cap: 3650 days (10 years).",
+        save: "Save",
+        saving: "Saving…",
+        saved: "Saved.",
+        reset: "Reset to default",
+        resetConfirm: "Reset share defaults to shipped values?",
+        currentDefault: (days: number) =>
+          days === 0
+            ? "Currently: never expires (forever)."
+            : `Currently: ${days} day${days === 1 ? "" : "s"} from creation.`,
+      },
     },
     share: {
       // Recipient-facing labels (public /share/[token] page).
@@ -1850,6 +1958,11 @@ const messagesEn = {
         `All submitted domains are on the ban list (${count} total): ${sample}${
           truncated ? "…" : ""
         }`,
+      // Rerun banner (added 2026-05-21).
+      rerunBannerTitle: "Rerun of",
+      rerunBannerCancel: "Cancel rerun",
+      rerunBannerHelp:
+        "A new Run will be added to this Job. Edit the domain list or AI provider, then submit.",
     },
     checkAvailability: {
       title: "Availability",
@@ -1874,6 +1987,11 @@ const messagesEn = {
         `All submitted domains are on the ban list (${count} total): ${sample}${
           truncated ? "…" : ""
         }`,
+      // Rerun banner (added 2026-05-21).
+      rerunBannerTitle: "Rerun of",
+      rerunBannerCancel: "Cancel rerun",
+      rerunBannerHelp:
+        "A new Run will be added to this Job. Edit the domain list, then submit.",
     },
     jobsWhoisHistory: {
       title: "Whois History — Jobs",
@@ -2790,6 +2908,15 @@ const messagesRu: Messages = {
           `Повтор отправлен — ${criteria} критериев на ${domains} домене(ах). Ждём, пока воркеры начнут…`,
         retryFailedNone: "Нет неудачных критериев для повтора.",
         retryFailedFailed: "Повтор не удался",
+        cancelRetry: "Отменить повтор",
+        cancelRetryBusy: "Отмена…",
+        cancelRetryHint:
+          "Остановить идущий Повтор неудачных. Отменяет фоновые задачи и сбрасывает RD, застрявшие в статусе «в работе».",
+        cancelRetryConfirm:
+          "Отменить идущий повтор? Уже выполненная работа сохраняется; запросы в полёте прерываются, RD в статусе «в работе» переводятся в терминальный.",
+        cancelRetryDone: (canceled, flipped) =>
+          `Повтор отменён — задач прервано: ${canceled}, RD сброшено: ${flipped}.`,
+        cancelRetryFailed: "Отмена повтора не удалась",
         filterStatusLabel: "Статус",
         filterStatusAll: "все",
         filterStatusPending: "ожидание",
@@ -2896,8 +3023,16 @@ const messagesRu: Messages = {
           wayback: "Wayback",
           wayback_classify: "Классификация",
           theme: "Тематика",
+          whois_history: "Whois",
           final: "Итог",
         },
+        whoisBand: {
+          dropped: "дропнут",
+          mixed: "возможный дрифт",
+          insufficient: "мало истории",
+          stable: "стабильный",
+        },
+        whoisCycles: (n) => `× ${n} циклов`,
         legendDiff: "Разные",
         legendSame: "Одинаковые",
         legendOnlyA: "Только в A",
@@ -3122,8 +3257,11 @@ const messagesRu: Messages = {
         // 2026-05-17: row-number column for "I'm on row N" orientation.
         rowNumber: "№",
         domain: "Домен",
-        // 2026-05-17: mirrors the Backlog page's renamed Source column.
+        // 2026-05-23: Source column заменён на Max price.
         source: "Источник",
+        maxPrice: "Макс $",
+        maxPriceSortHint:
+          "Клик для сортировки по Макс. цене. По возрастанию (сначала дешёвые) → по убыванию → по умолчанию. Строки без max_price в бэклоге всегда уходят в конец.",
         verdict: "Ahrefs",
         verdictSortHint:
           "Кликните для сортировки по баллу. Цикл: убыв → возр → по умолчанию. Частичные / без вердикта всегда уходят вниз.",
@@ -3141,6 +3279,16 @@ const messagesRu: Messages = {
         runs: "Запуски",
         pin: "Закреплённый запуск",
         backlog: "Очередь",
+      },
+      quickShare: {
+        iconTitle:
+          "Скопировать ссылку «только просмотр» для этого домена (1 клик). Срок действия настраивается в Ссылки → Настройки по умолчанию.",
+        copying: "Создание ссылки…",
+        copiedNew: "Ссылка создана и скопирована.",
+        copiedReused: "Существующая ссылка скопирована.",
+        copyFailed: "Не удалось скопировать — скопируйте вручную:",
+        noRd: "Для этого домена пока нет проанализированного запуска — поделиться нечем.",
+        failed: "Быстрая ссылка не удалась",
       },
       backlogActions: {
         order: "Заказать",
@@ -3320,6 +3468,23 @@ const messagesRu: Messages = {
         ahrefsConfMinHelp:
           "Ползунок: минимальная уверенность Итоговой оценки Ahrefs. Тащите вправо для более строгого порога; до упора влево — фильтр выключен. Строки без итоговой оценки (или с частичной) скрываются, как только порог становится больше нуля.",
         confSliderOff: "выкл",
+        // Фильтр циклов whois — см. EN (флип "<N" вместо ">=N").
+        whoisCyclesMax: "Циклы whois",
+        whoisCyclesMaxHelp:
+          "Фильтр по числу циклов владения по whois. <2 = домен никогда не дропался (цикл = 1, стабильная creation_date); <3 = максимум один дроп; <5 = максимум три. Меньше — чище история. Строки без whois-анализа скрываются при любом активном фильтре.",
+        whoisCyclesAny: "Любое",
+        whoisCyclesLt2: "< 2 (без дропа)",
+        whoisCyclesLt3: "< 3 (макс. 1 дроп)",
+        whoisCyclesLt4: "< 4 (макс. 2 дропа)",
+        whoisCyclesLt5: "< 5 (макс. 3 дропа)",
+        maxPriceRange: "Макс $",
+        maxPriceMaxHelp:
+          "Оставить только строки, у которых Макс. цена из бэклога попадает в этот диапазон USD. Оставьте любое поле пустым, чтобы убрать соответствующую границу. Строки без бэклог-записи или без max_price скрываются, как только заполнено хотя бы одно поле.",
+        maxPriceMinPlaceholder: "от",
+        maxPriceMaxPlaceholder: "до",
+        maxPriceMinAria: "Макс. цена — нижняя граница (USD)",
+        maxPriceMaxAria: "Макс. цена — верхняя граница (USD)",
+        maxPriceClearAria: "Сбросить фильтр Макс. цены",
         clear: "Очистить фильтры",
         matchedCount: (filtered, total) =>
           `Отфильтровано: ${filtered} из ${total}`,
@@ -4056,6 +4221,41 @@ const messagesRu: Messages = {
       copy: "Скопировать",
       open: "Открыть",
       revoke: "Отозвать",
+      activate: "Активировать",
+      activateConfirm:
+        "Активировать ссылку снова? Получатель снова получит доступ (если срок ещё не истёк). История просмотров сохраняется.",
+      hardDelete: "Удалить",
+      hardDeleteConfirm:
+        "Удалить запись о ссылке безвозвратно? История (просмотры, IP создателя) будет потеряна. Если важна история — используйте Отозвать.",
+      deleteRevoked: "Удалить отозванные",
+      deleteRevokedConfirm: (n) =>
+        n > 0
+          ? `Безвозвратно удалить ${n} отозванных ссылок? История просмотров будет потеряна. Активные ссылки не затрагиваются.`
+          : "Безвозвратно удалить ВСЕ отозванные ссылки? История просмотров будет потеряна. Активные ссылки не затрагиваются.",
+      deleteRevokedHint:
+        "Удалить безвозвратно все отозванные ссылки. История (просмотры, IP) будет потеряна. Активные ссылки не затрагиваются.",
+      deleteRevokedDone: (n) => `Удалено отозванных ссылок: ${n}.`,
+      deleteRevokedFailed: "Удаление отозванных не удалось",
+      hardDeleteFailed: "Удаление не удалось",
+      activateFailed: "Активация не удалась",
+      settings: {
+        title: "Настройки по умолчанию",
+        toggle: "Настройки по умолчанию",
+        intro:
+          "Значения по умолчанию для новых ссылок. Поставьте 0, чтобы по умолчанию ссылки были бессрочными.",
+        defaultExpiresLabel: "Срок действия по умолчанию (дней)",
+        defaultExpiresHint:
+          "Применяется, когда срок не выбран явно. 0 = бессрочно (рекомендуется для внутренних ссылок). Максимум: 3650 дней (10 лет).",
+        save: "Сохранить",
+        saving: "Сохранение…",
+        saved: "Сохранено.",
+        reset: "Сбросить к значениям по умолчанию",
+        resetConfirm: "Сбросить настройки ссылок к стандартным значениям?",
+        currentDefault: (days) =>
+          days === 0
+            ? "Сейчас: бессрочно (никогда не истекает)."
+            : `Сейчас: ${days} дней с момента создания.`,
+      },
     },
     share: {
       viewOnlyBadge: "Drop Sherlock — общий анализ (только просмотр)",
@@ -4105,6 +4305,11 @@ const messagesRu: Messages = {
         `Все указанные домены в бан-листе (${count} всего): ${sample}${
           truncated ? "…" : ""
         }`,
+      // Баннер перезапуска (добавлено 2026-05-21).
+      rerunBannerTitle: "Перезапуск",
+      rerunBannerCancel: "Отменить перезапуск",
+      rerunBannerHelp:
+        "Будет добавлен новый Run в эту задачу. Отредактируйте список доменов или AI-провайдер и нажмите отправить.",
     },
     checkAvailability: {
       title: "Доступность",
@@ -4129,6 +4334,11 @@ const messagesRu: Messages = {
         `Все указанные домены в бан-листе (${count} всего): ${sample}${
           truncated ? "…" : ""
         }`,
+      // Баннер перезапуска (добавлено 2026-05-21).
+      rerunBannerTitle: "Перезапуск",
+      rerunBannerCancel: "Отменить перезапуск",
+      rerunBannerHelp:
+        "Будет добавлен новый Run в эту задачу. Отредактируйте список доменов и нажмите отправить.",
     },
     jobsWhoisHistory: {
       title: "История Whois — Задачи",

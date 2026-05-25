@@ -247,8 +247,20 @@ export default function JobDetailPage({
             />
           </div>
           <div className="flex flex-wrap gap-2">
+            {/* Rerun routes by job.kind so a Whois job rerun lands on
+                the Whois form (not the Quality form). Each form accepts
+                ?rerun=N, pre-fills domains + ai from the source job's
+                spec, and submits as a new Run on the same Job via the
+                kind-agnostic /jobs/{id}/rerun endpoint. Default to
+                Quality for legacy jobs whose `kind` is undefined. */}
             <Link
-              href={`/analyze?rerun=${jobId}`}
+              href={
+                job.kind === "whois_history"
+                  ? `/check/whois-history?rerun=${jobId}`
+                  : job.kind === "availability"
+                    ? `/check/availability?rerun=${jobId}`
+                    : `/analyze?rerun=${jobId}`
+              }
               className="text-sm px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-700 text-white"
             >
               {ts.rerun}

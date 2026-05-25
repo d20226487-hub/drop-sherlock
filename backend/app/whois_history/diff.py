@@ -145,11 +145,59 @@ def _detect_creation_changes(
 ) -> list[dict[str, Any]]:
     """A live domain's creation_date is immutable; any change between
     snapshots means the domain was deleted and re-registered. We track
-    creation_date as an ISO string so the events serialize cleanly."""
-    return _diff_pairs(
+    creation_date as an ISO string so the events serialize cleanly.
+
+    Two paths produce an event:
+
+    1. **Value-to-value transition** via `_diff_pairs` — the registry
+       reported one creation_date in an earlier snapshot and a different
+       one later. Direct evidence of re-registration.
+
+    2. **Post-dating** — the registry's currently-reported creation_date
+       is LATER than the earliest snapshot's `query_time`. Logical proof
+       of re-registration: we have a whois record for the domain before
+       the registry claims it was created, which is impossible unless
+       it was deleted and re-registered. This catches the common ccTLD
+       case where the original snapshot lacked `creation_date` (so
+       `_diff_pairs` skips it as None) but a later snapshot exposes
+       a date that contradicts our earlier observation of the domain
+       being live. Example: ospanovfund.kz had a 2020-04-03 whois
+       snapshot with creation_date=None and a different registrant,
+       then a 2024-03-23 snapshot with creation_date=2024-03-02 —
+       impossible without a drop. Without this branch the deterministic
+       counter returned 1 even though the AI judge gave dropped=0.95.
+    """
+    events = _diff_pairs(
         records,
         lambda r: r.creation_date.isoformat() if r.creation_date else None,
     )
+    # Post-dating check. Pick the most recent reported creation_date
+    # (the registry's current claim) and compare against our earliest
+    # observation. If the claim post-dates the observation, synthesize
+    # an event so the primary branch of `_estimate_ownership_cycles`
+    # fires. Only add if there's no value-to-value transition already
+    # for the same date — avoids double-counting when both signals fire.
+    if records:
+        earliest = records[0].query_time
+        latest_creation: date | None = None
+        for r in reversed(records):
+            if r.creation_date is not None:
+                latest_creation = r.creation_date
+                break
+        if latest_creation is not None and latest_creation > earliest:
+            iso = latest_creation.isoformat()
+            already_present = any(
+                e.get("to") == iso for e in events
+            )
+            if not already_present:
+                events.append({
+                    "from": None,
+                    "to": iso,
+                    "at": latest_creation.isoformat(),
+                    "prev_at": earliest.isoformat(),
+                    "reason": "post_dates_history",
+                })
+    return events
 
 
 def _detect_drop_pipeline_events(
@@ -171,6 +219,110 @@ def _detect_drop_pipeline_events(
                 "codes": hit,
             })
     return events
+
+
+def _estimate_ownership_cycles(
+    creation_changes: list[dict[str, Any]],
+    coverage_gaps: list[dict[str, Any]],
+    has_creation_data: bool,
+) -> int:
+    """Conservative count of distinct registration cycles a domain has
+    been through. Used by the Database page filter to flag domains that
+    have changed hands more than N times (high-risk for a drop hunter:
+    "the domain already passed through other drop hunters' hands").
+
+    Counting rules (deliberately strict — only HARD signals):
+
+      - creation_date is immutable on a live domain. Every change is
+        unambiguous evidence of one full delete + re-register cycle.
+        Primary signal: `cycles = 1 + len(creation_date_changes)`.
+
+      - When creation_date IS present and stable across snapshots,
+        the domain CANNOT have been deleted between them (the
+        immutability invariant — a re-registration would have changed
+        creation_date). So even if coverage_gaps are detected, they
+        must be polling-cadence artefacts, not drops. Return 1.
+
+      - Coverage-gaps fallback fires ONLY when creation_date is fully
+        absent from every record (registry doesn't expose it post-GDPR
+        in some ccTLDs). In that case each NXDOMAIN gap is the best
+        evidence we have: `cycles = 1 + len(coverage_gaps_days)`.
+
+    Soft signals (owner / email / org changes) are NOT counted here.
+    Post-GDPR redactions mean a REDACTED → REDACTED transition is just
+    a provider artefact, not necessarily an ownership change. The AI
+    judge weights those nuances; this counter stays deterministic.
+
+    Returns 1 for "no evidence of any drop" (likely original owner, or
+    insufficient history) up to a cap of 10 (anything higher is almost
+    certainly polling-noise, not real cycles)."""
+    if creation_changes:
+        return min(10, 1 + len(creation_changes))
+    if has_creation_data:
+        # creation_date was visible and stable -> no drop happened
+        # between snapshots regardless of any gap noise.
+        return 1
+    if coverage_gaps:
+        return min(10, 1 + len(coverage_gaps))
+    return 1
+
+
+def compute_cycles_from_diff_dict(diff: dict[str, Any]) -> int | None:
+    """Compute ownership_cycles from a stored `diff` dict (i.e. the
+    serialized form already on a CriterionResult.data_json). Mirrors
+    `_estimate_ownership_cycles` and applies the post-dating signal so
+    existing CRs surface a correct count without needing a re-fetch.
+
+    Returns None when `diff` is malformed (no signal data present).
+
+    The DB/run-summary read paths both call this rather than reading
+    the stored `diff.ownership_cycles` directly — the stored value was
+    computed at fetch time with whatever formula was current then, but
+    the read path can apply newer corrective signals without changing
+    the underlying data. Re-fetching to backfill old CRs would burn
+    paid WhoisFreaks calls; recomputing on read is free.
+    """
+    if not isinstance(diff, dict):
+        return None
+    drop_sig = diff.get("drop_signals") or {}
+    cc = drop_sig.get("creation_date_changes") or []
+    cg = drop_sig.get("coverage_gaps_days") or []
+    current_state = diff.get("current_state") or {}
+    first_seen = diff.get("first_seen")
+    current_creation = current_state.get("creation_date") if isinstance(
+        current_state, dict
+    ) else None
+
+    # Post-dating synthetic signal — see `_detect_creation_changes`. We
+    # only apply it when the stored `creation_date_changes` doesn't
+    # already cover it (idempotent with new CRs whose compute_diff
+    # already emitted the event).
+    extra = 0
+    if (
+        isinstance(current_creation, str)
+        and isinstance(first_seen, str)
+        and current_creation > first_seen
+    ):
+        already_listed = (
+            isinstance(cc, list)
+            and any(
+                isinstance(e, dict) and e.get("to") == current_creation
+                for e in cc
+            )
+        )
+        if not already_listed:
+            extra = 1
+
+    if isinstance(cc, list) and len(cc) > 0:
+        return min(10, 1 + len(cc) + extra)
+    if extra:
+        return min(10, 1 + extra)
+    has_creation = bool(current_creation)
+    if has_creation:
+        return 1
+    if isinstance(cg, list) and len(cg) > 0:
+        return min(10, 1 + len(cg))
+    return 1
 
 
 def _detect_coverage_gaps(
@@ -219,6 +371,7 @@ def compute_diff(
             "snapshot_count": 0,
             "first_seen": None,
             "last_seen": None,
+            "ownership_cycles": 1,
             "drop_signals": {
                 "creation_date_changes": [],
                 "drop_pipeline_status_events": [],
@@ -242,16 +395,30 @@ def compute_diff(
     records = sorted(records, key=lambda r: r.query_time)
     latest = records[-1]
 
+    creation_changes = _detect_creation_changes(records)
+    coverage_gaps = _detect_coverage_gaps(records, coverage_gap_threshold_days)
+    # creation_date is the immutability anchor — if it's present at
+    # all in any record, we trust it as evidence (stable = no drop;
+    # changed = drop). Only fall back to gap-based estimates when no
+    # record exposed creation_date.
+    has_creation_data = any(r.creation_date is not None for r in records)
+
     return {
         "snapshot_count": len(records),
         "first_seen": records[0].query_time.isoformat(),
         "last_seen": latest.query_time.isoformat(),
+        # Deterministic cycle counter (see _estimate_ownership_cycles).
+        # Surfaced on Database rows so the operator can filter
+        # "multi-hand" domains (cycles >= 3 = passed through 2+ owners
+        # after the original registrant) without needing to read every
+        # AI summary by hand.
+        "ownership_cycles": _estimate_ownership_cycles(
+            creation_changes, coverage_gaps, has_creation_data,
+        ),
         "drop_signals": {
-            "creation_date_changes": _detect_creation_changes(records),
+            "creation_date_changes": creation_changes,
             "drop_pipeline_status_events": _detect_drop_pipeline_events(records),
-            "coverage_gaps_days": _detect_coverage_gaps(
-                records, coverage_gap_threshold_days
-            ),
+            "coverage_gaps_days": coverage_gaps,
         },
         "soft_signals": {
             # Track on EMAIL hashing-aware comparison since most

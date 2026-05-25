@@ -159,6 +159,16 @@ async def submit_job(
     # automatically — `ai=`, `use_cache`, `lang`, and `check_availability`
     # have each gone missing in a field-by-field rebuild here at some point.
     norm_spec = payload.spec.model_copy(update={"domains": cleaned_domains})
+    # Force-disable whois_history + availability — Quality runs never
+    # dispatch these (they have their own pillar runners). Leaving them
+    # enabled silently completed runs with missing CR rows, then Retry-
+    # failed correctly identified the gap and dispatched per-domain
+    # whois/availability work the operator didn't ask for. Closing the
+    # footgun at submit (2026-05-24, runs 124+126 reproducer). See the
+    # docstring of `strip_pillar_criteria_from_quality_spec` for the
+    # full reasoning.
+    from ..schemas import strip_pillar_criteria_from_quality_spec
+    norm_spec = strip_pillar_criteria_from_quality_spec(norm_spec)
     # Auto-enable wayback + V2 sampling when classify is on. Done AFTER
     # the empty-criteria guard above so a spec with ONLY classify on (and
     # everything else disabled) still passes — classify counts.

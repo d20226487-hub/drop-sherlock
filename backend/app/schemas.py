@@ -298,6 +298,15 @@ class CriteriaSpec(BaseModel):
     )
 
 
+# Pillar-only criteria — Quality runs' per-domain loop never dispatches
+# these (their CRs come from `whois_history.runner.process_whois_history_run`
+# / `availability_runner.process_availability_run` respectively). Used by
+# `strip_pillar_criteria_from_quality_spec` to close the silent-skip
+# footgun where a Quality spec arrives with one of them enabled
+# (2026-05-24 — caused runs 124/126's whois "stuck running" cohort).
+PILLAR_ONLY_CRITERIA: tuple[str, ...] = ("whois_history", "availability")
+
+
 # --- AI selection ------------------------------------------------------------
 
 # `provider` values match the keys in `app.ai_judge.AI_PROVIDERS` plus None,
@@ -345,6 +354,47 @@ class AnalyzeSpec(BaseModel):
     # exactly as before. Per-domain results land in the
     # availability_checks history table either way.
     check_availability: bool = False
+
+
+def strip_pillar_criteria_from_quality_spec(spec: "AnalyzeSpec") -> "AnalyzeSpec":
+    """Return a copy of `spec` with all `PILLAR_ONLY_CRITERIA` flipped to
+    `enabled=False`. No-op when none were enabled.
+
+    Background: the Quality runner's per-domain loop (`tasks._process_domain`)
+    iterates `build_preview`'s request list, which only emits Ahrefs +
+    Wayback fetches. `whois_history` and `availability` have their own
+    pillar runners (`whois_history.runner.process_whois_history_run`,
+    `availability_runner.process_availability_run`) — Quality runs do NOT
+    dispatch them. Leaving them enabled creates a silent-skip footgun:
+    the run finalizes `status=done` with the CR rows missing, then any
+    later Retry-failed click correctly picks them up and dispatches per-
+    domain whois/availability work the user didn't ask for.
+
+    Concrete reproducer (2026-05-24, runs 124+126 of the Wincraft jobs):
+    Quality spec arrived with `whois_history.enabled=True` (likely
+    inherited from a prior Whois-pillar run via spec prefill). Original
+    run finalized done with only 14/89 whois CRs (silent skip on 75 RDs).
+    User hit Retry-failed thinking they had 1 failed criterion; retry
+    correctly identified 80 RDs as needing whois work, dispatched per-RD
+    whois pillar calls, then worker death (uvicorn restart) left 80 RDs
+    stranded in `status='running'`. Stripping at submit eliminates the
+    silent-skip class of bug at the source.
+
+    Callers: `analyze.submit_job` (always quality), `jobs.rerun_job`
+    (only when `job.kind == 'quality'`)."""
+    needs_change = any(
+        getattr(spec.criteria, name).enabled
+        for name in PILLAR_ONLY_CRITERIA
+    )
+    if not needs_change:
+        return spec
+    new_criteria_updates: dict[str, object] = {}
+    for name in PILLAR_ONLY_CRITERIA:
+        cfg = getattr(spec.criteria, name)
+        if cfg.enabled:
+            new_criteria_updates[name] = cfg.model_copy(update={"enabled": False})
+    updated_criteria = spec.criteria.model_copy(update=new_criteria_updates)
+    return spec.model_copy(update={"criteria": updated_criteria})
 
 
 # --- Preview response --------------------------------------------------------

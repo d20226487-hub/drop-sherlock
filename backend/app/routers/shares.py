@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from .. import app_settings
 from ..db import get_db
 from ..models import DomainShare, Run, RunDomain
 
@@ -119,6 +120,62 @@ def _client_ip(request: Request) -> str:
 
 
 # --- Routes ---------------------------------------------------------------
+#
+# ORDERING NOTE: literal-segment routes that share a prefix with `/{token}`
+# (e.g. `/settings`, `/delete-revoked`) MUST be declared before the
+# `/{token}` routes below, otherwise FastAPI matches the path as
+# `token="settings"` first and you get a 404 (or worse, a stale token
+# lookup against a literal string). Verified empirically when this was
+# added 2026-05-24 — moving `/settings` to the end broke the GET.
+
+
+class ShareDefaultsOut(BaseModel):
+    """Effective share-defaults blob returned by GET/PUT /shares/settings."""
+    default_expires_in_days: int
+    # Echo the shipped defaults next to the effective values so the FE
+    # can render a "Reset to default" affordance without a second fetch.
+    defaults: dict
+
+
+class ShareDefaultsIn(BaseModel):
+    # Same shape as `get_share_defaults` output; missing fields keep their
+    # current values (merge semantics — matches the other Settings PUTs).
+    default_expires_in_days: int | None = Field(default=None, ge=0, le=3650)
+
+
+@router.get("/settings", response_model=ShareDefaultsOut)
+def get_share_settings() -> ShareDefaultsOut:
+    """Return the effective share-defaults blob (DB override merged over
+    shipped defaults) plus the shipped defaults for reset UX."""
+    cfg = app_settings.get_share_defaults()
+    return ShareDefaultsOut(
+        default_expires_in_days=cfg["default_expires_in_days"],
+        defaults=dict(app_settings.DEFAULT_SHARE_DEFAULTS),
+    )
+
+
+@router.put("/settings", response_model=ShareDefaultsOut)
+def update_share_settings(payload: ShareDefaultsIn) -> ShareDefaultsOut:
+    """Merge `payload` over the current defaults and persist."""
+    update: dict = {}
+    if payload.default_expires_in_days is not None:
+        update["default_expires_in_days"] = payload.default_expires_in_days
+    cfg = app_settings.set_share_defaults(update) if update else app_settings.get_share_defaults()
+    return ShareDefaultsOut(
+        default_expires_in_days=cfg["default_expires_in_days"],
+        defaults=dict(app_settings.DEFAULT_SHARE_DEFAULTS),
+    )
+
+
+@router.delete("/settings", response_model=ShareDefaultsOut)
+def reset_share_settings() -> ShareDefaultsOut:
+    """Drop the override → next read returns shipped defaults."""
+    cfg = app_settings.reset_share_defaults()
+    return ShareDefaultsOut(
+        default_expires_in_days=cfg["default_expires_in_days"],
+        defaults=dict(app_settings.DEFAULT_SHARE_DEFAULTS),
+    )
+
 
 @router.post("", response_model=ShareOut)
 def create_share(
@@ -300,3 +357,199 @@ def revoke_all_active(db: Session = Depends(get_db)) -> dict:
         r.revoked_at = now
     db.commit()
     return {"revoked": len(rows)}
+
+
+# --- Activate + hard-delete (added 2026-05-24) -----------------------------
+# DESIGN: `DELETE /shares/{token}` is preserved as soft-revoke (existing
+# UX). Hard-delete + activate are NEW behaviours exposed via distinct
+# endpoints so the existing per-row "Revoke" and bulk-revoke UX is
+# unchanged. Activation only clears `revoked_at` — if the row was both
+# revoked AND past its expires_at, it stays "expired" until the operator
+# also bumps the expiry (kept as a separate decision per the locked
+# 2026-05-24 design call).
+
+@router.post("/{token}/activate", response_model=ShareOut)
+def activate_share(
+    token: str,
+    db: Session = Depends(get_db),
+) -> ShareOut:
+    """Reverse a soft-revoke by clearing `revoked_at`. Idempotent — an
+    already-active row is returned unchanged. The view_count + audit
+    fields are preserved (they were never touched by revoke either)."""
+    share = db.get(DomainShare, token)
+    if share is None:
+        raise HTTPException(404, "share not found")
+    if share.revoked_at is not None:
+        share.revoked_at = None
+        db.commit()
+        db.refresh(share)
+    rd = db.get(RunDomain, share.run_domain_id)
+    run = rd.run if rd else None
+    return _share_to_out(share, rd, run)
+
+
+@router.delete("/{token}/hard")
+def hard_delete_share(
+    token: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Hard-delete a share row. Loses audit trail (view_count, created_ip,
+    last_viewed_at) — use soft-revoke unless you actively want this row
+    gone. The UI surfaces this only on already-revoked rows, so the audit
+    trail loss is consistent with the operator's intent to forget the
+    share. Returns 404 if token not found (idempotency NOT desired — the
+    operator should know if they're acting on a stale token list)."""
+    share = db.get(DomainShare, token)
+    if share is None:
+        raise HTTPException(404, "share not found")
+    db.delete(share)
+    db.commit()
+    return {"deleted": 1, "token": token}
+
+
+class BulkDeleteIn(BaseModel):
+    # Optional list of tokens. When absent (or empty), the endpoint
+    # hard-deletes EVERY currently-revoked row. This mirrors the
+    # nuclear `DELETE /shares` (revoke-all-active) UX — one click on the
+    # FE button wipes all revoked rows.
+    tokens: list[str] = Field(default_factory=list, max_length=10000)
+
+
+# --- One-click quick-share for a specific RunDomain (added 2026-05-24) ----
+# Sibling of `POST /database/quick-share` (which resolves by domain →
+# pinned/latest rd). The Domain-page caller already knows EXACTLY which
+# rd it wants to share — it's looking at that specific run-domain — so
+# we take rd_id directly rather than re-resolving by domain string.
+#
+# Behaviour:
+#   1. Look up the most-recent active share for this rd via the same
+#      reuse policy as the Database flow (non-revoked + non-expired,
+#      newest first). Re-click should never multiply tokens.
+#   2. Otherwise mint a fresh token with the operator-configured
+#      default expiry (`share_defaults.default_expires_in_days`).
+#
+# Returns the same response shape as `POST /database/quick-share` so the
+# FE can share types across the two callers.
+
+class QuickShareForRdIn(BaseModel):
+    run_domain_id: int
+
+
+class QuickShareForRdOut(BaseModel):
+    run_domain_id: int | None
+    domain: str
+    token: str | None
+    share_url: str | None
+    expires_at: datetime | None
+    reused: bool
+    error: str
+
+
+@router.post("/quick", response_model=QuickShareForRdOut)
+def quick_share_for_rd(
+    payload: QuickShareForRdIn,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> QuickShareForRdOut:
+    """One-click share for a specific RunDomain. Reuses the most-recent
+    active share for this rd; otherwise mints a token with the operator-
+    configured default expiry. Used by the Domain-page Share button after
+    its 2026-05-24 modal-to-1-click conversion."""
+    rd = db.get(RunDomain, payload.run_domain_id)
+    if rd is None:
+        return QuickShareForRdOut(
+            run_domain_id=payload.run_domain_id,
+            domain="",
+            token=None,
+            share_url=None,
+            expires_at=None,
+            reused=False,
+            error="run domain not found",
+        )
+
+    # Reuse policy — mirror of database._find_active_share. Inlined
+    # (rather than imported) so the shares router doesn't take a
+    # circular import dependency on the database router.
+    now = datetime.utcnow()
+    existing = (
+        db.query(DomainShare)
+        .filter(DomainShare.run_domain_id == rd.id)
+        .filter(DomainShare.revoked_at.is_(None))
+        .filter(
+            (DomainShare.expires_at.is_(None))
+            | (DomainShare.expires_at > now)
+        )
+        .order_by(DomainShare.created_at.desc())
+        .first()
+    )
+    if existing is not None:
+        return QuickShareForRdOut(
+            run_domain_id=rd.id,
+            domain=rd.domain,
+            token=existing.token,
+            share_url=f"/share/{existing.token}",
+            expires_at=existing.expires_at,
+            reused=True,
+            error="",
+        )
+
+    cfg = app_settings.get_share_defaults()
+    days = int(cfg.get("default_expires_in_days") or 0)
+    expires_at: datetime | None = None
+    if days > 0:
+        expires_at = datetime.utcnow() + timedelta(days=days)
+    for _ in range(5):
+        token = secrets.token_urlsafe(_TOKEN_BYTES)
+        if db.get(DomainShare, token) is None:
+            break
+    else:
+        return QuickShareForRdOut(
+            run_domain_id=rd.id,
+            domain=rd.domain,
+            token=None,
+            share_url=None,
+            expires_at=None,
+            reused=False,
+            error="could not allocate a unique share token",
+        )
+    share = DomainShare(
+        token=token,
+        run_domain_id=rd.id,
+        note="quick-share (Domain page)",
+        expires_at=expires_at,
+        created_ip=_client_ip(request),
+    )
+    db.add(share)
+    db.commit()
+    db.refresh(share)
+    return QuickShareForRdOut(
+        run_domain_id=rd.id,
+        domain=rd.domain,
+        token=share.token,
+        share_url=f"/share/{share.token}",
+        expires_at=share.expires_at,
+        reused=False,
+        error="",
+    )
+
+
+@router.post("/delete-revoked")
+def delete_revoked(
+    payload: BulkDeleteIn = Body(default_factory=BulkDeleteIn),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Bulk hard-delete revoked share rows. With an empty `tokens` list,
+    deletes ALL currently-revoked rows (nuclear "Delete revoked" button).
+    With a non-empty `tokens` list, only deletes the listed tokens IF
+    they're currently revoked — active rows are silently skipped (use
+    `/bulk-revoke` first if you want them gone too).
+
+    Returns the count actually deleted."""
+    q = db.query(DomainShare).filter(DomainShare.revoked_at.is_not(None))
+    if payload.tokens:
+        q = q.filter(DomainShare.token.in_(payload.tokens))
+    rows = q.all()
+    for r in rows:
+        db.delete(r)
+    db.commit()
+    return {"deleted": len(rows)}

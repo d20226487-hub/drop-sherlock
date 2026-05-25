@@ -287,6 +287,57 @@ function VerdictPill({ value }: { value: string | null }) {
   );
 }
 
+// Tone map for the 4 whois bands. Mirrors the Database page so the
+// vocabulary is consistent across pages: dropped = red, mixed = amber,
+// insufficient = neutral-grey (signal too thin), stable = green.
+const WHOIS_BAND_TONE: Record<string, string> = {
+  dropped: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
+  mixed: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
+  insufficient:
+    "bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400",
+  stable:
+    "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300",
+};
+
+function WhoisCell({
+  band,
+  cycles,
+  summary,
+}: {
+  band: string | undefined;
+  cycles: number | null | undefined;
+  summary: string | undefined;
+}) {
+  const { t } = useT();
+  const ts = t.pages.jobs.compare;
+  const bandLabels = ts.whoisBand as unknown as Record<string, string>;
+  if (!band) {
+    return <span className="text-neutral-400 dark:text-neutral-600">—</span>;
+  }
+  const tone =
+    WHOIS_BAND_TONE[band] ||
+    "bg-neutral-100 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300";
+  const label = bandLabels[band] ?? band;
+  return (
+    <div className="inline-flex items-center gap-1.5 flex-wrap">
+      <span
+        className={`text-xs px-2 py-0.5 rounded-full ${tone}`}
+        title={summary || label}
+      >
+        {label}
+      </span>
+      {typeof cycles === "number" && cycles > 1 && (
+        <span
+          className="text-[10px] text-neutral-600 dark:text-neutral-400"
+          title={summary || undefined}
+        >
+          {ts.whoisCycles(cycles)}
+        </span>
+      )}
+    </div>
+  );
+}
+
 // Neutral text chip for wayback_classify outputs (category, theme). These
 // aren't quality verdicts — they're free-form / user-defined strings — so
 // they get a neutral tone, no semantic color coding. Wraps long themes
@@ -385,6 +436,9 @@ function CompareTable({
     const known = ts.cols as unknown as Record<string, string>;
     if (key === "wayback_classify") {
       return known.wayback_classify ?? "Classify";
+    }
+    if (key === "whois_history") {
+      return known.whois_history ?? "Whois";
     }
     return known[key] ?? key;
   };
@@ -629,6 +683,40 @@ function CompareRow({
             </td>,
             <td key={`${c}-theme-B`} className={`px-2 py-2 ${themeDiff}`}>
               <TextChip value={bTheme} />
+            </td>,
+          ];
+        }
+        // whois_history has no `ai_assessment` — its verdict is encoded
+        // as `band` (derived from dropped_confidence on the backend) plus
+        // `ownership_cycles` for the drop count. Compare across runs by
+        // band; cycles count comes along but doesn't drive the diff
+        // shade (a re-judge might shift dropped_confidence across band
+        // boundaries without changing the underlying cycle count).
+        if (c === "whois_history") {
+          const aWh = a?.criteria[c];
+          const bWh = b?.criteria[c];
+          const aBand = aWh?.band ?? "";
+          const bBand = bWh?.band ?? "";
+          const diffShade = both && aBand !== bBand
+            ? "bg-amber-50 dark:bg-amber-900/10"
+            : "";
+          return [
+            <td
+              key={`${c}-A`}
+              className={`px-2 py-2 border-l dark:border-neutral-800 ${diffShade}`}
+            >
+              <WhoisCell
+                band={aBand}
+                cycles={aWh?.ownership_cycles}
+                summary={aWh?.summary}
+              />
+            </td>,
+            <td key={`${c}-B`} className={`px-2 py-2 ${diffShade}`}>
+              <WhoisCell
+                band={bBand}
+                cycles={bWh?.ownership_cycles}
+                summary={bWh?.summary}
+              />
             </td>,
           ];
         }

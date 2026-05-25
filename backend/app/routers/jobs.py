@@ -598,7 +598,22 @@ def get_job(job_id: int, db: Session = Depends(get_db)) -> JobDetail:
 @router.get("/{job_id}/spec")
 def get_job_spec(job_id: int, db: Session = Depends(get_db)) -> dict:
     """The latest AnalyzeSpec for this job — used by the Analyze page to
-    prefill the form when rerunning."""
+    prefill the form when rerunning.
+
+    Domains source (2026-05-21 fix): the union of every RunDomain ever
+    created under this Job, NOT just `Job.spec_json.domains`. The
+    `/jobs/{id}/rerun` endpoint overwrites `Job.spec_json` with each
+    rerun's curated subset (so the latest criteria + ai settings stick
+    on the next prefill), which silently lost the original full domain
+    list if the user ever re-ran with a narrower selection. Reading
+    domains from the RunDomain table makes prefill always show every
+    domain this Job has analyzed — the user can curate down from the
+    full set on rerun without ever losing earlier-imported domains.
+
+    All other spec fields (criteria, ai, lang, use_cache, etc.) still
+    come from Job.spec_json — those are intentionally "latest config
+    wins" so an operator's curated AI provider choice carries forward.
+    """
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(404, "job not found")
@@ -614,6 +629,30 @@ def get_job_spec(job_id: int, db: Session = Depends(get_db)) -> dict:
         spec = AnalyzeSpec.model_validate(raw).model_dump(mode="json")
     except Exception:
         spec = raw
+
+    # Override domains with the union of all RunDomain.domain rows
+    # across every Run of this Job. Order: keep insertion order of the
+    # first time each domain was seen so the original import sequence
+    # is preserved (useful when the operator was applying spreadsheet
+    # logic to ordering — e.g. high-priority first).
+    seen: set[str] = set()
+    all_domains: list[str] = []
+    for (dom,) in (
+        db.query(RunDomain.domain)
+        .join(Run, Run.id == RunDomain.run_id)
+        .filter(Run.job_id == job.id)
+        .order_by(RunDomain.id.asc())
+        .all()
+    ):
+        if dom and dom not in seen:
+            seen.add(dom)
+            all_domains.append(dom)
+    if all_domains:
+        # Only override when there ARE historical RunDomains — for a
+        # brand-new Job with 0 runs, leave spec.domains as-is.
+        if isinstance(spec, dict):
+            spec["domains"] = all_domains
+
     return {"job_id": job.id, "name": job.name, "notes": job.notes, "spec": spec}
 
 
@@ -760,11 +799,20 @@ async def rerun_job(
     cleaned = [d.strip() for d in payload.spec.domains if d.strip()]
     if not cleaned:
         raise HTTPException(400, "at least one domain is required")
+    # Validate that the spec activates at least one criterion across ANY
+    # pillar (Quality / Whois / Availability). Earlier this only checked
+    # the 6 Quality criteria, which rejected reruns of Whois and
+    # Availability jobs (their specs leave Quality criteria off and turn
+    # on whois_history or availability instead). The 2026-05-21 fix
+    # broadens the check so /jobs/{id}/rerun is kind-agnostic — dispatch_run
+    # already routes by job.kind, so the rerun endpoint just needs to
+    # accept any valid pillar spec.
     enabled_count = sum(
         1
         for k in (
             "backlinks", "refdomains", "anchors", "keywords",
             "wayback", "wayback_classify",
+            "whois_history", "availability",
         )
         if getattr(payload.spec.criteria, k).enabled
     )
@@ -776,6 +824,13 @@ async def rerun_job(
     # rerun (and `ai=` / `use_cache` / `lang` before that). See the matching
     # comment in routers/analyze.py.
     norm_spec = payload.spec.model_copy(update={"domains": cleaned})
+    # Same Quality-pillar guard as `/analyze/jobs` — but ONLY for quality
+    # jobs. Whois-kind / availability-kind reruns legitimately need those
+    # criteria enabled (their pillar runners dispatch them), so we must
+    # not strip them. Gated on `job.kind`. (2026-05-24)
+    if (job.kind or "quality") == "quality":
+        from ..schemas import strip_pillar_criteria_from_quality_spec
+        norm_spec = strip_pillar_criteria_from_quality_spec(norm_spec)
     # Auto-enable wayback + V2 sampling when classify is on.
     from .analyze import auto_enable_wayback_for_classify
     auto_enable_wayback_for_classify(norm_spec)
@@ -1844,6 +1899,72 @@ def get_run_summary(run_id: int, db: Session = Depends(get_db)) -> dict:
                 entry["language"] = verdict.get("primary_language") or ""
                 entry["category"] = verdict.get("category") or ""
                 entry["drift_detected"] = bool(verdict.get("drift_detected"))
+            # whois_history also lacks an `assessment` — its verdict shape
+            # is {dropped_confidence, transferred_confidence, summary, ...}.
+            # The Compare page needs the band (dropped / mixed / insufficient
+            # / stable) + ownership_cycles to render a meaningful cell.
+            # Mirrors the Database page derivation in routers/database.py.
+            if cr.criterion == "whois_history":
+                from .database import _whois_band
+                dc: float | None = None
+                tc: float | None = None
+                summ = ""
+                if isinstance(verdict, dict):
+                    raw_dc = verdict.get("dropped_confidence")
+                    if isinstance(raw_dc, (int, float)) and not isinstance(
+                        raw_dc, bool
+                    ) and 0.0 <= float(raw_dc) <= 1.0:
+                        dc = float(raw_dc)
+                    raw_tc = verdict.get("transferred_confidence")
+                    if isinstance(raw_tc, (int, float)) and not isinstance(
+                        raw_tc, bool
+                    ) and 0.0 <= float(raw_tc) <= 1.0:
+                        tc = float(raw_tc)
+                    raw_s = verdict.get("summary")
+                    if isinstance(raw_s, str):
+                        summ = raw_s
+                cycles: int | None = None
+                if cr.data_json:
+                    try:
+                        wh_data = json.loads(cr.data_json)
+                    except json.JSONDecodeError:
+                        wh_data = None
+                    diff = (
+                        ((wh_data or {}).get("diff") or {})
+                        if isinstance(wh_data, dict)
+                        else {}
+                    )
+                    # Always recompute via the shared helper — see
+                    # routers/database.py for the rationale (retroactive
+                    # correction for legacy CRs without re-fetching).
+                    from ..whois_history.diff import (
+                        compute_cycles_from_diff_dict,
+                    )
+                    recomputed = (
+                        compute_cycles_from_diff_dict(diff)
+                        if isinstance(diff, dict)
+                        else None
+                    )
+                    raw_cycles = (
+                        diff.get("ownership_cycles")
+                        if isinstance(diff, dict)
+                        else None
+                    )
+                    if (
+                        recomputed is not None
+                        and isinstance(raw_cycles, int)
+                        and 1 <= raw_cycles <= 10
+                    ):
+                        cycles = max(raw_cycles, recomputed)
+                    elif recomputed is not None:
+                        cycles = recomputed
+                    elif isinstance(raw_cycles, int) and 1 <= raw_cycles <= 10:
+                        cycles = raw_cycles
+                entry["dropped_confidence"] = dc
+                entry["transferred_confidence"] = tc
+                entry["band"] = _whois_band(dc)
+                entry["ownership_cycles"] = cycles
+                entry["summary"] = summ
             per_crit[cr.criterion] = entry
         # Surface the numeric score from final_assessment_json so the
         # Analyze summary table can render the score pill (the score is
@@ -2249,6 +2370,31 @@ async def retry_failed_run_route(
         raise HTTPException(404, "run not found")
     if "error" in result:
         raise HTTPException(400, result["error"])
+    return result
+
+
+@runs_router.post("/{run_id}/cancel-retry-failed")
+async def cancel_retry_failed_route(run_id: int) -> dict:
+    """Force-cancel an in-flight Retry-failed dispatch.
+
+    The standard `POST /runs/{id}/cancel` short-circuits with
+    `already_terminal=True` for runs whose `status` is `done|failed|
+    canceled` — which is precisely the state a retry-failed dispatch
+    runs against (you can only retry-failed a terminal run). So that
+    button can't stop the retry. This endpoint exists for that gap:
+    it cancels the asyncio tasks dispatched by `retry_failed_run_now`
+    + cleans up stuck-running RDs left behind by task death (uvicorn
+    restart, exception, etc.).
+
+    Always returns 200 with a counts envelope so the FE can render
+    the same success banner regardless of whether anything was
+    actually in flight — operator clicks "Cancel" expecting "stopped",
+    not a 4xx because "nothing was running anyway."
+    """
+    from ..tasks import cancel_retry_failed_now
+    result = cancel_retry_failed_now(run_id)
+    if result.get("found") is False:
+        raise HTTPException(404, "run not found")
     return result
 
 

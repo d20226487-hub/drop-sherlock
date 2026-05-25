@@ -1,16 +1,18 @@
 "use client";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ShareRecord } from "@/lib/api";
+import { api, ShareRecord, ShareSettings } from "@/lib/api";
 import { useT } from "@/lib/i18n";
 
 // Management UI for view-only share links. Surfaces every share token
 // the operator has minted (active + revoked + expired) with filters,
 // search, bulk revoke, per-row revoke / extend-expiry actions.
 //
-// The page is read-mostly so we server-paginate (50/page default) +
-// poll the backend for fresh `view_count` + `last_viewed_at` on a soft
-// cadence. Bulk actions go through POST /shares/bulk-revoke.
+// 2026-05-24 wave: added per-row Delete (hard-delete) + Activate
+// (un-revoke), a bulk "Delete revoked" button, and a collapsible
+// Settings panel for the per-shop default share duration. The new UX
+// keeps the original Revoke flow untouched — Delete + Activate only
+// surface on revoked rows.
 
 type StatusFilter = "all" | "active" | "revoked" | "expired";
 
@@ -35,6 +37,13 @@ export default function SharesPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkResult, setBulkResult] = useState<string | null>(null);
+
+  // Settings panel state (collapsible, closed by default — keeps the
+  // primary management workflow front-and-centre).
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<ShareSettings | null>(null);
+  const [settingsDraft, setSettingsDraft] = useState<number>(0);
+  const [settingsBusy, setSettingsBusy] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -62,6 +71,21 @@ export default function SharesPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Load settings once on mount — the panel renders the value
+  // regardless of whether the operator has opened it (collapsible header
+  // shows the current default in the trigger).
+  useEffect(() => {
+    void (async () => {
+      try {
+        const s = await api.getShareSettings();
+        setSettings(s);
+        setSettingsDraft(s.default_expires_in_days);
+      } catch {
+        // Non-fatal — page still works without the settings panel.
+      }
+    })();
+  }, []);
 
   const totalPages = Math.max(1, Math.ceil(total / perPage));
 
@@ -137,6 +161,94 @@ export default function SharesPage() {
     }
   }
 
+  async function activateOne(token: string) {
+    if (!window.confirm(ts.activateConfirm)) return;
+    try {
+      await api.activateShare(token);
+      await load();
+    } catch (e) {
+      setBulkResult(
+        ts.activateFailed + ": " + (e instanceof Error ? e.message : String(e)),
+      );
+    }
+  }
+
+  async function hardDeleteOne(token: string) {
+    if (!window.confirm(ts.hardDeleteConfirm)) return;
+    try {
+      await api.hardDeleteShare(token);
+      // Drop from selection set since the row no longer exists.
+      setSelected((prev) => {
+        const next = new Set(prev);
+        next.delete(token);
+        return next;
+      });
+      await load();
+    } catch (e) {
+      setBulkResult(
+        ts.hardDeleteFailed + ": " + (e instanceof Error ? e.message : String(e)),
+      );
+    }
+  }
+
+  async function deleteAllRevoked() {
+    // The endpoint with empty `tokens` wipes EVERY revoked row, not
+    // just those on the current page. We display the on-page revoked
+    // count in the prompt as a rough magnitude hint — exact wipe count
+    // comes back in the response.
+    const visibleRevoked = items.filter((x) => statusOf(x) === "revoked").length;
+    if (!window.confirm(ts.deleteRevokedConfirm(visibleRevoked))) return;
+    setBulkBusy(true);
+    setBulkResult(null);
+    try {
+      const r = await api.deleteRevokedShares([]);
+      setBulkResult(ts.deleteRevokedDone(r.deleted));
+      setSelected(new Set());
+      await load();
+    } catch (e) {
+      setBulkResult(
+        ts.deleteRevokedFailed +
+          ": " +
+          (e instanceof Error ? e.message : String(e)),
+      );
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  async function saveSettings() {
+    setSettingsBusy(true);
+    try {
+      const updated = await api.updateShareSettings({
+        default_expires_in_days: settingsDraft,
+      });
+      setSettings(updated);
+      setSettingsDraft(updated.default_expires_in_days);
+      setBulkResult(ts.settings.saved);
+      setTimeout(() => setBulkResult(null), 2000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSettingsBusy(false);
+    }
+  }
+
+  async function resetSettings() {
+    if (!window.confirm(ts.settings.resetConfirm)) return;
+    setSettingsBusy(true);
+    try {
+      const updated = await api.resetShareSettings();
+      setSettings(updated);
+      setSettingsDraft(updated.default_expires_in_days);
+      setBulkResult(ts.settings.saved);
+      setTimeout(() => setBulkResult(null), 2000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSettingsBusy(false);
+    }
+  }
+
   async function copyUrl(token: string) {
     const url = `${window.location.origin}/share/${token}`;
     try {
@@ -155,6 +267,73 @@ export default function SharesPage() {
         <p className="text-sm text-neutral-600 dark:text-neutral-400 mt-1">
           {ts.intro}
         </p>
+      </div>
+
+      {/* Default settings — collapsible. Closed by default so it
+          doesn't compete with the management table on first view, but
+          the trigger surfaces the current default so it's never
+          invisible. */}
+      <div className="rounded-md border dark:border-neutral-800 bg-neutral-50/40 dark:bg-neutral-900/40">
+        <button
+          type="button"
+          onClick={() => setSettingsOpen((v) => !v)}
+          className="w-full px-3 py-2 flex items-center justify-between text-left text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800/40 rounded-md"
+        >
+          <span className="font-medium">
+            {ts.settings.toggle}
+            {settings && (
+              <span className="ml-2 text-xs text-neutral-500 dark:text-neutral-400 font-normal">
+                — {ts.settings.currentDefault(settings.default_expires_in_days)}
+              </span>
+            )}
+          </span>
+          <span className="text-neutral-400">{settingsOpen ? "▾" : "▸"}</span>
+        </button>
+        {settingsOpen && (
+          <div className="px-4 py-3 border-t dark:border-neutral-800 space-y-3 text-sm">
+            <p className="text-xs text-neutral-600 dark:text-neutral-400">
+              {ts.settings.intro}
+            </p>
+            <div className="flex items-end gap-3 flex-wrap">
+              <div className="space-y-1">
+                <label className="text-xs text-neutral-500 dark:text-neutral-400 block">
+                  {ts.settings.defaultExpiresLabel}
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  max={3650}
+                  value={settingsDraft}
+                  onChange={(e) =>
+                    setSettingsDraft(
+                      Math.max(0, Math.min(3650, parseInt(e.target.value || "0", 10))),
+                    )
+                  }
+                  className="w-28 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-900 px-2 py-1"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={saveSettings}
+                disabled={settingsBusy}
+                className="text-xs px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
+              >
+                {settingsBusy ? ts.settings.saving : ts.settings.save}
+              </button>
+              <button
+                type="button"
+                onClick={resetSettings}
+                disabled={settingsBusy}
+                className="text-xs px-3 py-1.5 rounded border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+              >
+                {ts.settings.reset}
+              </button>
+            </div>
+            <p className="text-[11px] text-neutral-500 dark:text-neutral-400">
+              {ts.settings.defaultExpiresHint}
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Filters bar */}
@@ -221,8 +400,9 @@ export default function SharesPage() {
         </button>
       </div>
 
-      {/* Bulk actions strip — only shown when something is selected, OR
-          when we want to expose the nuclear "revoke all active". */}
+      {/* Bulk actions strip — selection-conditional revoke + always-on
+          nuclear buttons on the right. "Delete revoked" sits alongside
+          "Revoke all active" so the two destructive ops live together. */}
       <div className="flex items-center gap-2 flex-wrap">
         {selected.size > 0 && (
           <div className="flex items-center gap-2 rounded-md bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/60 px-3 py-1.5 text-xs">
@@ -246,15 +426,26 @@ export default function SharesPage() {
             </button>
           </div>
         )}
-        <button
-          type="button"
-          onClick={revokeAllActive}
-          disabled={bulkBusy}
-          className="ml-auto text-xs px-3 py-1.5 rounded border border-rose-300 dark:border-rose-700 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/30 disabled:opacity-50"
-          title={ts.revokeAllHint}
-        >
-          {ts.revokeAll}
-        </button>
+        <div className="ml-auto flex items-center gap-2">
+          <button
+            type="button"
+            onClick={deleteAllRevoked}
+            disabled={bulkBusy}
+            className="text-xs px-3 py-1.5 rounded border border-rose-300 dark:border-rose-700 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/30 disabled:opacity-50"
+            title={ts.deleteRevokedHint}
+          >
+            {ts.deleteRevoked}
+          </button>
+          <button
+            type="button"
+            onClick={revokeAllActive}
+            disabled={bulkBusy}
+            className="text-xs px-3 py-1.5 rounded border border-rose-300 dark:border-rose-700 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/30 disabled:opacity-50"
+            title={ts.revokeAllHint}
+          >
+            {ts.revokeAll}
+          </button>
+        </div>
       </div>
 
       {bulkResult && (
@@ -380,6 +571,33 @@ export default function SharesPage() {
                         className="text-xs text-rose-600 dark:text-rose-400 hover:underline"
                       >
                         {ts.revoke}
+                      </button>
+                    )}
+                    {st === "revoked" && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => activateOne(s.token)}
+                          className="text-xs text-emerald-600 dark:text-emerald-400 hover:underline mr-2"
+                        >
+                          {ts.activate}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => hardDeleteOne(s.token)}
+                          className="text-xs text-rose-600 dark:text-rose-400 hover:underline"
+                        >
+                          {ts.hardDelete}
+                        </button>
+                      </>
+                    )}
+                    {st === "expired" && (
+                      <button
+                        type="button"
+                        onClick={() => hardDeleteOne(s.token)}
+                        className="text-xs text-rose-600 dark:text-rose-400 hover:underline"
+                      >
+                        {ts.hardDelete}
                       </button>
                     )}
                   </td>

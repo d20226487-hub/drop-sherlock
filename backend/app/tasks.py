@@ -1163,13 +1163,41 @@ async def _retry_failed_run_domain(
     criteria ignore it). The cascade ensures wayback_classify gets
     re-judged after wayback's samples land, so we don't need to pass
     the flag to the classify branch — its read of the wayback CR's
-    samples picks up the fresh data automatically."""
+    samples picks up the fresh data automatically.
+
+    Cancel-aware between criteria (2026-05-24): when `cancel_retry_failed_now`
+    sets the cancel flag, the next iteration of this loop bails — defense
+    in depth alongside the `task.cancel()` that the cancel orchestrator
+    fires (task.cancel() raises CancelledError at the next await, which
+    is also what bails out of `_reanalyze_run_domain_criterion`)."""
+    # Resolve the parent run_id once so the cancel check below doesn't
+    # need an extra DB hit per iteration.
+    parent_run_id: int | None = None
+    try:
+        db_lookup = SessionLocal()
+        try:
+            rd = db_lookup.get(RunDomain, run_domain_id)
+            if rd is not None:
+                parent_run_id = rd.run_id
+        finally:
+            db_lookup.close()
+    except Exception:  # noqa: BLE001
+        # Don't fail the whole retry just because the cancel check
+        # couldn't initialize. Workers will still respect task.cancel().
+        parent_run_id = None
     try:
         for c in criteria:
+            if parent_run_id is not None and is_canceled(parent_run_id):
+                break
             await _reanalyze_run_domain_criterion(
                 run_domain_id, c, spec, track_set=False,
                 resample_only=resample_only,
             )
+    except asyncio.CancelledError:
+        # task.cancel() from cancel_retry_failed_now reached us. Let the
+        # exception propagate AFTER we've cleaned up our reanalyzing
+        # tracker entry (handled by the `finally` below).
+        raise
     except Exception:  # noqa: BLE001
         log.exception(
             "retry-failed for run_domain %s failed", run_domain_id,
@@ -1177,6 +1205,109 @@ async def _retry_failed_run_domain(
     finally:
         if track_set:
             _REANALYZING_RUN_DOMAINS.discard(run_domain_id)
+
+
+def cancel_retry_failed_now(run_id: int) -> dict:
+    """Force-cancel an in-flight Retry-failed dispatch for `run_id`.
+
+    Three-step orchestration (each step independently useful, but the
+    whole sequence is what gives the user a clean "stopped" state):
+
+    1. `request_cancel(run_id)` — sets the in-process flag so any
+       cancel-aware code paths (including `_retry_failed_run_domain`'s
+       between-criteria check, all the `is_canceled(...)` sites in
+       `_process_domain`, and the wayback/availability auto-retry
+       watchers) bail at the next checkpoint.
+    2. `task.cancel()` on every tracked retry task that belongs to a
+       run-domain of this run. This is what actually interrupts mid-
+       await coroutines (`_reanalyze_run_domain_criterion` doesn't
+       check `is_canceled` itself — historical oversight — so without
+       this step a stuck HTTP fetch would keep running).
+    3. Reset RDs stuck in `status='running'` to a sane terminal state
+       (mirrors the manual cleanup logic used for runs 124/126 on
+       2026-05-24). For each affected rd, derive the new status from
+       its CR statuses: any failed → failed; all done → done; mixed →
+       done as the most conservative "not running anymore" landing.
+
+    Returns `{run_id, found, canceled_tasks, flipped_rds, status}`.
+    `found=False` only when the run row itself doesn't exist; ALL other
+    outcomes (no in-flight tasks, no stuck rds, …) come back with
+    `found=True` and zeroed counts so the FE can render the same
+    success banner regardless.
+    """
+    from datetime import datetime as _dt
+
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is None:
+            return {"id": run_id, "found": False}
+
+        # Step 1: flag.
+        request_cancel(run_id)
+
+        # Step 2: cancel tracked tasks. The set may contain entries from
+        # ANY run; we only cancel those whose rd belongs to this run.
+        # Walk a snapshot of the items so concurrent .discard()s from
+        # task `finally` blocks don't mutate during iteration.
+        rd_ids_in_run = {
+            rd_id for (rd_id,) in db.query(RunDomain.id)
+            .filter(RunDomain.run_id == run_id)
+            .all()
+        }
+        canceled_tasks = 0
+        for rd_id, task in list(_REANALYZING_RUN_DOMAINS.items()):
+            if rd_id not in rd_ids_in_run:
+                continue
+            if task is None or task.done():
+                continue
+            task.cancel()
+            canceled_tasks += 1
+        # The run-level reanalyze tracker may also be active (separate
+        # entry point, but same cancel intent here).
+        run_level_task = _REANALYZING_RUNS.get(run_id)
+        if run_level_task is not None and not run_level_task.done():
+            run_level_task.cancel()
+            canceled_tasks += 1
+
+        # Step 3: reset stuck-running RDs. We do this even when
+        # canceled_tasks is 0 because the most common operator complaint
+        # is "the page shows N running but nothing is happening" — the
+        # tasks died (e.g. uvicorn restart) and we still need to clean
+        # up the visible state.
+        stuck = (
+            db.query(RunDomain)
+            .filter(RunDomain.run_id == run_id)
+            .filter(RunDomain.status == "running")
+            .all()
+        )
+        flipped = 0
+        for rd in stuck:
+            cr_statuses = {cr.status for cr in rd.results}
+            if "failed" in cr_statuses:
+                rd.status = "failed"
+            elif cr_statuses and all(s == "done" for s in cr_statuses):
+                rd.status = "done"
+            else:
+                # Mixed / nothing — most conservative landing so the row
+                # doesn't show "running" indefinitely. The user can
+                # re-retry later; `_collect_failed_criteria` will pick
+                # up the genuine gaps correctly.
+                rd.status = "done"
+            if rd.finished_at is None:
+                rd.finished_at = _dt.utcnow()
+            flipped += 1
+        if flipped:
+            db.commit()
+        return {
+            "id": run_id,
+            "found": True,
+            "canceled_tasks": canceled_tasks,
+            "flipped_rds": flipped,
+            "status": "canceled",
+        }
+    finally:
+        db.close()
 
 
 # --- Wayback auto-retry watcher (added 2026-05-17) --------------------------
@@ -2060,8 +2191,142 @@ def _finish_run(run_id: int, success: bool, error: str) -> None:
         if error:
             run.error = error
         db.commit()
+
+        # Coverage audit (2026-05-24) — see _audit_missing_cr_coverage's
+        # docstring. Only runs on success=True finalizations; failure
+        # paths already surface RD-level failure via the workers' own
+        # error stamping. Wrapped in try/except so an audit bug can
+        # never block the run finalization itself.
+        if success:
+            try:
+                _audit_missing_cr_coverage(run_id, db)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "coverage audit failed for run %s — finalization "
+                    "succeeded but rd.status may not reflect missing CRs",
+                    run_id,
+                )
     finally:
         db.close()
+
+
+def _audit_missing_cr_coverage(run_id: int, db: Session) -> None:
+    """Detect "silently incomplete" RDs and flip them done → failed.
+
+    A Quality run can legitimately complete with `run.status='done'`
+    while individual RDs are missing CR rows for criteria the spec
+    enabled — historically because a pillar-only criterion
+    (whois_history / availability) slipped into the Quality spec
+    (the runner's per-domain loop never dispatched them), more rarely
+    because an exception inside `_process_domain` aborted the per-
+    criterion loop before reaching the missing one.
+
+    Without this audit the run page reads "8 done · 1 failed" even
+    when 75 RDs are silently missing whois — operator hits Retry-
+    failed thinking 1 RD needs work, gets 80+ RDs dispatched. Surfacing
+    the gap as `rd.status='failed'` makes the run page count match
+    reality so the operator's mental model lines up with what Retry-
+    failed will actually do.
+
+    Expected criteria by job kind:
+      quality       → enabled criteria from the Quality runner's
+                      universe (backlinks/refdomains/anchors/keywords/
+                      wayback/wayback_classify). whois_history +
+                      availability are EXCLUDED even when present in the
+                      spec — fix B at submit blocks new ones, and old
+                      Quality specs with them on shouldn't get blanket-
+                      failed retroactively (they're a spec bug, not an
+                      execution bug).
+      whois_history → {"whois_history"} only.
+      availability  → {"availability"} only.
+
+    Audit complexity: O(num_rds) DB query for RDs + O(num_crs) for CRs +
+    O(num_rds × |expected|) check. For 100k RD runs this is ~1s. We do
+    one bulk RunDomain query + one bulk CriterionResult query rather
+    than walking the lazy `rd.results` relationship per row (would be
+    N+1).
+    """
+    run = db.get(Run, run_id)
+    if run is None or not run.spec_json:
+        return
+    try:
+        spec = AnalyzeSpec.model_validate(json.loads(run.spec_json))
+    except Exception:  # noqa: BLE001
+        return
+
+    job = db.get(Job, run.job_id) if run.job_id else None
+    job_kind = (job.kind if job is not None else None) or "quality"
+
+    if job_kind == "quality":
+        # Limit to the criteria the Quality runner actually dispatches.
+        # Pillar-only ones (whois_history/availability) are intentionally
+        # excluded — see docstring.
+        quality_universe = (
+            "backlinks", "refdomains", "anchors", "keywords",
+            "wayback", "wayback_classify",
+        )
+        expected = {
+            c for c in quality_universe
+            if (getattr(spec.criteria, c, None) is not None)
+            and getattr(getattr(spec.criteria, c), "enabled", False)
+        }
+    elif job_kind == "whois_history":
+        wh = getattr(spec.criteria, "whois_history", None)
+        expected = {"whois_history"} if (wh and wh.enabled) else set()
+    elif job_kind == "availability":
+        av = getattr(spec.criteria, "availability", None)
+        expected = {"availability"} if (av and av.enabled) else set()
+    else:
+        expected = set()
+
+    if not expected:
+        return
+
+    rds = (
+        db.query(RunDomain)
+        .filter(RunDomain.run_id == run_id)
+        .all()
+    )
+    rd_ids = [rd.id for rd in rds]
+    if not rd_ids:
+        return
+
+    # Pull CR (rd_id, criterion) pairs in one shot rather than touching
+    # rd.results per row. Only criterion + rd_id needed for the audit.
+    cr_pairs = (
+        db.query(CriterionResult.run_domain_id, CriterionResult.criterion)
+        .filter(CriterionResult.run_domain_id.in_(rd_ids))
+        .all()
+    )
+    present_by_rd: dict[int, set[str]] = {rd_id: set() for rd_id in rd_ids}
+    for rd_id_, criterion_ in cr_pairs:
+        present_by_rd.setdefault(rd_id_, set()).add(criterion_)
+
+    flipped = 0
+    for rd in rds:
+        if rd.status != "done":
+            # Don't touch pending/running/failed/canceled — they have
+            # other invariants and the user might be acting on them.
+            continue
+        missing = expected - present_by_rd.get(rd.id, set())
+        if not missing:
+            continue
+        rd.status = "failed"
+        marker = (
+            "coverage audit: missing CR rows for enabled criteria: "
+            + ", ".join(sorted(missing))
+        )
+        rd.error = (
+            f"{rd.error}; {marker}" if rd.error else marker
+        )
+        flipped += 1
+    if flipped:
+        db.commit()
+        log.info(
+            "coverage audit on run %s flipped %d done→failed RDs "
+            "(expected criteria: %s)",
+            run_id, flipped, sorted(expected),
+        )
 
 
 # --- Per-domain worker ------------------------------------------------------

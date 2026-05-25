@@ -24,6 +24,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+import httpx
 from sqlalchemy.orm import Session
 
 from .. import ai_judge
@@ -191,6 +192,31 @@ async def _process_whois_domain(
         if rd is None:
             log.warning("whois_history runner: rd_id=%s missing", rd_id)
             return
+        # Defense-in-depth resume idempotency (2026-05-23). The orchestrator
+        # already filters out done RDs, but this per-domain function is
+        # also reachable from the retry-failed path — and any future
+        # caller that forgets to filter would silently re-spend paid
+        # WhoisFreaks + AI calls. If we already have a successful whois
+        # CR on this RD, short-circuit. `spec_override` (retry path)
+        # bypasses the skip because the operator is explicitly asking
+        # for a re-judge under a different model.
+        if spec_override is None:
+            existing = (
+                db.query(CriterionResult)
+                .filter(
+                    CriterionResult.run_domain_id == rd_id,
+                    CriterionResult.criterion == "whois_history",
+                    CriterionResult.status == "done",
+                )
+                .first()
+            )
+            if existing is not None and existing.ai_verdict_json:
+                log.info(
+                    "whois_history runner: rd=%s already has a done "
+                    "verdict CR (cr_id=%s), skipping re-fetch",
+                    rd_id, existing.id,
+                )
+                return
         domain = rd.domain
         rd.status = "running"
         rd.started_at = datetime.utcnow()
@@ -223,20 +249,48 @@ async def _process_whois_domain(
     ai_model_override: str | None = None
     lang = "en"
     try:
-        cr = CriterionResult(
-            run_domain_id=rd_id,
-            criterion="whois_history",
-            status="running",
-            fetched_at=datetime.utcnow(),
-            data_json=json.dumps({
+        # Reuse an existing whois CR row if one is here (e.g. cleared by
+        # a re-judge operation that wiped ai_verdict_json + reset status
+        # back to pending). Without this, every re-process creates a NEW
+        # CR row, leaving the old one orphaned with stale data — that's
+        # how Run 121 ended up with 8 RDs holding 2 CR rows each. Single-
+        # row-per-(rd, criterion) is the invariant the rest of the code
+        # implicitly expects (e.g. database.py's `crs_by_rd` mapping).
+        cr = (
+            db.query(CriterionResult)
+            .filter(
+                CriterionResult.run_domain_id == rd_id,
+                CriterionResult.criterion == "whois_history",
+            )
+            .order_by(CriterionResult.id.desc())
+            .first()
+        )
+        if cr is None:
+            cr = CriterionResult(
+                run_domain_id=rd_id,
+                criterion="whois_history",
+                status="running",
+                fetched_at=datetime.utcnow(),
+                data_json=json.dumps({
+                    "records": records_json,
+                    "diff": diff_json,
+                    "provider": provider_name,
+                }),
+                request_url="",
+                error=fetch_error,
+            )
+            db.add(cr)
+        else:
+            cr.status = "running"
+            cr.fetched_at = datetime.utcnow()
+            cr.data_json = json.dumps({
                 "records": records_json,
                 "diff": diff_json,
                 "provider": provider_name,
-            }),
-            request_url="",
-            error=fetch_error,
-        )
-        db.add(cr)
+            })
+            cr.error = fetch_error
+            cr.ai_verdict_json = ""
+            cr.ai_verdict_error = ""
         db.commit()
         db.refresh(cr)
         cr_id = cr.id
@@ -339,7 +393,26 @@ async def _process_whois_domain(
             timeout=_AI_TIMEOUT_SECONDS,
         )
     except (
+        # 2026-05-23: widened to cover transient network errors during
+        # the AI HTTP call. Previously only the provider-side wrappers
+        # were caught (ProviderConfigError, ProviderError, ValueError) —
+        # so an `httpx.ConnectError` from a brief DNS blip on
+        # generativelanguage.googleapis.com (or any AI provider host)
+        # escaped this except, propagated through `asyncio.gather` with
+        # `return_exceptions=False`, hit the orchestrator's outer
+        # except, and marked the ENTIRE run failed. One transient DNS
+        # error then required manual `failed → pending` flipping to
+        # resume (Run 121, 2026-05-23: 342 pending domains stranded).
+        #
+        # httpx.HTTPError is the common base — covers ConnectError,
+        # ReadError, ReadTimeout, etc. asyncio.TimeoutError handles
+        # bare timeouts not wrapped by httpx. OSError catches the very
+        # rare gaierror that slips past httpx wrapping on some
+        # platforms. All three become per-domain failures with the
+        # error stored on the CR + RD, exactly like a WhoisFreaks
+        # fetch failure does — and the other domains keep going.
         ProviderConfigError, ProviderError, ValueError,
+        httpx.HTTPError, asyncio.TimeoutError, OSError,
     ) as e:
         ai_error = (type(e).__name__, str(e))
         log.warning(
@@ -389,9 +462,31 @@ async def process_whois_history_run(run_id: int) -> None:
         run.started_at = ownership_token
         run.error = ""
         db.commit()
+        # Resume idempotency (2026-05-23). Pick up only RDs that aren't
+        # already terminal. `resume_run_now` resets running+pending RDs
+        # back to pending and DROPS partial CRs while preserving done
+        # CRs — so by the time we dispatch here, "done" RDs already
+        # have a verdict and should be skipped. Without this filter,
+        # every pause+resume cycle re-fetches WhoisFreaks + re-runs the
+        # AI judge on already-done domains, creating duplicate CR rows
+        # and burning paid quota (observed on Run 121, 2026-05-23: 8
+        # RDs ended up with 2 CR rows each).
+        #
+        # Matches how the Quality runner's resume path uses
+        # `_completed_criteria` to short-circuit refetching. Note: we
+        # filter by RunDomain.status (not by whether a CR exists),
+        # because resume_run_now is the source-of-truth gate — if a
+        # done RD's CR was somehow missing, the only safe move is still
+        # to skip and let the operator clear the RD via the retry-
+        # failed flow rather than blindly re-fetch.
         rd_ids = [
             r.id for r in
-            db.query(RunDomain).filter(RunDomain.run_id == run_id).all()
+            db.query(RunDomain)
+            .filter(
+                RunDomain.run_id == run_id,
+                RunDomain.status.in_(("pending", "running")),
+            )
+            .all()
         ]
     finally:
         db.close()
@@ -411,25 +506,30 @@ async def process_whois_history_run(run_id: int) -> None:
         async with outer_sem:
             await _process_whois_domain(rd_id, run_id)
 
-    try:
-        await asyncio.gather(
-            *(_one(r) for r in rd_ids), return_exceptions=False,
+    # `return_exceptions=True` so a stray exception from one domain
+    # doesn't kill the gather + mark the whole run failed. Per-domain
+    # failures are already supposed to be caught inside
+    # `_process_whois_domain` and turned into per-RD `failed` state —
+    # this is defense-in-depth for any future exception class that the
+    # per-domain except chain doesn't cover. Without it, one bad domain
+    # strands every other domain in the same run (Run 121 incident,
+    # 2026-05-23).
+    results = await asyncio.gather(
+        *(_one(r) for r in rd_ids), return_exceptions=True,
+    )
+    stray = [r for r in results if isinstance(r, BaseException)]
+    if stray:
+        log.warning(
+            "whois_history run %s: %d per-domain task(s) raised stray "
+            "exceptions despite the per-domain except chain — first: "
+            "%s: %s",
+            run_id, len(stray), type(stray[0]).__name__, stray[0],
         )
-    except Exception as e:  # noqa: BLE001
-        log.exception("whois_history run %s failed", run_id)
-        if not _still_owns():
-            return
-        db = SessionLocal()
-        try:
-            run = db.get(Run, run_id)
-            if run is not None and run.status == "running":
-                run.status = "failed"
-                run.error = f"{type(e).__name__}: {e}"
-                run.finished_at = datetime.utcnow()
-                db.commit()
-        finally:
-            db.close()
-        return
+        # Don't mark the whole run failed — the rest of the domains
+        # may have completed. The affected RDs stay at status='running'
+        # or whatever phase they were in; the operator can hit
+        # "Retry failed/stuck" to reset and resume them, same flow as
+        # any other per-domain failure.
 
     # 3. Mark done.
     if not _still_owns():

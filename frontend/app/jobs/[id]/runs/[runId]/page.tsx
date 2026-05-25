@@ -1239,6 +1239,35 @@ export default function RunDetailPage({
     }
   }
 
+  // Force-cancel an in-flight Retry-failed dispatch (added 2026-05-24).
+  // The standard Cancel button on the run-lifecycle bar short-circuits
+  // for terminal runs (which retry-failed always runs against), so this
+  // is the only way to halt a runaway retry that's hammering whois /
+  // wayback / ahrefs in the background.
+  async function handleCancelRetryFailed() {
+    if (!run) return;
+    if (!window.confirm(ts.cancelRetryConfirm)) return;
+    setRetryBusy(true);
+    setRetryError(null);
+    try {
+      const r = await api.cancelRetryFailedRun(runId);
+      // Clear the in-flight banner immediately — the next reload will
+      // pick up the now-terminal RD statuses.
+      setPendingRetry(null);
+      setRetryOutcome({
+        tone: "partial",
+        text: ts.cancelRetryDone(r.canceled_tasks, r.flipped_rds),
+      });
+      await reload();
+    } catch (e) {
+      setRetryError(
+        `${ts.cancelRetryFailed}: ${(e as Error).message || "unknown"}`,
+      );
+    } finally {
+      setRetryBusy(false);
+    }
+  }
+
   async function handleRename() {
     if (!run) return;
     const next = window.prompt(ts.renamePrompt(run.id), run.name ?? "");
@@ -1402,6 +1431,23 @@ export default function RunDetailPage({
                       )
                     : ts.retryFailed(failedCount.criteria)}
               </button>
+              {/* Cancel-retry (added 2026-05-24). Renders only while a
+                  Retry-failed dispatch is in flight — outside that window
+                  there's nothing to cancel and showing the button would
+                  be confusing. Tied to the same `retryBusy` lock as the
+                  primary button so the two can't be clicked at the same
+                  time during the cancel itself. */}
+              {(pendingRetry !== null || anyReanalyzing) && (
+                <button
+                  type="button"
+                  onClick={handleCancelRetryFailed}
+                  disabled={retryBusy}
+                  title={ts.cancelRetryHint}
+                  className="text-xs px-2 py-1 rounded-md border border-rose-400 bg-rose-100 text-rose-900 dark:border-rose-700 dark:bg-rose-950/60 dark:text-rose-200 hover:bg-rose-200 dark:hover:bg-rose-900/60 disabled:opacity-50"
+                >
+                  {retryBusy ? ts.cancelRetryBusy : ts.cancelRetry}
+                </button>
+              )}
               <ReanalyzeBar
                 defaultProvider={specAi.provider}
                 defaultModel={specAi.model}
