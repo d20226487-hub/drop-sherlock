@@ -623,12 +623,21 @@ async def lifespan(_: FastAPI):
         db.close()
     sched = get_scheduler()
     sched.start()
-    # Daily auto-prune of dismissed errors past their retention window.
-    # The same prune also runs opportunistically on every GET /errors call;
-    # the scheduled job covers the case where the Errors page is never
-    # opened. Idempotent — safe to run as often as needed.
+    # Daily auto-prune of error rows past their retention window. Two
+    # complementary sweeps share one scheduled job + one retention
+    # setting:
+    #   - `prune_dismissed_errors` — drops dismissed errors (and clears
+    #     the `error` column on persisted-source rows). Also runs
+    #     opportunistically on every GET /errors call.
+    #   - `prune_old_error_log` (added 2026-05-27) — drops UNDISMISSED
+    #     ErrorLog rows whose `created_at` is older than retention.
+    #     Closes the disk-leak gap where forgotten background-job
+    #     exceptions accumulated in the Phase-2 `error_log` table
+    #     forever. The same retention window applies — operator-
+    #     intent is "errors older than N days are noise."
+    # Both idempotent — safe to run as often as needed.
     from .app_settings import get_error_retention_days
-    from .routers.errors import prune_dismissed_errors
+    from .routers.errors import prune_dismissed_errors, prune_old_error_log
 
     def _scheduled_error_prune() -> None:
         days = get_error_retention_days()
@@ -642,6 +651,33 @@ async def lifespan(_: FastAPI):
             logging.getLogger(__name__).exception("scheduled error prune failed")
         finally:
             db.close()
+        # Separate session for the open-log sweep so a failure in either
+        # leg can't leak transaction state into the other.
+        db2 = SessionLocal()
+        try:
+            n = prune_old_error_log(db2, days)
+            if n > 0:
+                import logging
+                logging.getLogger(__name__).info(
+                    "scheduled error_log prune: deleted %d row(s) older than %d days",
+                    n, days,
+                )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "scheduled error_log prune failed"
+            )
+        finally:
+            db2.close()
+
+    # One-shot at boot — catches up after a long-stopped instance and
+    # gives existing deployments their first prune the moment this code
+    # lands (no need to wait 24h for the first scheduled run).
+    try:
+        _scheduled_error_prune()
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("boot error prune failed")
 
     sched.add_job(
         _scheduled_error_prune,

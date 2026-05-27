@@ -399,7 +399,23 @@ function SnapshotsTable({
                 <td className="py-1 pr-3 text-neutral-500">
                   {formatAge(s.age_seconds)}
                 </td>
-                <td className="py-1 pr-3">
+                <td className="py-1 pr-3 whitespace-nowrap">
+                  {/* Download (added 2026-05-27). Direct browser
+                      navigation rather than an XHR — the file streams
+                      through Caddy without a multi-MB in-memory blob.
+                      Same basic-auth gate as the rest of /api so
+                      anyone who can see this table can pull the file.
+                      Filename pre-validated server-side via the
+                      `_FILENAME_RE`, but encodeURIComponent here too
+                      for belt-and-braces. */}
+                  <a
+                    href={api.backupDownloadUrl(s.filename)}
+                    download={s.filename}
+                    title={ts.download.buttonHint}
+                    className="mr-2 px-2 py-0.5 text-[11px] rounded border border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-950/40 inline-block"
+                  >
+                    {ts.download.button}
+                  </a>
                   <button
                     type="button"
                     onClick={() => {
@@ -407,9 +423,46 @@ function SnapshotsTable({
                       setConfirming(s);
                     }}
                     title={ts.restore.buttonHint}
-                    className="px-2 py-0.5 text-[11px] rounded border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/40"
+                    className="mr-2 px-2 py-0.5 text-[11px] rounded border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/40"
                   >
                     {ts.restore.button}
+                  </button>
+                  {/* Manual delete (added 2026-05-27). Confirms
+                      inline (no modal) since the action is reversible-
+                      ish: the snapshot is gone, but other snapshots
+                      remain. The native confirm() is sufficient
+                      friction for the "did I really mean that file?"
+                      check. */}
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (
+                        !window.confirm(
+                          ts.deleteRow.confirm(s.filename),
+                        )
+                      ) {
+                        return;
+                      }
+                      try {
+                        await api.deleteBackup(s.filename);
+                        setRestoreResult({
+                          ok: true,
+                          message: ts.deleteRow.done(s.filename),
+                        });
+                        onRestored(); // reuse the parent's reload hook
+                      } catch (e) {
+                        const msg =
+                          e instanceof Error ? e.message : String(e);
+                        setRestoreResult({
+                          ok: false,
+                          message: `${ts.deleteRow.failed}: ${msg}`,
+                        });
+                      }
+                    }}
+                    title={ts.deleteRow.buttonHint}
+                    className="px-2 py-0.5 text-[11px] rounded border border-rose-300 dark:border-rose-700 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+                  >
+                    {ts.deleteRow.button}
                   </button>
                 </td>
               </tr>

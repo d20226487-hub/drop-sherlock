@@ -50,6 +50,13 @@ log = logging.getLogger(__name__)
 # changes. Keep the env names DROP_SHERLOCK_* so they don't collide.
 BACKUP_DIR = Path(os.environ.get("DROP_SHERLOCK_BACKUP_DIR", "/data/backups"))
 BACKUP_KEEP = int(os.environ.get("DROP_SHERLOCK_BACKUP_KEEP", "14"))
+# Pre-restore (safety) snapshots used to grow forever — one row added
+# every time the operator did Restore-from-snapshot or Upload-and-
+# restore. Default 7 == roughly a week of restore activity at one
+# restore/day; enough headroom to undo several restore mistakes in a
+# row, but capped so the long tail doesn't accumulate (locked
+# 2026-05-27). Operators who restore aggressively can bump via env.
+PRERESTORE_KEEP = int(os.environ.get("DROP_SHERLOCK_PRERESTORE_KEEP", "7"))
 BACKUP_INTERVAL_HOURS = int(
     os.environ.get("DROP_SHERLOCK_BACKUP_INTERVAL_HOURS", "24")
 )
@@ -58,14 +65,23 @@ BACKUP_ENABLED = os.environ.get(
 ).strip().lower() in ("1", "true", "yes", "on")
 
 # Matches both regular snapshots and pre-restore safety snapshots.
-# The latter use the `prerestore` infix so they're easy to filter and
-# are EXEMPT from rotation pruning (they're undo-snapshots, written
-# right before a restore — keeping them is the whole point).
+# The latter use the `prerestore` infix so they're easy to filter.
+# Pre-restore files used to be unconditionally retained (they're undo-
+# snapshots); 2026-05-27 added a separate `PRERESTORE_KEEP` cap so the
+# oldest still age out, just on their own counter.
 _FILENAME_RE = re.compile(
     r"^drop_sherlock-(?:prerestore-)?(\d{8})-(\d{6})\.db\.gz$"
 )
 _PRERESTORE_RE = re.compile(
     r"^drop_sherlock-prerestore-\d{8}-\d{6}\.db\.gz$"
+)
+# Leaked SQLite work files from `restore_from_snapshot`'s temp DB —
+# `restore-<random>.db-shm` / `.db-wal`. The .db file itself is normally
+# renamed atomically into place, but the `-shm` / `-wal` siblings are
+# sometimes left behind when SQLite touches them after we've closed the
+# connection. `cleanup_orphan_restore_files()` sweeps these at boot.
+_RESTORE_ARTIFACT_RE = re.compile(
+    r"^restore-[a-z0-9]+\.db-(shm|wal)$"
 )
 
 
@@ -133,14 +149,25 @@ def list_snapshots() -> list[dict]:
     return out
 
 
-def _prune(keep: int) -> int:
-    """Drop regular snapshots beyond `keep`. Pre-restore snapshots are
-    EXEMPT — they're undo-snapshots written right before a restore and
-    losing them defeats the purpose. Returns the number of files
-    removed (regular only)."""
+def _prune(
+    keep: int, *, prerestore_keep: int | None = None,
+) -> int:
+    """Drop regular snapshots beyond `keep` AND pre-restore snapshots
+    beyond `prerestore_keep` (default = module-level PRERESTORE_KEEP).
+    Pre-restore snapshots were unconditionally retained before
+    2026-05-27 — that worked fine for occasional restores but caused
+    unbounded growth for operators who restored often (3 pre-restore
+    files = 18 MB locally; on a busy box this can be many GB over
+    months). The separate counter preserves their semantic priority
+    (always at least N undo-snapshots available) while still capping
+    the long tail.
+
+    Returns the total number of files removed (regular + pre-restore)."""
     if keep <= 0:
         return 0
-    regular = [s for s in list_snapshots() if not s["prerestore"]]
+    snapshots = list_snapshots()
+    regular = [s for s in snapshots if not s["prerestore"]]
+    prerestore = [s for s in snapshots if s["prerestore"]]
     removed = 0
     for entry in regular[keep:]:
         p = BACKUP_DIR / entry["filename"]
@@ -149,7 +176,127 @@ def _prune(keep: int) -> int:
             removed += 1
         except OSError as e:
             log.warning("backup prune failed for %s: %s", p, e)
+    pk = prerestore_keep if prerestore_keep is not None else PRERESTORE_KEEP
+    if pk > 0:
+        for entry in prerestore[pk:]:
+            p = BACKUP_DIR / entry["filename"]
+            try:
+                p.unlink()
+                removed += 1
+            except OSError as e:
+                log.warning(
+                    "prerestore prune failed for %s: %s", p, e,
+                )
     return removed
+
+
+def cleanup_orphan_restore_files(*, min_age_seconds: int = 3600) -> int:
+    """Sweep leaked `restore-<token>.db-shm/wal` files from BACKUP_DIR.
+
+    `restore_from_snapshot()` writes a `restore-<token>.db` next to
+    the live DB while it decompresses + verifies the snapshot, then
+    renames the .db file into place. The accompanying `-shm` / `-wal`
+    siblings normally don't exist (no writes happen to that temp DB)
+    but SQLite occasionally touches them under WAL mode probing. They
+    don't get cleaned up by the rename step and accumulate forever
+    (32KB each `-shm`, 0B `-wal` locally — small but tidy to remove).
+
+    `min_age_seconds` (default 1 hour) protects against a race where
+    a restore is in progress on another process. Anything older than
+    that is genuinely orphaned.
+
+    Returns the count of files deleted."""
+    if not BACKUP_DIR.exists():
+        return 0
+    now = datetime.now(timezone.utc).timestamp()
+    removed = 0
+    for p in BACKUP_DIR.iterdir():
+        if not p.is_file():
+            continue
+        if not _RESTORE_ARTIFACT_RE.match(p.name):
+            continue
+        try:
+            stat = p.stat()
+        except OSError:
+            continue
+        if (now - stat.st_mtime) < min_age_seconds:
+            continue
+        try:
+            p.unlink()
+            removed += 1
+        except OSError as e:
+            log.warning(
+                "orphan restore-artifact cleanup failed for %s: %s", p, e,
+            )
+    if removed:
+        log.info(
+            "cleaned up %d orphan restore-artifact file(s) in %s",
+            removed, BACKUP_DIR,
+        )
+    return removed
+
+
+def latest_snapshot_age_seconds() -> int | None:
+    """Age of the most recent NON-prerestore snapshot in seconds, or
+    None when no snapshots exist. Used by main.py's boot logic to
+    decide whether to fire an immediate catch-up backup (closes the
+    "every container rebuild resets the 24h interval" gap)."""
+    snapshots = list_snapshots()
+    regular = [s for s in snapshots if not s["prerestore"]]
+    if not regular:
+        return None
+    # list_snapshots returns newest-first.
+    return regular[0]["age_seconds"]
+
+
+def resolve_snapshot_path(filename: str) -> Path:
+    """Sanitize a user-supplied filename and return its on-disk path.
+
+    Raises ValueError when:
+      - the basename doesn't match `_FILENAME_RE` (defeats path
+        traversal like `../../../etc/passwd` and protects against
+        deleting arbitrary files on /data),
+      - the resolved path escapes BACKUP_DIR (defense in depth on
+        symlink shenanigans),
+      - the file doesn't exist.
+
+    Used by both the download endpoint and the manual-delete endpoint."""
+    # Strip any incoming path components defensively — even though the
+    # FastAPI route declares `{filename}` as a single segment, an
+    # operator could craft `%2E%2E%2F` etc. Path(...).name reduces it
+    # to the basename, which we then re-validate against the regex.
+    name = Path(filename).name
+    if not _FILENAME_RE.match(name):
+        raise ValueError(f"invalid backup filename: {filename!r}")
+    p = (BACKUP_DIR / name).resolve()
+    backup_dir_resolved = BACKUP_DIR.resolve()
+    try:
+        p.relative_to(backup_dir_resolved)
+    except ValueError as e:
+        raise ValueError(
+            f"resolved path escapes backup dir: {p}"
+        ) from e
+    if not p.is_file():
+        raise FileNotFoundError(f"snapshot not found: {name}")
+    return p
+
+
+def delete_snapshot(filename: str) -> dict:
+    """Manual delete of a snapshot by filename. Sanitized through
+    `resolve_snapshot_path` — operator can't ask us to delete arbitrary
+    files. Returns the metadata of what was deleted."""
+    p = resolve_snapshot_path(filename)
+    stat = p.stat()
+    metadata = {
+        "filename": p.name,
+        "size_bytes": stat.st_size,
+        "prerestore": bool(_PRERESTORE_RE.match(p.name)),
+    }
+    p.unlink()
+    log.info(
+        "manually deleted snapshot %s (%d bytes)", p.name, stat.st_size,
+    )
+    return metadata
 
 
 def run_backup(*, keep: int | None = None, prerestore: bool = False) -> dict:

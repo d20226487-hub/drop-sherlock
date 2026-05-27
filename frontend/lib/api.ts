@@ -2368,6 +2368,28 @@ export const api = {
       body: JSON.stringify({ filename }),
     }),
 
+  // Download URL for a snapshot (added 2026-05-27). Returns the
+  // absolute path the browser should navigate to — we don't fetch
+  // here because triggering a multi-MB download through XHR forces a
+  // full in-memory blob; a direct `<a href=...>` lets the browser
+  // stream it to disk like any other download.
+  backupDownloadUrl: (filename: string) =>
+    `${BASE}/backups/${encodeURIComponent(filename)}/download`,
+
+  // Manual delete (added 2026-05-27). Used by the per-row trash icon
+  // in the Backups settings table to free space on demand without
+  // waiting for natural rotation. Both regular and prerestore
+  // snapshots are deletable; the backend sanitizes the filename so
+  // path traversal can't escape BACKUP_DIR.
+  deleteBackup: (filename: string) =>
+    request<{
+      filename: string;
+      size_bytes: number;
+      prerestore: boolean;
+    }>(`/backups/${encodeURIComponent(filename)}`, {
+      method: "DELETE",
+    }),
+
   // Upload a local .db.gz and immediately restore from it. Bypasses
   // the JSON `request()` wrapper because file uploads need multipart
   // and the browser must set the Content-Type with the boundary.

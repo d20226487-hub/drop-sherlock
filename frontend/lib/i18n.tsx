@@ -1415,7 +1415,22 @@ const messagesEn = {
           failPrefix: "Restore failed",
           prerestoreBadge: "pre-restore",
           prerestoreHint:
-            "Safety snapshot taken automatically right before a restore. Exempt from auto-rotation.",
+            "Safety snapshot taken automatically right before a restore. Capped at 7 most-recent by default (configurable via DROP_SHERLOCK_PRERESTORE_KEEP).",
+        },
+        // Per-row download + delete (added 2026-05-27).
+        download: {
+          button: "Download",
+          buttonHint:
+            "Save this snapshot to your computer for offsite backup. Streams the file directly — no in-memory buffering.",
+        },
+        deleteRow: {
+          button: "Delete",
+          buttonHint:
+            "Permanently remove this snapshot from the server. Cannot be undone.",
+          confirm: (filename: string) =>
+            `Delete ${filename}? This frees disk space immediately and cannot be undone. Other snapshots are unaffected.`,
+          done: (filename: string) => `Deleted ${filename}.`,
+          failed: "Delete failed",
         },
         upload: {
           heading: "Import backup from file",
@@ -3749,7 +3764,21 @@ const messagesRu: Messages = {
           failPrefix: "Восстановление не удалось",
           prerestoreBadge: "страховочный",
           prerestoreHint:
-            "Страховочный снимок, созданный автоматически перед восстановлением. Не подлежит автоудалению.",
+            "Страховочный снимок, создаётся автоматически перед восстановлением. По умолчанию хранятся 7 последних (настраивается через DROP_SHERLOCK_PRERESTORE_KEEP).",
+        },
+        download: {
+          button: "Скачать",
+          buttonHint:
+            "Скачать этот снимок на ваш компьютер для офлайн-копии. Файл стримится напрямую — без буферизации в памяти.",
+        },
+        deleteRow: {
+          button: "Удалить",
+          buttonHint:
+            "Безвозвратно удалить этот снимок с сервера. Действие нельзя отменить.",
+          confirm: (filename) =>
+            `Удалить ${filename}? Место освободится немедленно, действие необратимо. Другие снимки не затрагиваются.`,
+          done: (filename) => `Удалено: ${filename}.`,
+          failed: "Удаление не удалось",
         },
         upload: {
           heading: "Импорт бэкапа из файла",

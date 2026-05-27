@@ -1,3 +1,19 @@
+# --- Shared log rotation (added 2026-05-27) ---------------------------------
+# The Docker daemon's default json-file driver has NO rotation when
+# `Config: {}`, so each container's log file grows forever — measured
+# 50 MB – 1 GB/day in production for chatty API containers, eating the
+# deployment server's disk over weeks. Anchoring `&default-logging` here
+# keeps the cap uniform across api/web/caddy without copy-paste drift.
+# Cap math: max-size 10m × max-file 5 = 50 MB ceiling per container,
+# ever. Old files auto-truncated; nothing for an operator to manage.
+# Override per-service by re-specifying `logging:` (e.g. bump caddy if
+# its access log volume becomes the limiting signal).
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   api:
     build: ./backend
@@ -7,6 +23,7 @@ services:
       - ./data:/data
     expose:
       - "8000"
+    logging: *default-logging
     # Healthcheck so Caddy / docker compose know when the API is
     # actually ready. Hits /health (returns {"ok":true}) so we don't
     # depend on any business endpoint.
@@ -15,7 +32,15 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      # 120s start_period (2026-05-27): the boot-time catch-up backup
+      # added on the same day can take 20-40 seconds on a ~200 MB DB
+      # (gzipping a SQLite online-backup is CPU-bound) before the
+      # health endpoint becomes reachable. The previous 20s window was
+      # too tight: api timed out "unhealthy" once, which caused
+      # docker-compose to skip the `web` container (`depends_on: api:
+      # service_healthy`) even though api recovered seconds later. 2
+      # minutes covers a 1 GB DB with comfortable headroom.
+      start_period: 120s
 
   web:
     build:
@@ -32,6 +57,7 @@ services:
       HOSTNAME: 0.0.0.0
     expose:
       - "3000"
+    logging: *default-logging
     depends_on:
       api:
         condition: service_healthy
@@ -57,6 +83,7 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    logging: *default-logging
     depends_on:
       - api
       - web

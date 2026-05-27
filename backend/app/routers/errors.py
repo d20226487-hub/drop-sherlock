@@ -319,6 +319,70 @@ def _annotate_dismissals(
 
 # --- Endpoints --------------------------------------------------------------
 
+def prune_old_error_log(db: Session, retention_days: int | None) -> int:
+    """Hard-delete ErrorLog rows older than `retention_days`, regardless
+    of dismiss status. Companion to `prune_dismissed_errors`.
+
+    Why both: `prune_dismissed_errors` only drops ErrorLog rows when
+    the user has explicitly clicked Dismiss AND the dismissal has aged
+    past retention. Undismissed-but-forgotten ErrorLog rows
+    (background-job exceptions, opportunistic `log.exception` calls
+    from cascade providers, the wayback / WhoisFreaks 429 retries that
+    eventually succeed but log the intermediate failures) accumulate
+    forever without this sweep. For a 30-day retention, "I haven't
+    dismissed it AND it's >30 days old" reliably means "noise" — the
+    operator wasn't going to look at it.
+
+    Persisted-source errors (criterion_results.error / .ai_verdict_error
+    / run_domains.error / runs.error) are NOT touched by this — they
+    live on rows whose lifecycle is owned by the run system. Only the
+    Phase-2 sink (`error_log` table) is age-pruned.
+
+    Returns the count deleted. Batched (1000/round) to avoid long
+    SQLite writer locks if a long-overdue prune sweeps a huge backlog
+    (e.g. retention flipped Never → 7 after months of accumulation)."""
+    if retention_days is None:
+        return 0
+    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    BATCH = 1000
+    total = 0
+    while True:
+        # Pull a batch of expired IDs first, then delete by IN-list.
+        # Two-step rather than `DELETE … WHERE created_at < cutoff
+        # LIMIT N` because SQLite's DELETE doesn't support LIMIT
+        # without a non-default compile flag.
+        ids = [
+            row[0] for row in
+            db.query(ErrorLog.id)
+            .filter(ErrorLog.created_at < cutoff)
+            .order_by(ErrorLog.id.asc())
+            .limit(BATCH)
+            .all()
+        ]
+        if not ids:
+            break
+        deleted = (
+            db.query(ErrorLog)
+            .filter(ErrorLog.id.in_(ids))
+            .delete(synchronize_session=False)
+        )
+        # Cascade cleanup: any DismissedError that pointed at these
+        # ErrorLog rows is now a dangling reference. Harmless (the
+        # composite-key lookup would just miss) but unused, so drop
+        # them here to keep the table tidy. This is also what
+        # `prune_dismissed_errors`'s log-branch would have done if the
+        # dismissal had been the one to expire first.
+        db.query(DismissedError).filter(
+            DismissedError.source_kind == "log",
+            DismissedError.source_id.in_(ids),
+        ).delete(synchronize_session=False)
+        db.commit()
+        total += deleted
+        if len(ids) < BATCH:
+            break
+    return total
+
+
 def prune_dismissed_errors(db: Session, retention_days: int | None) -> dict[str, int]:
     """Delete dismissed errors whose `dismissed_at` is older than the cutoff.
     Open errors are never touched — only dismissed ones age out.

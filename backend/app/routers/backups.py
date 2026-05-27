@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -61,6 +62,64 @@ def run_now() -> dict:
         return backups_mod.run_backup()
     except RuntimeError as e:
         raise HTTPException(500, str(e))
+
+
+# --- Download + delete (added 2026-05-27) ---------------------------------
+# Download path lets the operator pull snapshots off the deploy server
+# for offsite storage. Delete lets them free disk on demand without
+# waiting for natural rotation (useful when a pre-restore snapshot is
+# obviously stale and the operator wants the space back today).
+#
+# Both endpoints route filenames through `backups_mod.resolve_snapshot_
+# path` which validates against `_FILENAME_RE` + checks the resolved
+# path doesn't escape BACKUP_DIR — closes the obvious path-traversal
+# class of bug (operator can't ask us to download `/etc/passwd` or
+# delete the live DB).
+
+@router.get("/{filename}/download")
+def download_snapshot(filename: str) -> FileResponse:
+    """Stream a snapshot file for offsite backup. Behind the same
+    Caddy basic-auth gate as the rest of /api — no extra ACL since
+    anyone who can hit the Settings page already has DB read access.
+    """
+    try:
+        p = backups_mod.resolve_snapshot_path(filename)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    # media_type=application/gzip nudges browsers to download rather
+    # than try to render. Content-Disposition explicitly preserves the
+    # original filename so the operator can drop the file straight back
+    # onto another deploy via Upload-and-restore.
+    return FileResponse(
+        path=str(p),
+        media_type="application/gzip",
+        filename=p.name,
+    )
+
+
+class DeleteSnapshotOut(BaseModel):
+    filename: str
+    size_bytes: int
+    prerestore: bool
+
+
+@router.delete("/{filename}", response_model=DeleteSnapshotOut)
+def delete_snapshot_route(filename: str) -> DeleteSnapshotOut:
+    """Hard-delete a snapshot file. Operator-initiated only — the
+    scheduled prune handles the bulk case. Used by the Settings UI
+    when an operator wants to drop a specific (e.g. stale pre-restore)
+    file without waiting for natural rotation."""
+    try:
+        meta = backups_mod.delete_snapshot(filename)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except OSError as e:
+        raise HTTPException(500, f"delete failed: {e}")
+    return DeleteSnapshotOut(**meta)
 
 
 @router.get("/remote")
