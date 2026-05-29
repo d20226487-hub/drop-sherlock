@@ -77,8 +77,15 @@ services:
     env_file: .env
     ports:
       # 8081 / 8444 chosen because serp-monitor's caddy already owns 8080 / 8443.
-      - "${HTTP_PORT:-8081}:80"
-      - "${HTTPS_PORT:-8444}:443"
+      # Explicit `0.0.0.0:` prefix added 2026-05-29: without it, Docker
+      # advertises the port on both IPv4 and IPv6 (`[::]:8081`), but
+      # Docker Desktop's host-side IPv6 forwarding to the Linux VM is
+      # often broken — Windows browsers resolve `localhost` to `::1`
+      # first, connection is refused, browser shows ERR_EMPTY_RESPONSE.
+      # Explicit IPv4 bind avoids the broken `[::]` advertisement
+      # entirely; localhost will resolve via 127.0.0.1 (which works).
+      - "0.0.0.0:${HTTP_PORT:-8081}:80"
+      - "0.0.0.0:${HTTPS_PORT:-8444}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

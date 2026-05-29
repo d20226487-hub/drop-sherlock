@@ -1323,11 +1323,31 @@ def cancel_retry_failed_now(run_id: int) -> dict:
 # whois / availability) per the 2026-05-17 design call — silently
 # burning Ahrefs units in the background would violate user expectations.
 #
-# Skip rules (locked 2026-05-17):
+# Skip rules (2026-05-17 baseline, V2-aware rules added 2026-05-29):
 #   - wayback CR.status='failed'                → retry wayback (cascade
-#                                                  pulls classify in)
+#                                                  pulls classify in),
+#                                                  REGULAR path
 #   - classify CR.status='failed' AND wayback
-#     CR has ≥1 row                            → retry classify only
+#     CR has ≥1 V1 row AND V2 samples = 0 AND
+#     spec.wayback.sample_pages=True            → RESAMPLE-ONLY retry on
+#                                                  [wayback, classify]
+#                                                  (closes the run 128
+#                                                  silent-V2-fail loop:
+#                                                  classify can never
+#                                                  succeed without V2
+#                                                  samples, so re-judging
+#                                                  classify alone burns
+#                                                  AI tokens for nothing
+#                                                  — what we actually need
+#                                                  is to refetch V2 from
+#                                                  Wayback)
+#   - classify CR.status='failed' AND wayback
+#     CR has V2 samples ≥ 1                    → retry classify only,
+#                                                  REGULAR path (samples
+#                                                  exist; verdict is just
+#                                                  stale, e.g. AI cache
+#                                                  served pre-V2 failure
+#                                                  before samples landed)
 #   - classify CR.status='failed' AND wayback
 #     CR has 0 rows                            → SKIP (the empty archive
 #                                                  is the answer; the
@@ -1355,14 +1375,55 @@ def _wayback_cr_has_rows(cr: "CriterionResult") -> bool:
     return isinstance(rows, list) and len(rows) > 0
 
 
+def _wayback_cr_v2_sample_count(cr: "CriterionResult") -> int:
+    """Count V2 page-content samples attached to a wayback CR. Used by
+    the auto-retry watcher to distinguish:
+
+      - V2 = 0 with V1 ≥ 1 → Wayback's `/web/<ts>/<url>` sample endpoint
+        silently failed during the original fetch (rate-limit, 404 on
+        the specific snapshot, etc). The wayback CR finalized 'done'
+        but classify can't run without samples. The right remedy is
+        `resample_only=True` — re-pick + re-fetch V2 against the
+        existing V1 rows, no new CDX call.
+
+      - V2 ≥ 1 → samples are present; if classify still shows the old
+        'needs V2 page samples' error it's a stale verdict (AI cache hit
+        served the pre-V2 failure). A plain classify re-judge with
+        use_cache=False clears it. No resample needed.
+
+    Returns 0 when data_json is missing / malformed / has no `samples`
+    key (the V2 attach step never wrote any)."""
+    if not cr.data_json:
+        return 0
+    try:
+        body = json.loads(cr.data_json)
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(body, dict):
+        return 0
+    samples = body.get("samples")
+    if not isinstance(samples, list):
+        return 0
+    return len(samples)
+
+
 def _collect_wayback_retry_candidates(
     run_id: int, spec: AnalyzeSpec,
-) -> dict[int, list[str]]:
+) -> dict[int, tuple[list[str], bool]]:
     """Stricter cousin of `_collect_failed_criteria`. Returns only
     wayback-criterion failures worth retrying — never Ahrefs / Whois /
-    Availability — and skips classify failures rooted in an empty CDX
-    response (see module docstring for the rule)."""
-    out: dict[int, list[str]] = {}
+    Availability — paired with a `resample_only` flag per RD so the
+    caller can dispatch the right retry shape.
+
+    Return value: `{rd_id: (criteria_list, resample_only)}`. The flag
+    is consumed by `_retry_failed_run_domain(..., resample_only=...)`
+    which routes to `_reanalyze_run_domain_criterion`'s resample-only
+    branch for the wayback criterion. Classify ignores the flag (per
+    the pipeline memory) and runs its normal re-judge — which now
+    reads the freshly-attached V2 samples.
+
+    Locked rules — see module docstring for the full table."""
+    out: dict[int, tuple[list[str], bool]] = {}
     db = SessionLocal()
     try:
         run = db.get(Run, run_id)
@@ -1376,6 +1437,15 @@ def _collect_wayback_retry_candidates(
         cls_enabled = (
             cls_cfg is not None and getattr(cls_cfg, "enabled", False)
         )
+        # Resample-only requires sample_pages enabled in the spec. With
+        # it off, V2 samples will always be 0 by design — re-trying
+        # would re-emit the same "no samples" classify failure. Falls
+        # back to the plain classify retry (which will also fail the
+        # same way, but at least we don't burn extra wayback fetches).
+        wb_sample_pages = (
+            wb_cfg is not None
+            and bool(getattr(wb_cfg, "sample_pages", False))
+        )
         for rd in run.domains:
             if rd.status == "canceled":
                 continue
@@ -1384,20 +1454,33 @@ def _collect_wayback_retry_candidates(
             cls_cr = crs.get("wayback_classify")
 
             retry: list[str] = []
-            # Wayback fetch failure → retry; cascade handles classify.
+            resample_only = False
+            # Branch 1: wayback fetch failure → retry; cascade handles classify.
             if wb_cr is None or wb_cr.status == "failed":
                 retry.append("wayback")
                 if cls_enabled:
                     retry.append("wayback_classify")
             elif cls_enabled and cls_cr is not None and cls_cr.status == "failed":
-                # Classify failed but the wayback fetch is fine. Only
-                # worth retrying if the wayback CR actually has rows —
-                # otherwise the failure mode is "no archive history",
-                # which a re-judge can't fix.
-                if _wayback_cr_has_rows(wb_cr):
+                # Branch 2/3/4: classify failed, wayback fetch fine.
+                if not _wayback_cr_has_rows(wb_cr):
+                    # Branch 4: no V1 rows → no archive history → skip.
+                    continue
+                v2_count = _wayback_cr_v2_sample_count(wb_cr)
+                if v2_count == 0 and wb_sample_pages:
+                    # Branch 2: V2 silent-fail case — fire resample-only
+                    # so the next attempt actually fixes the underlying
+                    # gap. Include classify in the criteria list so the
+                    # sequential loop re-judges it against the newly-
+                    # attached samples.
+                    retry.append("wayback")
+                    retry.append("wayback_classify")
+                    resample_only = True
+                else:
+                    # Branch 3: V2 present (or sample_pages disabled);
+                    # plain classify re-judge handles the stale verdict.
                     retry.append("wayback_classify")
             if retry:
-                out[rd.id] = retry
+                out[rd.id] = (retry, resample_only)
         return out
     finally:
         db.close()
@@ -1490,8 +1573,8 @@ async def _wayback_auto_retry_loop(
             # Skip RDs already being worked on by a manual retry — partial
             # dispatch confuses both the in-flight workers and the UI.
             candidates = {
-                rd_id: criteria
-                for rd_id, criteria in candidates.items()
+                rd_id: payload
+                for rd_id, payload in candidates.items()
                 if not _REANALYZING_RUN_DOMAINS.is_active(rd_id)
             }
             if not candidates:
@@ -1499,14 +1582,20 @@ async def _wayback_auto_retry_loop(
 
             # Force use_cache=False so a flaky wayback fetch's cached row
             # doesn't get served back to us instead of re-querying CDX.
+            # Also kills the AI verdict cache so a classify cache-hit
+            # can't serve the pre-V2 failure verdict back to us after
+            # resample lands fresh samples (the "stale-verdict" bug
+            # that bit run 128's #18099, #18200, #18220).
             retry_spec = spec.model_copy(deep=True)
             retry_spec.use_cache = False
 
             tasks: list[asyncio.Task] = []
-            for rd_id, criteria in candidates.items():
+            for rd_id, (criteria, resample_only) in candidates.items():
                 t = asyncio.create_task(
                     _retry_failed_run_domain(
-                        rd_id, criteria, retry_spec, track_set=True,
+                        rd_id, criteria, retry_spec,
+                        track_set=True,
+                        resample_only=resample_only,
                     ),
                 )
                 _REANALYZING_RUN_DOMAINS.add_task(rd_id, t)

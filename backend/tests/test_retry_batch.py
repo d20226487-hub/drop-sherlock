@@ -568,3 +568,164 @@ def test_retry_failed_on_availability_run_skips_ai_gate(
     assert retried_rd_ids == {rd_err.id, rd_orphan.id}
     for _rd_id, crits in spawned:
         assert crits == ["availability"]
+
+
+# --- Wayback auto-retry watcher candidate logic (added 2026-05-29) --------
+
+
+def _seed_wayback_watcher_run(session):
+    """Build a Quality-kind run with four distinct RDs that exercise each
+    branch of `_collect_wayback_retry_candidates`:
+
+      rd_resample: wayback CR done with 200 V1 rows but ZERO V2 samples
+                   (Wayback's /web/<ts>/<url> sample endpoint silently
+                   failed during the original fetch — the run 128
+                   reproducer). classify CR failed.
+                   Expected: (["wayback", "wayback_classify"], True)
+      rd_stale:    wayback CR done with V1 rows AND 10 V2 samples;
+                   classify CR failed (stale verdict from before V2
+                   samples landed — the run 128 #18099 / #18200 / #18220
+                   cohort that needed manual classify re-judge).
+                   Expected: (["wayback_classify"], False)
+      rd_empty:    wayback CR done with 0 V1 rows (domain has no
+                   archive history); classify failed because there's
+                   nothing to judge.
+                   Expected: skipped entirely (re-judge can't fix it)
+      rd_wb_failed: wayback CR status='failed' (CDX fetch errored).
+                   Expected: (["wayback", "wayback_classify"], False)
+                   — regular retry, cascade pulls classify in
+    """
+    from app.models import CriterionResult, Job, Run, RunDomain
+    job = Job(name="t-watcher", spec_json="{}", kind="quality")
+    session.add(job)
+    session.flush()
+    # Quality spec with wayback + sample_pages on (the resample-only
+    # branch requires sample_pages=True) and wayback_classify enabled.
+    # B/D/A/K disabled to match the Wincraft "Wayback" run shape that
+    # bit us on runs 124/126/128.
+    spec = {
+        "criteria": {
+            "backlinks": {"enabled": False, "limit": 20, "filters": {}, "sort": []},
+            "refdomains": {"enabled": False, "limit": 20, "filters": {}, "sort": []},
+            "anchors": {"enabled": False, "limit": 20, "filters": {}, "sort": []},
+            "keywords": {"enabled": False, "limit": 20, "sort": []},
+            "wayback": {
+                "enabled": True, "limit": 200,
+                "sample_pages": True, "sample_count": 10,
+                "filters": {}, "sort": [],
+            },
+            "wayback_classify": {"enabled": True, "language_mode": "library"},
+        },
+        "ai": {"provider": "gemini", "model": "test-model"},
+    }
+    run = Run(
+        job_id=job.id, status="done",
+        spec_json=json.dumps(spec),
+        finished_at=datetime.utcnow(),
+    )
+    session.add(run)
+    session.flush()
+    rd_resample = RunDomain(run_id=run.id, domain="resample.com", status="failed")
+    rd_stale = RunDomain(run_id=run.id, domain="stale.com", status="failed")
+    rd_empty = RunDomain(run_id=run.id, domain="empty.com", status="failed")
+    rd_wb_failed = RunDomain(run_id=run.id, domain="wb-failed.com", status="failed")
+    session.add_all([rd_resample, rd_stale, rd_empty, rd_wb_failed])
+    session.flush()
+    # rd_resample: wayback done with V1 rows but NO V2 samples.
+    session.add_all([
+        CriterionResult(
+            run_domain_id=rd_resample.id, criterion="wayback",
+            status="done",
+            data_json=json.dumps({
+                "wayback": [{"timestamp": f"2020010100000{i}", "original": "x"}
+                            for i in range(5)],
+                "samples": [],  # ← the silent-V2-fail signature
+            }),
+        ),
+        CriterionResult(
+            run_domain_id=rd_resample.id, criterion="wayback_classify",
+            status="failed",
+            ai_verdict_error="wayback_classify needs Wayback V2 page samples — none on the wayback CR row.",
+        ),
+    ])
+    # rd_stale: wayback done with V1 AND V2; classify still failed.
+    session.add_all([
+        CriterionResult(
+            run_domain_id=rd_stale.id, criterion="wayback",
+            status="done",
+            data_json=json.dumps({
+                "wayback": [{"timestamp": f"2020010100000{i}", "original": "x"}
+                            for i in range(5)],
+                "samples": [{"timestamp": "20200101000000", "body": "..."}
+                            for _ in range(10)],
+            }),
+        ),
+        CriterionResult(
+            run_domain_id=rd_stale.id, criterion="wayback_classify",
+            status="failed",
+            ai_verdict_error="stale verdict from before V2 samples landed",
+        ),
+    ])
+    # rd_empty: wayback done but 0 V1 rows.
+    session.add_all([
+        CriterionResult(
+            run_domain_id=rd_empty.id, criterion="wayback",
+            status="done",
+            data_json=json.dumps({"wayback": [], "samples": []}),
+        ),
+        CriterionResult(
+            run_domain_id=rd_empty.id, criterion="wayback_classify",
+            status="failed",
+            ai_verdict_error="no Wayback rows to sample",
+        ),
+    ])
+    # rd_wb_failed: wayback CDX fetch errored.
+    session.add_all([
+        CriterionResult(
+            run_domain_id=rd_wb_failed.id, criterion="wayback",
+            status="failed", error="cdx 500",
+        ),
+        # No classify CR — fetch never ran.
+    ])
+    session.commit()
+    return run, rd_resample, rd_stale, rd_empty, rd_wb_failed
+
+
+def test_watcher_collects_resample_only_when_v2_missing(fresh_db):
+    """Locks in the 2026-05-29 fix: when classify failed because V2
+    samples are empty (Wayback throttled /web/<ts>/<url> mid-fetch),
+    the watcher returns `resample_only=True` and includes both wayback
+    + wayback_classify in the criteria list. Without this fix the
+    watcher would just re-judge classify, which can't possibly succeed
+    without samples — burning AI tokens and never recovering."""
+    from app.tasks import _collect_wayback_retry_candidates
+    from app.schemas import AnalyzeSpec
+    run, rd_resample, rd_stale, rd_empty, rd_wb_failed = (
+        _seed_wayback_watcher_run(fresh_db)
+    )
+    spec = AnalyzeSpec.model_validate(json.loads(run.spec_json))
+    out = _collect_wayback_retry_candidates(run.id, spec)
+
+    # rd_empty is intentionally skipped — re-judging can't fix "no
+    # archive history".
+    assert rd_empty.id not in out, (
+        f"empty-archive RD should be skipped, got {out[rd_empty.id]!r}"
+    )
+
+    # rd_resample: V2 silent-fail → resample-only on both criteria.
+    assert rd_resample.id in out
+    criteria, resample_only = out[rd_resample.id]
+    assert resample_only is True
+    assert criteria == ["wayback", "wayback_classify"]
+
+    # rd_stale: V2 samples present → plain classify re-judge.
+    assert rd_stale.id in out
+    criteria, resample_only = out[rd_stale.id]
+    assert resample_only is False
+    assert criteria == ["wayback_classify"]
+
+    # rd_wb_failed: wayback CDX fetch failed → regular retry, cascade.
+    assert rd_wb_failed.id in out
+    criteria, resample_only = out[rd_wb_failed.id]
+    assert resample_only is False
+    assert criteria == ["wayback", "wayback_classify"]
