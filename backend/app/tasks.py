@@ -4654,9 +4654,15 @@ def _attach_wayback_samples(cr_id: int, samples: list[dict]) -> None:
     AI judge + UI via the explicit "samples" key.
 
     No-op if `samples` is empty so we don't re-write data_json on a domain
-    that returned no usable snapshot picks."""
+    that returned no usable snapshot picks.
+
+    Side effect (added 2026-05-29): on a successful attach, also
+    invalidates the sibling wayback_classify CR's stored verdict for
+    the same RunDomain. See `_invalidate_classify_verdict_for_wayback_cr`
+    docstring for the rationale (the run-128 stale-verdict cohort)."""
     if not samples:
         return
+    rd_id_for_invalidate: int | None = None
     db = SessionLocal()
     try:
         cr = db.get(CriterionResult, cr_id)
@@ -4670,7 +4676,81 @@ def _attach_wayback_samples(cr_id: int, samples: list[dict]) -> None:
             return
         body["samples"] = samples
         cr.data_json = json.dumps(body, ensure_ascii=False)
+        # Capture the RD id before commit so the downstream invalidate
+        # call doesn't have to re-open the row just to read run_domain_id.
+        rd_id_for_invalidate = cr.run_domain_id
         db.commit()
+    finally:
+        db.close()
+    # Wipe stale classify verdict OUTSIDE the attach session so a
+    # failure in the invalidate path can't roll back the V2 write —
+    # samples landing is the load-bearing outcome here; classify
+    # invalidation is a safety net on top of it.
+    if rd_id_for_invalidate is not None:
+        try:
+            _invalidate_classify_verdict_for_wayback_cr(rd_id_for_invalidate)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "classify-verdict invalidate after V2 attach failed for "
+                "run_domain=%s — classify may need a manual re-judge",
+                rd_id_for_invalidate,
+            )
+
+
+def _invalidate_classify_verdict_for_wayback_cr(run_domain_id: int) -> int:
+    """Wipe the wayback_classify CR's stored verdict + cache pointers on
+    a given RD, so the next classify run (re-judge / cascade / watcher)
+    can't be fooled into reusing a pre-V2 failure.
+
+    Why this is its own helper (added 2026-05-29):
+
+    The run 128 stale-verdict cohort (RDs #18099, #18200, #18220) all
+    showed the same pattern: a manual `resample_only=True` retry landed
+    V2 samples on the wayback CR, but the classify CR kept showing the
+    pre-V2 'wayback_classify needs Wayback V2 page samples' error
+    verdict — operator had to fire a separate per-criterion classify
+    re-judge to clear it. Two reinforcing causes:
+
+      1. Cross-job verdict cache: `_run_wayback_classify_for_domain`
+         consults `_try_serve_verdict_from_cache` keyed on
+         `(domain, criterion, params_hash, prompt_hash)`. The pre-V2
+         FAILURE was stored in `cr.ai_verdict_error`; cache lookups
+         don't distinguish error verdicts from success, so the next
+         classify call could be served the stale failure even though
+         the underlying data has changed.
+      2. Phase 2 / explicit re-judge race: `_run_ai_for_domain`'s
+         Phase 2 fires classify automatically after wayback re-judge,
+         and `_retry_failed_run_domain`'s cascade fires it again
+         explicitly. The two passes have different timings; under
+         async-loop interleaving the explicit pass could read the CR
+         while Phase 2's write was mid-flight.
+
+    Fix: wipe `ai_verdict_json + ai_verdict_error + ai_cached_from_run_id
+    + prompt_hash` on the classify CR. The blank prompt_hash forces a
+    cache miss on the next lookup (`compute_prompt_hash` returns a
+    non-empty hash on the live call → no match against ""), so even if
+    the cache held a stale verdict it can't be reused. Status is left
+    alone (the next classify pass sets it via `_set_criterion_status`).
+
+    Returns count of fields wiped (0 = no classify CR existed yet, 1 =
+    invalidated). The count is mostly useful for testing — production
+    callers don't care."""
+    db = SessionLocal()
+    try:
+        cls_cr = (
+            db.query(CriterionResult)
+            .filter(CriterionResult.run_domain_id == run_domain_id)
+            .filter(CriterionResult.criterion == "wayback_classify")
+            .one_or_none()
+        )
+        if cls_cr is None:
+            return 0
+        cls_cr.ai_verdict_json = ""
+        cls_cr.ai_verdict_error = ""
+        cls_cr.ai_cached_from_run_id = None
+        cls_cr.prompt_hash = ""
+        db.commit()
+        return 1
     finally:
         db.close()
 

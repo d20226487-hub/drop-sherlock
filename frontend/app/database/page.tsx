@@ -28,7 +28,7 @@ import { CsvColumn, csvFilename, downloadBlob, toCsv } from "@/lib/csv";
 import { MultiSelectFilter } from "@/components/multi-select-filter";
 import { VerdictHoverCard } from "@/components/verdict-hover-card";
 import { BacklogActionsCell } from "@/components/backlog-actions-cell";
-import { EditableTextCell } from "@/components/editable-cell";
+import { EditablePriceCell, EditableTextCell } from "@/components/editable-cell";
 import { BACKLOG_HANDOFF_KEY } from "@/lib/backlog-handoff";
 
 // Helper: wrap children in a Next Link when href is non-null, otherwise
@@ -2235,6 +2235,26 @@ export default function DatabasePage() {
                         : prev,
                     );
                   }}
+                  onMaxPriceSaved={(maxPrice) => {
+                    // Same optimistic merge pattern as onNoteSaved —
+                    // the Max Price edit closes its editor in <1ms but
+                    // the silent reload settles in 200-500ms, so
+                    // without this the cell briefly displays the stale
+                    // pre-edit value before the network roundtrip
+                    // arrives.
+                    setData((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            rows: prev.rows.map((row) =>
+                              row.domain === r.domain
+                                ? { ...row, backlog_max_price: maxPrice }
+                                : row,
+                            ),
+                          }
+                        : prev,
+                    );
+                  }}
                   availability={
                     // Prefer ad-hoc recheck overlay when present (so the
                     // user's recheck click shows immediately); fall back
@@ -2452,6 +2472,7 @@ function DomainListRow({
   onToggle,
   onBacklogUpdated,
   onNoteSaved,
+  onMaxPriceSaved,
   availability,
   recheckBusy,
   onRecheck,
@@ -2462,6 +2483,12 @@ function DomainListRow({
   onToggle: () => void;
   onBacklogUpdated: () => void;
   onNoteSaved: (note: string) => void;
+  // Optimistic-merge callback for the Max Price edit (added 2026-05-29).
+  // Mirrors `onNoteSaved`'s pattern: parent updates local state instead
+  // of forcing a /database/domains round-trip so the new price renders
+  // the instant the cell closes its editor, not 200-500ms later when
+  // the silent reload settles.
+  onMaxPriceSaved: (maxPrice: number | null) => void;
   availability?: {
     status: AvailabilityStatus;
     provider: string;
@@ -3255,9 +3282,35 @@ function DomainListRow({
           Availability → Note). 2026-05-23: Source column replaced
           by Max price — same join (BacklogDomain) so no extra
           fetch cost. Right-aligned numeric. Dim when no price set
-          on the backlog row (or no backlog row at all). */}
+          on the backlog row (or no backlog row at all).
+          2026-05-29: editable for domains that already have a
+          backlog row (matches the Backlog page UX). For domains
+          WITHOUT a backlog row (row.backlog_id null), the cell
+          stays read-only `—` since editing would need an auto-
+          create endpoint — operator can click Order/Discard first
+          to seed the row, then come back to edit the price. */}
       <td className="px-3 py-2 align-top text-xs text-right tabular-nums text-neutral-700 dark:text-neutral-300">
-        {typeof row.backlog_max_price === "number" ? (
+        {row.backlog_id !== null ? (
+          <EditablePriceCell
+            value={row.backlog_max_price ?? null}
+            onSave={async (v) => {
+              const next = v as number | null;
+              await api.updateBacklogRow(row.backlog_id as number, {
+                max_price: next,
+              });
+              // Optimistic local merge — see onMaxPriceSaved comment in
+              // the parent for why we don't reload. The user reported
+              // (2026-05-29) that going through onBacklogUpdated's
+              // silent reload made the cell flash the OLD value for
+              // 200-500ms after Enter while waiting for the network
+              // roundtrip; the merge avoids the flash entirely.
+              onMaxPriceSaved(next);
+            }}
+          />
+        ) : typeof row.backlog_max_price === "number" ? (
+          // Safety: backlog_id null but the join surfaced a price.
+          // Render read-only rather than offering an edit that would
+          // 4xx for lack of a target row.
           `$${row.backlog_max_price.toLocaleString()}`
         ) : (
           <span className="text-neutral-400 dark:text-neutral-500">—</span>

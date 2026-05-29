@@ -729,3 +729,98 @@ def test_watcher_collects_resample_only_when_v2_missing(fresh_db):
     criteria, resample_only = out[rd_wb_failed.id]
     assert resample_only is False
     assert criteria == ["wayback", "wayback_classify"]
+
+
+# --- Classify-verdict invalidation after V2 attach (added 2026-05-29) -----
+
+
+def _seed_rd_with_stale_classify(session, *, cls_status="failed",
+                                  with_v2: bool = False):
+    """Build one RD with a wayback CR (V1 rows present) + a classify CR
+    that's holding a stale 'needs V2 samples' error. Used to exercise
+    the cross-helper invalidation path (`_attach_wayback_samples` →
+    `_invalidate_classify_verdict_for_wayback_cr`)."""
+    from app.models import CriterionResult, Job, Run, RunDomain
+    job = Job(name="t-invalidate", spec_json="{}", kind="quality")
+    session.add(job)
+    session.flush()
+    run = Run(job_id=job.id, status="done", spec_json="{}",
+              finished_at=datetime.utcnow())
+    session.add(run)
+    session.flush()
+    rd = RunDomain(run_id=run.id, domain="t.com", status="failed")
+    session.add(rd)
+    session.flush()
+    wb_body = {"wayback": [{"timestamp": "20200101000000", "original": "x"}]}
+    if with_v2:
+        wb_body["samples"] = [{"timestamp": "20200101000000", "body": "..."}]
+    wb_cr = CriterionResult(
+        run_domain_id=rd.id, criterion="wayback", status="done",
+        data_json=json.dumps(wb_body),
+    )
+    cls_cr = CriterionResult(
+        run_domain_id=rd.id, criterion="wayback_classify",
+        status=cls_status,
+        ai_verdict_error="wayback_classify needs Wayback V2 page samples...",
+        ai_verdict_json="",
+        ai_cached_from_run_id=999,
+        prompt_hash="abc123stalehash",
+    )
+    session.add_all([wb_cr, cls_cr])
+    session.commit()
+    return rd, wb_cr, cls_cr
+
+
+def test_attach_wayback_samples_invalidates_classify_verdict(fresh_db):
+    """Locks in the 2026-05-29 fix: when V2 samples land on a wayback
+    CR via `_attach_wayback_samples`, the sibling wayback_classify CR's
+    stored verdict + cache pointers get wiped automatically. This
+    closes the run-128 stale-verdict cohort where operator had to
+    manually fire per-criterion classify re-judges on RDs #18099 /
+    #18200 / #18220 even though their wayback CRs already had V2."""
+    from app.tasks import _attach_wayback_samples
+    from app.models import CriterionResult
+    rd, wb_cr, cls_cr = _seed_rd_with_stale_classify(fresh_db)
+    # Sanity: classify holds the stale error before the attach.
+    assert cls_cr.ai_verdict_error.startswith("wayback_classify needs")
+    assert cls_cr.prompt_hash == "abc123stalehash"
+    assert cls_cr.ai_cached_from_run_id == 999
+
+    fresh_samples = [
+        {"timestamp": "20200101000000", "url": "http://t.com/", "body": "..."},
+    ]
+    _attach_wayback_samples(wb_cr.id, fresh_samples)
+
+    # Re-read the classify CR via a fresh query — the helper opens its
+    # own session, so the test's session needs to expire its cached row.
+    fresh_db.expire_all()
+    cls_after = (
+        fresh_db.query(CriterionResult)
+        .filter(CriterionResult.id == cls_cr.id).one()
+    )
+    assert cls_after.ai_verdict_error == ""
+    assert cls_after.ai_verdict_json == ""
+    assert cls_after.ai_cached_from_run_id is None
+    assert cls_after.prompt_hash == ""
+
+
+def test_attach_wayback_samples_no_op_leaves_classify_alone(fresh_db):
+    """Empty samples → `_attach_wayback_samples` is a no-op on the
+    wayback CR, AND must NOT touch the classify CR. Without this guard
+    a throttled V2 fetch (samples=[]) would still wipe the classify
+    error, giving the operator a misleadingly clean classify slot."""
+    from app.tasks import _attach_wayback_samples
+    from app.models import CriterionResult
+    rd, wb_cr, cls_cr = _seed_rd_with_stale_classify(fresh_db)
+    _attach_wayback_samples(wb_cr.id, [])  # no samples
+    fresh_db.expire_all()
+    cls_after = (
+        fresh_db.query(CriterionResult)
+        .filter(CriterionResult.id == cls_cr.id).one()
+    )
+    # Stale error preserved: classify can't be re-judged usefully when
+    # samples are still missing, so the error message stays as a
+    # truthful signal until V2 actually arrives.
+    assert cls_after.ai_verdict_error.startswith("wayback_classify needs")
+    assert cls_after.prompt_hash == "abc123stalehash"
+    assert cls_after.ai_cached_from_run_id == 999
