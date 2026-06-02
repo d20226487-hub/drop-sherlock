@@ -1192,9 +1192,55 @@ export type DatabaseDomainList = {
     // disables the dropdown in that case.
     sources?: string[];
   };
-  // Total domain count across the full set (regardless of pagination).
-  // Equal to rows.length when no offset/limit was passed.
+  // Total domain count across the full set (no filters). Only populated
+  // when include_options=true (it rides along with the heavy options
+  // computation); 0 on the page-flip path — the frontend caches it.
   total: number;
+  // Count after filters but before pagination — drives the pagination bar
+  // + "X / Y" hint. Added 2026-06-02 with server-side pagination.
+  filtered_total: number;
+  page: number;
+  per_page: number;
+  // Count of availability-only-taken domains hidden by default (only
+  // populated when include_options=true). Drives the "show taken" toggle
+  // label + prevents a misleading empty screen.
+  hidden_total: number;
+};
+
+// Server-side filter/sort/pagination params for listDatabaseDomains
+// (2026-06-02). Mirrors the Database page's former client-side filter
+// state; every field is optional and omitted when empty. Multi-selects
+// whose values can contain commas (source = registrar, AI-authored
+// language/category) ride as repeated query params.
+export type DatabaseListOpts = {
+  page?: number;
+  per_page?: number; // 0 / omitted = return every filtered row
+  include_options?: boolean;
+  fresh?: boolean;
+  verdict?: string[];
+  wayback_verdict?: string[];
+  whois_band?: string[];
+  availability?: string[];
+  language?: string[];
+  category?: string[];
+  criterion?: string[];
+  notes?: "any" | "with" | "without";
+  source?: string[];
+  status?: string[];
+  wayback_conf_min?: number;
+  ahrefs_conf_min?: number;
+  dr_min?: number;
+  ref_domains_min?: number;
+  whois_cycles_max?: number;
+  max_price_min?: number;
+  max_price_max?: number;
+  search?: string;
+  sort?: "verdict" | "whois" | "max_price";
+  direction?: "asc" | "desc";
+  // Reveal availability-only domains whose Availability-JOB verdict isn't
+  // `available` (hidden by default to keep big availability runs from
+  // burying the Database page).
+  show_taken?: boolean;
 };
 
 export type RunDomainProgressLite = {
@@ -1204,8 +1250,53 @@ export type RunDomainProgressLite = {
 export const api = {
   getSettings: () => request<SettingsPayload>("/settings/"),
 
-  listDatabaseDomains: () =>
-    request<DatabaseDomainList>("/database/domains"),
+  listDatabaseDomains: (opts: DatabaseListOpts = {}) => {
+    const p = new URLSearchParams();
+    if (opts.page) p.set("page", String(opts.page));
+    if (opts.per_page) p.set("per_page", String(opts.per_page));
+    if (opts.include_options === false) p.set("include_options", "false");
+    if (opts.fresh) p.set("fresh", "true");
+    // Repeated query params for the multi-selects (comma-safe).
+    const repeated: [string, string[] | undefined][] = [
+      ["verdict", opts.verdict],
+      ["wayback_verdict", opts.wayback_verdict],
+      ["whois_band", opts.whois_band],
+      ["availability", opts.availability],
+      ["language", opts.language],
+      ["category", opts.category],
+      ["criterion", opts.criterion],
+      ["source", opts.source],
+      ["status", opts.status],
+    ];
+    for (const [key, arr] of repeated) {
+      if (arr && arr.length) for (const v of arr) p.append(key, v);
+    }
+    if (opts.notes && opts.notes !== "any") p.set("notes", opts.notes);
+    // Numeric thresholds — only sent when active (> 0) so an idle filter
+    // never narrows the set.
+    const nums: [string, number | undefined][] = [
+      ["wayback_conf_min", opts.wayback_conf_min],
+      ["ahrefs_conf_min", opts.ahrefs_conf_min],
+      ["dr_min", opts.dr_min],
+      ["ref_domains_min", opts.ref_domains_min],
+      ["whois_cycles_max", opts.whois_cycles_max],
+      ["max_price_min", opts.max_price_min],
+      ["max_price_max", opts.max_price_max],
+    ];
+    for (const [key, val] of nums) {
+      if (typeof val === "number" && val > 0) p.set(key, String(val));
+    }
+    if (opts.search && opts.search.trim()) p.set("search", opts.search.trim());
+    if (opts.sort) {
+      p.set("sort", opts.sort);
+      if (opts.direction) p.set("direction", opts.direction);
+    }
+    if (opts.show_taken) p.set("show_taken", "true");
+    const qs = p.toString();
+    return request<DatabaseDomainList>(
+      `/database/domains${qs ? "?" + qs : ""}`,
+    );
+  },
 
   deleteDatabaseDomains: (domains: string[]) =>
     request<{

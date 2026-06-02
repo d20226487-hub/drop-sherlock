@@ -11,7 +11,7 @@ import {
   DatabaseDomainList,
   DatabaseDomainRow,
 } from "@/lib/api";
-import { usePaginatedSearch } from "@/lib/use-paginated-search";
+import { PaginatedSearch } from "@/lib/use-paginated-search";
 import {
   PaginationBottomBar,
   PaginationTopBar,
@@ -420,6 +420,14 @@ export default function DatabasePage() {
   // comparison.
   const [maxPriceMin, setMaxPriceMin] = useState<number>(0);
   const [maxPriceMax, setMaxPriceMax] = useState<number>(0);
+  // "Show taken" toggle (2026-06-02). OFF by default: availability-only
+  // domains whose Availability-JOB verdict isn't `available` are hidden
+  // server-side so a bulk-availability run doesn't bury the page. ON
+  // reveals them. (Domains with real analysis / inline rechecks / notes
+  // are never hidden — see hide_candidates in routers/database.py.) This
+  // is a visibility toggle, not a narrowing filter, so it's deliberately
+  // excluded from `filtersActive` / `clearFilters`.
+  const [showTaken, setShowTaken] = useState<boolean>(false);
 
   // Persistent filters (2026-05-18). Each browser keeps its own copy in
   // localStorage so two operators on the same /database page don't
@@ -492,6 +500,7 @@ export default function DatabasePage() {
         ) {
           setMaxPriceMax(v.maxPriceMax);
         }
+        if (typeof v.showTaken === "boolean") setShowTaken(v.showTaken);
       }
     } catch {
       // Corrupt / inaccessible localStorage — fall through to defaults.
@@ -531,6 +540,7 @@ export default function DatabasePage() {
             whoisCyclesMax,
             maxPriceMin,
             maxPriceMax,
+            showTaken,
           }),
         );
       } catch {
@@ -558,6 +568,7 @@ export default function DatabasePage() {
     whoisCyclesMax,
     maxPriceMin,
     maxPriceMax,
+    showTaken,
   ]);
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -586,6 +597,60 @@ export default function DatabasePage() {
   // exclusive with the other two sort signals; clicking it clears
   // them so the table has one active sort at a time.
   const [maxPriceSort, setMaxPriceSort] = useState<"asc" | "desc" | null>(null);
+
+  // --- Server-side pagination (2026-06-02) -------------------------------
+  // Mirrors the Backlog page: filters / sort / search / page all live here
+  // and drive a server fetch (filtering + sorting + pagination now happen
+  // backend-side). `searchInput` is the immediate input value; `search`
+  // is its debounced echo used for fetching. `cachedTotal` / `cachedOptions`
+  // persist across page-flips so the page-flip fetch can skip the heavy
+  // option computation (include_options=false), exactly like Backlog.
+  const [page, setPage] = useState<number>(1);
+  const [perPage, setPerPage] = useState<number>(50);
+  const [searchInput, setSearchInput] = useState<string>("");
+  const [search, setSearch] = useState<string>("");
+  const [cachedTotal, setCachedTotal] = useState<number>(0);
+  // Count of availability-only-taken domains hidden by the default rule —
+  // labels the "show taken" toggle + guards the empty screen.
+  const [cachedHiddenTotal, setCachedHiddenTotal] = useState<number>(0);
+  const [cachedOptions, setCachedOptions] = useState<
+    DatabaseDomainList["filter_options"]
+  >({
+    ai_providers: [],
+    ai_models: [],
+    verdicts: [],
+    wayback_verdicts: [],
+    languages: [],
+    categories: [],
+    whois_bands: [],
+    availability_statuses: [],
+    sources: [],
+  });
+  // Tracks the last non-page deps so the fetch effect can tell a pure
+  // page-flip (cheap: skip options) from a filter/sort/search change.
+  const lastDepsRef = useRef<string | null>(null);
+  // Monotonic request id — guards against an earlier (slower, full) fetch
+  // resolving AFTER a later page-flip fetch and clobbering the view.
+  const reqSeqRef = useRef<number>(0);
+  // Accumulates row data across every page the user visits so the
+  // selection-driven handlers (Apruv export, Quality dominant-job hint)
+  // can read fields for domains selected on a different page than the one
+  // currently displayed. Reset when the candidate set changes.
+  const rowsByDomainRef = useRef<Map<string, DatabaseDomainRow>>(new Map());
+
+  // Resolve the single active sort signal (the three are mutually
+  // exclusive — each header handler clears the other two) into the
+  // server's sort/direction params.
+  const { serverSort, serverDir } = useMemo<{
+    serverSort: "verdict" | "whois" | "max_price" | undefined;
+    serverDir: "asc" | "desc" | undefined;
+  }>(() => {
+    if (verdictSort) return { serverSort: "verdict", serverDir: verdictSort };
+    if (whoisSort) return { serverSort: "whois", serverDir: whoisSort };
+    if (maxPriceSort)
+      return { serverSort: "max_price", serverDir: maxPriceSort };
+    return { serverSort: undefined, serverDir: undefined };
+  }, [verdictSort, whoisSort, maxPriceSort]);
 
   // Send-to-pillar state (replaces the old "Reanalyze" bulk picker
   // 2026-05-18). Tracks which pillar dispatch is currently in flight
@@ -680,53 +745,212 @@ export default function DatabasePage() {
     }
   }
 
-  function reload(opts: { silent?: boolean } = {}) {
-    let cancelled = false;
+  // Server-driven fetch. Pulls ONE page of already-filtered/sorted rows.
+  //   • refreshOptions=true  → ask for total + filter_options (heavy);
+  //     cache them. Used on filter/sort/search changes, manual Refresh,
+  //     and post-mutation reloads. Page-flips pass false and reuse the
+  //     cached values (mirrors Backlog's include_options skip).
+  //   • fresh=true           → bypass the backend's 20s aggregation
+  //     snapshot cache so a just-committed mutation (or a change made on
+  //     another page, e.g. Backlog) shows immediately.
+  //   • clearSelection=true  → the candidate set reshaped; drop stale
+  //     picks + reset the cross-page row accumulator.
+  function reload(
+    opts: {
+      silent?: boolean;
+      refreshOptions?: boolean;
+      clearSelection?: boolean;
+      fresh?: boolean;
+    } = {},
+  ) {
     if (!opts.silent) setError(null);
     setRefreshing(true);
+    const includeOptions = opts.refreshOptions ?? true;
+    const seq = ++reqSeqRef.current;
     api
-      .listDatabaseDomains()
+      .listDatabaseDomains({
+        page,
+        per_page: perPage,
+        include_options: includeOptions,
+        fresh: opts.fresh ?? false,
+        verdict: verdicts,
+        wayback_verdict: waybackVerdicts,
+        whois_band: whoisBands,
+        availability: availabilityFilter,
+        language: languages,
+        category: categories,
+        criterion: criteria,
+        notes: notesFilter,
+        source: sourceFilter,
+        status: statusFilter,
+        wayback_conf_min: waybackConfMin,
+        ahrefs_conf_min: ahrefsConfMin,
+        dr_min: drMin,
+        ref_domains_min: refDomainsMin,
+        whois_cycles_max: whoisCyclesMax,
+        max_price_min: maxPriceMin,
+        max_price_max: maxPriceMax,
+        search,
+        sort: serverSort,
+        direction: serverDir,
+        show_taken: showTaken,
+      })
       .then((d) => {
-        if (!cancelled) {
-          setData(d);
-          setLastRefreshed(new Date());
-          setSelected((prev) => {
-            const stillExists = new Set(d.rows.map((r) => r.domain));
-            const next = new Set<string>();
-            for (const dom of prev) if (stillExists.has(dom)) next.add(dom);
-            return next;
-          });
-          // The /availability/latest cache hydration was removed
-          // 2026-05-16 — the Availability column now reads from
-          // `row.availability_*` (CR-scoped, populated server-side from
-          // the aux availability source), so the column agrees with the
-          // Job-page chip math. Clear any stale ad-hoc recheck overlay
-          // so a hard reload doesn't keep showing a fresher-than-CR
-          // result the user can't trace back to a job.
-          setAvailabilityByDomain({});
+        // Drop stale responses (an earlier full fetch landing after a
+        // later page-flip fetch). Only the most recent request wins.
+        if (seq !== reqSeqRef.current) return;
+        setData(d);
+        setLastRefreshed(new Date());
+        if (includeOptions) {
+          setCachedTotal(d.total);
+          setCachedHiddenTotal(d.hidden_total ?? 0);
+          setCachedOptions(d.filter_options);
         }
+        // Merge this page's rows into the cross-page accumulator so
+        // selection-driven handlers can read fields for off-page picks.
+        if (opts.clearSelection) {
+          rowsByDomainRef.current = new Map(
+            d.rows.map((r) => [r.domain, r]),
+          );
+          setSelected(new Set());
+        } else {
+          for (const r of d.rows) rowsByDomainRef.current.set(r.domain, r);
+        }
+        // Clear the ad-hoc recheck overlay only on a genuine (non-silent
+        // or option-refreshing) reload — NOT on every page-flip, or a
+        // user's recheck result would vanish when they page away.
+        if (includeOptions) setAvailabilityByDomain({});
       })
       .catch((e: Error) => {
-        if (!cancelled) setError(e.message);
+        if (seq === reqSeqRef.current) setError(e.message);
       })
       .finally(() => {
-        if (!cancelled) setRefreshing(false);
+        if (seq === reqSeqRef.current) setRefreshing(false);
       });
-    return () => {
-      cancelled = true;
-    };
   }
 
-  useEffect(() => {
-    return reload();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Keep a ref to the latest `reload` so the mount-only visibility/focus
+  // listener calls it with current filter state (not the stale empty-
+  // filter closure from first render — the run-page's stale-closure trap).
+  const reloadRef = useRef(reload);
+  reloadRef.current = reload;
 
+  // Debounce the search box into the fetched `search` value so typing
+  // doesn't fire a request per keystroke.
+  useEffect(() => {
+    const id = window.setTimeout(() => setSearch(searchInput), 300);
+    return () => window.clearTimeout(id);
+  }, [searchInput]);
+
+  // Reset to page 1 whenever a filter / sort / search / per-page change
+  // reshapes the candidate set (avoids "page 5 of a 1-page result").
+  useEffect(() => {
+    setPage(1);
+  }, [
+    verdicts,
+    waybackVerdicts,
+    whoisBands,
+    availabilityFilter,
+    languages,
+    categories,
+    criteria,
+    notesFilter,
+    sourceFilter,
+    statusFilter,
+    waybackConfMin,
+    ahrefsConfMin,
+    drMin,
+    refDomainsMin,
+    whoisCyclesMax,
+    maxPriceMin,
+    maxPriceMax,
+    search,
+    perPage,
+    serverSort,
+    serverDir,
+    showTaken,
+  ]);
+
+  // Main fetch effect. Gated on `filtersHydrated` so the first request
+  // already carries the localStorage-restored filters (no fetch-twice
+  // flash). A pure page-flip skips the heavy total/options query +
+  // keeps the selection; everything else refreshes them.
+  useEffect(() => {
+    if (!filtersHydrated) return;
+    const nonPageDeps = JSON.stringify({
+      perPage,
+      verdicts,
+      waybackVerdicts,
+      whoisBands,
+      availabilityFilter,
+      languages,
+      categories,
+      criteria,
+      notesFilter,
+      sourceFilter,
+      statusFilter,
+      waybackConfMin,
+      ahrefsConfMin,
+      drMin,
+      refDomainsMin,
+      whoisCyclesMax,
+      maxPriceMin,
+      maxPriceMax,
+      search,
+      serverSort,
+      serverDir,
+      showTaken,
+    });
+    const onlyPageChanged =
+      lastDepsRef.current !== null && lastDepsRef.current === nonPageDeps;
+    lastDepsRef.current = nonPageDeps;
+    reload({
+      silent: true,
+      refreshOptions: !onlyPageChanged,
+      clearSelection: !onlyPageChanged,
+    });
+    if (onlyPageChanged) {
+      window.scrollTo({ top: 0, behavior: "instant" });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    filtersHydrated,
+    page,
+    perPage,
+    verdicts,
+    waybackVerdicts,
+    whoisBands,
+    availabilityFilter,
+    languages,
+    categories,
+    criteria,
+    notesFilter,
+    sourceFilter,
+    statusFilter,
+    waybackConfMin,
+    ahrefsConfMin,
+    drMin,
+    refDomainsMin,
+    whoisCyclesMax,
+    maxPriceMin,
+    maxPriceMax,
+    search,
+    serverSort,
+    serverDir,
+    showTaken,
+  ]);
 
   useEffect(() => {
     function onVisible() {
       if (document.visibilityState === "visible") {
-        reload({ silent: true });
+        // Refresh on focus to catch cross-tab changes — but DON'T force a
+        // fresh rebuild (the focus event also fires on initial navigation,
+        // and a cache-bypass there would re-run the ~seconds-long
+        // aggregation on every landing). The backend's 20s snapshot TTL +
+        // mutation invalidation keep this fresh enough; the manual Refresh
+        // button is the on-demand cache-bypass. Via the ref so it uses the
+        // CURRENT filter state.
+        reloadRef.current({ silent: true, refreshOptions: true });
       }
     }
     document.addEventListener("visibilitychange", onVisible);
@@ -735,6 +959,7 @@ export default function DatabasePage() {
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onVisible);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function toggleOne(domain: string) {
@@ -751,279 +976,39 @@ export default function DatabasePage() {
   // the file. Pin management now lives on the Run page (per-criterion
   // pins panel) and the Job page (read-only widget).
 
-  const filtered = useMemo<DatabaseDomainRow[]>(() => {
-    if (!data) return [];
-    // OR semantics inside each multi-select: a row passes the filter if its
-    // value is one of the selected options. AND semantics across distinct
-    // filters: a row must pass every active filter. All filters operate
-    // CLIENT-SIDE on the current server slice (Phase 1 design, 2026-05-16).
-    // Phase 2 attempted to push the multi-select filters to backend SQL
-    // and was rolled back the same day — see the rollback comment in
-    // routers/database.py for context.
-    function matchVerdict(r: DatabaseDomainRow): boolean {
-      if (verdicts.length === 0) return true;
-      return verdicts.some((v) => {
-        if (v === "__none__") return !r.final_bucket && !r.final_partial;
-        if (v === "__partial__") return !!r.final_partial;
-        return r.final_bucket === v;
-      });
-    }
-    function matchWayback(r: DatabaseDomainRow): boolean {
-      if (waybackVerdicts.length === 0) return true;
-      return waybackVerdicts.some((v) => {
-        if (v === "__none__") return !r.wayback_assessment;
-        return r.wayback_assessment === v;
-      });
-    }
-    function matchLang(r: DatabaseDomainRow): boolean {
-      if (languages.length === 0) return true;
-      return languages.some((v) => {
-        if (v === "__none__") return !r.primary_language;
-        return r.primary_language === v;
-      });
-    }
-    function matchCat(r: DatabaseDomainRow): boolean {
-      if (categories.length === 0) return true;
-      return categories.some((v) => {
-        if (v === "__none__") return !r.category;
-        return r.category === v;
-      });
-    }
-    function matchWhois(r: DatabaseDomainRow): boolean {
-      if (whoisBands.length === 0) return true;
-      return whoisBands.some((v) => {
-        if (v === "__none__") return !r.whois_band;
-        return r.whois_band === v;
-      });
-    }
-    function matchAvailability(r: DatabaseDomainRow): boolean {
-      if (availabilityFilter.length === 0) return true;
-      // Reads CR-scoped data (row.availability_status), NOT the ad-hoc
-      // recheck overlay. Keeps the filter universe consistent with the
-      // Job-page chip math — a click on "available" returns the same
-      // domain set that the chip's "свободен" count is bucketing.
-      return availabilityFilter.some((v) => {
-        if (v === "__none__") return !r.availability_status;
-        return r.availability_status === v;
-      });
-    }
-    return data.rows.filter((r) => {
-      // Pin filter + Cache filter REMOVED 2026-05-23 (user-requested
-      // simplification): pinning is a one-shot setup gesture, not a
-      // recurring filter; cache state changes too fast to filter
-      // against. Predicate logic kept stripped to reduce reader
-      // confusion — localStorage hydrates the legacy values but the UI
-      // doesn't read them.
-      if (
-        sourceFilter.length > 0 &&
-        !sourceFilter.includes(r.backlog_registrar || "")
-      ) {
-        return false;
-      }
-      // Backlog status filter — narrow to rows whose attached
-      // BacklogDomain.status is in the selected set. Rows with no
-      // backlog row (backlog_status null) are excluded as soon as ANY
-      // status is selected (they have nothing to match against).
-      if (statusFilter.length > 0) {
-        if (
-          r.backlog_status == null ||
-          !statusFilter.includes(r.backlog_status)
-        ) {
-          return false;
-        }
-      }
-      if (!matchVerdict(r)) return false;
-      if (!matchWayback(r)) return false;
-      if (!matchWhois(r)) return false;
-      if (!matchAvailability(r)) return false;
-      if (!matchLang(r)) return false;
-      if (!matchCat(r)) return false;
-      // Confidence thresholds (added 2026-05-13). null verdicts are
-      // excluded when the threshold is > 0 — a row without a verdict
-      // can't be "above 0.7 confidence" by any meaningful definition.
-      if (waybackConfMin > 0) {
-        if (
-          typeof r.wayback_confidence !== "number" ||
-          r.wayback_confidence < waybackConfMin
-        ) {
-          return false;
-        }
-      }
-      if (ahrefsConfMin > 0) {
-        if (
-          typeof r.final_confidence !== "number" ||
-          r.final_confidence < ahrefsConfMin
-        ) {
-          return false;
-        }
-      }
-      // Ahrefs Batch Analysis "≥" thresholds (2026-06-02). DR prefers
-      // the pinned batch domain_rating, falling back to the imported
-      // backlog DR (same value the DR chip shows). Referring-domains
-      // comes only from the batch run. Rows missing the value are
-      // excluded while the filter is on.
-      if (drMin > 0) {
-        const v = r.batch_metrics?.domain_rating ?? r.backlog_ahrefs_dr;
-        if (typeof v !== "number" || v < drMin) return false;
-      }
-      if (refDomainsMin > 0) {
-        const v = r.batch_metrics?.refdomains_dofollow;
-        if (typeof v !== "number" || v < refDomainsMin) return false;
-      }
-      // Whois ownership-cycles threshold. Flipped 2026-05-23 from
-      // ">= N" semantics to "< N" semantics per user request — when
-      // scanning drop-domain lists, the operator's question is "which
-      // ones probably never dropped?" (clean history → less competition,
-      // less prior-owner baggage), not "which ones definitely dropped?".
-      // Dropdown values now read "any / <2 / <3 / <4 / <5" and the
-      // numeric encoding maps:
-      //   0 → off
-      //   1 → cycles < 1   (impossible: every analyzed domain has
-      //                     cycles >= 1; effectively "no rows" but
-      //                     surfaces if the data ever exposes 0)
-      //   2 → cycles < 2  (= 1, "never dropped" — most common pick)
-      //   3 → cycles < 3  (no drop OR one drop)
-      //   4 → cycles < 4
-      //   5 → cycles < 5
-      // Rows without whois data (cycles=null) are excluded under any
-      // active filter — null can't satisfy a numeric comparison.
-      if (whoisCyclesMax > 0) {
-        if (typeof r.whois_ownership_cycles !== "number") {
-          return false;
-        }
-        if (r.whois_ownership_cycles >= whoisCyclesMax) {
-          return false;
-        }
-      }
-      // Max price range filter (slider → min/max pair 2026-05-23).
-      // Each bound is independently optional: 0 means "no bound on
-      // that side". When either is set, rows without a backlog
-      // max_price are excluded (no data can't satisfy the bound).
-      if (maxPriceMin > 0 || maxPriceMax > 0) {
-        if (typeof r.backlog_max_price !== "number") {
-          return false;
-        }
-        if (maxPriceMin > 0 && r.backlog_max_price < maxPriceMin) {
-          return false;
-        }
-        if (maxPriceMax > 0 && r.backlog_max_price > maxPriceMax) {
-          return false;
-        }
-      }
-      // "Any criterion" semantics: a row passes if at least one of the
-      // selected criteria is enabled. The pre-2026-05-17 `minRecords`
-      // companion was dropped along with the input — operators filter
-      // by verdict + confidence which already screens out empty results.
-      if (criteria.length > 0) {
-        const anyMatch = criteria.some((k) => {
-          const c = r.criteria[k];
-          return !!c && c.enabled;
-        });
-        if (!anyMatch) return false;
-      }
-      // Cache filter REMOVED 2026-05-23 (user-requested simplification).
-      if (notesFilter === "with" && !r.note) return false;
-      if (notesFilter === "without" && r.note) return false;
-      return true;
-    });
-  }, [
-    data,
-    sourceFilter,
-    statusFilter,
-    verdicts,
-    waybackVerdicts,
-    whoisBands,
-    availabilityFilter,
-    languages,
-    categories,
-    criteria,
-    notesFilter,
-    waybackConfMin,
-    ahrefsConfMin,
-    drMin,
-    refDomainsMin,
-    whoisCyclesMax,
-    maxPriceMin,
-    maxPriceMax,
-  ]);
+  // Server already returns this page's filtered + sorted slice; the
+  // client no longer re-filters or re-sorts (server-side pagination
+  // rewire, 2026-06-02 — see routers/database.py:list_domains). `pageRows`
+  // is simply the current page.
+  const pageRows = data?.rows ?? [];
 
-  const sorted = useMemo<DatabaseDomainRow[]>(() => {
-    if (verdictSort) {
-      const dir = verdictSort === "asc" ? 1 : -1;
-      function rank(r: DatabaseDomainRow): number {
-        return r.final_score ?? Number.NEGATIVE_INFINITY;
-      }
-      function isScored(r: DatabaseDomainRow): boolean {
-        return !r.final_partial && r.final_score != null;
-      }
-      return [...filtered].sort((a, b) => {
-        const aScored = isScored(a);
-        const bScored = isScored(b);
-        if (aScored !== bScored) return aScored ? -1 : 1;
-        if (!aScored && !bScored) {
-          return (
-            (a.final_partial ? 0 : 1) - (b.final_partial ? 0 : 1)
-          );
-        }
-        const ra = rank(a);
-        const rb = rank(b);
-        if (ra === rb) return a.domain.localeCompare(b.domain);
-        return (ra - rb) * dir;
-      });
-    }
-    if (whoisSort) {
-      // Whois sort: rows WITH a Whois verdict on top, rest sink. Within
-      // the verdict set, ascending puts the lowest dropped_confidence
-      // (most stable) first — that's the "good first" direction.
-      const dir = whoisSort === "asc" ? 1 : -1;
-      function hasVerdict(r: DatabaseDomainRow): boolean {
-        return typeof r.whois_dropped_confidence === "number";
-      }
-      return [...filtered].sort((a, b) => {
-        const aHas = hasVerdict(a);
-        const bHas = hasVerdict(b);
-        if (aHas !== bHas) return aHas ? -1 : 1;
-        if (!aHas && !bHas) return a.domain.localeCompare(b.domain);
-        const ra = a.whois_dropped_confidence as number;
-        const rb = b.whois_dropped_confidence as number;
-        if (ra === rb) return a.domain.localeCompare(b.domain);
-        return (ra - rb) * dir;
-      });
-    }
-    if (maxPriceSort) {
-      // Max-price sort (added 2026-05-23): rows WITH a backlog
-      // max_price on top, rest sink to the bottom. Same priced-then-
-      // unpriced shape as the verdict + whois sorts so the operator
-      // never has to scroll past null cells to find sortable data.
-      // Ascending = cheapest first (the procurement default).
-      const dir = maxPriceSort === "asc" ? 1 : -1;
-      function priced(r: DatabaseDomainRow): boolean {
-        return typeof r.backlog_max_price === "number";
-      }
-      return [...filtered].sort((a, b) => {
-        const aP = priced(a);
-        const bP = priced(b);
-        if (aP !== bP) return aP ? -1 : 1;
-        if (!aP && !bP) return a.domain.localeCompare(b.domain);
-        const ra = a.backlog_max_price as number;
-        const rb = b.backlog_max_price as number;
-        if (ra === rb) return a.domain.localeCompare(b.domain);
-        return (ra - rb) * dir;
-      });
-    }
-    return filtered;
-  }, [filtered, verdictSort, whoisSort, maxPriceSort]);
+  // Adapter exposing the server pagination state in the PaginatedSearch
+  // shape the shared PaginationTopBar / PaginationBottomBar consume — so
+  // those components stay untouched. `query`/`setQuery` drive the
+  // (debounced) search box; `setPage`/`setPageSize` map to the server
+  // page/perPage state. `total` = full-set count (cached across page-
+  // flips); `filteredTotal` = post-filter count from the last response.
+  const filteredTotal = data?.filtered_total ?? 0;
+  const pageCount = Math.max(1, Math.ceil(filteredTotal / Math.max(1, perPage)));
+  const startIdx = (page - 1) * perPage;
+  const searchState: PaginatedSearch<DatabaseDomainRow> = {
+    query: searchInput,
+    setQuery: (q) => setSearchInput(q),
+    pageSize: perPage,
+    setPageSize: (n) => setPerPage(n),
+    page,
+    setPage: (n) => setPage(n),
+    total: cachedTotal,
+    filteredTotal,
+    // The bars never read filteredAll; CSV export does its own full fetch.
+    filteredAll: pageRows,
+    pageCount,
+    paged: pageRows,
+    start: filteredTotal === 0 ? 0 : startIdx + 1,
+    end: filteredTotal === 0 ? 0 : startIdx + pageRows.length,
+  };
 
-  const search = usePaginatedSearch<DatabaseDomainRow>(
-    sorted,
-    (item, q) =>
-      item.domain.toLowerCase().includes(q) ||
-      item.pinned_job_name.toLowerCase().includes(q) ||
-      item.note.toLowerCase().includes(q),
-    { initialPageSize: 50 },
-  );
-
-  const pageDomains = search.paged.map((r) => r.domain);
+  const pageDomains = pageRows.map((r) => r.domain);
   const pageAllSelected =
     pageDomains.length > 0 && pageDomains.every((d) => selected.has(d));
   function togglePageSelect() {
@@ -1060,20 +1045,23 @@ export default function DatabasePage() {
         // single "Analyze N" button. Used to pre-fill the Quality form
         // so cache hits stay warm.
         const counts = new Map<number, { n: number; maxRun: number }>();
-        if (data) {
-          for (const r of data.rows) {
-            if (!selected.has(r.domain)) continue;
-            const wb = r.criteria?.wayback;
-            const jid = wb?.source_job_id;
-            const rid = wb?.source_run_id;
-            if (typeof jid !== "number") continue;
-            const cur = counts.get(jid) ?? { n: 0, maxRun: 0 };
-            cur.n += 1;
-            if (typeof rid === "number" && rid > cur.maxRun) {
-              cur.maxRun = rid;
-            }
-            counts.set(jid, cur);
+        // Read from the cross-page row accumulator (not just the visible
+        // page) so a selection spanning multiple pages still resolves the
+        // dominant source job. Missing rows just don't contribute — the
+        // hint is a cache-warming optimization, safe to under-count.
+        for (const domain of domains) {
+          const r = rowsByDomainRef.current.get(domain);
+          if (!r) continue;
+          const wb = r.criteria?.wayback;
+          const jid = wb?.source_job_id;
+          const rid = wb?.source_run_id;
+          if (typeof jid !== "number") continue;
+          const cur = counts.get(jid) ?? { n: 0, maxRun: 0 };
+          cur.n += 1;
+          if (typeof rid === "number" && rid > cur.maxRun) {
+            cur.maxRun = rid;
           }
+          counts.set(jid, cur);
         }
         let dominantJobId: number | null = null;
         let bestN = 0;
@@ -1128,7 +1116,7 @@ export default function DatabasePage() {
         runs: r.deleted_runs,
         jobs: r.deleted_jobs,
       });
-      reload();
+      reload({ fresh: true });
     } catch (e) {
       setDeleteError((e as Error).message || "delete failed");
     } finally {
@@ -1148,7 +1136,7 @@ export default function DatabasePage() {
         updated: r.updated,
         created: r.created,
       });
-      reload({ silent: true });
+      reload({ silent: true, fresh: true });
     } catch (e) {
       setBulkBacklogResult({
         status,
@@ -1233,7 +1221,7 @@ export default function DatabasePage() {
         already: r.already_banned,
         invalid: r.invalid,
       });
-      reload({ silent: true });
+      reload({ silent: true, fresh: true });
     } catch (e) {
       setBulkBanResult({
         added: 0,
@@ -1262,8 +1250,11 @@ export default function DatabasePage() {
       // (no analyzed run) won't be in `data.rows` but we still want
       // to include them in the CSV with empty cells — they'll have a
       // share-link error from the backend.
-      const rowByDomain = new Map<string, DatabaseDomainRow>();
-      for (const r of data?.rows ?? []) rowByDomain.set(r.domain, r);
+      // Use the cross-page accumulator so a selection spanning pages
+      // still has column data for every picked domain (not just the
+      // visible page). Domains never loaded yield empty cells (+ a
+      // backend share-link error), same as before.
+      const rowByDomain = rowsByDomainRef.current;
 
       const linkResp = await api.approveShareLinks(domains, apruvExpiresDays);
       const linkByDomain = new Map<string, typeof linkResp.items[number]>();
@@ -1480,11 +1471,52 @@ export default function DatabasePage() {
     [],
   );
 
-  function exportCsv(scope: "visible" | "all") {
-    const rows =
-      scope === "visible" ? search.filteredAll : data?.rows ?? [];
-    const csv = toCsv(rows, csvColumns);
-    downloadBlob(csv, csvFilename(`drop-sherlock-database-${scope}`));
+  // Server-side pagination means the client only holds ONE page, so CSV
+  // export fetches the full set itself (per_page=0 = every row). "visible"
+  // re-sends the active filters/sort so the file matches what the user is
+  // looking at; "all" omits them for the whole database. Reuses the same
+  // client-side column getters — no backend CSV builder needed.
+  const [exporting, setExporting] = useState<"" | "visible" | "all">("");
+  async function exportCsv(scope: "visible" | "all") {
+    if (exporting) return;
+    setExporting(scope);
+    try {
+      const d = await api.listDatabaseDomains(
+        scope === "visible"
+          ? {
+              per_page: 0,
+              include_options: false,
+              verdict: verdicts,
+              wayback_verdict: waybackVerdicts,
+              whois_band: whoisBands,
+              availability: availabilityFilter,
+              language: languages,
+              category: categories,
+              criterion: criteria,
+              notes: notesFilter,
+              source: sourceFilter,
+              status: statusFilter,
+              wayback_conf_min: waybackConfMin,
+              ahrefs_conf_min: ahrefsConfMin,
+              dr_min: drMin,
+              ref_domains_min: refDomainsMin,
+              whois_cycles_max: whoisCyclesMax,
+              max_price_min: maxPriceMin,
+              max_price_max: maxPriceMax,
+              search,
+              sort: serverSort,
+              direction: serverDir,
+              show_taken: showTaken,
+            }
+          : { per_page: 0, include_options: false },
+      );
+      const csv = toCsv(d.rows, csvColumns);
+      downloadBlob(csv, csvFilename(`drop-sherlock-database-${scope}`));
+    } catch (e) {
+      setError((e as Error).message || "export failed");
+    } finally {
+      setExporting("");
+    }
   }
 
   const filtersActive =
@@ -1524,7 +1556,17 @@ export default function DatabasePage() {
       </div>
     );
   }
-  if (data.rows.length === 0) {
+  // Full-page "empty" ONLY when the database genuinely has no domains —
+  // NOT when an active filter narrowed the page to zero (that case keeps
+  // the filter bar visible and shows the in-table "no match" message, so
+  // the user can adjust/clear the filter). cachedTotal is the unfiltered
+  // count from the last options-bearing response.
+  if (
+    cachedTotal === 0 &&
+    cachedHiddenTotal === 0 &&
+    !filtersActive &&
+    search === ""
+  ) {
     return (
       <div className="space-y-3">
         <h1 className="text-2xl font-semibold">{ts.title}</h1>
@@ -1535,7 +1577,9 @@ export default function DatabasePage() {
     );
   }
 
-  const opts = data.filter_options;
+  // Filter dropdowns read the CACHED options (preserved across page-flips
+  // where the server skips the heavy options computation).
+  const opts = cachedOptions;
 
   return (
     <div className="space-y-6">
@@ -1557,7 +1601,7 @@ export default function DatabasePage() {
           )}
           <button
             type="button"
-            onClick={() => reload()}
+            onClick={() => reload({ fresh: true })}
             disabled={refreshing}
             className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
           >
@@ -1566,20 +1610,20 @@ export default function DatabasePage() {
           <button
             type="button"
             onClick={() => exportCsv("visible")}
-            disabled={!data || search.filteredTotal === 0}
+            disabled={exporting !== "" || filteredTotal === 0}
             className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
             title={ts.exportVisibleHelp}
           >
-            {ts.exportVisible(search.filteredTotal)}
+            {ts.exportVisible(filteredTotal)}
           </button>
           <button
             type="button"
             onClick={() => exportCsv("all")}
-            disabled={!data || data.rows.length === 0}
+            disabled={exporting !== "" || cachedTotal === 0}
             className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
             title={ts.exportAllHelp}
           >
-            {ts.exportAll(data?.rows.length ?? 0)}
+            {ts.exportAll(cachedTotal)}
           </button>
         </div>
       </div>
@@ -1587,15 +1631,34 @@ export default function DatabasePage() {
       <section className="rounded-lg border dark:border-neutral-800 bg-white dark:bg-neutral-900 p-4 space-y-3">
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <h2 className="text-sm font-semibold">{ts.filters.heading}</h2>
-          {filtersActive && (
-            <button
-              type="button"
-              onClick={clearFilters}
-              className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
-            >
-              {ts.filters.clear}
-            </button>
-          )}
+          <div className="flex items-center gap-3 flex-wrap">
+            {/* Show-taken toggle — only meaningful when there ARE hidden
+                availability-only-taken domains (or it's already on, so the
+                user can switch it back off). */}
+            {(cachedHiddenTotal > 0 || showTaken) && (
+              <label
+                className="text-xs inline-flex items-center gap-1.5 cursor-pointer text-neutral-600 dark:text-neutral-400"
+                title={ts.filters.showTakenHelp}
+              >
+                <input
+                  type="checkbox"
+                  checked={showTaken}
+                  onChange={(e) => setShowTaken(e.target.checked)}
+                  className="cursor-pointer"
+                />
+                {ts.filters.showTaken(cachedHiddenTotal)}
+              </label>
+            )}
+            {filtersActive && (
+              <button
+                type="button"
+                onClick={clearFilters}
+                className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                {ts.filters.clear}
+              </button>
+            )}
+          </div>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 text-sm">
           {/* Source filter (2026-05-17) — multi-select on
@@ -1980,11 +2043,11 @@ export default function DatabasePage() {
           <div className="flex items-center gap-2 text-xs text-neutral-600 dark:text-neutral-400 pt-1">
             <span>
               {ts.filters.matchedCount(
-                filtered.length,
-                data?.rows.length ?? 0,
+                filteredTotal,
+                cachedTotal,
               )}
             </span>
-            {filtered.length === 0 && (
+            {filteredTotal === 0 && (
               <span className="text-amber-600 dark:text-amber-400">
                 · {ts.filters.matchedCountEmpty}
               </span>
@@ -1993,7 +2056,7 @@ export default function DatabasePage() {
         )}
       </section>
 
-      <PaginationTopBar state={search} searchPlaceholder={ts.searchPlaceholder} />
+      <PaginationTopBar state={searchState} searchPlaceholder={ts.searchPlaceholder} />
 
       {selected.size > 0 && (
         <div className="rounded-md border border-blue-300 dark:border-blue-900/60 bg-blue-50 dark:bg-blue-950/40 px-3 py-2 text-sm space-y-2">
@@ -2171,7 +2234,7 @@ export default function DatabasePage() {
         </div>
       )}
 
-      {search.paged.length === 0 ? (
+      {pageRows.length === 0 ? (
         <p className="text-sm text-neutral-500 dark:text-neutral-400">
           {ts.noMatch}
         </p>
@@ -2291,14 +2354,14 @@ export default function DatabasePage() {
               </tr>
             </thead>
             <tbody>
-              {search.paged.map((r, i) => (
+              {pageRows.map((r, i) => (
                 <DomainListRow
                   key={r.domain}
                   row={r}
-                  rowNumber={search.start + i}
+                  rowNumber={startIdx + i + 1}
                   selected={selected.has(r.domain)}
                   onToggle={() => toggleOne(r.domain)}
-                  onBacklogUpdated={() => reload({ silent: true })}
+                  onBacklogUpdated={() => reload({ silent: true, fresh: true })}
                   onNoteSaved={(note) => {
                     // Optimistic merge so the new note is visible
                     // immediately without a full /database/domains
@@ -2361,7 +2424,7 @@ export default function DatabasePage() {
         </div>
       )}
 
-      <PaginationBottomBar state={search} />
+      <PaginationBottomBar state={searchState} />
 
       {/* Apruv export modal (added 2026-05-20). Inline conditional so the
           markup lives next to the state that drives it; the page already

@@ -25,10 +25,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
+import time
 from collections import Counter, defaultdict
 from datetime import date, datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -261,12 +263,25 @@ class DomainListResponse(BaseModel):
     # Materialized filter universes — easier than reconstructing on the
     # frontend. Sorted, no dedup needed beyond what the set provides.
     # Always computed across the FULL row set (regardless of pagination)
-    # so the dropdown options stay complete.
+    # so the dropdown options stay complete. May be an EMPTY dict when the
+    # caller passed include_options=false (page-flip path) — the frontend
+    # then reuses its cached copy. Mirrors the Backlog list endpoint.
     filter_options: dict[str, list[str]]
-    # Total domain count across all pages (added 2026-05-10 for
-    # optional server-side pagination — see ?offset=&limit= on
-    # /database/domains).
+    # Total domain count across the FULL set (no filters). Like Backlog's
+    # `total`, only populated when include_options=true (it's part of the
+    # heavy options computation); 0 on the page-flip path.
     total: int = 0
+    # Count AFTER filters but BEFORE pagination — drives the pagination bar
+    # and the "X / Y" hint. Added 2026-06-02 alongside server-side
+    # pagination (mirrors BacklogListResponse.filtered_total).
+    filtered_total: int = 0
+    page: int = 1
+    per_page: int = 0
+    # Count of availability-only-taken domains hidden by the default
+    # `show_taken=false` rule (2026-06-02). Lets the UI label the "show
+    # taken" toggle and avoid a misleading "database empty" screen when
+    # everything is merely hidden. Only populated when include_options.
+    hidden_total: int = 0
 
 
 # --- Helpers ----------------------------------------------------------------
@@ -423,23 +438,24 @@ def _bucket_for(
 
 # --- Endpoint ---------------------------------------------------------------
 
-def list_domains(
-    db: Session = Depends(get_db),
-    offset: int = 0,
-    limit: int | None = None,
-) -> DomainListResponse:
-    """One row per unique domain across all jobs/runs.
+def _build_all_rows(
+    db: Session,
+) -> tuple[list[DomainRow], dict[str, list[str]], set[str]]:
+    """Heavy aggregation: one DomainRow per unique domain across all
+    jobs/runs (fully sorted — pinned-first by finished_at desc, then
+    alphabetical), plus the materialized filter-option universes.
 
     Each row's data comes from the explicitly-pinned RunDomain (if any).
     Domains with no pin still appear so the user can pin one — their cells
     are blank. Notes are domain-keyed and unaffected by the pin.
 
-    The `offset` and `limit` parameters slice the returned `rows` list
-    in Python AFTER the global sort + filter-options computation. The
-    full per-domain aggregation always runs across every RunDomain in
-    the DB — this is heavy at large N (the load-everything design that
-    pre-dates 2026-05-16) and is the known scale ceiling for the
-    Database page."""
+    This is the most expensive read in the app (pin walk + multi-source
+    synth + per-row JSON parsing) and runs across EVERY RunDomain in the
+    DB — the known scale ceiling for the Database page. Server-side
+    filtering / sorting / pagination is applied downstream by
+    `list_domains`; a short-TTL snapshot cache (`_get_all_rows`) absorbs
+    page-flip + filter-toggle bursts so this doesn't re-run every
+    request."""
     all_rds: list[RunDomain] = db.query(RunDomain).all()
     rds_by_domain: dict[str, list[RunDomain]] = defaultdict(list)
     rds_by_run_and_domain: dict[tuple[int, str], RunDomain] = {}
@@ -712,6 +728,17 @@ def list_domains(
     mixed_t = sc["mixed_threshold"]
 
     rows: list[DomainRow] = []
+    # Domains eligible to be HIDDEN from the Database page unless the
+    # "show taken" toggle is on (2026-06-02). Populated for domains whose
+    # ONLY pillar data is an Availability JOB result (a CR) that came back
+    # non-`available` — the bulk-availability noise the operator doesn't
+    # want cluttering Database. Deliberately NOT populated for: domains
+    # with any Quality/Wayback/Whois/Batch analysis (always shown), domains
+    # whose availability came from an INLINE recheck (history fallback, no
+    # CR — user touched it deliberately), or domains carrying a note.
+    # `list_domains` applies the toggle; the full set stays cached so the
+    # toggle is a cheap per-request filter, not a rebuild.
+    hide_candidates: set[str] = set()
     providers: set[str] = set()
     models: set[str] = set()
     verdicts: set[str] = set()
@@ -1394,6 +1421,29 @@ def list_domains(
                         for k, v in m.items()
                     }
 
+        # Availability-only-taken hide rule (2026-06-02). A domain is a
+        # hide candidate when its ONLY pillar data is an Availability JOB
+        # result that isn't `available`. Conditions:
+        #   • no Quality pin (per_crit_sources empty) and no whois/batch aux
+        #     → availability is the sole pillar;
+        #   • `av_src is not None` → the availability verdict came from a
+        #     CriterionResult (an Availability JOB), NOT the inline-recheck
+        #     history fallback (which leaves av_src None) — so a domain the
+        #     operator inline-rechecked never vanishes;
+        #   • verdict != "available";
+        #   • no user note (a noted domain is one the operator cares about).
+        # `wayback`/`wayback_classify` live in per_crit_sources, so a
+        # Wayback-analyzed domain is covered by the per_crit_sources check.
+        if (
+            not per_crit_sources
+            and "whois_history" not in aux_sources
+            and "ahrefs_batch_analysis" not in aux_sources
+            and av_src is not None
+            and availability_status != "available"
+            and not (note_row.note if note_row else "")
+        ):
+            hide_candidates.add(domain)
+
         rows.append(DomainRow(
             domain=domain,
             is_pinned=True,
@@ -1479,16 +1529,7 @@ def list_domains(
         ),
     )
 
-    total = len(rows)
-    if limit is not None:
-        # Slice AFTER the global sort + filter-options computation so
-        # paged consumers still see a stable, complete picture.
-        sliced = rows[offset : offset + max(0, limit)]
-    else:
-        sliced = rows
-    return DomainListResponse(
-        rows=sliced,
-        filter_options={
+    filter_options: dict[str, list[str]] = {
             "ai_providers": sorted(providers),
             "ai_models": sorted(models),
             "verdicts": sorted(verdicts),
@@ -1521,31 +1562,517 @@ def list_domains(
                     .all()
                 }
             ),
-        },
-        total=total,
+    }
+    return rows, filter_options, hide_candidates
+
+
+# --- Aggregation snapshot cache (2026-06-02) -------------------------------
+# `_build_all_rows` is the heaviest read in the app. With client-side
+# pagination (pre-2026-06-02) it ran ONCE per page visit; server-side
+# pagination would otherwise re-run it on every page-flip / filter toggle.
+# A short-TTL snapshot of the fully-aggregated rows + filter_options
+# absorbs those bursts — mirrors the Backlog list endpoint's count cache.
+#
+# Staleness: ≤ _ROWS_CACHE_TTL_SEC after an EXTERNAL change (a run
+# finishing & auto-pinning, a Backlog-page edit). In-app mutations on
+# THIS router (pin / unpin / domain delete / note edit) call
+# `_invalidate_rows_cache()` so they reflect immediately; the Database
+# page passes fresh=true after bulk actions on other routers. The page
+# also reloads on focus/visibility (cache-served), so cross-tab changes
+# self-heal within the TTL.
+#
+# Why a LONG TTL: `_build_all_rows` is a full load-everything aggregation
+# (~tens of seconds at a few thousand domains — the known scale ceiling).
+# Server-side pagination means EVERY filter / sort / page change hits this
+# endpoint, so the snapshot must survive a whole filtering session or the
+# user would pay the rebuild cost again mid-session. Pre-2026-06-02 the
+# page loaded the full set ONCE then filtered client-side (instant); the
+# long-lived cache preserves that "build once, slice many" feel while
+# moving the slicing server-side. 5 min comfortably covers an
+# interactive triage session; mutations + manual Refresh (fresh=true)
+# are the immediate-truth escape hatches.
+_ROWS_CACHE_TTL_SEC = 300.0
+# Cache entry: (expiry, rows, filter_options, hide_candidates).
+_rows_cache: dict[
+    str, tuple[float, list[DomainRow], dict[str, list[str]], set[str]]
+] = {}
+# Guards reads/writes of `_rows_cache` (held only for microseconds).
+_rows_cache_lock = threading.Lock()
+# Single-flight build lock (2026-06-02). `_build_all_rows` is a ~tens-of-
+# seconds load-everything aggregation. Without coalescing, a burst of COLD
+# requests — multiple LAN users, or the requests that arrive right after a
+# mutation clears the cache — would EACH run the build concurrently,
+# saturating uvicorn's shared thread pool + the single SQLite writer and
+# producing 502s (observed in testing). This lock serializes builders: the
+# first cold caller builds + populates the cache; peers block here, then
+# re-read the just-built snapshot instead of rebuilding. CRITICAL: warm
+# reads never reach this lock — they return at the top-of-function cache
+# check below — so an in-progress 38s build never blocks a cache hit.
+_rows_build_lock = threading.Lock()
+
+
+def _invalidate_rows_cache() -> None:
+    with _rows_cache_lock:
+        _rows_cache.clear()
+
+
+def _read_rows_cache(
+    now: float,
+) -> tuple[list[DomainRow], dict[str, list[str]], set[str]] | None:
+    """Return the unexpired snapshot, or None on miss/expiry."""
+    with _rows_cache_lock:
+        ent = _rows_cache.get("all")
+        if ent is not None and ent[0] > now:
+            return ent[1], ent[2], ent[3]
+    return None
+
+
+def _get_all_rows(
+    db: Session, *, fresh: bool = False,
+) -> tuple[list[DomainRow], dict[str, list[str]], set[str]]:
+    """Return (full sorted rows, filter_options, hide_candidates) from the
+    snapshot cache (`_ROWS_CACHE_TTL_SEC`). `fresh=True` forces a rebuild
+    (callers that must observe their own just-committed write). Builds are
+    SINGLE-FLIGHTED via `_rows_build_lock` so a burst of cold callers shares
+    one build instead of each running the multi-second aggregation."""
+    # Fast path: a warm cache hit returns WITHOUT touching the build lock,
+    # so concurrent cold builds never stall warm readers.
+    if not fresh:
+        hit = _read_rows_cache(time.monotonic())
+        if hit is not None:
+            return hit
+    # Cold (or fresh) path — serialize builders.
+    with _rows_build_lock:
+        # A peer may have built the snapshot while we waited for the lock.
+        # Non-fresh callers happily reuse it. Fresh callers always rebuild
+        # so the result reflects their own write (concurrent fresh callers
+        # therefore serialize — rare: one Refresh click / post-mutation
+        # reload — and that's an acceptable cost for guaranteed freshness).
+        if not fresh:
+            hit = _read_rows_cache(time.monotonic())
+            if hit is not None:
+                return hit
+        rows, options, hide_candidates = _build_all_rows(db)
+        with _rows_cache_lock:
+            _rows_cache["all"] = (
+                time.monotonic() + _ROWS_CACHE_TTL_SEC,
+                rows,
+                options,
+                hide_candidates,
+            )
+        return rows, options, hide_candidates
+
+
+# --- Server-side filter / sort / search (2026-06-02) -----------------------
+# Ported verbatim from the Database page's former client-side predicates
+# so behavior is identical; they now run server-side over the aggregated
+# rows so a page only ships the rows it displays. OR semantics inside a
+# multi-select; AND across distinct filters. Sentinels: "__none__" =
+# field empty/absent; "__partial__" = verdict is a partial final.
+
+def _match_multi(value: str, selected: list[str]) -> bool:
+    """OR-match helper for the simple "value in selected, with __none__
+    meaning empty" multi-selects (wayback / whois band / availability /
+    language / category)."""
+    if not selected:
+        return True
+    for v in selected:
+        if v == "__none__":
+            if not value:
+                return True
+        elif value == v:
+            return True
+    return False
+
+
+def _apply_domain_filters(
+    rows: list[DomainRow],
+    *,
+    verdicts: list[str],
+    wayback_verdicts: list[str],
+    whois_bands: list[str],
+    availability: list[str],
+    languages: list[str],
+    categories: list[str],
+    criteria: list[str],
+    notes: str,
+    sources: list[str],
+    statuses: list[str],
+    wayback_conf_min: float,
+    ahrefs_conf_min: float,
+    dr_min: float,
+    ref_domains_min: float,
+    whois_cycles_max: int,
+    max_price_min: float,
+    max_price_max: float,
+) -> list[DomainRow]:
+    def keep(r: DomainRow) -> bool:
+        # Verdict (final bucket) — __none__ = no bucket & not partial;
+        # __partial__ = partial final.
+        if verdicts:
+            ok = False
+            for v in verdicts:
+                if v == "__none__":
+                    if not r.final_bucket and not r.final_partial:
+                        ok = True
+                elif v == "__partial__":
+                    if r.final_partial:
+                        ok = True
+                elif r.final_bucket == v:
+                    ok = True
+            if not ok:
+                return False
+        if not _match_multi(r.wayback_assessment, wayback_verdicts):
+            return False
+        if not _match_multi(r.whois_band, whois_bands):
+            return False
+        if not _match_multi(r.availability_status, availability):
+            return False
+        if not _match_multi(r.primary_language, languages):
+            return False
+        if not _match_multi(r.category, categories):
+            return False
+        # Source = backlog_registrar (exact membership; rows whose
+        # registrar isn't in the selected set are dropped).
+        if sources and (r.backlog_registrar or "") not in sources:
+            return False
+        # Backlog status — rows with no backlog row are excluded when any
+        # status is selected.
+        if statuses:
+            if r.backlog_status is None or r.backlog_status not in statuses:
+                return False
+        # Confidence thresholds — null confidence excluded when min > 0.
+        if wayback_conf_min > 0:
+            if (
+                r.wayback_confidence is None
+                or r.wayback_confidence < wayback_conf_min
+            ):
+                return False
+        if ahrefs_conf_min > 0:
+            if (
+                r.final_confidence is None
+                or r.final_confidence < ahrefs_conf_min
+            ):
+                return False
+        # Ahrefs Batch "≥": DR prefers batch domain_rating, falls back to
+        # imported backlog DR; refdomains only from the batch run.
+        if dr_min > 0:
+            dr = r.batch_metrics.get("domain_rating")
+            if dr is None:
+                dr = r.backlog_ahrefs_dr
+            if dr is None or dr < dr_min:
+                return False
+        if ref_domains_min > 0:
+            rd = r.batch_metrics.get("refdomains_dofollow")
+            if rd is None or rd < ref_domains_min:
+                return False
+        # Whois ownership-cycles "< N" (null excluded when filter on).
+        if whois_cycles_max > 0:
+            if r.whois_ownership_cycles is None:
+                return False
+            if r.whois_ownership_cycles >= whois_cycles_max:
+                return False
+        # Max-price range — null excluded when either bound is set.
+        if max_price_min > 0 or max_price_max > 0:
+            if r.backlog_max_price is None:
+                return False
+            if max_price_min > 0 and r.backlog_max_price < max_price_min:
+                return False
+            if max_price_max > 0 and r.backlog_max_price > max_price_max:
+                return False
+        # "Any criterion" — passes if at least one selected criterion is
+        # enabled on the row.
+        if criteria:
+            if not any(
+                (r.criteria.get(k) is not None and r.criteria[k].enabled)
+                for k in criteria
+            ):
+                return False
+        if notes == "with" and not r.note:
+            return False
+        if notes == "without" and r.note:
+            return False
+        return True
+
+    return [r for r in rows if keep(r)]
+
+
+def _apply_domain_search(rows: list[DomainRow], search: str) -> list[DomainRow]:
+    q = (search or "").strip().lower()
+    if not q:
+        return rows
+    return [
+        r for r in rows
+        if q in r.domain.lower()
+        or q in (r.pinned_job_name or "").lower()
+        or q in (r.note or "").lower()
+    ]
+
+
+def _apply_domain_sort(
+    rows: list[DomainRow], sort: str | None, direction: str | None,
+) -> list[DomainRow]:
+    """Re-sort by one of the three user-clickable columns. No `sort` keeps
+    the aggregator's default order (pinned-first, then alphabetical).
+    Mirrors the former client-side sort comparators exactly: rows WITH the
+    sortable value float to the top, rest sink, ties break by domain."""
+    if not sort:
+        return rows
+    dir_mul = 1 if (direction or "asc") == "asc" else -1
+    NEG = float("-inf")
+    if sort == "verdict":
+        def scored(r: DomainRow) -> bool:
+            return (not r.final_partial) and r.final_score is not None
+
+        def key(r: DomainRow):
+            return (
+                0 if scored(r) else 1,
+                0 if (scored(r) or r.final_partial) else 1,
+                ((r.final_score if r.final_score is not None else NEG) * dir_mul),
+                r.domain,
+            )
+        return sorted(rows, key=key)
+    if sort == "whois":
+        def key(r: DomainRow):
+            has = r.whois_dropped_confidence is not None
+            return (
+                0 if has else 1,
+                ((r.whois_dropped_confidence if has else NEG) * dir_mul),
+                r.domain,
+            )
+        return sorted(rows, key=key)
+    if sort == "max_price":
+        def key(r: DomainRow):
+            has = r.backlog_max_price is not None
+            return (
+                0 if has else 1,
+                ((r.backlog_max_price if has else NEG) * dir_mul),
+                r.domain,
+            )
+        return sorted(rows, key=key)
+    raise HTTPException(400, f"unknown sort column: {sort}")
+
+
+def list_domains(
+    db: Session = Depends(get_db),
+    *,
+    offset: int = 0,
+    limit: int | None = None,
+    include_options: bool = True,
+    fresh: bool = False,
+    verdicts: list[str] | None = None,
+    wayback_verdicts: list[str] | None = None,
+    whois_bands: list[str] | None = None,
+    availability: list[str] | None = None,
+    languages: list[str] | None = None,
+    categories: list[str] | None = None,
+    criteria: list[str] | None = None,
+    notes: str = "any",
+    sources: list[str] | None = None,
+    statuses: list[str] | None = None,
+    wayback_conf_min: float = 0.0,
+    ahrefs_conf_min: float = 0.0,
+    dr_min: float = 0.0,
+    ref_domains_min: float = 0.0,
+    whois_cycles_max: int = 0,
+    max_price_min: float = 0.0,
+    max_price_max: float = 0.0,
+    search: str = "",
+    sort: str | None = None,
+    direction: str | None = None,
+    show_taken: bool = False,
+) -> DomainListResponse:
+    """Server-side filtered / sorted / paginated domain list. The heavy
+    aggregation runs once (cached) via `_get_all_rows`; filters + sort +
+    search + slice are applied in Python over its output. With no filters
+    and `limit=None` it returns every row (used by internal callers like
+    /translate-verdicts).
+
+    `show_taken=False` (the default) hides availability-only domains whose
+    Availability-JOB verdict isn't `available` (the `hide_candidates` set
+    from `_build_all_rows`) — keeps a bulk-availability run from burying
+    Database under taken/unknown domains. Domains with any other analysis,
+    inline-rechecked domains, and noted domains are never in that set.
+    Internal callers (e.g. /translate-verdicts) leave it False, which is
+    correct — those domains carry no Quality verdict to translate anyway."""
+    all_rows, filter_options, hide_candidates = _get_all_rows(db, fresh=fresh)
+
+    # Base visibility universe: drop availability-only-taken domains unless
+    # the operator asked to see them. Applied BEFORE filters/search so
+    # `total` + every count reflects the visible universe.
+    if show_taken or not hide_candidates:
+        base_rows = all_rows
+    else:
+        base_rows = [r for r in all_rows if r.domain not in hide_candidates]
+
+    filtered = _apply_domain_filters(
+        base_rows,
+        verdicts=verdicts or [],
+        wayback_verdicts=wayback_verdicts or [],
+        whois_bands=whois_bands or [],
+        availability=availability or [],
+        languages=languages or [],
+        categories=categories or [],
+        criteria=criteria or [],
+        notes=notes or "any",
+        sources=sources or [],
+        statuses=statuses or [],
+        wayback_conf_min=wayback_conf_min,
+        ahrefs_conf_min=ahrefs_conf_min,
+        dr_min=dr_min,
+        ref_domains_min=ref_domains_min,
+        whois_cycles_max=whois_cycles_max,
+        max_price_min=max_price_min,
+        max_price_max=max_price_max,
+    )
+    filtered = _apply_domain_search(filtered, search)
+    filtered = _apply_domain_sort(filtered, sort, direction)
+
+    filtered_total = len(filtered)
+    if limit is not None:
+        sliced = filtered[offset : offset + max(0, limit)]
+    else:
+        sliced = filtered
+    per_page = limit if limit is not None else filtered_total
+    page = (offset // limit + 1) if (limit and limit > 0) else 1
+    return DomainListResponse(
+        rows=sliced,
+        filter_options=filter_options if include_options else {},
+        total=len(base_rows) if include_options else 0,
+        filtered_total=filtered_total,
+        page=page,
+        per_page=per_page,
+        hidden_total=len(hide_candidates) if include_options else 0,
     )
 
 
+# Comma-prone multi-selects (source = registrar, language/category are
+# AI-authored) use REPEATED query params (?source=a&source=b) — the same
+# rationale as Backlog's registrar param. Enum-ish ones could be CSV but
+# repeated keeps one consistent shape.
 @router.get("/domains", response_model=DomainListResponse)
 async def _list_domains_route(
-    offset: int = 0,
-    limit: int | None = None,
+    page: int = 1,
+    per_page: int = 0,
+    include_options: bool = True,
+    fresh: bool = False,
+    verdict: list[str] | None = Query(None),
+    wayback_verdict: list[str] | None = Query(None),
+    whois_band: list[str] | None = Query(None),
+    availability: list[str] | None = Query(None),
+    language: list[str] | None = Query(None),
+    category: list[str] | None = Query(None),
+    criterion: list[str] | None = Query(None),
+    notes: str = "any",
+    source: list[str] | None = Query(None),
+    status: list[str] | None = Query(None),
+    wayback_conf_min: float = 0.0,
+    ahrefs_conf_min: float = 0.0,
+    dr_min: float = 0.0,
+    ref_domains_min: float = 0.0,
+    whois_cycles_max: int = 0,
+    max_price_min: float = 0.0,
+    max_price_max: float = 0.0,
+    search: str = "",
+    sort: str | None = None,
+    direction: str | None = None,
+    show_taken: bool = False,
 ) -> DomainListResponse:
     """Async wrapper for `list_domains`. The DB walk is the heaviest
-    read in the app (per-criterion source resolution, JSON parsing per
-    row, multi-source synth) — off-loading it to asyncio.to_thread
-    keeps the event loop responsive when 5+ users land on the Database
-    page during a busy analyze run. A fresh Session is opened inside
-    the executor so it never crosses thread boundaries."""
-    return await asyncio.to_thread(_run_list_domains, offset, limit)
+    read in the app — off-loaded to asyncio.to_thread so the event loop
+    stays responsive. `per_page=0` (or omitted) returns every filtered
+    row in one shot (used by CSV export); otherwise it paginates.
+    `show_taken=true` reveals the availability-only-taken domains hidden
+    by default."""
+    limit = per_page if per_page and per_page > 0 else None
+    offset = (max(1, page) - 1) * per_page if limit else 0
+    return await asyncio.to_thread(
+        _run_list_domains,
+        offset,
+        limit,
+        include_options,
+        fresh,
+        verdict,
+        wayback_verdict,
+        whois_band,
+        availability,
+        language,
+        category,
+        criterion,
+        notes,
+        source,
+        status,
+        wayback_conf_min,
+        ahrefs_conf_min,
+        dr_min,
+        ref_domains_min,
+        whois_cycles_max,
+        max_price_min,
+        max_price_max,
+        search,
+        sort,
+        direction,
+        show_taken,
+    )
 
 
 def _run_list_domains(
-    offset: int, limit: int | None,
+    offset: int,
+    limit: int | None,
+    include_options: bool,
+    fresh: bool,
+    verdict: list[str] | None,
+    wayback_verdict: list[str] | None,
+    whois_band: list[str] | None,
+    availability: list[str] | None,
+    language: list[str] | None,
+    category: list[str] | None,
+    criterion: list[str] | None,
+    notes: str,
+    source: list[str] | None,
+    status: list[str] | None,
+    wayback_conf_min: float,
+    ahrefs_conf_min: float,
+    dr_min: float,
+    ref_domains_min: float,
+    whois_cycles_max: int,
+    max_price_min: float,
+    max_price_max: float,
+    search: str,
+    sort: str | None,
+    direction: str | None,
+    show_taken: bool,
 ) -> DomainListResponse:
     db = SessionLocal()
     try:
-        return list_domains(db=db, offset=offset, limit=limit)
+        return list_domains(
+            db=db,
+            offset=offset,
+            limit=limit,
+            include_options=include_options,
+            fresh=fresh,
+            verdicts=verdict,
+            wayback_verdicts=wayback_verdict,
+            whois_bands=whois_band,
+            availability=availability,
+            languages=language,
+            categories=category,
+            criteria=criterion,
+            notes=notes,
+            sources=source,
+            statuses=status,
+            wayback_conf_min=wayback_conf_min,
+            ahrefs_conf_min=ahrefs_conf_min,
+            dr_min=dr_min,
+            ref_domains_min=ref_domains_min,
+            whois_cycles_max=whois_cycles_max,
+            max_price_min=max_price_min,
+            max_price_max=max_price_max,
+            search=search,
+            sort=sort,
+            direction=direction,
+            show_taken=show_taken,
+        )
     finally:
         db.close()
 
@@ -1613,6 +2140,7 @@ def pin_domain(
                     ex.run_id = run.id
                     ex.updated_at = now
     db.commit()
+    _invalidate_rows_cache()
     return PinOut(domain=domain, pinned_run_domain_id=rd.id)
 
 
@@ -1650,6 +2178,7 @@ def unpin_domain(domain: str, db: Session = Depends(get_db)) -> dict:
         .delete(synchronize_session=False)
     )
     db.commit()
+    _invalidate_rows_cache()
     return {"unpinned": domain, "count": int(n)}
 
 
@@ -1718,6 +2247,7 @@ def delete_domains(
         synchronize_session=False
     )
     db.commit()
+    _invalidate_rows_cache()
     return DeleteDomainsOut(
         deleted_run_domains=deleted_run_domains,
         deleted_runs=deleted_runs,
@@ -1762,6 +2292,7 @@ def upsert_note(
         row.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(row)
+    _invalidate_rows_cache()
     return NoteOut(domain=row.domain, note=row.note, updated_at=row.updated_at)
 
 

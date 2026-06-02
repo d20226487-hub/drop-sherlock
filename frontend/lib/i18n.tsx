@@ -1219,6 +1219,9 @@ const messagesEn = {
         matchedCount: (filtered: number, total: number) =>
           `Filtered: ${filtered} of ${total} domain${total === 1 ? "" : "s"}`,
         matchedCountEmpty: "no rows match the current filters",
+        showTaken: (n: number) => `Show taken (${n})`,
+        showTakenHelp:
+          "By default, domains whose only data is an Availability-job result that came back NOT available (registered / unknown / error / not supported) are hidden from this page so a bulk availability run doesn't bury it. Turn this on to show them too. Domains with any other analysis, inline rechecks, or a note are never hidden.",
       },
       verdictSpread: (counts: Record<string, number>) => {
         const parts: string[] = [];
@@ -3603,6 +3606,9 @@ const messagesRu: Messages = {
         matchedCount: (filtered, total) =>
           `Отфильтровано: ${filtered} из ${total}`,
         matchedCountEmpty: "ни одна строка не подходит под текущие фильтры",
+        showTaken: (n) => `Показать занятые (${n})`,
+        showTakenHelp:
+          "По умолчанию домены, у которых есть только результат Availability-задачи со статусом НЕ available (registered / unknown / error / not supported), скрыты с этой страницы, чтобы массовая проверка доступности её не переполняла. Включите, чтобы показать и их. Домены с любым другим анализом, ручными перепроверками или заметкой не скрываются никогда.",
       },
       verdictSpread: (counts) => {
         const parts: string[] = [];
