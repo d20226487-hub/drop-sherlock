@@ -34,6 +34,7 @@ const CHECK_LINK_BY_KIND: Record<JobKind, string> = {
   quality: "/check/quality",
   whois_history: "/check/whois-history",
   availability: "/check/availability",
+  ahrefs_batch_analysis: "/check/ahrefs-batch-analysis",
 };
 
 export function JobsListByKind({ kind }: { kind: JobKind }) {

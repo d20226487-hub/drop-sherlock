@@ -416,11 +416,12 @@ export default function BacklogPage() {
   // have functional forms; Availability accepts the same handoff key
   // even though its check page is currently a stub — operators can
   // still kick off availability runs from this menu.
-  type Pillar = "quality" | "whois" | "availability";
+  type Pillar = "quality" | "whois" | "availability" | "ahrefs_batch";
   const PILLAR_ROUTES: Record<Pillar, string> = {
     quality: "/check/quality?from_backlog=1",
     whois: "/check/whois-history?from_backlog=1",
     availability: "/check/availability?from_backlog=1",
+    ahrefs_batch: "/check/ahrefs-batch-analysis?from_backlog=1",
   };
 
   // Unified handoff for "send these domains to <pillar>". Replaces the
@@ -845,6 +846,15 @@ export default function BacklogPage() {
           </button>
           <button
             type="button"
+            onClick={() => handleSendTo("ahrefs_batch", "filtered")}
+            disabled={bulkBusy}
+            className="text-xs px-3 py-1 rounded-md border border-emerald-300 dark:border-emerald-900/60 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 disabled:opacity-50"
+            title={ts.sendToPicker.ahrefsBatchHint}
+          >
+            {ts.sendToPicker.ahrefsBatch}
+          </button>
+          <button
+            type="button"
             onClick={handleBulkDeleteAllFiltered}
             // Disabled when no filter is active — protects against
             // a careless "Delete all 358 filtered" click on a fresh
@@ -927,6 +937,15 @@ export default function BacklogPage() {
               title={ts.sendToPicker.availabilityHint}
             >
               {ts.sendToPicker.availability}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSendTo("ahrefs_batch", "ids")}
+              disabled={bulkBusy}
+              className="text-xs px-3 py-1 rounded-md bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+              title={ts.sendToPicker.ahrefsBatchHint}
+            >
+              {ts.sendToPicker.ahrefsBatch}
             </button>
             <button
               type="button"
@@ -1199,6 +1218,8 @@ function BacklogAvailabilityCell({
         return "bg-emerald-100 text-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-200";
       case "registered":
         return "bg-neutral-100 text-neutral-800 dark:bg-neutral-800 dark:text-neutral-200";
+      case "not_supported":
+        return "bg-violet-100 text-violet-900 dark:bg-violet-950/60 dark:text-violet-200";
       case "error":
         return "bg-rose-100 text-rose-900 dark:bg-rose-950/60 dark:text-rose-200";
       default:
@@ -1208,6 +1229,7 @@ function BacklogAvailabilityCell({
   const label = (() => {
     if (status === "available") return a.statusAvailable;
     if (status === "registered") return a.statusRegistered;
+    if (status === "not_supported") return a.statusNotSupported;
     if (status === "error") return a.statusError;
     if (status === "unknown") return a.statusUnknown;
     return null;

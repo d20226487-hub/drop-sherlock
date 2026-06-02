@@ -11,6 +11,7 @@ import { NotesEditor } from "@/components/notes-editor";
 import { ShareButton } from "@/components/share-button";
 import { WhoisHistoryDomainView } from "@/components/whois-history-domain-view";
 import { AvailabilityDomainView } from "@/components/availability-domain-view";
+import { AhrefsBatchAnalysisDomainView } from "@/components/ahrefs-batch-analysis-domain-view";
 import { AiPreviewPanel } from "@/components/ai-preview-panel";
 import {
   WaybackSamplesTimeline,
@@ -322,6 +323,43 @@ export default function DomainDetailPage({
           </div>
         </header>
         <AvailabilityDomainView data={data} />
+        <section className="pt-6 border-t dark:border-neutral-800">
+          <NotesEditor
+            domain={data.domain}
+            initialNote={data.note}
+            initialUpdatedAt={data.note_updated_at}
+            onSaved={(note, updatedAt) => {
+              setData((prev) =>
+                prev ? { ...prev, note, note_updated_at: updatedAt } : prev,
+              );
+            }}
+          />
+        </section>
+      </div>
+    );
+  }
+
+  // Ahrefs Batch Analysis pillar — metrics table, no AI, no cost panel
+  // (the metric fetch cost lives at the run level). Same header layout
+  // as availability/whois for visual consistency.
+  if (data.job_kind === "ahrefs_batch_analysis") {
+    return (
+      <div className="space-y-10">
+        <Link
+          href={`/jobs/${jobId}/runs/${runId}`}
+          className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+        >
+          {ts.backToRun(runId)}
+        </Link>
+        <header className="space-y-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <h1 className="text-2xl font-semibold font-mono">
+              {ts.title(data.domain)}
+            </h1>
+            <StatusPill status={data.status} />
+          </div>
+        </header>
+        <AhrefsBatchAnalysisDomainView data={data} />
         <section className="pt-6 border-t dark:border-neutral-800">
           <NotesEditor
             domain={data.domain}

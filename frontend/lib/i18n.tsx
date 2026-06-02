@@ -66,12 +66,14 @@ const messagesEn = {
       quality: "Quality (Wayback + Ahrefs)",
       whoisHistory: "Whois History",
       availability: "Availability",
+      ahrefsBatchAnalysis: "Ahrefs Batch Analysis",
       toggleAria: "Open Check menu",
     },
     jobsDropdown: {
       quality: "Quality",
       whoisHistory: "Whois History",
       availability: "Availability",
+      ahrefsBatchAnalysis: "Ahrefs Batch Analysis",
       toggleAria: "Open Jobs menu",
     },
   },
@@ -507,6 +509,9 @@ const messagesEn = {
             good: "available",
             mixed: "registered",
             low_quality: "low quality",
+            // Double domain under a private multi-label suffix
+            // (jcg.us.com) — availability can't be verified (2026-06-02).
+            not_supported: "not supported",
             // 2026-05-16 split: distinct keys for the two non-terminal
             // outcomes. `unknown` = cascade ran, couldn't classify (no
             // retry helps); `error` = cascade itself failed (retryable).
@@ -523,6 +528,11 @@ const messagesEn = {
             low_quality: "dropped/transferred",
             partial: "partial",
             no_verdict: "no verdict",
+          },
+          labelAhrefsBatch: {
+            good: "fetched",
+            error: "error",
+            no_verdict: "no data",
           },
         },
       },
@@ -639,12 +649,15 @@ const messagesEn = {
         filterAvailabilityAny: "any",
         filterAvailabilityAvailable: "available",
         filterAvailabilityRegistered: "registered",
-        // 'unknown' bucket relabeled "not supported" 2026-05-17 — in
-        // practice most cascade-unknown verdicts come from "no RDAP
-        // server for this TLD + WHOIS:43 couldn't parse" which is
-        // effectively "the providers we have don't cover this TLD."
-        // The bucket key stays `unknown` for backend stability.
-        filterAvailabilityUnknown: "not supported",
+        // Real `not_supported` verdict (2026-06-02): "double domains"
+        // under a private multi-label suffix (e.g. jcg.us.com) the
+        // cascade refuses to guess on. Distinct from `unknown` below.
+        filterAvailabilityNotSupported: "not supported",
+        // `unknown` = cascade ran but couldn't determine (no RDAP server
+        // for the TLD + unparseable WHOIS). Was previously mislabeled
+        // "not supported"; renamed back 2026-06-02 now that a real
+        // not_supported status exists. Bucket key stays `unknown`.
+        filterAvailabilityUnknown: "unknown",
         filterAvailabilityError: "error",
         // `filterAvailabilityNoVerdict` removed from the Run-page
         // filter 2026-05-17 (orphaned/missing CRs aren't actionable
@@ -1118,7 +1131,8 @@ const messagesEn = {
           "Filter by the latest availability-check result (RDAP / Domainr / WHOIS:43 cascade). Separate from the criterion filter — availability isn't a CR-row criterion.",
         availabilityAvailable: "available",
         availabilityRegistered: "registered",
-        availabilityUnknown: "not supported",
+        availabilityNotSupported: "not supported",
+        availabilityUnknown: "unknown",
         availabilityError: "error",
         availabilityNeverChecked: "(never checked)",
         languageAny: "Any language",
@@ -1170,6 +1184,13 @@ const messagesEn = {
         ahrefsConfMinHelp:
           "Slider: minimum Ahrefs Final Assessment confidence. Drag to set the threshold; all the way left = off. Rows without a final (or with a partial) are hidden once the threshold is above zero.",
         confSliderOff: "off",
+        drMin: "DR ≥",
+        drMinHelp:
+          "Minimum Domain Rating. Uses the pinned Ahrefs Batch Analysis DR (falls back to the imported backlog DR). Blank/0 = off; rows without a DR are hidden when set.",
+        refDomainsMin: "RD (f) ≥",
+        refDomainsMinHelp:
+          "Minimum referring domains (dofollow) from the pinned Ahrefs Batch Analysis run. Blank/0 = off; rows without the metric are hidden when set.",
+        numMinPlaceholder: "any",
         // Whois ownership-cycles filter. 2026-05-23: semantic flipped
         // from ">= N" (find dropped) to "< N" (find clean history) —
         // drop hunter's primary question is "which look freshest".
@@ -1736,6 +1757,7 @@ const messagesEn = {
       statusRegistered: "registered",
       statusUnknown: "unknown",
       statusError: "error",
+      statusNotSupported: "not supported",
       // Column hover
       checkedAt: (when: string) => `checked ${when}`,
       expiresOn: (date: string) => `expires ${date}`,
@@ -2008,6 +2030,52 @@ const messagesEn = {
       rerunBannerHelp:
         "A new Run will be added to this Job. Edit the domain list, then submit.",
     },
+    checkAhrefsBatch: {
+      title: "Ahrefs Batch Analysis",
+      subtitle:
+        "Pull current-snapshot Ahrefs /batch-analysis metrics (DR, referring domains, backlinks, organic traffic + keywords) across a domain list. One CriterionResult row per domain holds the selected metrics. Resilient to 100,000 domains — fetched in batches of 100.",
+      pipelineHint:
+        "No AI involved — the metrics are the verdict. Cost ≈ 1 unit/domain/metric (a 50-unit floor per 100-domain batch). Configure the Ahrefs API key in Settings → Providers.",
+      metricsHeading: "Metrics",
+      metricsHint:
+        "Pick which Ahrefs batch-analysis fields to fetch. DR only by default (cheapest). Each extra metric adds ~1 unit/domain.",
+      selectAll: "Select all",
+      clearAll: "Clear all",
+      countryLabel: "Country (optional)",
+      countryHint:
+        "Scopes Organic traffic / keywords to one country. Worldwide when blank. ISO alpha-2 code, e.g. us, gb, de.",
+      countryAny: "Worldwide",
+      labelHeading: "Job label",
+      labelHint:
+        "Optional. The name shows on /jobs/ahrefs-batch-analysis and on the job detail page; the note is for free-form context.",
+      nameLabel: "Name",
+      namePlaceholder: "Auto-generated from the first domain if blank",
+      notesLabel: "Notes",
+      notesPlaceholder: "Why are you analyzing these?",
+      submit: "Run batch analysis",
+      submitting: "Dispatching…",
+      settingsLink: "Open Ahrefs settings",
+      noMetricsError: "Pick at least one metric.",
+      summary: (n: number) => `${n} domain${n === 1 ? "" : "s"} ready`,
+      skippedBanned: (n: number) =>
+        `Skipped ${n} banned domain${n === 1 ? "" : "s"} from the input.`,
+      allBannedError: (count: number, sample: string, truncated: boolean) =>
+        `All submitted domains are on the ban list (${count} total): ${sample}${
+          truncated ? "…" : ""
+        }`,
+      rerunBannerTitle: "Rerun of",
+      rerunBannerCancel: "Cancel rerun",
+      rerunBannerHelp:
+        "A new Run will be added to this Job. Edit the domain list, then submit.",
+    },
+    ahrefsBatchDomain: {
+      heading: "Ahrefs Batch Analysis metrics",
+      metric: "Metric",
+      value: "Value",
+      noData:
+        "No metrics yet — run pending, failed, or this domain's batch was rejected.",
+      errorPrefix: "Fetch error",
+    },
     jobsWhoisHistory: {
       title: "Whois History — Jobs",
       subtitle:
@@ -2045,6 +2113,14 @@ const messagesEn = {
           "Submitted Availability (RDAP / Domainr / WHOIS-43 cascade) jobs.",
         empty: "No Availability jobs yet — Wave 3 ships the submit page.",
         goCheck: "Open Check → Availability",
+      },
+      ahrefs_batch_analysis: {
+        title: "Jobs — Ahrefs Batch Analysis",
+        intro:
+          "Submitted Ahrefs Batch Analysis jobs (bulk /batch-analysis metrics). Click a job to see its runs + per-domain metrics.",
+        empty:
+          "No Ahrefs Batch Analysis jobs yet — start one from Check → Ahrefs Batch Analysis.",
+        goCheck: "Open Check → Ahrefs Batch Analysis",
       },
     },
     // Wave 2b (2026-05-15) — per-domain page for whois_history-kind
@@ -2198,7 +2274,8 @@ const messagesEn = {
           "Filter by the latest availability-check result (RDAP / Domainr / WHOIS:43 cascade).",
         availabilityAvailable: "available",
         availabilityRegistered: "registered",
-        availabilityUnknown: "not supported",
+        availabilityNotSupported: "not supported",
+        availabilityUnknown: "unknown",
         availabilityError: "error",
         availabilityNeverChecked: "(never checked)",
       },
@@ -2230,6 +2307,9 @@ const messagesEn = {
         availability: "Availability",
         availabilityHint:
           "Run the availability cascade (RDAP / Domainr / WHOIS:43) to confirm what's currently registered.",
+        ahrefsBatch: "Ahrefs Batch",
+        ahrefsBatchHint:
+          "Run Ahrefs Batch Analysis (DR, referring domains, backlinks, organic metrics) — the cheap bulk pre-filter before Wayback / full Ahrefs.",
       },
       analyzedHint: (n: number) =>
         `${n} backlog domain${n === 1 ? " has" : "s have"} been analyzed but ${n === 1 ? "isn't" : "aren't"} marked yet.`,
@@ -2377,12 +2457,14 @@ const messagesRu: Messages = {
       quality: "Качество (Wayback + Ahrefs)",
       whoisHistory: "История Whois",
       availability: "Доступность",
+      ahrefsBatchAnalysis: "Ahrefs Batch Analysis",
       toggleAria: "Открыть меню Проверки",
     },
     jobsDropdown: {
       quality: "Качество",
       whoisHistory: "История Whois",
       availability: "Доступность",
+      ahrefsBatchAnalysis: "Ahrefs Batch Analysis",
       toggleAria: "Открыть меню Задач",
     },
   },
@@ -2828,6 +2910,9 @@ const messagesRu: Messages = {
             good: "свободен",
             mixed: "занят",
             low_quality: "низкое качество",
+            // Двойной домен под приватным многоуровневым суффиксом
+            // (jcg.us.com) — доступность не проверить (2026-06-02).
+            not_supported: "не поддерживается",
             // 2026-05-16 split (см. EN labelAvailability).
             unknown: "неизвестно",
             error: "ошибка",
@@ -2840,6 +2925,11 @@ const messagesRu: Messages = {
             low_quality: "дроп/смена владельца",
             partial: "частично",
             no_verdict: "без вердикта",
+          },
+          labelAhrefsBatch: {
+            good: "получено",
+            error: "ошибка",
+            no_verdict: "нет данных",
           },
         },
       },
@@ -2948,7 +3038,8 @@ const messagesRu: Messages = {
         filterAvailabilityAny: "любая",
         filterAvailabilityAvailable: "свободен",
         filterAvailabilityRegistered: "занят",
-        filterAvailabilityUnknown: "не поддерживается",
+        filterAvailabilityNotSupported: "не поддерживается",
+        filterAvailabilityUnknown: "неизвестно",
         filterAvailabilityError: "ошибка",
         // `filterAvailabilityNoVerdict` исключён из фильтра Run-страницы
         // 2026-05-17 (см. EN). Ключ сохранён на случай других ссылок.
@@ -3435,7 +3526,8 @@ const messagesRu: Messages = {
           "Фильтр по последнему результату проверки доступности (каскад RDAP / Domainr / WHOIS:43). Отдельно от фильтра критериев — доступность не является CR-критерием.",
         availabilityAvailable: "свободен",
         availabilityRegistered: "занят",
-        availabilityUnknown: "не поддерживается",
+        availabilityNotSupported: "не поддерживается",
+        availabilityUnknown: "неизвестно",
         availabilityError: "ошибка",
         availabilityNeverChecked: "(не проверялся)",
         languageAny: "Любой язык",
@@ -3483,6 +3575,13 @@ const messagesRu: Messages = {
         ahrefsConfMinHelp:
           "Ползунок: минимальная уверенность Итоговой оценки Ahrefs. Тащите вправо для более строгого порога; до упора влево — фильтр выключен. Строки без итоговой оценки (или с частичной) скрываются, как только порог становится больше нуля.",
         confSliderOff: "выкл",
+        drMin: "DR ≥",
+        drMinHelp:
+          "Минимальный Domain Rating. Берётся DR из закреплённого запуска Ahrefs Batch Analysis (если нет — импортированный DR из бэклога). Пусто/0 — выкл; строки без DR скрываются.",
+        refDomainsMin: "RD (f) ≥",
+        refDomainsMinHelp:
+          "Минимум ссылающихся доменов (dofollow) из закреплённого запуска Ahrefs Batch Analysis. Пусто/0 — выкл; строки без метрики скрываются.",
+        numMinPlaceholder: "любое",
         // Фильтр циклов whois — см. EN (флип "<N" вместо ">=N").
         whoisCyclesMax: "Циклы whois",
         whoisCyclesMaxHelp:
@@ -4110,6 +4209,7 @@ const messagesRu: Messages = {
       statusRegistered: "занят",
       statusUnknown: "неизвестно",
       statusError: "ошибка",
+      statusNotSupported: "не поддерживается",
       checkedAt: (when: string) => `проверено ${when}`,
       expiresOn: (date: string) => `истекает ${date}`,
       registrar: (name: string) => `регистратор: ${name}`,
@@ -4369,6 +4469,51 @@ const messagesRu: Messages = {
       rerunBannerHelp:
         "Будет добавлен новый Run в эту задачу. Отредактируйте список доменов и нажмите отправить.",
     },
+    checkAhrefsBatch: {
+      title: "Ahrefs Batch Analysis",
+      subtitle:
+        "Получить текущие метрики Ahrefs /batch-analysis (DR, ссылающиеся домены, бэклинки, органический трафик и ключи) для списка доменов. На каждый домен — одна CriterionResult-запись с выбранными метриками. Выдерживает 100 000 доменов — выборка партиями по 100.",
+      pipelineHint:
+        "ИИ не используется — метрики и есть вердикт. Стоимость ≈ 1 юнит/домен/метрика (минимум 50 юнитов на партию из 100). Ключ Ahrefs API настраивается в Настройки → Провайдеры.",
+      metricsHeading: "Метрики",
+      metricsHint:
+        "Выберите, какие поля batch-analysis запрашивать. По умолчанию только DR (дешевле всего). Каждая доп. метрика добавляет ~1 юнит/домен.",
+      selectAll: "Выбрать все",
+      clearAll: "Снять все",
+      countryLabel: "Страна (необязательно)",
+      countryHint:
+        "Ограничивает Органический трафик / ключи одной страной. Пусто — весь мир. ISO alpha-2, напр. us, gb, de.",
+      countryAny: "Весь мир",
+      labelHeading: "Метка задачи",
+      labelHint:
+        "Необязательно. Имя видно в /jobs/ahrefs-batch-analysis и на странице задачи; заметка — свободный контекст.",
+      nameLabel: "Название",
+      namePlaceholder: "Автогенерация по первому домену, если пусто",
+      notesLabel: "Заметки",
+      notesPlaceholder: "Зачем анализируем?",
+      submit: "Запустить batch-анализ",
+      submitting: "Отправка…",
+      settingsLink: "Открыть настройки Ahrefs",
+      noMetricsError: "Выберите хотя бы одну метрику.",
+      summary: (n) => `${n} домен${n === 1 ? "" : ""} готов${n === 1 ? "" : "ы"} к запуску`,
+      skippedBanned: (n) => `Пропущено забаненных доменов: ${n}.`,
+      allBannedError: (count, sample, truncated) =>
+        `Все указанные домены в бан-листе (${count} всего): ${sample}${
+          truncated ? "…" : ""
+        }`,
+      rerunBannerTitle: "Перезапуск",
+      rerunBannerCancel: "Отменить перезапуск",
+      rerunBannerHelp:
+        "Будет добавлен новый Run в эту задачу. Отредактируйте список доменов и нажмите отправить.",
+    },
+    ahrefsBatchDomain: {
+      heading: "Метрики Ahrefs Batch Analysis",
+      metric: "Метрика",
+      value: "Значение",
+      noData:
+        "Метрик пока нет — запуск в очереди, упал, или партия этого домена отклонена.",
+      errorPrefix: "Ошибка запроса",
+    },
     jobsWhoisHistory: {
       title: "История Whois — Задачи",
       subtitle:
@@ -4401,6 +4546,14 @@ const messagesRu: Messages = {
           "Отправленные задачи раздела Доступность (RDAP / Domainr / WHOIS-43 каскад).",
         empty: "Пока нет задач Доступности — отправка появится в Волне 3.",
         goCheck: "Открыть Проверка → Доступность",
+      },
+      ahrefs_batch_analysis: {
+        title: "Задачи — Ahrefs Batch Analysis",
+        intro:
+          "Отправленные задачи Ahrefs Batch Analysis (массовые метрики /batch-analysis). Кликните на задачу, чтобы увидеть её запуски и метрики по доменам.",
+        empty:
+          "Пока нет задач Ahrefs Batch Analysis — начните в Проверка → Ahrefs Batch Analysis.",
+        goCheck: "Открыть Проверка → Ahrefs Batch Analysis",
       },
     },
     availabilityDomain: {
@@ -4544,7 +4697,8 @@ const messagesRu: Messages = {
           "Фильтр по последнему результату проверки доступности (каскад RDAP / Domainr / WHOIS:43).",
         availabilityAvailable: "свободен",
         availabilityRegistered: "занят",
-        availabilityUnknown: "не поддерживается",
+        availabilityNotSupported: "не поддерживается",
+        availabilityUnknown: "неизвестно",
         availabilityError: "ошибка",
         availabilityNeverChecked: "(не проверялся)",
       },
@@ -4583,6 +4737,9 @@ const messagesRu: Messages = {
         availability: "Availability",
         availabilityHint:
           "Запустить каскад доступности (RDAP / Domainr / WHOIS:43), чтобы подтвердить регистрацию.",
+        ahrefsBatch: "Ahrefs Batch",
+        ahrefsBatchHint:
+          "Запустить Ahrefs Batch Analysis (DR, реф.домены, беклинки, органические метрики) — дешёвый массовый префильтр перед Wayback / полным Ahrefs.",
       },
       analyzedHint: (n) =>
         n === 1

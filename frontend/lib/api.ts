@@ -90,7 +90,10 @@ export type AvailabilityStatus =
   | "available"
   | "registered"
   | "unknown"
-  | "error";
+  | "error"
+  // "Double domain" under a private multi-label suffix (e.g. jcg.us.com)
+  // the cascade can't authoritatively check — never treat as available.
+  | "not_supported";
 
 // Flat key→string config map for the Domain-availability Settings tab.
 // Mirrors `app_settings.AVAILABILITY_DEFAULTS`. The masked api-key
@@ -311,6 +314,14 @@ export type CriteriaSpec = {
   wayback_classify: {
     enabled: boolean;
     language_mode: "ai" | "library";
+  };
+  // Ahrefs Batch Analysis pillar (2026-06-02). Optional — only present
+  // on ahrefs_batch_analysis-kind specs. Carries the metric selection +
+  // optional country scoping.
+  ahrefs_batch_analysis?: {
+    enabled: boolean;
+    metrics: string[];
+    country: string | null;
   };
 };
 
@@ -604,7 +615,11 @@ export type JobsArchivedFilter = "active" | "archived" | "all";
 // Pillar discriminator (added Wave 1, 2026-05-15). Backfilled to
 // 'quality' on every pre-wave row. Drives /check/<pillar> and
 // /jobs/<pillar> route segmentation.
-export type JobKind = "quality" | "availability" | "whois_history";
+export type JobKind =
+  | "quality"
+  | "availability"
+  | "whois_history"
+  | "ahrefs_batch_analysis";
 
 export type RunSummary = {
   id: number;
@@ -710,6 +725,10 @@ export type RunDomainProgress = {
   // for this rd. Drives the Availability-pillar Run-page filter
   // dropdown and the per-row verdict pill.
   availability_status?: string;
+  // Per-rd Ahrefs batch-analysis metrics (2026-06-02). {field_id:
+  // value|null} from the latest ahrefs_batch_analysis CR. Empty for
+  // other kinds. Drives the Run-page metric columns.
+  batch_metrics?: Record<string, number | null>;
 };
 
 // AI cost accounting for one run, returned by /runs/{id}/cost. Cache hits
@@ -1056,6 +1075,10 @@ export type DatabaseDomainRow = {
   availability_registrar: string;
   availability_expires_on: string | null;
   availability_checked_at: string | null;
+  // Ahrefs batch-analysis metrics (2026-06-02) from the pinned
+  // ahrefs_batch_analysis CR. {field_id: value|null}; empty when no
+  // batch criterion is pinned. Drives the DR/RD(f)/B chips + filters.
+  batch_metrics?: Record<string, number | null>;
   total_runs: number;
   any_cached: boolean;
   // User-authored note attached to this domain. Empty string when no note.
@@ -2592,7 +2615,52 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+
+  submitAhrefsBatchAnalysisJob: (payload: {
+    domains: string[];
+    metrics: string[];
+    country?: string | null;
+    name?: string;
+    notes?: string;
+  }) =>
+    request<{
+      job_id: number;
+      run_id: number;
+      skipped_banned: string[];
+    }>("/analyze/ahrefs-batch-analysis", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };
+
+// Canonical Ahrefs batch-analysis metric ids + labels — mirror of the
+// backend providers/ahrefs_batch.BATCH_METRICS (same ids + order). Drives
+// the setup-page checkboxes and the run-page metric columns.
+export const AHREFS_BATCH_METRICS: { id: string; label: string }[] = [
+  { id: "domain_rating", label: "DR" },
+  { id: "refdomains_dofollow", label: "Ref domains (follow)" },
+  { id: "refdomains_nofollow", label: "Ref domains (nofollow)" },
+  { id: "backlinks_dofollow", label: "Backlinks (follow)" },
+  { id: "refips_subnets", label: "Ref IP subnets" },
+  { id: "org_traffic", label: "Organic traffic" },
+  { id: "org_keywords", label: "Organic keywords" },
+  { id: "org_keywords_4_10", label: "Organic keywords 4-10" },
+  { id: "org_keywords_11_20", label: "Organic keywords 11-20" },
+];
+
+// Format a batch-analysis metric value for display: DR is a 1-decimal
+// float, everything else an integer count. null → "—".
+export function formatBatchMetric(id: string, v: number | null | undefined): string {
+  if (v == null) return "—";
+  if (id === "domain_rating") return v.toFixed(1);
+  return Math.round(v).toLocaleString();
+}
+
+// Absolute URL for the run's batch-analysis CSV export (streamed by the
+// backend). Goes through the same /api base the request() helper uses.
+export function ahrefsBatchAnalysisCsvUrl(runId: number): string {
+  return `${BASE}/runs/${runId}/ahrefs-batch-analysis.csv`;
+}
 
 export type WhoisHistoryTestResult =
   | {

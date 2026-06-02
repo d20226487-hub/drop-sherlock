@@ -330,12 +330,50 @@ _RATE_LIMIT_DEFAULTS: dict[str, dict[str, int]] = {
     #     tier's published ceiling
     #   - max_concurrent=2: small bursts allowed (the runner's per-
     #     domain fan-out wants > 1), but never piles up.
-    #   - retry_max=2: WhoisFreaks 5xxs occasionally; one retry is
-    #     enough. 429 is NOT retried by the provider client (that'd
-    #     loop into more 429s) — the rate limiter prevents it instead.
-    # User can tune both up in Settings → Whois History → Rate limits
-    # once they confirm their plan's actual ceiling.
-    "whoisfreaks": {"rpm": 30, "max_concurrent": 2, "retry_max": 2},
+    #   - retry_max=3: matches wayback. 429 IS now retried (2026-05-23)
+    #     with jittered exponential backoff — see
+    #     `whois_history/providers/whoisfreaks.py:fetch_history`.
+    #     Combined with burst=1 (set in `limits._STRICT_BURST_PROVIDERS`)
+    #     this gives the upstream window time to roll forward without
+    #     amplifying the load. 5xx uses the same retry path.
+    # User can tune in Settings → Whois History → Rate limits once they
+    # confirm their plan's actual ceiling.
+    "whoisfreaks": {"rpm": 30, "max_concurrent": 2, "retry_max": 3},
+    # Wayback Sparkline tool (added 2026-05-23). Separate row from
+    # `wayback` because the sparkline endpoint (`__wb/sparkline`) is
+    # MUCH lighter than full CDX queries — small payload, simple
+    # server-side computation (it backs the calendar UI sparkline
+    # chart). Measured 0.4–1.0s/domain at sequential concurrency=1.
+    #
+    # Conservative defaults after live calibration on 2026-05-23
+    # (Job 2, 248 domains, original concurrency=8 → 22/42 done
+    # finished as 429s before the user paused):
+    #   - rpm=180: ~3 req/s. archive.org's sparkline throttles when
+    #     burst sustained around 6-8 in-flight; backing off to 3
+    #     leaves comfortable headroom without dropping throughput
+    #     below the "100k overnight" target.
+    #   - max_concurrent=3: tested-good ceiling. Operator can bump
+    #     via Settings → Rate limits once they confirm their network
+    #     path holds at a higher number.
+    #   - retry_max=3: jittered exponential. 429s get the same retry
+    #     treatment as transient 5xx (the provider client already
+    #     handles this); these defaults are the floor below which
+    #     retries shouldn't be needed at all.
+    # Independent from `wayback` so a sparkline batch doesn't
+    # starve quality-pillar wayback fetches and vice versa.
+    # `wayback_sparkline` is in `_STRICT_BURST_PROVIDERS` (limits.py)
+    # so burst=1 — bucket can't accumulate tokens past one, requests
+    # are strictly paced at 60/rpm seconds. rpm=180 → 0.33s spacing.
+    #
+    # retry_max=2 (3 total attempts) chosen empirically (2026-05-23):
+    # archive.org has BOTH a transient rolling-window 429 (clears in
+    # 60-120s) AND a per-domain "this URL is blocked" 429 that doesn't
+    # clear on any timescale we can wait through. The global cooldown
+    # gate in providers/wayback_sparkline.py:_arm_cooldown handles
+    # case 1; case 2 just needs to fail fast so the rest of the queue
+    # drains. With retry_max=5 a permanently-blocked domain held a
+    # worker slot for ~3 minutes; at retry_max=2 it's <10s.
+    "wayback_sparkline": {"rpm": 60, "max_concurrent": 1, "retry_max": 2},
 }
 
 # Providers that have configurable rate limits but are NOT exposed in
@@ -343,7 +381,7 @@ _RATE_LIMIT_DEFAULTS: dict[str, dict[str, int]] = {
 # in dedicated pillar tabs). Used by the rate-limit getter/setter to
 # validate "this is a known provider" without forcing the card UI to
 # render it.
-_RATE_LIMIT_EXTRAS: set[str] = {"whoisfreaks"}
+_RATE_LIMIT_EXTRAS: set[str] = {"whoisfreaks", "wayback_sparkline"}
 
 
 def _rate_key(provider: str, field: str) -> str:

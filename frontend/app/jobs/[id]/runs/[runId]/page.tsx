@@ -3,8 +3,11 @@ import Link from "next/link";
 import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useT } from "@/lib/i18n";
 import {
+  ahrefsBatchAnalysisCsvUrl,
+  AHREFS_BATCH_METRICS,
   api,
   AIProvider,
+  formatBatchMetric,
   RecomputeFinalResult,
   RunCost,
   RunDetail,
@@ -1110,6 +1113,7 @@ export default function RunDetailPage({
       "wayback_classify",
       "whois_history",
       "availability",
+      "ahrefs_batch_analysis",
     ];
     const out: string[] = [];
     for (const c of ALL) {
@@ -1648,6 +1652,7 @@ export default function RunDetailPage({
                     wayback_classify: "C",
                     whois_history: "H",
                     availability: "V",
+                    ahrefs_batch_analysis: "AB",
                   } as Record<string, string>
                 )[c];
                 const tone = pinnedHere
@@ -1753,6 +1758,15 @@ export default function RunDetailPage({
         runId={runId}
         runStatus={run.status}
         jobKind={run.job_kind ?? "quality"}
+        batchMetricIds={(() => {
+          try {
+            const spec = JSON.parse(run.spec_json || "{}");
+            const m = spec?.criteria?.ahrefs_batch_analysis?.metrics;
+            return Array.isArray(m) ? (m as string[]) : [];
+          } catch {
+            return [];
+          }
+        })()}
         onChanged={reload}
         statusFilter={statusFilter}
         setStatusFilter={setStatusFilter}
@@ -1785,6 +1799,7 @@ type WaybackFilterValue = "any" | "zero" | "nonzero";
 const AVAILABILITY_FILTER_OPTIONS: { value: string; key: keyof TextsType["pages"]["jobs"]["run"] }[] = [
   { value: "available", key: "filterAvailabilityAvailable" },
   { value: "registered", key: "filterAvailabilityRegistered" },
+  { value: "not_supported", key: "filterAvailabilityNotSupported" },
   { value: "unknown", key: "filterAvailabilityUnknown" },
   { value: "error", key: "filterAvailabilityError" },
   // `no_verdict` option removed 2026-05-17 — was rarely useful (CR
@@ -1887,6 +1902,9 @@ function DomainsSection({
   // filters (today: Wayback CDX) can hide on whois_history /
   // availability runs. Defaults to 'quality' on legacy callers.
   jobKind = "quality",
+  // Selected batch-analysis metric ids (from the run spec). Drives the
+  // dynamic metric columns on ahrefs_batch_analysis runs. Empty otherwise.
+  batchMetricIds = [],
   onChanged,
   // Status filter lifted to the parent (2026-05-16) so the parent's
   // server-side fetch can pass it as `?status_filter=...` to the
@@ -1916,6 +1934,7 @@ function DomainsSection({
   runId: number;
   runStatus: string;
   jobKind?: string;
+  batchMetricIds?: string[];
   onChanged: () => void;
   statusFilter: StatusFilterValue;
   setStatusFilter: (v: StatusFilterValue) => void;
@@ -2135,23 +2154,38 @@ function DomainsSection({
         <h2 className="text-lg font-semibold">{ts.domainsHeading}</h2>
         {domains.length > 0 && (
           <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => exportCsv("visible")}
-              disabled={search.filteredTotal === 0}
-              className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
-              title={ts.exportVisibleHelp}
-            >
-              {ts.exportVisible(search.filteredTotal)}
-            </button>
-            <button
-              type="button"
-              onClick={() => exportCsv("all")}
-              className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
-              title={ts.exportAllHelp}
-            >
-              {ts.exportAll(domains.length)}
-            </button>
+            {jobKind === "ahrefs_batch_analysis" ? (
+              // Server-streamed full CSV (domain × selected metrics, all
+              // rows) — the client-side export below is quality-shaped
+              // and wouldn't carry the dynamic metric columns.
+              <a
+                href={ahrefsBatchAnalysisCsvUrl(runId)}
+                className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                title={ts.exportAllHelp}
+              >
+                {ts.exportAll(domains.length)}
+              </a>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => exportCsv("visible")}
+                  disabled={search.filteredTotal === 0}
+                  className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+                  title={ts.exportVisibleHelp}
+                >
+                  {ts.exportVisible(search.filteredTotal)}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => exportCsv("all")}
+                  className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                  title={ts.exportAllHelp}
+                >
+                  {ts.exportAll(domains.length)}
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -2395,6 +2429,12 @@ function DomainsSection({
               pin filter naturally limits to the pillar's criteria). */}
           {(() => {
             const isQuality = jobKind === "quality";
+            const isBatch = jobKind === "ahrefs_batch_analysis";
+            // Resolve {id,label} for the run's selected metrics, in
+            // canonical order. Drives the dynamic metric columns.
+            const batchCols = isBatch
+              ? AHREFS_BATCH_METRICS.filter((m) => batchMetricIds.includes(m.id))
+              : [];
             return (
           <div className="overflow-x-auto rounded-md border dark:border-neutral-800">
             <table className="w-full text-sm">
@@ -2421,6 +2461,14 @@ function DomainsSection({
                       <th className="px-3 py-2 font-medium">{ts.cols.category}</th>
                     </>
                   )}
+                  {batchCols.map((m) => (
+                    <th
+                      key={m.id}
+                      className="px-3 py-2 font-medium text-right whitespace-nowrap"
+                    >
+                      {m.label}
+                    </th>
+                  ))}
                   <th className="px-3 py-2 font-medium">{ts.cols.finished}</th>
                   <th className="px-3 py-2 w-1" />
                 </tr>
@@ -2490,6 +2538,14 @@ function DomainsSection({
                           )}
                         </div>
                       </td>
+                      {batchCols.map((m) => (
+                        <td
+                          key={m.id}
+                          className="px-3 py-2 text-right tabular-nums whitespace-nowrap"
+                        >
+                          {formatBatchMetric(m.id, d.batch_metrics?.[m.id])}
+                        </td>
+                      ))}
                       {isQuality && (
                         <>
                       <td className="px-3 py-2">

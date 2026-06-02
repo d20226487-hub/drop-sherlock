@@ -401,6 +401,12 @@ export default function DatabasePage() {
   // the current threshold as a %.
   const [waybackConfMin, setWaybackConfMin] = useState<number>(0);
   const [ahrefsConfMin, setAhrefsConfMin] = useState<number>(0);
+  // Ahrefs Batch Analysis numeric thresholds (2026-06-02). "≥" filters
+  // on the pinned batch metrics: DR (prefers batch domain_rating, falls
+  // back to the imported backlog DR) and referring domains (dofollow).
+  // 0 = off. Rows lacking the value are excluded when the filter is on.
+  const [drMin, setDrMin] = useState<number>(0);
+  const [refDomainsMin, setRefDomainsMin] = useState<number>(0);
   // Max price range filter (added 2026-05-23, iterated to a paired
   // min/max input the same day after the slider proved unusable — a
   // step-50 slider can't express "between $1 and $20" cleanly, which
@@ -457,6 +463,8 @@ export default function DatabasePage() {
         if (Array.isArray(v.categories)) setCategories(v.categories);
         if (typeof v.waybackConfMin === "number") setWaybackConfMin(v.waybackConfMin);
         if (typeof v.ahrefsConfMin === "number") setAhrefsConfMin(v.ahrefsConfMin);
+        if (typeof v.drMin === "number") setDrMin(v.drMin);
+        if (typeof v.refDomainsMin === "number") setRefDomainsMin(v.refDomainsMin);
         if (
           typeof v.whoisCyclesMax === "number" &&
           v.whoisCyclesMax >= 0 &&
@@ -518,6 +526,8 @@ export default function DatabasePage() {
             categories,
             waybackConfMin,
             ahrefsConfMin,
+            drMin,
+            refDomainsMin,
             whoisCyclesMax,
             maxPriceMin,
             maxPriceMax,
@@ -543,6 +553,8 @@ export default function DatabasePage() {
     categories,
     waybackConfMin,
     ahrefsConfMin,
+    drMin,
+    refDomainsMin,
     whoisCyclesMax,
     maxPriceMin,
     maxPriceMax,
@@ -578,7 +590,7 @@ export default function DatabasePage() {
   // Send-to-pillar state (replaces the old "Reanalyze" bulk picker
   // 2026-05-18). Tracks which pillar dispatch is currently in flight
   // so the toolbar buttons can disable themselves during navigation.
-  type Pillar = "quality" | "whois" | "availability";
+  type Pillar = "quality" | "whois" | "availability" | "ahrefs_batch";
   const [sendingPillar, setSendingPillar] = useState<Pillar | null>(null);
   const [bulkBacklogBusy, setBulkBacklogBusy] = useState(false);
   const [bulkBacklogResult, setBulkBacklogResult] = useState<{
@@ -845,6 +857,19 @@ export default function DatabasePage() {
           return false;
         }
       }
+      // Ahrefs Batch Analysis "≥" thresholds (2026-06-02). DR prefers
+      // the pinned batch domain_rating, falling back to the imported
+      // backlog DR (same value the DR chip shows). Referring-domains
+      // comes only from the batch run. Rows missing the value are
+      // excluded while the filter is on.
+      if (drMin > 0) {
+        const v = r.batch_metrics?.domain_rating ?? r.backlog_ahrefs_dr;
+        if (typeof v !== "number" || v < drMin) return false;
+      }
+      if (refDomainsMin > 0) {
+        const v = r.batch_metrics?.refdomains_dofollow;
+        if (typeof v !== "number" || v < refDomainsMin) return false;
+      }
       // Whois ownership-cycles threshold. Flipped 2026-05-23 from
       // ">= N" semantics to "< N" semantics per user request — when
       // scanning drop-domain lists, the operator's question is "which
@@ -915,6 +940,8 @@ export default function DatabasePage() {
     notesFilter,
     waybackConfMin,
     ahrefsConfMin,
+    drMin,
+    refDomainsMin,
     whoisCyclesMax,
     maxPriceMin,
     maxPriceMax,
@@ -1072,7 +1099,9 @@ export default function DatabasePage() {
       router.push(
         pillar === "whois"
           ? "/check/whois-history?from_backlog=1"
-          : "/check/availability?from_backlog=1",
+          : pillar === "ahrefs_batch"
+            ? "/check/ahrefs-batch-analysis?from_backlog=1"
+            : "/check/availability?from_backlog=1",
       );
     } finally {
       // sendingPillar clears when this component unmounts on
@@ -1332,6 +1361,8 @@ export default function DatabasePage() {
     setStatusFilter([]);
     setWaybackConfMin(0);
     setAhrefsConfMin(0);
+    setDrMin(0);
+    setRefDomainsMin(0);
     setWhoisCyclesMax(0);
     setMaxPriceMin(0);
     setMaxPriceMax(0);
@@ -1469,6 +1500,8 @@ export default function DatabasePage() {
     statusFilter.length > 0 ||
     waybackConfMin > 0 ||
     ahrefsConfMin > 0 ||
+    drMin > 0 ||
+    refDomainsMin > 0 ||
     whoisCyclesMax > 0 ||
     maxPriceMin > 0 ||
     maxPriceMax > 0;
@@ -1701,6 +1734,10 @@ export default function DatabasePage() {
                 label: ts.filters.availabilityRegistered,
               },
               {
+                value: "not_supported",
+                label: ts.filters.availabilityNotSupported,
+              },
+              {
                 value: "unknown",
                 label: ts.filters.availabilityUnknown,
               },
@@ -1829,6 +1866,41 @@ export default function DatabasePage() {
               <option value={5}>{ts.filters.whoisCyclesLt5}</option>
             </select>
           </div>
+          {/* Ahrefs Batch "≥" thresholds (2026-06-02): DR + referring
+              domains (dofollow) from the pinned batch run. 0/blank = off. */}
+          <label className="flex flex-col gap-1 min-w-0" title={ts.filters.drMinHelp}>
+            <span className="text-xs text-neutral-500 dark:text-neutral-400">
+              {ts.filters.drMin}
+            </span>
+            <input
+              type="number"
+              min={0}
+              value={drMin || ""}
+              placeholder={ts.filters.numMinPlaceholder}
+              onChange={(e) =>
+                setDrMin(Math.max(0, parseFloat(e.target.value) || 0))
+              }
+              className="px-2 py-1.5 text-sm rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 outline-none focus:ring-2 focus:ring-blue-500/40 tabular-nums"
+            />
+          </label>
+          <label
+            className="flex flex-col gap-1 min-w-0"
+            title={ts.filters.refDomainsMinHelp}
+          >
+            <span className="text-xs text-neutral-500 dark:text-neutral-400">
+              {ts.filters.refDomainsMin}
+            </span>
+            <input
+              type="number"
+              min={0}
+              value={refDomainsMin || ""}
+              placeholder={ts.filters.numMinPlaceholder}
+              onChange={(e) =>
+                setRefDomainsMin(Math.max(0, parseInt(e.target.value, 10) || 0))
+              }
+              className="px-2 py-1.5 text-sm rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 outline-none focus:ring-2 focus:ring-blue-500/40 tabular-nums"
+            />
+          </label>
 
           {/* Max price range — paired number inputs (replaced the
               step-50 slider 2026-05-23 same day, after the slider
@@ -1969,6 +2041,15 @@ export default function DatabasePage() {
                 title={t.pages.backlog.sendToPicker.availabilityHint}
               >
                 {t.pages.backlog.sendToPicker.availability}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSendToPillar("ahrefs_batch")}
+                disabled={deleting || sendingPillar !== null}
+                className="text-xs px-3 py-1 rounded-md bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+                title={t.pages.backlog.sendToPicker.ahrefsBatchHint}
+              >
+                {t.pages.backlog.sendToPicker.ahrefsBatch}
               </button>
               <button
                 type="button"
@@ -2813,46 +2894,79 @@ function DomainListRow({
             {ts.bannedBadge}
           </span>
         )}
-        {/* Backlog-imported metadata chips (added 2026-05-20). DR + Age
-            come from BacklogDomain.ahrefs_dr / .domain_age_years —
-            populated only when the user mapped those columns during
-            CSV import. Each chip renders independently of the other;
-            the whole sub-line is omitted when both are null. */}
-        {(row.backlog_ahrefs_dr != null ||
-          row.backlog_domain_age_years != null) && (
-          <div className="mt-1 flex flex-wrap gap-1.5 text-[10px] leading-none">
-            {row.backlog_ahrefs_dr != null && (
-              <span
-                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-200 bg-neutral-50 text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300"
-                title="Ahrefs DR (Domain Rating) imported from the backlog CSV"
-              >
-                <span className="font-medium uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
-                  DR
+        {/* Metadata chips. DR / Age come from the BacklogDomain CSV
+            import; RD (f) / B (and a fresher DR) come from the PINNED
+            ahrefs_batch_analysis CR (2026-06-02). DR prefers the batch
+            value when present, falling back to the import-time DR. */}
+        {(() => {
+          const bm = row.batch_metrics ?? {};
+          const batchDr = bm.domain_rating;
+          const dr = batchDr != null ? batchDr : row.backlog_ahrefs_dr;
+          const drFromBatch = batchDr != null;
+          const rdf = bm.refdomains_dofollow;
+          const bl = bm.backlinks_dofollow;
+          const fmtInt = (n: number) => Math.round(n).toLocaleString();
+          const hasAny =
+            dr != null ||
+            row.backlog_domain_age_years != null ||
+            rdf != null ||
+            bl != null;
+          if (!hasAny) return null;
+          const chip =
+            "inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-200 bg-neutral-50 text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300";
+          const lbl =
+            "font-medium uppercase tracking-wide text-neutral-500 dark:text-neutral-400";
+          return (
+            <div className="mt-1 flex flex-wrap gap-1.5 text-[10px] leading-none">
+              {dr != null && (
+                <span
+                  className={chip}
+                  title={
+                    drFromBatch
+                      ? "Domain Rating from the pinned Ahrefs Batch Analysis run"
+                      : "Ahrefs DR (Domain Rating) imported from the backlog CSV"
+                  }
+                >
+                  <span className={lbl}>DR</span>
+                  <span className="tabular-nums">
+                    {Number.isInteger(dr) ? dr : dr.toFixed(1)}
+                  </span>
                 </span>
-                <span className="tabular-nums">
-                  {Number.isInteger(row.backlog_ahrefs_dr)
-                    ? row.backlog_ahrefs_dr
-                    : row.backlog_ahrefs_dr.toFixed(1)}
+              )}
+              {rdf != null && (
+                <span
+                  className={chip}
+                  title="Referring domains (dofollow) from the pinned Ahrefs Batch Analysis run"
+                >
+                  <span className={lbl}>RD (f)</span>
+                  <span className="tabular-nums">{fmtInt(rdf)}</span>
                 </span>
-              </span>
-            )}
-            {row.backlog_domain_age_years != null && (
-              <span
-                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-200 bg-neutral-50 text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300"
-                title="Domain age (years) imported from the backlog CSV"
-              >
-                <span className="font-medium uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
-                  Age
+              )}
+              {bl != null && (
+                <span
+                  className={chip}
+                  title="Backlinks (dofollow) from the pinned Ahrefs Batch Analysis run"
+                >
+                  <span className={lbl}>B</span>
+                  <span className="tabular-nums">{fmtInt(bl)}</span>
                 </span>
-                <span className="tabular-nums">
-                  {Number.isInteger(row.backlog_domain_age_years)
-                    ? `${row.backlog_domain_age_years}y`
-                    : `${row.backlog_domain_age_years.toFixed(1)}y`}
+              )}
+              {row.backlog_domain_age_years != null && (
+                <span
+                  className={chip}
+                  title="Domain age (years) imported from the backlog CSV"
+                >
+                  <span className={lbl}>Age</span>
+                  <span className="tabular-nums">
+                    {Number.isInteger(row.backlog_domain_age_years)
+                      ? `${row.backlog_domain_age_years}y`
+                      : `${row.backlog_domain_age_years.toFixed(1)}y`}
+                  </span>
                 </span>
-              </span>
-            )}
-          </div>
-        )}
+              )}
+            </div>
+          );
+        })()}
       </td>
       <td className="px-3 py-2 align-top">
         {!row.is_pinned ? (
@@ -3371,6 +3485,8 @@ function AvailabilityCell({
         return "bg-emerald-100 text-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-200";
       case "registered":
         return "bg-neutral-100 text-neutral-800 dark:bg-neutral-800 dark:text-neutral-200";
+      case "not_supported":
+        return "bg-violet-100 text-violet-900 dark:bg-violet-950/60 dark:text-violet-200";
       case "error":
         return "bg-rose-100 text-rose-900 dark:bg-rose-950/60 dark:text-rose-200";
       default:
@@ -3380,6 +3496,7 @@ function AvailabilityCell({
   const label = (() => {
     if (status === "available") return a.statusAvailable;
     if (status === "registered") return a.statusRegistered;
+    if (status === "not_supported") return a.statusNotSupported;
     if (status === "error") return a.statusError;
     if (status === "unknown") return a.statusUnknown;
     return null;

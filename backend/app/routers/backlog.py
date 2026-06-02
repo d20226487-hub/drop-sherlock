@@ -198,7 +198,9 @@ def _normalize_registrar_list(raw: list[str] | None) -> list[str]:
 # Valid AvailabilityCheck.status values. Mirrors models.AvailabilityCheck
 # docstring. The "__none__" sentinel here means "domain has never been
 # checked at all" (no row in `availability_checks`).
-_AVAILABILITY_STATUSES = {"available", "registered", "unknown", "error"}
+_AVAILABILITY_STATUSES = {
+    "available", "registered", "not_supported", "unknown", "error",
+}
 
 
 def _parse_availability_csv(raw: str | None) -> list[str]:
@@ -280,7 +282,8 @@ def _apply_backlog_filters(
         ]
         include_never = "__none__" in availability_statuses
         definitive_wanted = [
-            s for s in real_statuses if s in ("available", "registered")
+            s for s in real_statuses
+            if s in ("available", "registered", "not_supported")
         ]
         inconclusive_wanted = [
             s for s in real_statuses if s in ("unknown", "error")
@@ -301,7 +304,7 @@ def _apply_backlog_filters(
                 )
                 .where(
                     AvailabilityCheck.status.in_(
-                        ("available", "registered")
+                        ("available", "registered", "not_supported")
                     )
                 )
                 .group_by(AvailabilityCheck.domain)

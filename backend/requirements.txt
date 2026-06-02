@@ -42,3 +42,13 @@ google-auth==2.36.0
 # touch `requests` through google-auth; Vertex itself is called via
 # httpx. ~150 KB, pure-Python.
 requests==2.32.3
+# Public Suffix List for the availability cascade (added 2026-06-02).
+# Detects "double domains" registered under a PRIVATE multi-label suffix
+# (e.g. jcg.us.com — us.com is a CentralNic reseller registry under
+# .com). The parent gTLD's RDAP/WHOIS returns "not found" for these,
+# which the cascade would mis-read as AVAILABLE (a dangerous false
+# positive — the domain is in fact taken). We mark them `not_supported`
+# instead. The wheel BUNDLES a dated PSL snapshot (this pin = 2026-05-29
+# list) so there's no network fetch at runtime. Pure-Python. See
+# availability/suffix.py.
+publicsuffixlist==1.0.2.20260529

@@ -16,6 +16,7 @@ from ..availability.common import (
     STATUS_AVAILABLE,
     STATUS_ERROR,
     STATUS_REGISTERED,
+    TERMINAL_STATUSES,
     normalize_domain,
 )
 from ..db import get_db, SessionLocal
@@ -178,9 +179,7 @@ def latest_for_domains(
             func.max(AvailabilityCheck.checked_at).label("max_t"),
         )
         .filter(AvailabilityCheck.domain.in_(domains))
-        .filter(AvailabilityCheck.status.in_((
-            STATUS_AVAILABLE, STATUS_REGISTERED,
-        )))
+        .filter(AvailabilityCheck.status.in_(TERMINAL_STATUSES))
         .group_by(AvailabilityCheck.domain)
         .subquery()
     )

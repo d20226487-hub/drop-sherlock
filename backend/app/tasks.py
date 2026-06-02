@@ -446,6 +446,10 @@ def dispatch_run(run_id: int) -> asyncio.Task:
       • availability  → availability_runner.process_availability_run
                         (Wave 3) — runs the existing cascade with
                         use_cache=False and writes one CR per domain.
+      • ahrefs_batch_analysis → ahrefs_batch_analysis_runner
+                        .process_ahrefs_batch_analysis_run (2026-06-02)
+                        — chunked (100/call) Ahrefs /batch-analysis pull,
+                        resilient to 100k domains.
 
     Cheap DB peek (one PK lookup) to read the kind. Done synchronously
     here because the runner functions don't take spec via argument —
@@ -477,6 +481,13 @@ def dispatch_run(run_id: int) -> asyncio.Task:
     if kind == "availability":
         from .availability_runner import process_availability_run
         return asyncio.create_task(process_availability_run(run_id))
+    if kind == "ahrefs_batch_analysis":
+        from .ahrefs_batch_analysis_runner import (
+            process_ahrefs_batch_analysis_run,
+        )
+        return asyncio.create_task(
+            process_ahrefs_batch_analysis_run(run_id)
+        )
     return asyncio.create_task(process_run(run_id))
 
 
@@ -2531,7 +2542,7 @@ async def _run_availability_for_domain(
     """
     from datetime import date as _date
     from .availability import check_availability_async
-    from .availability.common import STATUS_REGISTERED
+    from .availability.common import STATUS_NOT_SUPPORTED, STATUS_REGISTERED
     from .app_settings import get_skip_registered_policy
     from .models import RunDomain
 
@@ -2542,6 +2553,28 @@ async def _run_availability_for_domain(
     # standalone Availability pillar runner shares the same code path.
     from .availability.backlog_upsert import upsert_backlog_expiration
     upsert_backlog_expiration(domain, result.expires_on, result.registrar)
+
+    # `not_supported` = a "double domain" under a private multi-label
+    # suffix (e.g. jcg.us.com) we can't verify. These are almost always
+    # already taken, so analysing them burns Ahrefs units on a domain
+    # the operator can never register. Skip Ahrefs unconditionally — no
+    # horizon check (we have no reliable expiry). Mirrors the
+    # skip-registered short-circuit below.
+    if result.status == STATUS_NOT_SUPPORTED:
+        db = SessionLocal()
+        try:
+            rd = db.get(RunDomain, run_domain_id)
+            if rd is not None:
+                rd.status = "done"
+                rd.finished_at = datetime.utcnow()
+                rd.skip_reason = (
+                    "not supported (private multi-label suffix — "
+                    "availability can't be verified)"
+                )
+                db.commit()
+        finally:
+            db.close()
+        return
 
     # Skip policy: registered + expires beyond horizon → no Ahrefs.
     policy = get_skip_registered_policy()

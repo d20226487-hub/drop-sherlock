@@ -425,7 +425,7 @@ function AnalyzePageInner() {
 
   const domainCount = spec.domains.length;
   const enabledCount = (Object.keys(criteria) as (keyof CriteriaSpec)[]).filter(
-    (k) => criteria[k].enabled,
+    (k) => criteria[k]?.enabled,
   ).length;
 
   function validate(): string | null {

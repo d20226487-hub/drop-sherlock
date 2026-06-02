@@ -147,6 +147,11 @@ class RunDomainProgress(BaseModel):
     # field the Job-page chip math reads. Drives the Run-page
     # Availability filter dropdown for availability-pillar runs.
     availability_status: str = ""
+    # Ahrefs batch-analysis metrics for THIS rd's ahrefs_batch_analysis CR
+    # (2026-06-02). {field_id: value|None} pulled from the latest CR's
+    # data_json.metrics; empty when no CR / malformed / not this kind.
+    # Drives the Run-page metric columns for ahrefs_batch_analysis runs.
+    batch_metrics: dict[str, float | None] = {}
 
 
 class RunDetail(BaseModel):
@@ -384,6 +389,7 @@ def _bucket_counts_for_run(
                 WHEN NOT json_valid(cr.data_json) THEN 'no_verdict'
                 WHEN json_extract(cr.data_json, '$.verdict.status') = 'available' THEN 'good'
                 WHEN json_extract(cr.data_json, '$.verdict.status') = 'registered' THEN 'mixed'
+                WHEN json_extract(cr.data_json, '$.verdict.status') = 'not_supported' THEN 'not_supported'
                 WHEN json_extract(cr.data_json, '$.verdict.status') = 'unknown' THEN 'unknown'
                 WHEN json_extract(cr.data_json, '$.verdict.status') = 'error' THEN 'error'
                 ELSE 'no_verdict'
@@ -425,6 +431,34 @@ def _bucket_counts_for_run(
               SELECT cr2.id FROM criterion_results cr2
               WHERE cr2.run_domain_id = rd.id
                 AND cr2.criterion = 'whois_history'
+              ORDER BY cr2.id DESC
+              LIMIT 1
+            )
+            WHERE rd.run_id = :run_id
+            GROUP BY bucket
+        """)
+        rows = db.execute(sql, {"run_id": run.id}).all()
+    elif kind == "ahrefs_batch_analysis":
+        # Metrics-only pillar — no AI verdict. Bucket purely on the CR's
+        # fetch status: done → 'good' (metrics in hand), failed → 'error'
+        # (chunk rejected / HTTP error, retryable), anything else (missing
+        # CR, runner-level failed, still pending) → 'no_verdict'. Same
+        # latest-CR-per-RD trick as the other pillars guards against
+        # resume-path duplicates.
+        sql = text("""
+            SELECT
+              CASE
+                WHEN cr.id IS NULL THEN 'no_verdict'
+                WHEN cr.status = 'done' THEN 'good'
+                WHEN cr.status = 'failed' THEN 'error'
+                ELSE 'no_verdict'
+              END AS bucket,
+              COUNT(*) AS cnt
+            FROM run_domains rd
+            LEFT JOIN criterion_results cr ON cr.id = (
+              SELECT cr2.id FROM criterion_results cr2
+              WHERE cr2.run_domain_id = rd.id
+                AND cr2.criterion = 'ahrefs_batch_analysis'
               ORDER BY cr2.id DESC
               LIMIT 1
             )
@@ -511,6 +545,7 @@ def list_jobs(
       pillar; default so pre-wave callers keep their behavior.
     - "availability": domain-availability cascade jobs (Wave 3)
     - "whois_history": historical-WHOIS drop-detection jobs (Wave 2)
+    - "ahrefs_batch_analysis": bulk Ahrefs /batch-analysis metric jobs
     - "all": ignore the kind filter (admin / debug)
     """
     q = db.query(Job)
@@ -520,10 +555,14 @@ def list_jobs(
         q = q.filter(Job.archived_at.is_not(None))
     elif archived != "all":
         raise HTTPException(400, "archived must be one of: active, archived, all")
-    if kind not in ("quality", "availability", "whois_history", "all"):
+    if kind not in (
+        "quality", "availability", "whois_history",
+        "ahrefs_batch_analysis", "all",
+    ):
         raise HTTPException(
             400,
-            "kind must be one of: quality, availability, whois_history, all",
+            "kind must be one of: quality, availability, whois_history, "
+            "ahrefs_batch_analysis, all",
         )
     if kind != "all":
         q = q.filter(Job.kind == kind)
@@ -866,7 +905,9 @@ async def rerun_job(
 # values the runner writes; 'no_verdict' is the residual chip bucket
 # (missing CR, status='failed'/'running'/'pending', empty/malformed
 # data_json, or any other verdict.status not in the four known ones).
-_AVAILABILITY_VERDICT_STATUSES = ("available", "registered", "unknown", "error")
+_AVAILABILITY_VERDICT_STATUSES = (
+    "available", "registered", "not_supported", "unknown", "error",
+)
 _AVAILABILITY_FILTER_BUCKETS = _AVAILABILITY_VERDICT_STATUSES + ("no_verdict",)
 
 
@@ -920,6 +961,11 @@ def _apply_availability_filter(filter_q, buckets: list[str]):
                 sqla_func.json_extract(av_cr.data_json, "$.verdict.status")
                 == "registered",
                 literal("registered"),
+            ),
+            (
+                sqla_func.json_extract(av_cr.data_json, "$.verdict.status")
+                == "not_supported",
+                literal("not_supported"),
             ),
             (
                 sqla_func.json_extract(av_cr.data_json, "$.verdict.status")
@@ -1077,6 +1123,27 @@ def get_run(
                     vs = verdict.get("status")
                     if isinstance(vs, str):
                         availability_status = vs
+        # Ahrefs batch-analysis metrics (2026-06-02) — latest CR per rd
+        # (same duplicate-guard as availability). Pull data_json.metrics
+        # so the run page can render one column per selected metric.
+        batch_metrics: dict[str, float | None] = {}
+        latest_batch_cr = max(
+            (cr for cr in d.results if cr.criterion == "ahrefs_batch_analysis"),
+            key=lambda cr: cr.id,
+            default=None,
+        )
+        if latest_batch_cr is not None and latest_batch_cr.data_json:
+            try:
+                batch_body = json.loads(latest_batch_cr.data_json)
+            except json.JSONDecodeError:
+                batch_body = None
+            if isinstance(batch_body, dict):
+                m = batch_body.get("metrics")
+                if isinstance(m, dict):
+                    batch_metrics = {
+                        k: (float(v) if isinstance(v, (int, float)) else None)
+                        for k, v in m.items()
+                    }
         # wayback_classify columns — pull straight from THIS rd's
         # classify CR ai_verdict_json. No cross-run stitching here:
         # the run page is run-isolated by design (per 2026-05-08 fix),
@@ -1170,6 +1237,7 @@ def get_run(
                 category_was=wbc_category_was,
                 wayback_rows=wayback_rows,
                 availability_status=availability_status,
+                batch_metrics=batch_metrics,
             )
         )
     from ..tasks import get_run_scoring_override
@@ -3084,6 +3152,104 @@ def get_run_status(run_id: int, db: Session = Depends(get_db)) -> RunStatus:
         total=len(run.domains),
         reanalyzing=is_reanalyzing_run(run.id),
         **counts,
+    )
+
+
+@runs_router.get("/{run_id}/ahrefs-batch-analysis.csv")
+def export_ahrefs_batch_analysis_csv(run_id: int, db: Session = Depends(get_db)):
+    """Stream the full domain × metrics table for an ahrefs_batch_analysis
+    run as CSV. Streamed + chunked at the DB layer so a 100k-domain run
+    exports without loading every row into memory. Columns are derived
+    from the run's spec (selected metrics, canonical order)."""
+    import csv
+    import io
+
+    from fastapi.responses import StreamingResponse
+
+    from ..providers.ahrefs_batch import BATCH_METRICS, canonical_metrics
+
+    run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+
+    # Selected metrics drive the columns. Fall back to all known metrics
+    # if the spec is missing/old so we never silently drop data.
+    try:
+        spec = AnalyzeSpec.model_validate_json(run.spec_json or "{}")
+        metrics = canonical_metrics(spec.criteria.ahrefs_batch_analysis.metrics)
+    except Exception:  # noqa: BLE001
+        metrics = []
+    if not metrics:
+        metrics = list(BATCH_METRICS.keys())
+
+    header = ["domain", "status"] + [BATCH_METRICS.get(m, m) for m in metrics]
+
+    def _rows():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+
+        def _flush() -> str:
+            out = buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            return out
+
+        writer.writerow(header)
+        yield _flush()
+
+        # Page through RunDomains in id order, joining the latest
+        # batch-analysis CR per domain. selectinload keeps it to O(page)
+        # queries instead of N+1.
+        PAGE = 1000
+        offset = 0
+        while True:
+            page = (
+                db.query(RunDomain)
+                .filter(RunDomain.run_id == run_id)
+                .order_by(RunDomain.id.asc())
+                .options(selectinload(RunDomain.results))
+                .offset(offset)
+                .limit(PAGE)
+                .all()
+            )
+            if not page:
+                break
+            for rd in page:
+                latest = max(
+                    (
+                        cr for cr in rd.results
+                        if cr.criterion == "ahrefs_batch_analysis"
+                    ),
+                    key=lambda cr: cr.id,
+                    default=None,
+                )
+                values: dict[str, float | None] = {}
+                if latest is not None and latest.data_json:
+                    try:
+                        body = json.loads(latest.data_json)
+                        m = body.get("metrics")
+                        if isinstance(m, dict):
+                            values = m
+                    except json.JSONDecodeError:
+                        pass
+                row = [rd.domain, rd.status]
+                for mid in metrics:
+                    v = values.get(mid)
+                    if v is None:
+                        row.append("")
+                    elif mid == "domain_rating":
+                        row.append(f"{float(v):.1f}")
+                    else:
+                        row.append(str(int(v)))
+                writer.writerow(row)
+            yield _flush()
+            offset += PAGE
+
+    filename = f"ahrefs-batch-analysis-run-{run_id}.csv"
+    return StreamingResponse(
+        _rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

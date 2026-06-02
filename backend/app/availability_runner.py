@@ -43,6 +43,7 @@ from .availability.common import (
     STATUS_AVAILABLE,
     STATUS_ERROR,
     STATUS_REGISTERED,
+    TERMINAL_STATUSES,
 )
 from .models import AvailabilityCheck, CriterionResult, Run, RunDomain
 
@@ -192,7 +193,7 @@ async def _process_availability_domain(
         # terminal answer. Scope is `run_id` (not all-time), so the
         # operator can still get a fresh "now error" verdict by spinning
         # up a brand-new availability run.
-        if result_status not in (STATUS_AVAILABLE, STATUS_REGISTERED):
+        if result_status not in TERMINAL_STATUSES:
             terminal_row = (
                 db.query(AvailabilityCheck)
                 .filter(AvailabilityCheck.domain == domain)

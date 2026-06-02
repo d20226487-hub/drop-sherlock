@@ -14,6 +14,18 @@ STATUS_AVAILABLE = "available"
 STATUS_REGISTERED = "registered"
 STATUS_UNKNOWN = "unknown"
 STATUS_ERROR = "error"
+# "Double domain" registered under a PRIVATE multi-label PSL suffix
+# (e.g. jcg.us.com) that the gTLD/ccTLD cascade can't authoritatively
+# check. We refuse to guess rather than emit a false `available`. See
+# availability/suffix.py. (13 chars — fits AvailabilityCheck.status's
+# String(16).)
+STATUS_NOT_SUPPORTED = "not_supported"
+
+# Resolved/terminal verdicts: the cascade can stop, and the
+# Database/Backlog Availability column should surface them. `error` and
+# `unknown` are NOT terminal — the cascade falls through to the next
+# provider and the column hides them.
+TERMINAL_STATUSES = (STATUS_AVAILABLE, STATUS_REGISTERED, STATUS_NOT_SUPPORTED)
 
 # Error categories — drive the Errors-page category filter (DNS / RDAP
 # / WHOIS / etc).

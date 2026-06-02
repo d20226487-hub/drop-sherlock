@@ -476,3 +476,152 @@ async def submit_availability_job(
     return SubmitAvailabilityOut(
         job_id=job.id, run_id=run.id, skipped_banned=skipped_banned,
     )
+
+
+# --- Ahrefs Batch Analysis pillar submit (2026-06-02) ---------------------
+# Bulk Ahrefs /batch-analysis metrics as a first-class Job kind. Like the
+# Availability pillar: no AI. Unlike it, carries per-job knobs (which
+# metrics, optional country). Built for 100k domains — RunDomains are
+# bulk-inserted and the chunked runner streams them in 100s.
+
+# Match the wayback-sparkline cap: a single typo shouldn't submit a
+# 10-million-row job. 100k is the user-confirmed target ceiling.
+_BATCH_MAX_DOMAINS = 100_000
+
+
+class SubmitAhrefsBatchAnalysisIn(BaseModel):
+    domains: list[str]
+    # Subset of providers.ahrefs_batch.BATCH_METRICS keys. Empty → DR
+    # only (the cheapest single field), matching the setup-page default.
+    metrics: list[str] = []
+    # Optional ISO alpha-2 country scoping org_traffic / org_keywords.
+    country: str | None = None
+    name: str | None = None
+    notes: str | None = None
+
+
+class SubmitAhrefsBatchAnalysisOut(BaseModel):
+    job_id: int
+    run_id: int
+    skipped_banned: list[str]
+
+
+@router.post("/ahrefs-batch-analysis", response_model=SubmitAhrefsBatchAnalysisOut)
+async def submit_ahrefs_batch_analysis_job(
+    payload: SubmitAhrefsBatchAnalysisIn, db: Session = Depends(get_db)
+) -> SubmitAhrefsBatchAnalysisOut:
+    """Mint a Job(kind='ahrefs_batch_analysis') + first Run + per-domain
+    RunDomains, then dispatch the chunked runner. Mirrors
+    `submit_availability_job` but carries the metric selection + country
+    on the spec and bulk-inserts RunDomains for 100k-scale submits."""
+    from .backlog import _normalize_domain
+    from ..ban_filter import filter_banned
+    from ..providers.ahrefs_batch import BATCH_METRICS, canonical_metrics
+
+    cleaned_domains = [d.strip() for d in payload.domains if d.strip()]
+    if not cleaned_domains:
+        raise HTTPException(400, "at least one domain is required")
+    if len(cleaned_domains) > _BATCH_MAX_DOMAINS:
+        raise HTTPException(
+            400,
+            f"max {_BATCH_MAX_DOMAINS:,} domains per job "
+            f"(you have {len(cleaned_domains):,})",
+        )
+
+    # Validate + canonicalize the requested metrics; default to DR only.
+    unknown = [m for m in payload.metrics if m not in BATCH_METRICS]
+    if unknown:
+        raise HTTPException(400, f"unknown metrics: {', '.join(unknown)}")
+    metrics = canonical_metrics(payload.metrics) or ["domain_rating"]
+    country = (payload.country or "").strip() or None
+
+    # Ban-list pre-filter — same envelope as the other pillar submits.
+    normalized_for_check = [_normalize_domain(d) for d in cleaned_domains]
+    pairs = list(zip(cleaned_domains, normalized_for_check))
+    _, banned_normalized = filter_banned(
+        db, [n for n in normalized_for_check if n],
+    )
+    if banned_normalized:
+        skipped_banned = [
+            original for original, norm in pairs
+            if norm and norm in banned_normalized
+        ]
+        cleaned_domains = [
+            original for original, norm in pairs
+            if not (norm and norm in banned_normalized)
+        ]
+        if not cleaned_domains:
+            sample = sorted(banned_normalized)
+            SAMPLE_CAP = 10
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "all_banned",
+                    "count": len(sample),
+                    "sample": sample[:SAMPLE_CAP],
+                    "truncated": len(sample) > SAMPLE_CAP,
+                },
+            )
+    else:
+        skipped_banned = []
+
+    # Canonical spec: only the ahrefs_batch_analysis criterion enabled,
+    # carrying the metric selection + country. No AI. use_cache=False —
+    # a Job is an explicit "fetch fresh now" ask (mirrors availability).
+    spec_dict = {
+        "domains": cleaned_domains,
+        "criteria": {
+            "backlinks": {"enabled": False},
+            "refdomains": {"enabled": False},
+            "anchors": {"enabled": False},
+            "keywords": {"enabled": False},
+            "wayback": {"enabled": False},
+            "wayback_classify": {"enabled": False},
+            "whois_history": {"enabled": False},
+            "availability": {"enabled": False},
+            "ahrefs_batch_analysis": {
+                "enabled": True,
+                "metrics": metrics,
+                "country": country,
+            },
+        },
+        "ai": {"provider": None, "model": None},
+        "use_cache": False,
+        "cross_job_cache": False,
+        "lang": "en",
+    }
+    norm_spec = AnalyzeSpec.model_validate(spec_dict)
+    spec_json = norm_spec.model_dump_json()
+
+    name = (payload.name or "").strip() or _autoname(cleaned_domains)
+    notes = (payload.notes or "").strip()
+
+    job = Job(
+        name=name,
+        notes=notes,
+        spec_json=spec_json,
+        kind="ahrefs_batch_analysis",
+    )
+    db.add(job)
+    db.flush()
+
+    run = Run(job_id=job.id, status="pending", spec_json=spec_json)
+    db.add(run)
+    db.flush()
+
+    # Bulk-insert RunDomains — at 100k a per-row add loop is ~15s; the
+    # mapping bulk insert is sub-second (same pattern as the wayback
+    # sparkline job submit).
+    db.bulk_insert_mappings(
+        RunDomain,
+        [
+            {"run_id": run.id, "domain": d, "status": "pending"}
+            for d in cleaned_domains
+        ],
+    )
+    db.commit()
+
+    dispatch_run(run.id)
+    return SubmitAhrefsBatchAnalysisOut(
+        job_id=job.id, run_id=run.id, skipped_banned=skipped_banned,
+    )

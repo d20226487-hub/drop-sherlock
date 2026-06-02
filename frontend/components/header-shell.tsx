@@ -324,30 +324,38 @@ export function HeaderShell() {
             triggerLabel={t.nav.check}
             toggleAria={t.nav.checkDropdown.toggleAria}
             items={[
-              { href: "/check/quality", label: t.nav.checkDropdown.quality },
-              {
-                href: "/check/whois-history",
-                label: t.nav.checkDropdown.whoisHistory,
-              },
               {
                 href: "/check/availability",
                 label: t.nav.checkDropdown.availability,
               },
+              {
+                href: "/check/ahrefs-batch-analysis",
+                label: t.nav.checkDropdown.ahrefsBatchAnalysis,
+              },
+              {
+                href: "/check/whois-history",
+                label: t.nav.checkDropdown.whoisHistory,
+              },
+              { href: "/check/quality", label: t.nav.checkDropdown.quality },
             ]}
           />
           <NavDropdown
             triggerLabel={t.nav.jobs}
             toggleAria={t.nav.jobsDropdown.toggleAria}
             items={[
-              { href: "/jobs/quality", label: t.nav.jobsDropdown.quality },
-              {
-                href: "/jobs/whois-history",
-                label: t.nav.jobsDropdown.whoisHistory,
-              },
               {
                 href: "/jobs/availability",
                 label: t.nav.jobsDropdown.availability,
               },
+              {
+                href: "/jobs/ahrefs-batch-analysis",
+                label: t.nav.jobsDropdown.ahrefsBatchAnalysis,
+              },
+              {
+                href: "/jobs/whois-history",
+                label: t.nav.jobsDropdown.whoisHistory,
+              },
+              { href: "/jobs/quality", label: t.nav.jobsDropdown.quality },
             ]}
           />
           <NavDropdown
@@ -364,6 +372,22 @@ export function HeaderShell() {
           <Link href="/shares" className={linkClass("/shares")}>
             {t.nav.shares}
           </Link>
+          {/* Tools — ad-hoc experimentation surface, not wired into
+              the Job/Run/CR pipeline. Two tools today:
+                - Ahrefs (/tools/ahrefs-batch-analysis) — bulk
+                  /batch-analysis metrics + /keywords-history probe
+                - Wayback (added 2026-05-23) — bulk total-capture-count
+                  via the sparkline endpoint at ~0.5s/domain
+              Both are DEV/operator-only so labels are hardcoded
+              (no i18n entry yet). */}
+          <NavDropdown
+            triggerLabel="Tools"
+            toggleAria="Open Tools menu"
+            items={[
+              { href: "/tools/ahrefs-batch-analysis", label: "Ahrefs" },
+              { href: "/tools/wayback", label: "Wayback" },
+            ]}
+          />
           <Link href="/errors" className={linkClass("/errors")}>
             {t.nav.errors}
           </Link>

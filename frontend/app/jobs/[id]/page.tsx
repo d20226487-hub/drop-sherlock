@@ -259,7 +259,9 @@ export default function JobDetailPage({
                   ? `/check/whois-history?rerun=${jobId}`
                   : job.kind === "availability"
                     ? `/check/availability?rerun=${jobId}`
-                    : `/analyze?rerun=${jobId}`
+                    : job.kind === "ahrefs_batch_analysis"
+                      ? `/check/ahrefs-batch-analysis?rerun=${jobId}`
+                      : `/analyze?rerun=${jobId}`
               }
               className="text-sm px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-700 text-white"
             >
@@ -403,6 +405,7 @@ function JobPinsPanel({ jobId }: { jobId: number }) {
     "wayback_classify",
     "whois_history",
     "availability",
+    "ahrefs_batch_analysis",
   ] as const;
   const LETTERS: Record<string, string> = {
     backlinks: "B",
@@ -413,6 +416,7 @@ function JobPinsPanel({ jobId }: { jobId: number }) {
     wayback_classify: "C",
     whois_history: "H",
     availability: "V",
+    ahrefs_batch_analysis: "AB",
   };
 
   const [pins, setPins] = useState<
@@ -775,6 +779,9 @@ const ROLLUP_ORDER: { key: string; bucket: FinalBucket | null }[] = [
   { key: "good", bucket: "good" },
   { key: "mixed", bucket: "mixed" },
   { key: "low_quality", bucket: "low_quality" },
+  // `not_supported` is availability-only (double domains under a private
+  // suffix); quality/whois never emit it, so the chip renders 0 → hidden.
+  { key: "not_supported", bucket: null },
   { key: "unknown", bucket: null },
   { key: "error", bucket: null },
   { key: "partial", bucket: null },
@@ -809,7 +816,9 @@ function VerdictRollupPills({
       ? (ts.labelAvailability as unknown as Record<string, string>)
       : jobKind === "whois_history"
         ? (ts.labelWhois as unknown as Record<string, string>)
-        : (ts.label as unknown as Record<string, string>);
+        : jobKind === "ahrefs_batch_analysis"
+          ? (ts.labelAhrefsBatch as unknown as Record<string, string>)
+          : (ts.label as unknown as Record<string, string>);
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   if (total === 0) return null;
   const isPinnedSource = pinnedRunId != null && pinnedRunId === sourceRunId;
@@ -849,9 +858,11 @@ function VerdictRollupPills({
           ? bucketPillTone(bucket)
           : key === "error"
             ? "bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300"
-            : key === "partial"
-              ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
-              : "bg-neutral-100 text-neutral-600 dark:bg-neutral-900 dark:text-neutral-400";
+            : key === "not_supported"
+              ? "bg-violet-100 text-violet-800 dark:bg-violet-950/60 dark:text-violet-300"
+              : key === "partial"
+                ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
+                : "bg-neutral-100 text-neutral-600 dark:bg-neutral-900 dark:text-neutral-400";
         return (
           <span
             key={key}

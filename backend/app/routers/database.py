@@ -192,6 +192,11 @@ class DomainRow(BaseModel):
     # read the same CR row. Empty string when no availability CR is
     # pinned or in fallback for this domain.
     availability_status: str = ""
+    # Ahrefs batch-analysis metrics (2026-06-02) — {field_id: value|null}
+    # from the pinned ahrefs_batch_analysis CR's data_json.metrics. Empty
+    # when no batch criterion is pinned for this domain. Drives the DR /
+    # RD(f) / B chips + the DR/refdomains Database filters.
+    batch_metrics: dict[str, float | None] = Field(default_factory=dict)
     availability_provider: str = ""
     availability_registrar: str = ""
     availability_expires_on: date | None = None
@@ -282,6 +287,11 @@ CRITERIA = (
     # availability CR row when one exists. compute_final ignores it
     # (no weight in scoring config).
     "availability",
+    # ahrefs_batch_analysis added 2026-06-02: pinnable aux criterion that
+    # surfaces the batch-analysis metrics (DR / refdomains_dofollow /
+    # backlinks_dofollow …) as Database chips. Pin-driven like the other
+    # aux pillars; compute_final ignores it (no scoring weight).
+    "ahrefs_batch_analysis",
 )
 
 # Independent-pillar criteria — surfacing only, never part of Quality
@@ -297,7 +307,7 @@ CRITERIA = (
 # `primary_run`, which dropped the Quality run's `scoring_override_json`
 # off the synth, silently re-scoring rows under global weights. See
 # 2026-05-16 fix for `45minut.kz` / `most.com.kz`.
-AUX_CRITERIA = ("whois_history", "availability")
+AUX_CRITERIA = ("whois_history", "availability", "ahrefs_batch_analysis")
 
 
 def _whois_band(dropped: float | None) -> str:
@@ -565,6 +575,19 @@ def list_domains(
         .all()
     }
 
+    # Ahrefs batch-analysis CRs by rd (2026-06-02). Same preload shape as
+    # availability so the batch metrics auto-surface on Database from the
+    # most-recent run WITHOUT requiring a manual pin (user-confirmed: auto
+    # is fine). A pin still wins when present (the aux-pin split runs
+    # first); this is the fallback for the common pin-free workflow.
+    batch_crs_by_rd_id: dict[int, CriterionResult] = {
+        cr.run_domain_id: cr
+        for cr in db.query(CriterionResult)
+        .filter(CriterionResult.criterion == "ahrefs_batch_analysis")
+        .filter(CriterionResult.data_json != "")
+        .all()
+    }
+
     # Notes: same IN-list pattern as backlog below. The notes table is
     # smaller in practice but the principle is identical — fetch only
     # the rows the page will actually display. (Index added 2026-05-10
@@ -625,7 +648,9 @@ def list_domains(
                 sqla_func.max(AvailabilityCheck.checked_at).label("max_t"),
             )
             .filter(AvailabilityCheck.domain.in_(domain_keys))
-            .filter(AvailabilityCheck.status.in_(("available", "registered")))
+            .filter(AvailabilityCheck.status.in_(
+                ("available", "registered", "not_supported")
+            ))
             .group_by(AvailabilityCheck.domain)
             .subquery()
         )
@@ -768,6 +793,26 @@ def list_domains(
                 aux_sources["availability"] = (d, d_run, d_job)
                 crs_by_rd[d.id]["availability"] = (
                     availability_crs_by_rd_id[d.id]
+                )
+                break
+
+        # Ahrefs batch-analysis fallback (2026-06-02) — same shape as the
+        # availability fallback above. When no pin contributes a batch
+        # source, surface the most-recent rd that has a batch CR so the
+        # DR / RD(f) / B chips populate automatically.
+        if "ahrefs_batch_analysis" not in aux_sources:
+            for d in domain_rds_sorted:
+                if d.id not in batch_crs_by_rd_id:
+                    continue
+                d_run = runs.get(d.run_id)
+                if d_run is None:
+                    continue
+                d_job = jobs.get(d_run.job_id)
+                if d_job is None:
+                    continue
+                aux_sources["ahrefs_batch_analysis"] = (d, d_run, d_job)
+                crs_by_rd[d.id]["ahrefs_batch_analysis"] = (
+                    batch_crs_by_rd_id[d.id]
                 )
                 break
 
@@ -1326,6 +1371,29 @@ def list_domains(
                 availability_checked_at = fallback.checked_at
                 availability_statuses_seen.add(fallback.status)
 
+        # Ahrefs batch-analysis metrics (2026-06-02) — sourced from the
+        # pinned ahrefs_batch_analysis CR's `data_json.metrics`. Pin-only
+        # (like whois): no fallback to unpinned/latest runs, so the chips
+        # reflect exactly the run the operator pinned.
+        batch_metrics: dict[str, float | None] = {}
+        batch_src = aux_sources.get("ahrefs_batch_analysis")
+        batch_cr = (
+            crs_by_rd.get(batch_src[0].id, {}).get("ahrefs_batch_analysis")
+            if batch_src else None
+        )
+        if batch_cr is not None and batch_cr.data_json:
+            try:
+                batch_parsed = json.loads(batch_cr.data_json)
+            except json.JSONDecodeError:
+                batch_parsed = None
+            if isinstance(batch_parsed, dict):
+                m = batch_parsed.get("metrics")
+                if isinstance(m, dict):
+                    batch_metrics = {
+                        k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+                        for k, v in m.items()
+                    }
+
         rows.append(DomainRow(
             domain=domain,
             is_pinned=True,
@@ -1373,6 +1441,7 @@ def list_domains(
             availability_registrar=availability_registrar,
             availability_expires_on=availability_expires_on,
             availability_checked_at=availability_checked_at,
+            batch_metrics=batch_metrics,
             total_runs=len(domain_rds),
             any_cached=any_cached,
             note=(note_row.note if note_row else ""),

@@ -87,6 +87,19 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
         return hashlib.sha256(
             _stable_json({"c": criterion}).encode("utf-8")
         ).hexdigest()
+    # ahrefs_batch_analysis (2026-06-02): no `limit`/`filters`/`sort`.
+    # The request shape is defined by the selected metrics + optional
+    # country, so the hash carries those (order-normalized). The runner
+    # forces use_cache=False like availability, so this is mainly for
+    # consistency + future-proofing.
+    if criterion == "ahrefs_batch_analysis":
+        return hashlib.sha256(
+            _stable_json({
+                "c": criterion,
+                "metrics": sorted(getattr(cfg, "metrics", []) or []),
+                "country": getattr(cfg, "country", None) or None,
+            }).encode("utf-8")
+        ).hexdigest()
     payload: dict[str, Any] = {
         "c": criterion,
         "limit": cfg.limit,

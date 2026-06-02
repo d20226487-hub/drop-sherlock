@@ -47,11 +47,20 @@ function statusTone(status?: string): string {
     return "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200";
   if (status === "registered")
     return "bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-200";
+  if (status === "not_supported")
+    return "bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-200";
   if (status === "unknown")
     return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200";
   if (status === "error")
     return "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-200";
   return "bg-neutral-100 text-neutral-600 dark:bg-neutral-800/60 dark:text-neutral-300";
+}
+
+// "not_supported" → "not supported" for display; everything else passes
+// through unchanged (the trace shows raw provider statuses).
+function statusLabel(status?: string): string {
+  if (status === "not_supported") return "not supported";
+  return status || "—";
 }
 
 export function AvailabilityDomainView({ data }: { data: RunDomainDetail }) {
@@ -75,7 +84,7 @@ export function AvailabilityDomainView({ data }: { data: RunDomainDetail }) {
                 verdict.status,
               )}`}
             >
-              {verdict.status}
+              {statusLabel(verdict.status)}
             </span>
           )}
         </div>
@@ -150,7 +159,7 @@ export function AvailabilityDomainView({ data }: { data: RunDomainDetail }) {
                           r.status,
                         )}`}
                       >
-                        {r.status || "—"}
+                        {statusLabel(r.status)}
                       </span>
                     </td>
                     <td className="px-3 py-2 text-xs text-neutral-600 dark:text-neutral-300">

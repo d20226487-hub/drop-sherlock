@@ -31,9 +31,11 @@ from .common import (
     ProviderResult,
     STATUS_AVAILABLE,
     STATUS_ERROR,
+    STATUS_NOT_SUPPORTED,
     STATUS_REGISTERED,
     normalize_domain,
 )
+from .suffix import is_private_suffix_domain
 
 
 @dataclass
@@ -189,6 +191,40 @@ async def check_availability_async(
         return SessionLocal(), True
 
     try:
+        # --- Phase 0: private-suffix guard (no providers, no Ahrefs).
+        # "Double domains" under a PRIVATE PSL suffix (e.g. jcg.us.com)
+        # can't be authoritatively checked — the parent gTLD's RDAP/WHOIS
+        # returns "not found", which the cascade would mis-read as
+        # AVAILABLE. Short-circuit to `not_supported` BEFORE the cache +
+        # providers so we never emit that false positive (and never spend
+        # Domainr quota on an unanswerable name). Detection is a local
+        # PSL lookup (~microseconds), so it's cheap to re-run every call
+        # rather than cache. We still persist one row so the verdict
+        # surfaces in the Database/Backlog column + per-run trace.
+        if is_private_suffix_domain(domain):
+            psl_result = ProviderResult(
+                provider="psl",
+                status=STATUS_NOT_SUPPORTED,
+                error_message=(
+                    "registered under a private multi-label suffix; "
+                    "the gTLD/ccTLD registry can't authoritatively "
+                    "confirm availability"
+                ),
+            )
+            s, owned = _open_session()
+            try:
+                _persist(s, domain, [psl_result], run_id)
+            finally:
+                if owned:
+                    s.close()
+            return AvailabilityResult(
+                domain=domain,
+                status=STATUS_NOT_SUPPORTED,
+                provider="psl",
+                from_cache=False,
+                checked_at=datetime.utcnow(),
+            )
+
         # --- Phase 1: cache check (short session, no await held)
         if use_cache:
             s, owned = _open_session()

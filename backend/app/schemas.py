@@ -281,6 +281,28 @@ class AvailabilityConfig(BaseModel):
     enabled: bool = False
 
 
+class AhrefsBatchAnalysisConfig(BaseModel):
+    """Ahrefs Batch Analysis criterion config (added 2026-06-02).
+
+    Unlike WhoisHistory/Availability (single `enabled` toggle), this
+    pillar carries per-job knobs because the cost + the result columns
+    depend on which metrics the operator picked:
+
+    - `metrics`: subset of providers.ahrefs_batch.BATCH_METRICS keys to
+      fetch. Drives both the Ahrefs `select` and the run-page columns.
+      Empty defaults to ["domain_rating"] at submit time (DR is the
+      cheapest single field).
+    - `country`: optional ISO alpha-2 country code scoping org_traffic /
+      org_keywords. None = worldwide.
+
+    Like the other pillars, the runner dispatches per-Job by `job.kind`,
+    not per-criterion — mixing with Quality criteria isn't supported."""
+
+    enabled: bool = False
+    metrics: list[str] = Field(default_factory=list)
+    country: str | None = None
+
+
 class CriteriaSpec(BaseModel):
     backlinks: BacklinksConfig = Field(default_factory=BacklinksConfig)
     refdomains: RefdomainsConfig = Field(default_factory=RefdomainsConfig)
@@ -296,6 +318,9 @@ class CriteriaSpec(BaseModel):
     availability: AvailabilityConfig = Field(
         default_factory=AvailabilityConfig
     )
+    ahrefs_batch_analysis: AhrefsBatchAnalysisConfig = Field(
+        default_factory=AhrefsBatchAnalysisConfig
+    )
 
 
 # Pillar-only criteria — Quality runs' per-domain loop never dispatches
@@ -304,7 +329,9 @@ class CriteriaSpec(BaseModel):
 # `strip_pillar_criteria_from_quality_spec` to close the silent-skip
 # footgun where a Quality spec arrives with one of them enabled
 # (2026-05-24 — caused runs 124/126's whois "stuck running" cohort).
-PILLAR_ONLY_CRITERIA: tuple[str, ...] = ("whois_history", "availability")
+PILLAR_ONLY_CRITERIA: tuple[str, ...] = (
+    "whois_history", "availability", "ahrefs_batch_analysis",
+)
 
 
 # --- AI selection ------------------------------------------------------------

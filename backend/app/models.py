@@ -619,3 +619,128 @@ class DomainShare(Base):
     # X-Forwarded-For first hop). Audit-only — never surfaced to the
     # recipient.
     created_ip: Mapped[str] = mapped_column(String(64), default="")
+
+
+# --- Wayback Sparkline batch jobs (Tools page, added 2026-05-23) ---------
+#
+# Standalone Tools-page flow for getting the TOTAL Wayback snapshot count
+# per domain at scale (target: 100k domains per submit). Sourced from
+# archive.org's `__wb/sparkline` endpoint — the same JSON the calendar
+# UI uses for its sparkline chart. Returns exact capture counts in ~0.4
+# to 1.0s/domain, ~130× faster than full CDX queries.
+#
+# Why a separate table tree (not the Job/Run/CR pipeline):
+#   - No criteria, no AI, no quality scoring — the only output is an
+#     integer per domain plus a couple of year markers. Reusing
+#     CriterionResult would force null columns everywhere and add noise
+#     to the Database page's row builder.
+#   - 100k results per submit don't fit the existing per-domain
+#     RunDomain pattern at sensible query speed — RunDomain has too
+#     many index-amplifying columns (criteria links, AI provenance,
+#     final_assessment). A flat sparkline-only result table indexes
+#     much tighter.
+#   - Cancelable/pausable independent of the Job pipeline so a 100k
+#     job doesn't compete with quality runs for the same orchestrator
+#     attention.
+#
+# Status semantics:
+#   pending    — created but not yet picked up by the runner
+#   running    — worker actively processing
+#   paused     — operator-issued pause (in-flight tasks finish then idle)
+#   done       — every domain has a terminal result row (ok or error)
+#   failed     — orchestrator-level failure (rare; per-domain errors
+#                stay on the result row and don't fail the job)
+#   canceled   — operator-issued cancel (worker exits; results stay)
+class WaybackSparklineJob(Base):
+    __tablename__ = "wayback_sparkline_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Optional user label so the list page can identify a job at a
+    # glance. Empty string ⇒ list page shows "Job #N" fallback.
+    name: Mapped[str] = mapped_column(String(255), default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    # Free-string status (same pattern as Run.status); allowed values
+    # listed in the class docstring above. The router enforces.
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+
+    # Submission stats — these don't move after submit. The
+    # progress counters live on the result rows (server-aggregates).
+    submitted_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Concurrency knob captured at submit time so changing the global
+    # default doesn't retroactively affect already-running jobs.
+    concurrency: Mapped[int] = mapped_column(Integer, default=8)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, index=True,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # IP of the user who submitted (best-effort, same pattern as
+    # DomainShare). Audit-only.
+    created_ip: Mapped[str] = mapped_column(String(64), default="")
+
+    results: Mapped[list["WaybackSparklineResult"]] = relationship(
+        back_populates="job",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class WaybackSparklineResult(Base):
+    """One row per domain per WaybackSparklineJob. Flat schema — no
+    foreign keys to RunDomain / CriterionResult; this is a standalone
+    Tools-page result table.
+
+    Sized for 100k rows per job. The composite (job_id, domain) index
+    powers the per-job results list; the (job_id, status) partial index
+    powers the runner's pending-pick query without scanning done rows."""
+    __tablename__ = "wayback_sparkline_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("wayback_sparkline_jobs.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    # Lowercased + trimmed at submit time so duplicate inputs collapse.
+    # NOT host-validated server-side; sparkline gracefully returns 0
+    # captures on garbage input so we just record the raw answer.
+    domain: Mapped[str] = mapped_column(String(512), index=True, nullable=False)
+    # pending → fetching → ok | error. fetching exists so the UI
+    # progress bar can show "X in flight" distinct from queued; the
+    # runner flips it on worker entry and back to ok/error on exit.
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+
+    # Total captures across all years. NULL until the result lands.
+    # Capped at sparkline's natural ceiling (~20M observed for
+    # google.com); int32 is plenty.
+    snapshot_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # First / last calendar year that has at least one capture. NULL
+    # when snapshot_count == 0 (no history). Useful for "drop hunter"
+    # filtering — short-history domains vs long-running brands.
+    first_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Count of distinct years in the sparkline payload's `years` map.
+    # Cheap quality signal — a domain with 10 captures spread over
+    # 15 years is likely a long-lived brand; 10 captures all in 2024
+    # is an active-but-young site.
+    years_with_data: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Free-text on error path (HTTP status, network exception). Empty
+    # on the happy path.
+    error_msg: Mapped[str] = mapped_column(Text, default="")
+    # Captured response time (ms) — useful for capacity planning
+    # ("which provider host is slow today?") and for the calibration
+    # logic that nudges concurrency down on sustained slowness.
+    elapsed_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    job: Mapped["WaybackSparklineJob"] = relationship(back_populates="results")
+
+    __table_args__ = (
+        # Per-job uniqueness on the domain so a buggy retry doesn't
+        # double-insert. Enforced at the DB level since the runner
+        # touches rows from multiple coroutines.
+        UniqueConstraint("job_id", "domain", name="uq_wayback_spark_job_domain"),
+    )

@@ -20,6 +20,7 @@ from .routers import (
     public_shares as public_shares_router,
     settings as settings_router,
     shares as shares_router,
+    tools as tools_router,
 )
 from .scheduler import get_scheduler
 from .tasks import mark_orphaned_runs_paused
@@ -596,6 +597,78 @@ def _migrate_legacy_pins_to_criterion_pins() -> None:
         db.close()
 
 
+def _backfill_ahrefs_batch_pins() -> None:
+    """Auto-pin the ahrefs_batch_analysis criterion for batch jobs that
+    finished BEFORE auto-pin-on-finalize existed (2026-06-02).
+
+    The runner now upserts a JobCriterionPin when a batch run completes,
+    so future runs surface as pinned everywhere (Job page, Database, run
+    panel). This backfill covers pre-existing batch jobs: for each
+    ahrefs_batch_analysis Job with no batch pin yet, pin its most-recent
+    `done` run that actually has batch CR data. Idempotent — skips jobs
+    that already have a batch pin."""
+    import logging
+    from sqlalchemy import select
+    from .models import CriterionResult, Job, JobCriterionPin, Run, RunDomain
+
+    log = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        jobs = (
+            db.execute(
+                select(Job).where(Job.kind == "ahrefs_batch_analysis")
+            )
+            .scalars()
+            .all()
+        )
+        if not jobs:
+            return
+        pinned = 0
+        for job in jobs:
+            already = (
+                db.query(JobCriterionPin)
+                .filter(
+                    JobCriterionPin.job_id == job.id,
+                    JobCriterionPin.criterion == "ahrefs_batch_analysis",
+                )
+                .first()
+            )
+            if already is not None:
+                continue
+            # Most-recent done run for this job that has ≥1 batch CR with
+            # data — walk newest-first, pin the first qualifying run.
+            runs = (
+                db.query(Run)
+                .filter(Run.job_id == job.id, Run.status == "done")
+                .order_by(Run.id.desc())
+                .all()
+            )
+            for run in runs:
+                has_data = (
+                    db.query(CriterionResult.id)
+                    .join(RunDomain, CriterionResult.run_domain_id == RunDomain.id)
+                    .filter(
+                        RunDomain.run_id == run.id,
+                        CriterionResult.criterion == "ahrefs_batch_analysis",
+                        CriterionResult.data_json != "",
+                    )
+                    .first()
+                )
+                if has_data is not None:
+                    db.add(JobCriterionPin(
+                        job_id=job.id,
+                        criterion="ahrefs_batch_analysis",
+                        run_id=run.id,
+                    ))
+                    pinned += 1
+                    break
+        if pinned:
+            db.commit()
+            log.info("auto-pinned ahrefs_batch_analysis for %s job(s)", pinned)
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
@@ -608,6 +681,7 @@ async def lifespan(_: FastAPI):
     _encrypt_legacy_secret_settings()
     _backfill_job_kind()
     _migrate_legacy_pins_to_criterion_pins()
+    _backfill_ahrefs_batch_pins()
     # Phase 2 — start capturing every error from any logger into error_log.
     # Idempotent so reload-on-edit dev scenarios don't double-attach.
     install_db_log_handler()
@@ -618,6 +692,32 @@ async def lifespan(_: FastAPI):
             import logging
             logging.getLogger(__name__).info(
                 "auto-paused %s orphaned run(s) on startup; user can resume", n
+            )
+        # Wayback Sparkline batches (Tools page, added 2026-05-23). Same
+        # auto-pause-on-restart contract as Run: any `running` sparkline
+        # job at boot time has no asyncio task left owning it, so
+        # leaving status='running' would lie to the UI. Mark paused so
+        # the operator can resume from the Tools page (the runner's
+        # resume path already handles cleanup of in-flight rows).
+        from .models import WaybackSparklineJob
+        spark_orphans = (
+            db.query(WaybackSparklineJob)
+            .filter(WaybackSparklineJob.status == "running")
+            .all()
+        )
+        for j in spark_orphans:
+            j.status = "paused"
+            j.error = (
+                "Process restarted while this batch was in progress; "
+                "auto-paused. Resume to continue (already-fetched rows "
+                "are preserved)."
+            )
+        if spark_orphans:
+            db.commit()
+            import logging
+            logging.getLogger(__name__).info(
+                "auto-paused %s orphaned sparkline batch(es) on startup",
+                len(spark_orphans),
             )
     finally:
         db.close()
@@ -760,6 +860,42 @@ async def lifespan(_: FastAPI):
     # deployment (or a dev box) doesn't accumulate stale snapshots.
     from . import backups as _backups
     if _backups.BACKUP_ENABLED and _backups._resolve_db_path() is not None:
+        # Boot-time orphan cleanup (added 2026-05-27). Sweeps leaked
+        # `restore-*.db-shm` / `.db-wal` files older than 1 hour out of
+        # BACKUP_DIR. Cheap, idempotent, runs once per container start.
+        try:
+            _backups.cleanup_orphan_restore_files()
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "orphan restore-artifact cleanup failed"
+            )
+
+        # Boot-time catch-up backup (added 2026-05-27). APScheduler's
+        # interval jobs fire AFTER `interval` from job-add time — so if
+        # the container restarts within the 24h window (the local
+        # deploy here rebuilds frequently), the scheduled backup never
+        # runs. Symptom on this box: last backup was 2026-05-14, 13
+        # days before this fix landed. Threshold is the configured
+        # interval + 10% slack so a sub-24h instance restart doesn't
+        # trigger a redundant snapshot every time.
+        try:
+            age = _backups.latest_snapshot_age_seconds()
+            threshold = int(_backups.BACKUP_INTERVAL_HOURS * 3600 * 1.1)
+            if age is None or age >= threshold:
+                import logging
+                logging.getLogger(__name__).info(
+                    "boot catch-up backup: last snapshot age=%s sec, "
+                    "threshold=%s sec — running now",
+                    age, threshold,
+                )
+                _backups.scheduled_backup()
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "boot catch-up backup failed"
+            )
+
         sched.add_job(
             _backups.scheduled_backup,
             "interval",
@@ -853,6 +989,7 @@ app.include_router(backups_router.router)
 app.include_router(availability_router.router)
 app.include_router(banlist_router.router)
 app.include_router(shares_router.router)
+app.include_router(tools_router.router)
 # Public router — Caddy bypasses basic-auth for `/api/public/*`. The
 # endpoints inside do their OWN access control via share tokens; no other
 # auth layer is in front of them, so each handler MUST validate.

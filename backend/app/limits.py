@@ -22,12 +22,23 @@ from .app_settings import get_rate_limits
 
 
 class _TokenBucket:
-    """Smooth refill, capacity = RPM. `acquire()` blocks until a token is
-    available. Single-process — fine for our single-uvicorn-worker setup."""
+    """Smooth refill at `rpm/60` tokens/sec with a configurable burst.
 
-    def __init__(self, rpm: int):
-        self.capacity = max(1, rpm)
-        self.refill_per_sec = self.capacity / 60.0
+    `burst` is the bucket capacity — the maximum number of tokens that can
+    accumulate while idle, i.e. how many requests can fire back-to-back
+    after a quiet period. It defaults to `rpm` (legacy "burst-up-to-the-
+    minute" behavior, fine for providers that publish their rate as a
+    rolling per-minute window). Providers with strict per-minute paid-tier
+    caps (WhoisFreaks is the canonical example) should pass `burst=1` so
+    requests get spaced exactly `60/rpm` seconds apart — no headroom for
+    a burst that exceeds the published ceiling.
+
+    Single-process — fine for our single-uvicorn-worker setup.
+    """
+
+    def __init__(self, rpm: int, burst: int | None = None):
+        self.capacity = max(1, burst if burst is not None else rpm)
+        self.refill_per_sec = max(1, rpm) / 60.0
         self.tokens = float(self.capacity)
         self.updated = time.monotonic()
         self._lock = asyncio.Lock()
@@ -52,11 +63,32 @@ class _TokenBucket:
 
 
 class _ProviderLimiter:
-    def __init__(self, rpm: int, max_concurrent: int):
-        self.bucket = _TokenBucket(rpm)
+    def __init__(self, rpm: int, max_concurrent: int, burst: int | None = None):
+        self.bucket = _TokenBucket(rpm, burst=burst)
         self.sem = asyncio.Semaphore(max(1, max_concurrent))
         self.rpm = rpm
         self.max_concurrent = max_concurrent
+        self.burst = self.bucket.capacity
+
+
+# Providers that enforce strict per-minute caps — no burst is safe.
+# The bucket's capacity gets pinned to 1 token, so a user-configured
+# rpm=N is realized as "one request every 60/N seconds" rather than
+# "N back-to-back, then idle".
+#
+# Members:
+#   - whoisfreaks: paid tier with hard per-minute caps (5/min seen).
+#     Bursting trips 429 even when sustained rate is well under quota.
+#   - wayback_sparkline (added 2026-05-23): archive.org's __wb/sparkline
+#     endpoint. Live calibration on Job 2 showed bursts of 8+ concurrent
+#     within the first second hit 429s before the rate-limiter's natural
+#     pacing took over — bucket capacity = rpm meant we burned the
+#     entire minute's budget in <1s. With burst=1, requests space at
+#     60/rpm seconds (e.g. rpm=180 → 0.33s apart) and stay under the
+#     hidden archive.org window.
+_STRICT_BURST_PROVIDERS: frozenset[str] = frozenset(
+    {"whoisfreaks", "wayback_sparkline"},
+)
 
 
 # Cache keyed by provider name. Invalidate by deleting the entry; the next
@@ -64,18 +96,32 @@ class _ProviderLimiter:
 _LIMITERS: dict[str, _ProviderLimiter] = {}
 
 
+def _burst_for(provider: str, rpm: int) -> int:
+    return 1 if provider in _STRICT_BURST_PROVIDERS else max(1, rpm)
+
+
 def get_limiter(provider: str) -> _ProviderLimiter:
     cached = _LIMITERS.get(provider)
     rl = get_rate_limits(provider)
+    desired_burst = _burst_for(provider, rl["rpm"])
     # If the configured values changed (user updated Settings), rebuild so
     # we don't run on stale capacity. Cheap: just reallocates a bucket and
     # semaphore. Side note — a Semaphore that's been acquired can't safely
     # be replaced if calls are mid-flight, but acquires through the OLD
     # limiter just keep it alive until they release. New acquires after this
     # rebuild use the new semaphore.
-    if cached and cached.rpm == rl["rpm"] and cached.max_concurrent == rl["max_concurrent"]:
+    if (
+        cached
+        and cached.rpm == rl["rpm"]
+        and cached.max_concurrent == rl["max_concurrent"]
+        and cached.burst == desired_burst
+    ):
         return cached
-    fresh = _ProviderLimiter(rpm=rl["rpm"], max_concurrent=rl["max_concurrent"])
+    fresh = _ProviderLimiter(
+        rpm=rl["rpm"],
+        max_concurrent=rl["max_concurrent"],
+        burst=desired_burst,
+    )
     _LIMITERS[provider] = fresh
     return fresh
 
