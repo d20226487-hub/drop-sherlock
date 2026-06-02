@@ -2509,12 +2509,21 @@ function DomainsSection({
                         />
                       </td>
                       <td className="px-3 py-2">
-                        <Link
-                          href={href}
-                          className="font-mono text-xs text-blue-600 dark:text-blue-400 hover:underline"
-                        >
-                          {d.domain}
-                        </Link>
+                        {/* Ahrefs Batch Analysis has no per-domain page —
+                            every metric is in the table columns — so the
+                            domain is plain text, not a link. */}
+                        {isBatch ? (
+                          <span className="font-mono text-xs text-neutral-700 dark:text-neutral-300">
+                            {d.domain}
+                          </span>
+                        ) : (
+                          <Link
+                            href={href}
+                            className="font-mono text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                          >
+                            {d.domain}
+                          </Link>
+                        )}
                         {d.is_pinned && (
                           <span
                             className="ml-1.5 text-amber-600 dark:text-amber-400"

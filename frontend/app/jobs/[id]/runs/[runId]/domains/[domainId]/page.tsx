@@ -1,5 +1,6 @@
 "use client";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { use, useEffect, useMemo, useState } from "react";
 import { useT } from "@/lib/i18n";
 import { api, AIProvider, RunCost, RunDomainDetail } from "@/lib/api";
@@ -11,7 +12,6 @@ import { NotesEditor } from "@/components/notes-editor";
 import { ShareButton } from "@/components/share-button";
 import { WhoisHistoryDomainView } from "@/components/whois-history-domain-view";
 import { AvailabilityDomainView } from "@/components/availability-domain-view";
-import { AhrefsBatchAnalysisDomainView } from "@/components/ahrefs-batch-analysis-domain-view";
 import { AiPreviewPanel } from "@/components/ai-preview-panel";
 import {
   WaybackSamplesTimeline,
@@ -126,6 +126,7 @@ export default function DomainDetailPage({
 
   const { t } = useT();
   const ts = t.pages.jobs.domain;
+  const router = useRouter();
 
   const [data, setData] = useState<RunDomainDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -167,6 +168,15 @@ export default function DomainDetailPage({
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [domainId]);
+
+  // Ahrefs Batch Analysis has no per-domain page — every metric is shown
+  // in the run table. Direct visits (old bookmarks / shared links) bounce
+  // back to the run.
+  useEffect(() => {
+    if (data?.job_kind === "ahrefs_batch_analysis") {
+      router.replace(`/jobs/${jobId}/runs/${runId}`);
+    }
+  }, [data?.job_kind, router, jobId, runId]);
 
   // Faster polling while a reanalyze is in flight so the verdict refresh
   // shows up quickly.
@@ -241,6 +251,12 @@ export default function DomainDetailPage({
   }
 
   if (data === null) {
+    return <div className="text-sm text-neutral-500">{t.common.loading}</div>;
+  }
+
+  // Batch jobs have no per-domain page — the redirect effect above is
+  // bouncing back to the run. Don't flash the Quality view in the meantime.
+  if (data.job_kind === "ahrefs_batch_analysis") {
     return <div className="text-sm text-neutral-500">{t.common.loading}</div>;
   }
 
@@ -323,43 +339,6 @@ export default function DomainDetailPage({
           </div>
         </header>
         <AvailabilityDomainView data={data} />
-        <section className="pt-6 border-t dark:border-neutral-800">
-          <NotesEditor
-            domain={data.domain}
-            initialNote={data.note}
-            initialUpdatedAt={data.note_updated_at}
-            onSaved={(note, updatedAt) => {
-              setData((prev) =>
-                prev ? { ...prev, note, note_updated_at: updatedAt } : prev,
-              );
-            }}
-          />
-        </section>
-      </div>
-    );
-  }
-
-  // Ahrefs Batch Analysis pillar — metrics table, no AI, no cost panel
-  // (the metric fetch cost lives at the run level). Same header layout
-  // as availability/whois for visual consistency.
-  if (data.job_kind === "ahrefs_batch_analysis") {
-    return (
-      <div className="space-y-10">
-        <Link
-          href={`/jobs/${jobId}/runs/${runId}`}
-          className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
-        >
-          {ts.backToRun(runId)}
-        </Link>
-        <header className="space-y-3">
-          <div className="flex items-center gap-3 flex-wrap">
-            <h1 className="text-2xl font-semibold font-mono">
-              {ts.title(data.domain)}
-            </h1>
-            <StatusPill status={data.status} />
-          </div>
-        </header>
-        <AhrefsBatchAnalysisDomainView data={data} />
         <section className="pt-6 border-t dark:border-neutral-800">
           <NotesEditor
             domain={data.domain}
