@@ -869,6 +869,10 @@ export default function RunDetailPage({
       // the slim payload but not the snapshot (shouldn't happen
       // mid-run) force a full reload too.
       let needsFullReload = false;
+      // Set when the RUN itself transitions non-terminal → terminal this
+      // tick (one event, at the very end). Forces an UN-debounced final
+      // full reload — see the block after setRun for why.
+      let runBecameTerminal = false;
       setRun((prev) => {
         if (prev == null) {
           // Snapshot not yet loaded — defer to the mount-time full
@@ -876,6 +880,9 @@ export default function RunDetailPage({
           return prev;
         }
         const TERMINAL = new Set(["done", "failed", "canceled"]);
+        if (!TERMINAL.has(prev.status) && TERMINAL.has(p.status)) {
+          runBecameTerminal = true;
+        }
         const bySlim = new Map(p.domains.map((d) => [d.id, d]));
         let mutated = false;
         const nextDomains = prev.domains.map((d) => {
@@ -912,11 +919,24 @@ export default function RunDetailPage({
         });
         // If the new domains array is structurally identical (every
         // entry reference reused), don't replace state at all —
-        // avoids an unnecessary reconcile.
-        if (!mutated) return prev;
+        // avoids an unnecessary reconcile. (Still fall through to update
+        // the run status when the run just went terminal.)
+        if (!mutated && !runBecameTerminal) return prev;
         return { ...prev, status: p.status, domains: nextDomains };
       });
-      if (needsFullReload) {
+      if (runBecameTerminal) {
+        // FINAL SETTLE — force a full reload, bypassing the 5s debounce.
+        // The terminal /runs/{id} payload carries columns the slim poll
+        // doesn't (ahrefs_batch_analysis `batch_metrics`, final scores,
+        // language/theme/category). The run reaching terminal is the
+        // moment they become available AND the moment adaptive polling
+        // stops — so a debounced-away reload here would strand the page
+        // on pre-final data until a manual refresh (the reported
+        // batch-metrics bug). This fires once (single run-level
+        // transition), so it can't re-create the per-domain reload storm
+        // the debounce below exists to prevent.
+        void reload();
+      } else if (needsFullReload) {
         // Debounced fire-and-forget (Option D, 2026-05-18). Each
         // detected transition USED to fire its own full /runs/{id}
         // (11k rows on the offending availability run), so a 40-
