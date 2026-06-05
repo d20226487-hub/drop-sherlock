@@ -746,6 +746,13 @@ def delete_job(job_id: int, db: Session = Depends(get_db)) -> dict:
     run_ids = [r.id for r in job.runs]
     for rid in run_ids:
         request_cancel(rid)
+    # JobCriterionPin has NO cascade (SQLite FK enforcement is off in our
+    # config), so delete this job's pins explicitly — otherwise they
+    # orphan and later collide on the (job_id, criterion) UNIQUE
+    # constraint when SQLite reuses this job's rowid (e.g. a job import).
+    db.query(JobCriterionPin).filter(
+        JobCriterionPin.job_id == job.id
+    ).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
     for rid in run_ids:
@@ -787,6 +794,12 @@ def bulk_delete_jobs(
         run_ids.extend(r.id for r in j.runs)
     for rid in run_ids:
         request_cancel(rid)
+    # Cascade JobCriterionPins explicitly — see the single-job DELETE
+    # endpoint for why (no FK cascade; orphans collide on rowid reuse).
+    if found_ids:
+        db.query(JobCriterionPin).filter(
+            JobCriterionPin.job_id.in_(found_ids)
+        ).delete(synchronize_session=False)
     for j in found:
         db.delete(j)
     if found:

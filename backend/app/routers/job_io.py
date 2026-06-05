@@ -307,6 +307,20 @@ async def import_job(
     db.add(new_job)
     db.flush()  # need new_job.id for the FK rewrites below
 
+    # Defensive orphan-pin sweep (2026-06-05). JobCriterionPin had no
+    # cascade on job delete (SQLite FK enforcement is off in our config),
+    # so a previously-deleted job can leave pins behind. SQLite reuses the
+    # deleted job's rowid for `new_job`, so those orphan pins now share
+    # `new_job.id` — and our fresh pins below would hit the
+    # (job_id, criterion) UNIQUE constraint, 500-ing the whole import
+    # (observed: re-importing a job after deleting its first import).
+    # Clear any pins squatting on this id before we insert ours. The
+    # delete_job / bulk_delete_jobs endpoints now also cascade pins, so
+    # new deletes won't create orphans — this covers ones from before.
+    db.query(JobCriterionPin).filter(
+        JobCriterionPin.job_id == new_job.id
+    ).delete(synchronize_session=False)
+
     # Run remap: {export_id: new_run_id}
     run_id_map: dict[int, int] = {}
     for r in bundle.get("runs", []):
