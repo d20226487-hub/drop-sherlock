@@ -110,6 +110,43 @@ const DEFAULT_CRITERIA: CriteriaSpec = {
   },
 };
 
+// Quality "always-on" baseline filters. When we PRE-FILL criteria from a
+// source job (Database / Backlog send-to-analyze, which copy the source's
+// spec to maximize cache hits), an older or hand-edited source spec can
+// have these off — silently weakening every downstream analysis. Force
+// them on at pre-fill time so a new analysis always starts from the
+// quality baseline (the operator can still untick before submitting).
+// 2026-06-05, per report that refdomains dofollow/non_spammy + anchors
+// dofollow arrived OFF from a Backlog send. (A brand-new /check/quality
+// already starts from DEFAULT_CRITERIA, which has these on — this only
+// repairs the pre-filled paths.) Backlinks carries its OWN extra
+// default-on baseline beyond dofollow/non_spammy — noindex_exclude,
+// content_only, root_only — so force those too (matches DEFAULT_CRITERIA).
+function withQualityDefaults(c: CriteriaSpec): CriteriaSpec {
+  return {
+    ...c,
+    backlinks: {
+      ...c.backlinks,
+      filters: {
+        ...c.backlinks.filters,
+        dofollow: true,
+        non_spammy: true,
+        noindex_exclude: true,
+        content_only: true,
+        root_only: true,
+      },
+    },
+    refdomains: {
+      ...c.refdomains,
+      filters: { ...c.refdomains.filters, dofollow: true, non_spammy: true },
+    },
+    anchors: {
+      ...c.anchors,
+      filters: { ...c.anchors.filters, dofollow: true },
+    },
+  };
+}
+
 function parseDomains(raw: string): string[] {
   return raw
     .split(/\r?\n/)
@@ -295,7 +332,7 @@ function AnalyzePageInner() {
       .getJobSpec(sourceJobIdParam)
       .then((r) => {
         if (cancelled) return;
-        setCriteria(r.spec.criteria);
+        setCriteria(withQualityDefaults(r.spec.criteria));
         if (r.spec.ai) setAi(r.spec.ai);
         setPrefillSource({
           jobId: sourceJobIdParam,
@@ -347,7 +384,7 @@ function AnalyzePageInner() {
       .getLastSpec()
       .then((r) => {
         if (!r.spec) return;
-        setCriteria(r.spec.criteria);
+        setCriteria(withQualityDefaults(r.spec.criteria));
         if (r.spec.ai) setAi(r.spec.ai);
       })
       .catch(() => {
