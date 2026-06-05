@@ -189,15 +189,15 @@ export function WaybackSamplesTimeline({
                   <span className="text-xs uppercase tracking-wide text-neutral-500">
                     H2
                   </span>
+                  {/* Show ALL headings — they're the exact evidence the
+                      AI judge reads, so truncating them hid signals the
+                      operator couldn't reconcile against the verdict
+                      (e.g. injected pharma/ED headings buried past the
+                      old 6-item cap). 2026-06-05. */}
                   <ul className="text-sm list-disc ml-5 text-neutral-700 dark:text-neutral-300">
-                    {s.h2s.slice(0, 6).map((h, j) => (
+                    {s.h2s.map((h, j) => (
                       <li key={j}>{h}</li>
                     ))}
-                    {s.h2s.length > 6 ? (
-                      <li className="text-neutral-400 italic">
-                        {ts.moreItems(s.h2s.length - 6)}
-                      </li>
-                    ) : null}
                   </ul>
                 </div>
               ) : null}
@@ -207,14 +207,9 @@ export function WaybackSamplesTimeline({
                     H3
                   </span>
                   <ul className="text-sm list-disc ml-5 text-neutral-700 dark:text-neutral-300">
-                    {s.h3s.slice(0, 6).map((h, j) => (
+                    {s.h3s.map((h, j) => (
                       <li key={j}>{h}</li>
                     ))}
-                    {s.h3s.length > 6 ? (
-                      <li className="text-neutral-400 italic">
-                        {ts.moreItems(s.h3s.length - 6)}
-                      </li>
-                    ) : null}
                   </ul>
                 </div>
               ) : null}
