@@ -217,7 +217,15 @@ class RunDomain(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
-    domain: Mapped[str] = mapped_column(String(512))
+    # Indexed 2026-06-07: augmentation chain (`link_augmenters_for_run`),
+    # Database row builder (`rds_by_domain` lookup), share-link resolver,
+    # and the bulk-delete-by-domain path all filter `run_domains.domain
+    # == ?`. Without an index, the priors_query inside
+    # `link_augmenters_for_run` scans the whole table by rowid for every
+    # new RunDomain — at ~10k RDs that turned a 76-domain Analyze submit
+    # into a 21-second hang (profiled 2026-06-07). The startup migration
+    # creates the index in-place for pre-existing DBs.
+    domain: Mapped[str] = mapped_column(String(512), index=True)
     status: Mapped[str] = mapped_column(String(20), default="pending")
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

@@ -551,6 +551,21 @@ def _build_all_rows(
         sources_by_domain[domain] = per_crit
         aux_sources_by_domain[domain] = aux
 
+    # One-time spec parse per Run (perf fix 2026-06-07). Was previously
+    # inside the per-domain loop (`for rid in contributing_run_ids: ...
+    # _spec_for_run(r.spec_json)`), which at 7k+ domains parsed each
+    # spec_json string dozens of times and validated through Pydantic
+    # for every recurrence. Profiled hot: 8k+ json.loads + 90k+ Pydantic
+    # validates per `/database/domains` call ≈ 23 s wall on the user's
+    # data. Hoisting it here cuts that to ONE parse per Run (≤ a few
+    # dozen) and turns the in-loop lookup into a dict-get. The dict
+    # covers EVERY known Run (not just contributing ones) so the in-
+    # loop code can ask freely — overhead is negligible because the
+    # `runs` dict only holds a few dozen rows in practice.
+    specs_by_run_id: dict[int, AnalyzeSpec | None] = {
+        rid: _spec_for_run(r.spec_json) for rid, r in runs.items()
+    }
+
     # Per-field metric merge for ahrefs_batch_analysis (2026-06-07).
     # Two-stage workflow the user runs in practice: Job A fetches `domain_
     # rating` only (cheap), filters survivors by DR; Job B then fetches
@@ -951,17 +966,16 @@ def _build_all_rows(
             key=lambda triple: triple[1].finished_at or datetime.min,
         )
 
-        # Pre-load spec for every contributing run so we know which
-        # criteria each run had ENABLED — drives the per-criterion
-        # "enabled" flag on the response. Includes aux runs so the
-        # whois_history / availability columns also get their `enabled`
-        # flag populated correctly.
+        # Per-domain view of "which run had which spec" — was previously
+        # an in-loop json.loads + Pydantic validate per contributing
+        # run (saw 8k+ json.loads / call at 7k domains). Hoisted to a
+        # one-shot pre-pass into `specs_by_run_id` above; here we just
+        # look up.
         contributing_run_ids = {r.id for (_, r, _) in per_crit_sources.values()}
         contributing_run_ids |= {r.id for (_, r, _) in aux_sources.values()}
-        specs_by_run: dict[int, AnalyzeSpec | None] = {}
-        for rid in contributing_run_ids:
-            r = runs.get(rid)
-            specs_by_run[rid] = _spec_for_run(r.spec_json) if r else None
+        specs_by_run: dict[int, AnalyzeSpec | None] = {
+            rid: specs_by_run_id.get(rid) for rid in contributing_run_ids
+        }
 
         spec_ai_provider = ""
         spec_ai_model = ""

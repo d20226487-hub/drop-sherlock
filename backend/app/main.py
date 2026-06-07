@@ -175,6 +175,17 @@ def _migrate_sqlite_columns() -> None:
         # 2026-05-17: import-dedup lookup keyed on the per-bundle UUID
         # written at export time.
         ("ix_jobs_export_uuid", "jobs", "export_uuid"),
+        # Added 2026-06-07 — the Analyze submit path's augmentation
+        # chain (`link_augmenters_for_run` in augmentation.py) runs one
+        # `WHERE run_domains.domain = ? AND id < ? ORDER BY id DESC
+        # LIMIT 50` query per new RunDomain. With no index on `domain`
+        # the planner fell back to a rowid scan; profiled hot at 9.6k
+        # RDs the augmentation pass took 21 s for a 76-domain submit —
+        # i.e. the POST /analyze/jobs hang the user reported. The same
+        # index also speeds up the share-link resolver
+        # (`_resolve_share_target_rd`), the bulk-delete-by-domain path
+        # on /database, and the Backlog `analyzed_links` join.
+        ("ix_run_domains_domain", "run_domains", "domain"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in additions:
