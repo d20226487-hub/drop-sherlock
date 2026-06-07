@@ -551,6 +551,52 @@ def _build_all_rows(
         sources_by_domain[domain] = per_crit
         aux_sources_by_domain[domain] = aux
 
+    # Per-field metric merge for ahrefs_batch_analysis (2026-06-07).
+    # Two-stage workflow the user runs in practice: Job A fetches `domain_
+    # rating` only (cheap), filters survivors by DR; Job B then fetches
+    # `refdomains_dofollow`+`backlinks_dofollow` for the survivors only
+    # (saves Ahrefs credits). Each batch run autopins its own job, but
+    # `aux_sources_by_domain['ahrefs_batch_analysis']` above only carries
+    # ONE pin (the most-recent), so Job A's DR vanished as soon as Job B
+    # was pinned — Database row showed RD/BL but no DR.
+    #
+    # Fix: collect ALL job-pinned batch CRs per domain (one per job, the
+    # autopinned latest run of each), preload their CRs, and let
+    # `_to_domain_row` do a per-field merge (newest non-null wins). The
+    # existing `aux_sources` single-source path stays as the navigation
+    # anchor (tooltip + chip link target) and as the no-pin fallback —
+    # only batch_metrics' VALUE derivation changes.
+    #
+    # User-locked scope choice (2026-06-07): "pinned CRs only" — the
+    # merge does NOT include un-pinned older runs. Within a single
+    # batch job, only the latest (auto-pinned) run contributes; to keep
+    # both halves of a two-stage workflow visible, the user creates one
+    # job per field-subset batch.
+    batch_pinned_rds_by_domain: dict[str, list[RunDomain]] = {}
+    for domain, domain_rds in rds_by_domain.items():
+        jobs_for_domain: set[int] = set()
+        for d in domain_rds:
+            r = runs.get(d.run_id)
+            if r is not None:
+                jobs_for_domain.add(r.job_id)
+        pinned_rds: list[RunDomain] = []
+        for jid in jobs_for_domain:
+            run_id = pins_by_job.get(jid, {}).get("ahrefs_batch_analysis")
+            if run_id is None:
+                continue
+            rd = rds_by_run_and_domain.get((run_id, domain))
+            if rd is None:
+                continue
+            pinned_rds.append(rd)
+            # Make sure this rd's CR lands in the about-to-be-built
+            # `crs_by_rd` index (the rd_ids_needed set drives that
+            # IN-list query). Without this, only the "best" pin's CR
+            # would be loaded and the merge would silently degrade to
+            # single-CR.
+            rd_ids_needed.add(rd.id)
+        if pinned_rds:
+            batch_pinned_rds_by_domain[domain] = pinned_rds
+
     # Single IN-list for every CriterionResult we'll surface — covers
     # exactly the rds resolved above.
     cr_rows: list[CriterionResult] = (
@@ -1398,28 +1444,74 @@ def _build_all_rows(
                 availability_checked_at = fallback.checked_at
                 availability_statuses_seen.add(fallback.status)
 
-        # Ahrefs batch-analysis metrics (2026-06-02) — sourced from the
-        # pinned ahrefs_batch_analysis CR's `data_json.metrics`. Pin-only
-        # (like whois): no fallback to unpinned/latest runs, so the chips
-        # reflect exactly the run the operator pinned.
+        # Ahrefs batch-analysis metrics — per-field merge across all
+        # job-pinned batch CRs for this domain (2026-06-07 rewrite, was
+        # single-CR read 2026-06-02). Walks `batch_pinned_rds_by_domain`
+        # (one rd per pinned job), sorts by run finished_at desc, and
+        # picks the newest non-null value for each metric field
+        # independently. Two-stage workflow this enables: Job A pinned
+        # with `domain_rating` only + Job B pinned with `refdomains_
+        # dofollow`+`backlinks_dofollow` only → row shows all three
+        # (instead of whichever job pinned last). Falls back to the
+        # existing single-source path (`aux_sources['ahrefs_batch_
+        # analysis']`) when no pins matched — covers both the no-pin
+        # fallback at line 830 and back-compat for the common one-job
+        # case (which carries through the same way as before because
+        # there's exactly one pinned CR to "merge").
         batch_metrics: dict[str, float | None] = {}
-        batch_src = aux_sources.get("ahrefs_batch_analysis")
-        batch_cr = (
-            crs_by_rd.get(batch_src[0].id, {}).get("ahrefs_batch_analysis")
-            if batch_src else None
-        )
-        if batch_cr is not None and batch_cr.data_json:
+        batch_pinned_pairs: list[tuple[CriterionResult, datetime]] = []
+        for rd in batch_pinned_rds_by_domain.get(domain, []):
+            cr = crs_by_rd.get(rd.id, {}).get("ahrefs_batch_analysis")
+            if cr is None or not cr.data_json:
+                continue
+            d_run = runs.get(rd.run_id)
+            if d_run is None:
+                continue
+            batch_pinned_pairs.append(
+                (cr, d_run.finished_at or datetime.min)
+            )
+        batch_pinned_pairs.sort(key=lambda p: p[1], reverse=True)
+        if not batch_pinned_pairs:
+            # No pinned batch CRs — fall back to the unpinned/most-recent
+            # CR surfaced into aux_sources at line 830. Same path as
+            # pre-2026-06-07, just expressed via the pair list so the
+            # merge loop below handles both cases uniformly.
+            batch_src = aux_sources.get("ahrefs_batch_analysis")
+            batch_cr = (
+                crs_by_rd.get(batch_src[0].id, {}).get("ahrefs_batch_analysis")
+                if batch_src else None
+            )
+            if batch_cr is not None and batch_cr.data_json:
+                fb_run = runs.get(batch_src[0].run_id) if batch_src else None
+                batch_pinned_pairs.append(
+                    (batch_cr, (fb_run.finished_at if fb_run else None) or datetime.min)
+                )
+        # Newest-non-null wins per field. A `null` in a newer CR does NOT
+        # override an older CR's non-null value — that's the whole point
+        # of the two-stage workflow (Job B's `domain_rating: null`
+        # mustn't clobber Job A's actual DR).
+        for cr, _stamp in batch_pinned_pairs:
             try:
-                batch_parsed = json.loads(batch_cr.data_json)
+                parsed = json.loads(cr.data_json)
             except json.JSONDecodeError:
-                batch_parsed = None
-            if isinstance(batch_parsed, dict):
-                m = batch_parsed.get("metrics")
-                if isinstance(m, dict):
-                    batch_metrics = {
-                        k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
-                        for k, v in m.items()
-                    }
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            m = parsed.get("metrics")
+            if not isinstance(m, dict):
+                continue
+            for k, v in m.items():
+                # Skip if a newer CR already produced a non-null value
+                # for this field.
+                if batch_metrics.get(k) is not None:
+                    continue
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    batch_metrics[k] = float(v)
+                elif k not in batch_metrics:
+                    # Remember the key was probed so the response carries
+                    # an explicit null instead of dropping the key. Mirrors
+                    # the original single-CR read's shape.
+                    batch_metrics[k] = None
 
         # Availability-only-taken hide rule (2026-06-02). A domain is a
         # hide candidate when its ONLY pillar data is an Availability JOB
