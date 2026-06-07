@@ -151,6 +151,13 @@ class ImportResult(BaseModel):
     # Distinct from duplicates so the user can tell "this was already in
     # the backlog" apart from "this is permanently banned".
     skipped_banned: int = 0
+    # Per-category counters for the Settings → Domain Filter exclusions
+    # (added 2026-06-07). Shape is `{category_key: count}` — today only
+    # `cctld` is populated. Designed so new categories (spam-keywords,
+    # banned-substrings, …) flow through with zero schema or UI churn:
+    # the frontend just iterates the dict and shows one line per non-
+    # zero entry. Empty dict when nothing was filtered.
+    skipped_filtered: dict[str, int] = {}
     # Subset of rejected-row diagnostics the UI surfaces ("row 12: bad
     # date"). Capped on the backend to keep the response small for huge
     # imports — UI shows the first ~20 with a "+N more" hint.
@@ -1250,6 +1257,28 @@ def import_rows(payload: ImportIn, db: Session = Depends(get_db)) -> ImportResul
         valid = [r for r in valid if r.domain not in banned_set]
     skipped_banned = len(banned_set)
 
+    # Domain Filter pre-filter (added 2026-06-07). Settings → Domain
+    # Filter holds a per-category exclusion list (today only `cctld`).
+    # Fetch the state ONCE here so the hot per-row loop below is just
+    # a string-split — even at the 10M-row cap the cost is negligible.
+    # Per-category counters bubble up in `skipped_filtered` so the
+    # UI can render "Skipped X by Country TLD" cleanly.
+    from ..app_settings import (
+        check_domain_filter,
+        get_domain_filter,
+    )
+    filter_state = get_domain_filter()
+    skipped_filtered: dict[str, int] = {}
+    if any(filter_state.get(k) for k in filter_state):
+        kept: list[ImportRowIn] = []
+        for r in valid:
+            excluded, cat = check_domain_filter(r.domain, filter_state)
+            if excluded and cat:
+                skipped_filtered[cat] = skipped_filtered.get(cat, 0) + 1
+            else:
+                kept.append(r)
+        valid = kept
+
     # One query to find which of the payload's domains are already in the
     # DB — vastly faster than per-row INSERT-with-IntegrityError-catch.
     domains = [r.domain for r in valid]
@@ -1282,13 +1311,19 @@ def import_rows(payload: ImportIn, db: Session = Depends(get_db)) -> ImportResul
         inserted += 1
     db.commit()
 
+    skipped_filtered_total = sum(skipped_filtered.values())
     skipped_invalid = (
-        len(payload.rows) - len(valid) - intra_payload_dupes - skipped_banned
+        len(payload.rows)
+        - len(valid)
+        - intra_payload_dupes
+        - skipped_banned
+        - skipped_filtered_total
     )
     return ImportResult(
         inserted=inserted,
         skipped_duplicates=intra_payload_dupes + db_dupes,
         skipped_invalid=skipped_invalid,
         skipped_banned=skipped_banned,
+        skipped_filtered=skipped_filtered,
         errors=errors,
     )

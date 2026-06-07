@@ -1936,6 +1936,22 @@ export const api = {
       { method: "POST", body: JSON.stringify({ items }) },
     ),
 
+  // --- Domain Filter (added 2026-06-07) ---
+  // Get the full state + the list of recognised categories. The
+  // categories array drives section order in the Settings UI; the
+  // frontend doesn't have to keep a duplicate list.
+  getDomainFilter: () =>
+    request<DomainFilterPayload>("/settings/domain-filter"),
+
+  // Whole-state replace. The state dict is normalised + sorted server-
+  // side (lowercased, leading dots stripped, deduped). Unknown category
+  // keys are silently dropped — only `categories` keys persist.
+  putDomainFilter: (state: DomainFilterState) =>
+    request<DomainFilterPayload>("/settings/domain-filter", {
+      method: "PUT",
+      body: JSON.stringify({ state }),
+    }),
+
   retryFailedRun: (
     runId: number,
     ai?: { provider?: string; model?: string },
@@ -2960,7 +2976,24 @@ export type BacklogImportResult = {
   // duplicates so the user can tell "already in backlog" apart from
   // "permanently banned".
   skipped_banned?: number;
+  // Per-category counters for the Settings → Domain Filter exclusions
+  // (added 2026-06-07). Shape is {category_key: count}; today only
+  // `cctld` ships, but the dict shape lets new categories surface
+  // automatically — the UI iterates whatever keys are present.
+  skipped_filtered?: Record<string, number>;
   errors: { row_index: number; message: string }[];
+};
+
+// Domain Filter (Settings → Domain Filter, added 2026-06-07). Schema is
+// a dict of category -> entries so new categories (spam-keywords,
+// banned-substrings, …) can ship by extending the backend's recognised
+// category list — the UI renders one section per `categories` entry
+// returned by the server.
+export type DomainFilterState = Record<string, string[]>;
+
+export type DomainFilterPayload = {
+  state: DomainFilterState;
+  categories: string[];
 };
 
 // ---- Backlog types ---------------------------------------------------------

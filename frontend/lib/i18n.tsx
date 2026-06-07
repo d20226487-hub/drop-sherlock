@@ -1054,6 +1054,8 @@ const messagesEn = {
           backlog_desired_price: "Desired price",
           backlog_max_price: "Max price",
           backlog_ahrefs_dr: "Ahrefs DR",
+          refdomains_dofollow: "Referring domains (follow)",
+          backlinks_dofollow: "Backlinks (follow)",
           backlog_domain_age_years: "Age (years)",
           final_score: "Ahrefs score",
           final_confidence: "Confidence",
@@ -1315,7 +1317,37 @@ const messagesEn = {
         wayback: "Wayback classification",
         availability: "Domain availability",
         whoisHistory: "Whois History",
+        domainFilter: "Domain Filter",
         others: "Others",
+      },
+      domainFilter: {
+        heading: "Domain Filter",
+        intro:
+          "Block domains from entering the backlog at import time. Today this filters country-level domains; more categories will land here over time.",
+        bulkOpen: "Bulk paste",
+        bulkClose: "Hide bulk paste",
+        bulkHint:
+          "One entry per line, or comma-separated. Whitespace and leading dots are ignored.",
+        bulkAdd: "Add to filter",
+        bulkAdding: "Adding…",
+        add: "Add",
+        adding: "Adding…",
+        empty: "No entries yet — domains are not filtered until you add some.",
+        clearAll: "Clear all",
+        confirmClear:
+          "Remove every entry from this category? This cannot be undone.",
+        noCategories: "No filter categories configured.",
+        removeAria: (v: string) => `Remove ${v}`,
+        fallbackBody:
+          "Domains matching any of these entries are skipped at backlog import.",
+        categories: {
+          cctld: {
+            title: "Country-level TLDs (ccTLD)",
+            body: "Excludes only domains whose TLD label matches AND that have exactly two labels — so `example.uk` is filtered, but `example.co.uk` and `bbc.co.uk` get through (open SLDs under ccTLDs stay registrable).",
+            placeholder: "uk, de, fr",
+            hint: "Just the TLD label (no leading dot). Lowercase. Press Enter to add.",
+          },
+        },
       },
       whoisHistory: {
         heading: "Whois History (drop detection)",
@@ -2393,6 +2425,10 @@ const messagesEn = {
             `Skipped ${n} duplicate${n === 1 ? "" : "s"} (already in backlog).`,
           skippedBanned: (n: number) =>
             `Skipped ${n} banned domain${n === 1 ? "" : "s"} (on the Ban List).`,
+          skippedFilteredCctld: (n: number) =>
+            `Skipped ${n} country-level domain${n === 1 ? "" : "s"} (Settings → Domain Filter).`,
+          skippedFilteredOther: (cat: string, n: number) =>
+            `Skipped ${n} domain${n === 1 ? "" : "s"} by filter "${cat}".`,
           skippedInvalid: (n: number) =>
             `Skipped ${n} invalid row${n === 1 ? "" : "s"}.`,
           errorsHeading: "Issues:",
@@ -3453,6 +3489,8 @@ const messagesRu: Messages = {
           backlog_desired_price: "Желаемая цена",
           backlog_max_price: "Макс. цена",
           backlog_ahrefs_dr: "Ahrefs DR",
+          refdomains_dofollow: "Ссылающиеся домены (follow)",
+          backlinks_dofollow: "Бэклинки (follow)",
           backlog_domain_age_years: "Возраст (лет)",
           final_score: "Ahrefs-балл",
           final_confidence: "Уверенность",
@@ -3738,7 +3776,37 @@ const messagesRu: Messages = {
         wayback: "Классификация Wayback",
         availability: "Доступность домена",
         whoisHistory: "История Whois",
+        domainFilter: "Фильтр доменов",
         others: "Прочее",
+      },
+      domainFilter: {
+        heading: "Фильтр доменов",
+        intro:
+          "Блокирует домены при импорте в очередь. Сейчас фильтруются страновые домены; со временем сюда добавятся другие категории.",
+        bulkOpen: "Массовая вставка",
+        bulkClose: "Скрыть вставку",
+        bulkHint:
+          "Одна запись на строку или через запятую. Пробелы и ведущие точки игнорируются.",
+        bulkAdd: "Добавить в фильтр",
+        bulkAdding: "Добавление…",
+        add: "Добавить",
+        adding: "Добавление…",
+        empty: "Пока пусто — домены не фильтруются, пока вы не добавите хотя бы одну запись.",
+        clearAll: "Очистить",
+        confirmClear:
+          "Удалить все записи в этой категории? Это действие необратимо.",
+        noCategories: "Категории фильтра не настроены.",
+        removeAria: (v: string) => `Удалить ${v}`,
+        fallbackBody:
+          "Домены, совпадающие с любой из записей, пропускаются при импорте в очередь.",
+        categories: {
+          cctld: {
+            title: "Страновые TLD (ccTLD)",
+            body: "Исключает только домены, у которых TLD из списка И ровно два уровня — `example.uk` будет отфильтрован, а `example.co.uk` и `bbc.co.uk` пройдут (открытые SLD под ccTLD остаются регистрируемыми).",
+            placeholder: "uk, de, fr",
+            hint: "Только метка TLD (без ведущей точки), в нижнем регистре. Enter — добавить.",
+          },
+        },
       },
       whoisHistory: {
         heading: "История Whois (выявление дропов)",
@@ -4833,6 +4901,10 @@ const messagesRu: Messages = {
           inserted: (n) => `Добавлено новых доменов: ${n}.`,
           skippedDupes: (n) => `Пропущено дубликатов (уже в очереди): ${n}.`,
           skippedBanned: (n) => `Пропущено забаненных доменов: ${n}.`,
+          skippedFilteredCctld: (n) =>
+            `Пропущено страновых доменов: ${n} (Настройки → Фильтр доменов).`,
+          skippedFilteredOther: (cat, n) =>
+            `Пропущено доменов фильтром «${cat}»: ${n}.`,
           skippedInvalid: (n) => `Пропущено некорректных строк: ${n}.`,
           errorsHeading: "Замечания:",
           moreErrors: (n) => `… и ещё ${n}`,

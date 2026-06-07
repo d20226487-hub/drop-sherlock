@@ -1306,6 +1306,165 @@ def set_import_max_rows(value: int) -> int:
     return value
 
 
+# --- Domain Filter (added 2026-06-07) -------------------------------------
+# User-managed exclusion list applied to /backlog/import. The state is a
+# dict of category -> list[str] so we can add new exclusion categories
+# (spam-keywords, banned-substrings, …) without touching the schema or
+# the API surface — frontends just render whichever categories are
+# present in the response.
+#
+# Today the only category is `cctld` — a list of TLD labels (e.g.
+# ["uk", "de", "fr"]). The match rule is intentionally narrow: a domain
+# is excluded ONLY when it has exactly TWO labels (`example.uk`) and the
+# last label is in the ccTLD list. Three-label names like `example.co.uk`
+# / `bbc.org.uk` are NOT excluded, because second-level SLDs under
+# ccTLDs (.co.uk, .org.uk, .com.au, .co.jp, …) are freely registrable
+# and the user explicitly wants them through. This avoids needing a
+# Public Suffix List dependency at the cost of allowing a handful of
+# exotic 2-label edge cases through; if that ever bites we'd revisit.
+DOMAIN_FILTER_KEY = "domain_filter"
+
+# Recognised category keys. The frontend renders a section per recognised
+# key; unknown keys in the stored dict are silently dropped on read so
+# stale entries from a removed category don't surface in the UI.
+DOMAIN_FILTER_CATEGORIES: tuple[str, ...] = ("cctld",)
+
+# Per-entry hard cap so a typo / paste of a giant blob doesn't blow up
+# the JSON column. List-length cap too, for the same reason. Both are
+# enforced at write time; reads silently truncate to be defensive.
+_DOMAIN_FILTER_ENTRY_MAX_LEN = 64
+_DOMAIN_FILTER_LIST_MAX_LEN = 5_000
+
+
+def _normalize_filter_entry(raw: object) -> str | None:
+    """Coerce a single user-entered filter value into the canonical
+    stored form: lowercase, no surrounding whitespace, no leading dot.
+    Returns None for empty / non-string / over-long inputs so the caller
+    can drop the row silently."""
+    if not isinstance(raw, str):
+        return None
+    v = raw.strip().lower()
+    if not v:
+        return None
+    # Strip a leading dot if the user typed ".uk" — store the bare label.
+    while v.startswith("."):
+        v = v[1:]
+    if not v:
+        return None
+    if len(v) > _DOMAIN_FILTER_ENTRY_MAX_LEN:
+        return None
+    # ccTLDs are letters/digits/hyphens only (RFC 1035 LDH). Reject
+    # anything that doesn't look like a label so we don't accept random
+    # strings that'd never match — including internal dots: the cctld
+    # match rule only inspects the final label, so storing `co.uk`
+    # would silently never match and confuse the user. Force them to
+    # store the bare TLD label.
+    for ch in v:
+        if not (ch.isalnum() or ch == "-"):
+            return None
+    return v
+
+
+def _normalize_filter_list(raw_list: object) -> list[str]:
+    """Validate + dedup (preserving first-seen order) + cap length."""
+    if not isinstance(raw_list, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in raw_list:
+        v = _normalize_filter_entry(item)
+        if v is None or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+        if len(out) >= _DOMAIN_FILTER_LIST_MAX_LEN:
+            break
+    out.sort()
+    return out
+
+
+def _normalize_filter_state(raw_state: object) -> dict[str, list[str]]:
+    """Coerce stored / submitted state into the canonical dict shape.
+    Always returns a key per recognised category (empty list when the
+    user hasn't populated it) so the frontend can render every section
+    without null-checks."""
+    out: dict[str, list[str]] = {cat: [] for cat in DOMAIN_FILTER_CATEGORIES}
+    if not isinstance(raw_state, dict):
+        return out
+    for cat in DOMAIN_FILTER_CATEGORIES:
+        if cat in raw_state:
+            out[cat] = _normalize_filter_list(raw_state[cat])
+    return out
+
+
+def get_domain_filter() -> dict[str, list[str]]:
+    """Current domain-filter state. Always returns a full dict keyed by
+    every recognised category — keys with no user entries map to []."""
+    db = SessionLocal()
+    try:
+        raw = _get(db, DOMAIN_FILTER_KEY) or ""
+    finally:
+        db.close()
+    if not raw:
+        return _normalize_filter_state(None)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return _normalize_filter_state(None)
+    return _normalize_filter_state(parsed)
+
+
+def set_domain_filter(state: dict) -> dict[str, list[str]]:
+    """Replace the entire filter state. Inputs are normalised + sorted.
+    Unknown category keys are silently dropped — only categories in
+    DOMAIN_FILTER_CATEGORIES are persisted."""
+    if not isinstance(state, dict):
+        raise ValueError(
+            "domain_filter state must be an object keyed by category name",
+        )
+    cleaned = _normalize_filter_state(state)
+    db = SessionLocal()
+    try:
+        _set(db, DOMAIN_FILTER_KEY, json.dumps(cleaned))
+    finally:
+        db.close()
+    return cleaned
+
+
+def check_domain_filter(
+    domain: str,
+    state: dict[str, list[str]] | None = None,
+) -> tuple[bool, str | None]:
+    """Return (excluded, category_key) for a single domain. Pure — takes
+    a pre-fetched state for hot loops, falls back to a DB read for
+    one-offs. Reuses the canonical 2-label rule for the `cctld`
+    category; future categories add their own branch here.
+
+    Match rule for `cctld`:
+      - `example.uk`     → 2 labels, last in list → excluded.
+      - `example.co.uk`  → 3 labels → NOT excluded (open SLD).
+      - `bbc.co.uk`      → 3 labels → NOT excluded.
+      - `example.com`    → 2 labels but `com` not in list → NOT excluded.
+    """
+    if not domain:
+        return False, None
+    s = state if state is not None else get_domain_filter()
+    cctlds = s.get("cctld") or []
+    if cctlds:
+        # Domain is already normalised by the time it reaches the
+        # import pipeline (lowercased, scheme/path/www stripped). Be
+        # defensive in case a future caller forgets.
+        dom = domain.strip().lower()
+        if dom.startswith("www."):
+            dom = dom[4:]
+        parts = dom.split(".")
+        if len(parts) == 2:
+            tld = parts[-1]
+            if tld in set(cctlds):
+                return True, "cctld"
+    return False, None
+
+
 # --- Availability cascade settings (added 2026-05-12) ---------------------
 # Flat key→value rows; all single-tab-managed in Settings → Domain
 # availability. Defaults match what an honest first user should expect:

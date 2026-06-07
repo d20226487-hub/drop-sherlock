@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from ..app_settings import (
     AI_PROVIDERS_FOR_MODELS,
     DEFAULT_SCORING_CONFIG,
+    DOMAIN_FILTER_CATEGORIES,
     PROVIDER_FIELDS,
     RATE_LIMIT_FIELDS,
     add_categories,
@@ -20,6 +21,7 @@ from ..app_settings import (
     get_ai_prompt,
     get_categories,
     get_classify_context_config,
+    get_domain_filter,
     get_known_models,
     get_language_mode,
     get_rate_limits,
@@ -32,6 +34,7 @@ from ..app_settings import (
     set_ai_prompt,
     set_categories,
     set_classify_context_config,
+    set_domain_filter,
     set_known_models,
     set_language_mode,
     set_provider_creds,
@@ -626,6 +629,41 @@ def add_categories_route(payload: CategoriesIn):
     merged = add_categories([i.model_dump() for i in payload.items])
     return {"categories": merged}
 
+
+# --- Domain Filter (added 2026-06-07) -------------------------------------
+# User-managed exclusion list applied at /backlog/import. Schema is a
+# dict of category -> list[str] so future categories (spam-keywords,
+# banned-substrings, …) ship by extending DOMAIN_FILTER_CATEGORIES in
+# app_settings — no router / migration changes needed.
+
+class DomainFilterIn(BaseModel):
+    # `state` is the whole dict the user wants persisted. Keys not in
+    # DOMAIN_FILTER_CATEGORIES are silently dropped server-side, so a
+    # stale category from an older frontend can't pollute the store.
+    state: dict[str, list[str]]
+
+
+@router.get("/domain-filter")
+def get_domain_filter_route():
+    """Return current filter state + the list of recognised categories.
+    The categories array drives the Settings UI section ordering; the
+    frontend doesn't have to keep a duplicate list in sync."""
+    return {
+        "state": get_domain_filter(),
+        "categories": list(DOMAIN_FILTER_CATEGORIES),
+    }
+
+
+@router.put("/domain-filter")
+def set_domain_filter_route(payload: DomainFilterIn):
+    try:
+        cleaned = set_domain_filter(payload.state)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "state": cleaned,
+        "categories": list(DOMAIN_FILTER_CATEGORIES),
+    }
 
 
 # --- Availability cascade settings (added 2026-05-12) ---------------------

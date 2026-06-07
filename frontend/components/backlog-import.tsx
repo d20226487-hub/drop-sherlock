@@ -563,6 +563,19 @@ export function BacklogImport({
                   {ts.result.skippedBanned(result.skipped_banned ?? 0)}
                 </li>
               )}
+              {result.skipped_filtered &&
+                Object.entries(result.skipped_filtered)
+                  .filter(([, n]) => n > 0)
+                  .map(([cat, n]) => (
+                    <li
+                      key={cat}
+                      className="text-violet-700 dark:text-violet-400"
+                    >
+                      {cat === "cctld"
+                        ? ts.result.skippedFilteredCctld(n)
+                        : ts.result.skippedFilteredOther(cat, n)}
+                    </li>
+                  ))}
               {result.skipped_invalid > 0 && (
                 <li className="text-amber-700 dark:text-amber-400">
                   {ts.result.skippedInvalid(result.skipped_invalid)}

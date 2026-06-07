@@ -16,6 +16,7 @@ import { BackupsEditor } from "@/components/backups-editor";
 import { ImportLimitEditor } from "@/components/import-limit-editor";
 import { AvailabilityEditor } from "@/components/availability-editor";
 import { WhoisHistoryEditor } from "@/components/whois-history-editor";
+import { DomainFilterEditor } from "@/components/domain-filter-editor";
 
 type SettingsTab =
   | "api"
@@ -23,6 +24,7 @@ type SettingsTab =
   | "wayback"
   | "availability"
   | "whoisHistory"
+  | "domainFilter"
   | "others";
 
 const TABS: SettingsTab[] = [
@@ -34,6 +36,11 @@ const TABS: SettingsTab[] = [
   // pillar. Lives between Availability and Others so the order matches
   // the pipeline pillars on the nav (Availability → Whois → Quality).
   "whoisHistory",
+  // 2026-06-07: Domain Filter — multi-category exclusion list applied at
+  // /backlog/import. Today only ccTLDs; designed to grow with more
+  // categories (spam-keywords, banned-substrings, …) without touching
+  // the schema or this enum.
+  "domainFilter",
   "others",
 ];
 
@@ -231,6 +238,17 @@ export default function SettingsPage() {
           {tab === "whoisHistory" && (
             <div className="space-y-8">
               <WhoisHistoryEditor />
+            </div>
+          )}
+
+          {tab === "domainFilter" && (
+            <div className="space-y-8">
+              <section className="space-y-4">
+                <h2 className="text-lg font-semibold">
+                  {ts.domainFilter.heading}
+                </h2>
+                <DomainFilterEditor />
+              </section>
             </div>
           )}
 
