@@ -1173,6 +1173,11 @@ export default function DatabasePage() {
     primary_theme: true,
     final_score: true,
     backlog_ahrefs_dr: true,
+    // Ahrefs batch-analysis link metrics (added 2026-06-07). DR / RD(f) /
+    // B are the three procurement signals an approver looks at together,
+    // so they default on whenever DR does.
+    refdomains_dofollow: true,
+    backlinks_dofollow: true,
     backlog_domain_age_years: true,
     backlog_desired_price: true,
     backlog_max_price: true,
@@ -1284,7 +1289,32 @@ export default function DatabasePage() {
           },
         },
         { key: "final_score", header: "ahrefs_score", get: (r) => r?.final_score ?? "" },
-        { key: "backlog_ahrefs_dr", header: "ahrefs_dr", get: (r) => r?.backlog_ahrefs_dr ?? "" },
+        {
+          key: "backlog_ahrefs_dr",
+          header: "ahrefs_dr",
+          // Mirror the Database row's DR chip policy (2026-06-02):
+          // prefer the pinned Ahrefs Batch Analysis `domain_rating`,
+          // fall back to the import-time `backlog_ahrefs_dr`. Without
+          // this fallback the export came out blank for every domain
+          // whose DR is only known from the batch run (the common
+          // case — the user rarely types DR into the import CSV).
+          get: (r) => r?.batch_metrics?.domain_rating ?? r?.backlog_ahrefs_dr ?? "",
+        },
+        // RD(f) / B come only from the pinned Ahrefs Batch Analysis CR
+        // (no import-time fallback exists; backlog CSVs don't carry
+        // these). Empty when the domain has no batch-analysis pin.
+        // Same field IDs the Database chip uses (page.tsx:2969-2970),
+        // so the CSV value matches the chip number 1:1.
+        {
+          key: "refdomains_dofollow",
+          header: "refdomains_dofollow",
+          get: (r) => r?.batch_metrics?.refdomains_dofollow ?? "",
+        },
+        {
+          key: "backlinks_dofollow",
+          header: "backlinks_dofollow",
+          get: (r) => r?.batch_metrics?.backlinks_dofollow ?? "",
+        },
         { key: "backlog_domain_age_years", header: "age_years", get: (r) => r?.backlog_domain_age_years ?? "" },
         { key: "backlog_desired_price", header: "desired_price", get: (r) => r?.backlog_desired_price ?? "" },
         { key: "backlog_max_price", header: "max_price", get: (r) => r?.backlog_max_price ?? "" },
@@ -2508,6 +2538,11 @@ export default function DatabasePage() {
                     { key: "share_url", locked: true },
                     { key: "final_score", locked: false },
                     { key: "backlog_ahrefs_dr", locked: false },
+                    // RD(f) / B sit next to DR so the picker order and
+                    // CSV column order both group the three Ahrefs link
+                    // metrics together. Defaults on (procurement signals).
+                    { key: "refdomains_dofollow", locked: false },
+                    { key: "backlinks_dofollow", locked: false },
                     { key: "backlog_domain_age_years", locked: false },
                     { key: "backlog_desired_price", locked: false },
                     { key: "backlog_max_price", locked: false },

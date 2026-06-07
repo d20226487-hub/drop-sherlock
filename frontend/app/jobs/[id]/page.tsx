@@ -222,7 +222,17 @@ export default function JobDetailPage({
   // Per-pillar back link (Wave 1, 2026-05-15) — point the user back at
   // the list page that matches THIS job's kind, not the legacy /jobs
   // path. Fallback to 'quality' for any row whose kind didn't backfill.
-  const backHref = `/jobs/${job.kind || "quality"}`;
+  //
+  // 2026-06-07 fix: `job.kind` is the backend enum value (snake_case —
+  // `ahrefs_batch_analysis`, `whois_history`), but Next.js static
+  // segments are hyphenated (`ahrefs-batch-analysis`, `whois-history`).
+  // The raw `${kind}` URL 404'd silently — user pressed Back from a
+  // finished Ahrefs Batch Analysis job and saw a "page does not load"
+  // not-found render. Convert underscores to hyphens to match the
+  // route filenames. Quality / availability are single-word so the
+  // replace is a no-op for them.
+  const kindSlug = (job.kind || "quality").replace(/_/g, "-");
+  const backHref = `/jobs/${kindSlug}`;
 
   return (
     <div className="space-y-6">
