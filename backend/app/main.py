@@ -186,6 +186,38 @@ def _migrate_sqlite_columns() -> None:
         # (`_resolve_share_target_rd`), the bulk-delete-by-domain path
         # on /database, and the Backlog `analyzed_links` join.
         ("ix_run_domains_domain", "run_domains", "domain"),
+        # Added 2026-06-08 (perf audit). `runs.job_id` is a foreign key,
+        # but SQLite does NOT auto-index FK child columns. The job→domain
+        # union (jobs.py get_job prefill), per-job export, and the
+        # job-scoped run rollups join run_domains→runs filtered by
+        # `runs.job_id`; with no index the planner SCANS the whole
+        # run_domains table (EXPLAIN showed "SCAN rd") instead of seeking
+        # the job's runs. With this index it drives from runs →
+        # ix_run_domains_run_id. Cheap: runs is a small table.
+        ("ix_runs_job_id", "runs", "job_id"),
+        # Added 2026-06-08 (perf audit). These two composites existed ONLY
+        # on the production DB (created out-of-band via manual SQL) and
+        # were never reproduced by this migration — so a fresh deploy or a
+        # backup-restore would silently drop them and regress the cache
+        # lookup + availability "latest check" queries back to slow plans.
+        # Codified here so they're reproducible. `IF NOT EXISTS` makes this
+        # a no-op on a DB that already has them.
+        #
+        #   • criterion_results(run_domain_id, criterion) — the per-job
+        #     cache lookup (cache.py lookup_cached_data / _verdict) enters
+        #     via run_domains.domain then seeks CRs by (run_domain_id,
+        #     criterion); EXPLAIN confirms it uses this index. It makes the
+        #     single-column ix_criterion_results_run_domain_id redundant,
+        #     but that one is left in place (harmless).
+        #   • availability_checks(domain, checked_at DESC) — the
+        #     "most-recent check per domain" lookups (cascade cache +
+        #     Database/Backlog availability hydration) want the newest row
+        #     for a domain; the DESC composite serves the ORDER BY ... LIMIT
+        #     directly instead of sorting.
+        ("ix_criterion_results_rd_crit", "criterion_results",
+         "run_domain_id, criterion"),
+        ("ix_availability_checks_domain_checked_at", "availability_checks",
+         "domain, checked_at DESC"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in additions:
