@@ -2031,7 +2031,7 @@ export default function DatabasePage() {
                 setMaxPriceMin(Number.isFinite(v) && v > 0 ? v : 0);
               }}
               aria-label={ts.filters.maxPriceMinAria}
-              className="w-20 min-w-0 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-xs font-mono outline-none focus:ring-1 focus:ring-blue-500/40"
+              className="w-20 min-w-0 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-xs font-mono outline-none focus:ring-1 focus:ring-blue-500/40 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
             />
             <span className="text-xs text-neutral-400 dark:text-neutral-500 shrink-0">
               –
@@ -2048,7 +2048,7 @@ export default function DatabasePage() {
                 setMaxPriceMax(Number.isFinite(v) && v > 0 ? v : 0);
               }}
               aria-label={ts.filters.maxPriceMaxAria}
-              className="w-20 min-w-0 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-xs font-mono outline-none focus:ring-1 focus:ring-blue-500/40"
+              className="w-20 min-w-0 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-xs font-mono outline-none focus:ring-1 focus:ring-blue-500/40 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
             />
             {(maxPriceMin > 0 || maxPriceMax > 0) && (
               <button

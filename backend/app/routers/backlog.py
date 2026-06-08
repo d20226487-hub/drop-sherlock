@@ -878,13 +878,15 @@ def export_csv(
 
 # Statuses that DON'T trigger the "X were analyzed; mark them?" hint.
 # `analyzed` is obvious; `discarded` means the user has actively dismissed
-# the domain so don't nag about it.
+# the domain so don't nag about it. `question` is likewise an active
+# triage decision — the operator has already looked and flagged it.
 _ANALYZED_HINT_EXCLUDED = (
     "analyzed",
     "order",
     "backordered",
     "bought",
     "discarded",
+    "question",
 )
 
 

@@ -1013,6 +1013,9 @@ const messagesEn = {
         discard: "Discard",
         discardHint:
           "Mark this domain as discarded. Updates the matching backlog row, or creates one if the domain isn't in Backlog yet.",
+        question: "Question",
+        questionHint:
+          "Flag this domain with a question (needs clarification before deciding). Updates the matching backlog row, or creates one if the domain isn't in Backlog yet.",
         currentStatus: (label: string) => `Current: ${label}`,
         notInBacklog: "not in Backlog",
         saving: "Saving…",
@@ -2287,6 +2290,7 @@ const messagesEn = {
         backordered: "Ordered",
         bought: "Bought",
         discarded: "Discarded",
+        question: "Question",
         banned: "Banned",
       },
       filters: {
@@ -3442,6 +3446,9 @@ const messagesRu: Messages = {
         discard: "Отбросить",
         discardHint:
           "Отметить домен как отброшенный. Обновит соответствующую строку в Очереди или создаст новую, если домена там нет.",
+        question: "Вопрос",
+        questionHint:
+          "Пометить домен как «вопрос» (требует уточнения перед решением). Обновит соответствующую строку в Очереди или создаст новую, если домена там нет.",
         currentStatus: (label) => `Сейчас: ${label}`,
         notInBacklog: "не в Очереди",
         saving: "Сохранение…",
@@ -4752,6 +4759,7 @@ const messagesRu: Messages = {
         backordered: "Заказан",
         bought: "Куплен",
         discarded: "Отброшен",
+        question: "Вопрос",
         banned: "Забанен",
       },
       filters: {

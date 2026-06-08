@@ -3006,6 +3006,7 @@ export type BacklogStatus =
   | "backordered"
   | "bought"
   | "discarded"
+  | "question"
   | "banned";
 
 export const BACKLOG_STATUSES: BacklogStatus[] = [
@@ -3016,6 +3017,7 @@ export const BACKLOG_STATUSES: BacklogStatus[] = [
   "backordered",
   "bought",
   "discarded",
+  "question",
   "banned",
 ];
 

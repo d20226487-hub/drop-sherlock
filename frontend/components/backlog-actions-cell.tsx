@@ -21,6 +21,8 @@ const STATUS_TONE: Record<BacklogStatus, string> = {
     "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200 font-semibold",
   discarded:
     "bg-neutral-200 text-neutral-500 dark:bg-neutral-800/60 dark:text-neutral-500 line-through",
+  question:
+    "bg-cyan-50 text-cyan-700 dark:bg-cyan-950/40 dark:text-cyan-300",
   banned:
     "bg-rose-100 text-rose-800 dark:bg-rose-950/40 dark:text-rose-300 line-through font-medium",
 };
@@ -85,6 +87,15 @@ export function BacklogActionsCell({
           className="px-2 py-0.5 rounded border border-neutral-300 dark:border-neutral-700 text-neutral-600 dark:text-neutral-400 hover:bg-neutral-50 dark:hover:bg-neutral-800 disabled:opacity-50"
         >
           {busy === "discarded" ? ts.saving : ts.discard}
+        </button>
+        <button
+          type="button"
+          onClick={() => setStatus("question")}
+          disabled={busy !== null}
+          title={ts.questionHint}
+          className="px-2 py-0.5 rounded border border-cyan-300 dark:border-cyan-700 text-cyan-700 dark:text-cyan-300 hover:bg-cyan-50 dark:hover:bg-cyan-950/40 disabled:opacity-50"
+        >
+          {busy === "question" ? ts.saving : ts.question}
         </button>
       </div>
       {backlogStatus ? (

@@ -55,6 +55,10 @@ class DomainNote(Base):
 #   analyzed      — analysis done, decision pending
 #   order         — queued for purchase (we want to buy this; order not
 #                   yet placed). Set by Database page "Order" action.
+#   question      — flagged for follow-up: the operator has a question /
+#                   needs clarification before deciding. Set by the
+#                   Database page "Question" action. Non-terminal — the
+#                   user resolves it to order/discarded later.
 #   backordered   — order placed (registrar drop-catch / auction bid /
 #                   manual purchase pending settlement). Manual flip from
 #                   the Backlog page row.
@@ -75,6 +79,7 @@ BACKLOG_STATUSES = (
     "backordered",
     "bought",
     "discarded",
+    "question",
     "banned",
 )
 
