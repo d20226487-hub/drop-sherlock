@@ -106,6 +106,7 @@ export type AvailabilitySettings = {
   availability__rdap__enabled: string;
   availability__domainr__enabled: string;
   availability__whois__enabled: string;
+  availability__whoisfreaks__enabled: string;
   availability__cascade_order: string;
   availability__dns__rps: string;
   availability__dns__max_concurrent: string;
@@ -115,6 +116,8 @@ export type AvailabilitySettings = {
   availability__domainr__max_concurrent: string;
   availability__whois__rps: string;
   availability__whois__max_concurrent: string;
+  availability__whoisfreaks__rps: string;
+  availability__whoisfreaks__max_concurrent: string;
   availability__domainr__api_key: string;
   availability__domainr__api_key__set: boolean;
   availability__cache_ttl_hours: string;
@@ -2271,6 +2274,12 @@ export const api = {
     if (opts.expiry_to) params.set("expiry_to", opts.expiry_to);
     if (opts.availability && opts.availability.length)
       params.set("availability", opts.availability.join(","));
+    if (opts.max_price_min && opts.max_price_min > 0)
+      params.set("max_price_min", String(opts.max_price_min));
+    if (opts.max_price_max && opts.max_price_max > 0)
+      params.set("max_price_max", String(opts.max_price_max));
+    if (opts.notes && opts.notes !== "any")
+      params.set("notes", opts.notes);
     if (opts.sort) {
       params.set("sort", opts.sort);
       if (opts.direction) params.set("direction", opts.direction);
@@ -2303,6 +2312,9 @@ export const api = {
     expiry_from?: string;
     expiry_to?: string;
     availability?: string[];
+    max_price_min?: number;
+    max_price_max?: number;
+    notes?: string;
   }) =>
     request<{ deleted: number }>(`/backlog/bulk-delete-filtered`, {
       method: "POST",
@@ -2319,6 +2331,9 @@ export const api = {
         availability: filters.availability?.length
           ? filters.availability.join(",")
           : null,
+        max_price_min: filters.max_price_min || 0,
+        max_price_max: filters.max_price_max || 0,
+        notes: filters.notes || "any",
       }),
     }),
 
@@ -2343,6 +2358,9 @@ export const api = {
           expiry_from?: string;
           expiry_to?: string;
           availability?: string[];
+          max_price_min?: number;
+          max_price_max?: number;
+          notes?: string;
         },
   ) => {
     if (payload.scope === "ids") {
@@ -2373,6 +2391,9 @@ export const api = {
         availability: payload.availability?.length
           ? payload.availability.join(",")
           : null,
+        max_price_min: payload.max_price_min || 0,
+        max_price_max: payload.max_price_max || 0,
+        notes: payload.notes || "any",
       }),
     });
   },
@@ -2388,6 +2409,9 @@ export const api = {
       expiry_from?: string;
       expiry_to?: string;
       availability?: string[];
+      max_price_min?: number;
+      max_price_max?: number;
+      notes?: string;
     },
   ) =>
     request<{ updated: number }>(`/backlog/bulk-status-filtered`, {
@@ -2405,6 +2429,9 @@ export const api = {
         availability: filters.availability?.length
           ? filters.availability.join(",")
           : null,
+        max_price_min: filters.max_price_min || 0,
+        max_price_max: filters.max_price_max || 0,
+        notes: filters.notes || "any",
       }),
     }),
 
@@ -3072,6 +3099,12 @@ export type BacklogListOpts = {
   // "available"/"registered"/"unknown"/"error" plus the "__none__"
   // sentinel for "domain has never been checked". Empty = no filter.
   availability?: string[];
+  // Max-price range filter (added 2026-06-08, mirrors the Database page).
+  // USD bounds on BacklogDomain.max_price; 0 = no bound on that side.
+  max_price_min?: number;
+  max_price_max?: number;
+  // Notes filter on the backlog Comments column: "any" | "with" | "without".
+  notes?: string;
   sort?: BacklogSortColumn;
   direction?: BacklogSortDirection;
   // Pass false on page navigation to skip the heavy total/registrars

@@ -1,17 +1,30 @@
-"""Domainr (via RapidAPI Basic tier) — optional commercial backup
-for TLDs RDAP doesn't reach.
+"""Domainr via Fastly's Domain Research API — optional commercial backup
+for TLDs RDAP doesn't reach (e.g. ccTLDs like .kz).
 
-Endpoint: GET https://domainr.p.rapidapi.com/v2/status?domain=<d>
-Auth: X-RapidAPI-Key + X-RapidAPI-Host headers.
+Switched from the RapidAPI flavor to Fastly-native on 2026-06-08: Domainr
+is a Fastly product, and the operator authenticates with a Fastly API
+token (created in the Fastly control panel), not a RapidAPI key.
 
-Returns a `summary` like "active" (registered), "undelegated" (no
-nameservers, often available), "inactive" (registered but not in DNS
-yet), "marketed" (for-sale), "parked", "tld" (the TLD root), etc.
+Endpoint: GET https://api.fastly.com/domain-management/v1/tools/status?domain=<d>
+Auth:     Fastly-Key: <fastly_api_token>  (standard Fastly API auth header)
+Docs:     https://docs.fastly.com/products/domain-research-api
+          https://www.fastly.com/documentation/reference/api/domain-management/domain-research/
 
-Mapping to our taxonomy:
-  - 'active' / 'inactive' / 'parked' / 'marketed' → registered
-  - 'undelegated' / 'unknown' (NXDOMAIN-equivalent) → available
-  - Anything else → unknown (let cascade continue)
+The Domain Research API product must be enabled on the Fastly account, and
+the token needs at least read access (global:read is sufficient — status
+is a GET). A precise check is the default; pass scope=estimate for a
+cheaper, less-accurate result (we use precise — buy decisions need it).
+
+Response JSON (single object): {domain, status, tags, zone, scope, offers}.
+`status` is a SPACE-DELIMITED list of status tokens in INCREASING order of
+precedence — the right-most token is the most important. Token meanings
+(per Domainr docs):
+  available : inactive, undelegated
+  taken     : active, parked, marketed, expiring, deleting, priced,
+              transferable, premium
+  blocked   : pending, disallowed, claimed, reserved, dpml, invalid
+              (can't be registered by us → treated as "not available")
+  n/a       : unknown, suffix, zone, tld → not decisive → cascade continues
 """
 from __future__ import annotations
 
@@ -34,16 +47,37 @@ from .common import (
 )
 
 
-DOMAINR_HOST = "domainr.p.rapidapi.com"
-DOMAINR_URL = f"https://{DOMAINR_HOST}/v2/status"
+# Fastly Domain Research API — status (availability) endpoint.
+DOMAINR_URL = "https://api.fastly.com/domain-management/v1/tools/status"
 
-_REGISTERED_SUMMARIES = frozenset({
-    "active", "inactive", "parked", "marketed", "reserved", "premium",
-    "deleting", "transferable", "disallowed", "expiring", "suffix",
+# Tokens that mean the domain can be registered right now.
+_AVAILABLE_STATUSES = frozenset({"inactive", "undelegated"})
+# Tokens that mean the domain is NOT available (taken/aftermarket, or
+# blocked by the registry/ICANN). We collapse "blocked" into registered
+# because the actionable answer for a drop hunter is the same: not free.
+_REGISTERED_STATUSES = frozenset({
+    "active", "parked", "marketed", "expiring", "deleting",
+    "priced", "transferable", "premium",
+    "pending", "disallowed", "claimed", "reserved", "dpml", "invalid",
 })
-_AVAILABLE_SUMMARIES = frozenset({
-    "undelegated", "available",
-})
+# "unknown" / "suffix" / "zone" / "tld" are not decisive → STATUS_UNKNOWN
+# so the cascade falls through to the next provider (e.g. port-43 WHOIS).
+
+
+def _resolve_status(status_str: str) -> str:
+    """Map Domainr's space-delimited `status` string to our taxonomy.
+
+    Honors Domainr precedence: the right-most token wins, so we scan from
+    the end and return on the first decisive (available/registered) token.
+    A status with only non-decisive tokens (unknown/suffix/zone/tld, or an
+    empty string) yields STATUS_UNKNOWN."""
+    tokens = status_str.lower().split()
+    for tok in reversed(tokens):
+        if tok in _AVAILABLE_STATUSES:
+            return STATUS_AVAILABLE
+        if tok in _REGISTERED_STATUSES:
+            return STATUS_REGISTERED
+    return STATUS_UNKNOWN
 
 
 async def check(domain: str, client: httpx.AsyncClient | None = None) -> ProviderResult:
@@ -54,7 +88,7 @@ async def check(domain: str, client: httpx.AsyncClient | None = None) -> Provide
             provider="domainr",
             status=STATUS_ERROR,
             latency_ms=0,
-            error_message="Domainr API key not configured",
+            error_message="Domainr (Fastly) API token not configured",
             error_category=ERR_CAT_DOMAINR,
         )
 
@@ -68,8 +102,8 @@ async def check(domain: str, client: httpx.AsyncClient | None = None) -> Provide
                 DOMAINR_URL,
                 params={"domain": domain},
                 headers={
-                    "X-RapidAPI-Key": api_key,
-                    "X-RapidAPI-Host": DOMAINR_HOST,
+                    "Fastly-Key": api_key,
+                    "Accept": "application/json",
                 },
             )
         except httpx.TimeoutException as e:
@@ -98,12 +132,17 @@ async def check(domain: str, client: httpx.AsyncClient | None = None) -> Provide
                 error_message="Domainr rate-limited / quota exhausted",
                 error_category=ERR_CAT_QUOTA,
             )
-        if r.status_code == 401 or r.status_code == 403:
+        if r.status_code in (401, 403):
+            # 401 = bad/expired token; 403 = token lacks access OR the
+            # Domain Research API product isn't enabled on the account.
             return ProviderResult(
                 provider="domainr",
                 status=STATUS_ERROR,
                 latency_ms=latency,
-                error_message=f"Domainr auth failed ({r.status_code})",
+                error_message=(
+                    f"Domainr (Fastly) auth failed ({r.status_code}) — check the "
+                    "Fastly API token and that the Domain Research API is enabled"
+                ),
                 error_category=ERR_CAT_DOMAINR,
             )
         if r.status_code != 200:
@@ -124,34 +163,37 @@ async def check(domain: str, client: httpx.AsyncClient | None = None) -> Provide
                 error_message=f"Domainr parse: {e}",
                 error_category=ERR_CAT_PARSE,
             )
-        # `status` is an array; we want the entry whose `domain` matches.
-        status_list = body.get("status") or []
-        summary = ""
-        for entry in status_list:
-            if isinstance(entry, dict) and entry.get("domain", "").lower() == domain.lower():
-                summary = (entry.get("summary") or "").lower()
-                break
-        if not summary and status_list and isinstance(status_list[0], dict):
-            summary = (status_list[0].get("summary") or "").lower()
-        if summary in _AVAILABLE_SUMMARIES:
+        # The status endpoint returns a single object. Be defensive: some
+        # Fastly list-style endpoints wrap results in {"data": [...]}, so
+        # accept either shape and pull the matching domain's status.
+        record = body
+        if isinstance(body, dict) and "status" not in body:
+            data = body.get("data")
+            if isinstance(data, list):
+                record = next(
+                    (
+                        d for d in data
+                        if isinstance(d, dict)
+                        and str(d.get("domain", "")).lower() == domain.lower()
+                    ),
+                    data[0] if data and isinstance(data[0], dict) else {},
+                )
+        status_str = ""
+        if isinstance(record, dict):
+            status_str = str(record.get("status") or "")
+        resolved = _resolve_status(status_str)
+        if resolved == STATUS_UNKNOWN:
             return ProviderResult(
                 provider="domainr",
-                status=STATUS_AVAILABLE,
+                status=STATUS_UNKNOWN,
                 latency_ms=latency,
-                raw_response=json.dumps(body)[:4000],
-            )
-        if summary in _REGISTERED_SUMMARIES:
-            return ProviderResult(
-                provider="domainr",
-                status=STATUS_REGISTERED,
-                latency_ms=latency,
+                error_message=f"Domainr status not actionable: {status_str or '<empty>'}",
                 raw_response=json.dumps(body)[:4000],
             )
         return ProviderResult(
             provider="domainr",
-            status=STATUS_UNKNOWN,
+            status=resolved,
             latency_ms=latency,
-            error_message=f"Domainr summary not actionable: {summary or '<empty>'}",
             raw_response=json.dumps(body)[:4000],
         )
     finally:

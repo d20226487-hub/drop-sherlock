@@ -235,11 +235,24 @@ def _apply_backlog_filters(
     expiry_from: date | None = None,
     expiry_to: date | None = None,
     availability_statuses: list[str] | None = None,
+    max_price_min: float = 0.0,
+    max_price_max: float = 0.0,
+    notes: str = "any",
 ):
     """Compose the standard set of filters onto a BacklogDomain query.
     Used by every endpoint that scopes by user-chosen filters (list,
     export, bulk-status-filtered, send-to-analyze) so a new filter only
-    needs to be added in one place."""
+    needs to be added in one place.
+
+    `max_price_min` / `max_price_max` (added 2026-06-08, mirrors the
+    Database page's price filter): an inclusive USD range on
+    `BacklogDomain.max_price`. 0 on a side = no bound there. Rows with a
+    NULL max_price are excluded as soon as either bound is set — NULL
+    can't satisfy a numeric comparison.
+
+    `notes` ('any'|'with'|'without', added 2026-06-08): filters on the
+    Backlog row's own `comments` field (the note column shown on the
+    page). 'with' = comments non-empty; 'without' = empty/NULL."""
     if search and search.strip():
         # Search now spans domain + project + comments (2026-05-18).
         # All three columns get the same case-insensitive substring
@@ -384,6 +397,34 @@ def _apply_backlog_filters(
             conds.append(latest_any_row.c.any_dom.is_(None))
         if conds:
             q = q.filter(or_(*conds))
+    # Max-price range (mirrors Database). NULL max_price excluded once a
+    # bound is set.
+    if max_price_min and max_price_min > 0:
+        q = q.filter(
+            BacklogDomain.max_price.isnot(None),
+            BacklogDomain.max_price >= max_price_min,
+        )
+    if max_price_max and max_price_max > 0:
+        q = q.filter(
+            BacklogDomain.max_price.isnot(None),
+            BacklogDomain.max_price <= max_price_max,
+        )
+    # Notes filter on the Backlog row's own `comments` column. `comments`
+    # defaults to "" (not NULL) but we defend against NULL too.
+    if notes == "with":
+        from sqlalchemy import func
+        q = q.filter(
+            BacklogDomain.comments.isnot(None),
+            func.trim(BacklogDomain.comments) != "",
+        )
+    elif notes == "without":
+        from sqlalchemy import func, or_ as _or
+        q = q.filter(
+            _or(
+                BacklogDomain.comments.is_(None),
+                func.trim(BacklogDomain.comments) == "",
+            )
+        )
     return q
 
 
@@ -515,6 +556,9 @@ def _filter_cache_key(
     expiry_from: date | None,
     expiry_to: date | None,
     availability_statuses: list[str] | None,
+    max_price_min: float = 0.0,
+    max_price_max: float = 0.0,
+    notes: str = "any",
 ) -> str:
     """Stable hash of the filter args — same filters across requests hit
     the same cache entry. Lists are sorted so option order doesn't
@@ -526,6 +570,9 @@ def _filter_cache_key(
         expiry_from.isoformat() if expiry_from else None,
         expiry_to.isoformat() if expiry_to else None,
         sorted(availability_statuses) if availability_statuses else None,
+        max_price_min or 0.0,
+        max_price_max or 0.0,
+        notes or "any",
     ]
     return "filtered:" + hashlib.sha1(
         repr(parts).encode("utf-8")
@@ -544,6 +591,9 @@ def list_backlog(
     expiry_from: date | None = None,
     expiry_to: date | None = None,
     availability: str | None = None,
+    max_price_min: float = 0.0,
+    max_price_max: float = 0.0,
+    notes: str = "any",
     sort: str | None = None,
     direction: str | None = None,
     # When false, the response skips `total` (full-table count) and
@@ -581,6 +631,9 @@ def list_backlog(
         expiry_from=expiry_from,
         expiry_to=expiry_to,
         availability_statuses=availability_statuses,
+        max_price_min=max_price_min,
+        max_price_max=max_price_max,
+        notes=notes,
     )
 
     filtered_key = _filter_cache_key(
@@ -590,6 +643,9 @@ def list_backlog(
         expiry_from=expiry_from,
         expiry_to=expiry_to,
         availability_statuses=availability_statuses,
+        max_price_min=max_price_min,
+        max_price_max=max_price_max,
+        notes=notes,
     )
     filtered_total = _cached_count(filtered_key, lambda: q.count())
 
@@ -657,6 +713,9 @@ async def _list_backlog_route(
     expiry_from: date | None = None,
     expiry_to: date | None = None,
     availability: str | None = None,
+    max_price_min: float = 0.0,
+    max_price_max: float = 0.0,
+    notes: str = "any",
     sort: str | None = None,
     direction: str | None = None,
     include_options: bool = Query(True),
@@ -675,6 +734,9 @@ async def _list_backlog_route(
         expiry_from,
         expiry_to,
         availability,
+        max_price_min,
+        max_price_max,
+        notes,
         sort,
         direction,
         include_options,
@@ -690,6 +752,9 @@ def _run_list_backlog(
     expiry_from: date | None,
     expiry_to: date | None,
     availability: str | None,
+    max_price_min: float,
+    max_price_max: float,
+    notes: str,
     sort: str | None,
     direction: str | None,
     include_options: bool,
@@ -705,6 +770,9 @@ def _run_list_backlog(
             expiry_from=expiry_from,
             expiry_to=expiry_to,
             availability=availability,
+            max_price_min=max_price_min,
+            max_price_max=max_price_max,
+            notes=notes,
             sort=sort,
             direction=direction,
             include_options=include_options,
@@ -845,6 +913,9 @@ def export_csv(
     expiry_from: date | None = None,
     expiry_to: date | None = None,
     availability: str | None = None,
+    max_price_min: float = 0.0,
+    max_price_max: float = 0.0,
+    notes: str = "any",
     sort: str | None = None,
     direction: str | None = None,
     db: Session = Depends(get_db),
@@ -864,6 +935,9 @@ def export_csv(
             expiry_from=expiry_from,
             expiry_to=expiry_to,
             availability_statuses=_parse_availability_csv(availability),
+            max_price_min=max_price_min,
+            max_price_max=max_price_max,
+            notes=notes,
         )
     q = _apply_sort(q, sort, direction)
 
@@ -956,6 +1030,9 @@ class BulkStatusFilteredIn(BaseModel):
     expiry_from: date | None = None
     expiry_to: date | None = None
     availability: str | None = None
+    max_price_min: float = 0.0
+    max_price_max: float = 0.0
+    notes: str = "any"
 
 
 class SendToAnalyzeIn(BaseModel):
@@ -973,6 +1050,9 @@ class SendToAnalyzeIn(BaseModel):
     expiry_from: date | None = None
     expiry_to: date | None = None
     availability: str | None = None
+    max_price_min: float = 0.0
+    max_price_max: float = 0.0
+    notes: str = "any"
 
 
 @router.post("/send-to-analyze")
@@ -992,6 +1072,9 @@ def send_to_analyze(
             expiry_from=payload.expiry_from,
             expiry_to=payload.expiry_to,
             availability_statuses=_parse_availability_csv(payload.availability),
+            max_price_min=payload.max_price_min,
+            max_price_max=payload.max_price_max,
+            notes=payload.notes,
         )
 
     # Pull just the domain strings + ids — no need for full rows.
@@ -1062,6 +1145,9 @@ def bulk_status_filtered(
         expiry_from=payload.expiry_from,
         expiry_to=payload.expiry_to,
         availability_statuses=_parse_availability_csv(payload.availability),
+        max_price_min=payload.max_price_min,
+        max_price_max=payload.max_price_max,
+        notes=payload.notes,
     )
 
     # Chunked update — keyset-paginated by id, committed per chunk so the
@@ -1110,6 +1196,9 @@ class BulkDeleteFilteredIn(BaseModel):
     expiry_from: date | None = None
     expiry_to: date | None = None
     availability: str | None = None
+    max_price_min: float = 0.0
+    max_price_max: float = 0.0
+    notes: str = "any"
 
 
 @router.post("/bulk-delete-filtered")
@@ -1124,6 +1213,9 @@ def bulk_delete_filtered(
         expiry_from=payload.expiry_from,
         expiry_to=payload.expiry_to,
         availability_statuses=_parse_availability_csv(payload.availability),
+        max_price_min=payload.max_price_min,
+        max_price_max=payload.max_price_max,
+        notes=payload.notes,
     )
     # Chunked delete by primary-key cursor — same pattern as
     # bulk_status_filtered. As each chunk commits, the matching set

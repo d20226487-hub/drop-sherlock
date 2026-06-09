@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api, AvailabilitySettings } from "@/lib/api";
 import { useT } from "@/lib/i18n";
 
-const PROVIDERS = ["dns", "rdap", "domainr", "whois"] as const;
+const PROVIDERS = ["dns", "rdap", "domainr", "whois", "whoisfreaks"] as const;
 type Provider = (typeof PROVIDERS)[number];
 
 export function AvailabilityEditor() {
@@ -343,7 +343,7 @@ function ApiKeyEditor({
         type="password"
         value={v}
         onChange={(e) => setV(e.target.value)}
-        placeholder="X-RapidAPI-Key…"
+        placeholder="Fastly API token…"
         className="flex-1 max-w-md px-2 py-1 text-sm rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 font-mono"
       />
       <button

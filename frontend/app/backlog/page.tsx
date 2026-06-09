@@ -23,6 +23,8 @@ import {
 
 const PER_PAGE_OPTIONS = [20, 50, 100];
 
+type NotesFilter = "any" | "with" | "without";
+
 export default function BacklogPage() {
   const { t } = useT();
   const ts = t.pages.backlog;
@@ -38,6 +40,13 @@ export default function BacklogPage() {
   // "__none__" matches domains that have never had an availability
   // check. Server-side resolved via the `availability` query param.
   const [availabilityFilter, setAvailabilityFilter] = useState<string[]>([]);
+  // Max-price range filter (added 2026-06-08, mirrors the Database page).
+  // Both independent USD numbers; 0/NaN = "no bound on that side". Rows
+  // without a max_price are excluded server-side when either bound is set.
+  const [maxPriceMin, setMaxPriceMin] = useState<number>(0);
+  const [maxPriceMax, setMaxPriceMax] = useState<number>(0);
+  // Notes filter (added 2026-06-08) on the backlog row's Comments column.
+  const [notesFilter, setNotesFilter] = useState<NotesFilter>("any");
   // Initial search seed (2026-05-17 B5 fix): read `?search=` from the
   // URL on mount so the Database → Backlog status-pill link can land
   // the user on a pre-filtered view. Uses window.location (vs.
@@ -152,6 +161,9 @@ export default function BacklogPage() {
       if (expiryTo) params.set("expiry_to", expiryTo);
       if (availabilityFilter.length)
         params.set("availability", availabilityFilter.join(","));
+      if (maxPriceMin > 0) params.set("max_price_min", String(maxPriceMin));
+      if (maxPriceMax > 0) params.set("max_price_max", String(maxPriceMax));
+      if (notesFilter !== "any") params.set("notes", notesFilter);
     }
     if (sortCol) {
       params.set("sort", sortCol);
@@ -192,6 +204,9 @@ export default function BacklogPage() {
     expiryFrom,
     expiryTo,
     availabilityFilter,
+    maxPriceMin,
+    maxPriceMax,
+    notesFilter,
     search,
     perPage,
     sortCol,
@@ -245,6 +260,9 @@ export default function BacklogPage() {
         availability: availabilityFilter.length
           ? availabilityFilter
           : undefined,
+        max_price_min: maxPriceMin > 0 ? maxPriceMin : undefined,
+        max_price_max: maxPriceMax > 0 ? maxPriceMax : undefined,
+        notes: notesFilter !== "any" ? notesFilter : undefined,
         sort: sortCol || undefined,
         direction: sortCol ? sortDir : undefined,
         include_options: includeOptions,
@@ -305,6 +323,9 @@ export default function BacklogPage() {
       expiryFrom,
       expiryTo,
       availabilityFilter,
+      maxPriceMin,
+      maxPriceMax,
+      notesFilter,
       search,
       sortCol,
       sortDir,
@@ -335,6 +356,9 @@ export default function BacklogPage() {
     expiryFrom,
     expiryTo,
     availabilityFilter,
+    maxPriceMin,
+    maxPriceMax,
+    notesFilter,
     search,
     sortCol,
     sortDir,
@@ -346,6 +370,9 @@ export default function BacklogPage() {
     setExpiryFrom("");
     setExpiryTo("");
     setAvailabilityFilter([]);
+    setMaxPriceMin(0);
+    setMaxPriceMax(0);
+    setNotesFilter("any");
     setSearch("");
   }
 
@@ -355,6 +382,9 @@ export default function BacklogPage() {
     !!expiryFrom ||
     !!expiryTo ||
     availabilityFilter.length > 0 ||
+    maxPriceMin > 0 ||
+    maxPriceMax > 0 ||
+    notesFilter !== "any" ||
     search.trim().length > 0;
 
   // --- Selection helpers --------------------------------------------------
@@ -462,6 +492,9 @@ export default function BacklogPage() {
               availability: availabilityFilter.length
                 ? availabilityFilter
                 : undefined,
+              max_price_min: maxPriceMin > 0 ? maxPriceMin : undefined,
+              max_price_max: maxPriceMax > 0 ? maxPriceMax : undefined,
+              notes: notesFilter !== "any" ? notesFilter : undefined,
             });
       if (r.count === 0) return;
       sessionStorage.setItem(
@@ -501,6 +534,9 @@ export default function BacklogPage() {
         availability: availabilityFilter.length
           ? availabilityFilter
           : undefined,
+        max_price_min: maxPriceMin > 0 ? maxPriceMin : undefined,
+        max_price_max: maxPriceMax > 0 ? maxPriceMax : undefined,
+        notes: notesFilter !== "any" ? notesFilter : undefined,
       });
       setSelected(new Set());
       reload({ silent: true, refreshOptions: true });
@@ -570,6 +606,9 @@ export default function BacklogPage() {
         availability: availabilityFilter.length
           ? availabilityFilter
           : undefined,
+        max_price_min: maxPriceMin > 0 ? maxPriceMin : undefined,
+        max_price_max: maxPriceMax > 0 ? maxPriceMax : undefined,
+        notes: notesFilter !== "any" ? notesFilter : undefined,
       });
       setSelected(new Set());
       reload({ silent: true, refreshOptions: true });
@@ -754,6 +793,79 @@ export default function BacklogPage() {
               onChange={(e) => setExpiryTo(e.target.value)}
               className="bg-transparent outline-none w-full text-sm"
             />
+          </label>
+          {/* Max-price range (added 2026-06-08, mirrors the Database page).
+              Both bounds independent; 0 = no bound. Native number-spinner
+              arrows hidden via the appearance utilities. */}
+          <div
+            className="flex items-center gap-2 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 min-w-0"
+            title={ts.filters.maxPriceMaxHelp}
+          >
+            <span className="text-xs text-neutral-500 dark:text-neutral-400 shrink-0">
+              {ts.filters.maxPriceRange}
+            </span>
+            <span className="text-xs text-neutral-400 dark:text-neutral-500 shrink-0">
+              $
+            </span>
+            <input
+              type="number"
+              inputMode="decimal"
+              min={0}
+              step="any"
+              placeholder={ts.filters.maxPriceMinPlaceholder}
+              value={maxPriceMin || ""}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setMaxPriceMin(Number.isFinite(v) && v > 0 ? v : 0);
+              }}
+              aria-label={ts.filters.maxPriceMinAria}
+              className="w-16 min-w-0 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-xs font-mono outline-none focus:ring-1 focus:ring-blue-500/40 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+            />
+            <span className="text-xs text-neutral-400 dark:text-neutral-500 shrink-0">
+              –
+            </span>
+            <input
+              type="number"
+              inputMode="decimal"
+              min={0}
+              step="any"
+              placeholder={ts.filters.maxPriceMaxPlaceholder}
+              value={maxPriceMax || ""}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setMaxPriceMax(Number.isFinite(v) && v > 0 ? v : 0);
+              }}
+              aria-label={ts.filters.maxPriceMaxAria}
+              className="w-16 min-w-0 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-xs font-mono outline-none focus:ring-1 focus:ring-blue-500/40 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+            />
+            {(maxPriceMin > 0 || maxPriceMax > 0) && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMaxPriceMin(0);
+                  setMaxPriceMax(0);
+                }}
+                aria-label={ts.filters.maxPriceClearAria}
+                className="text-xs text-neutral-400 hover:text-rose-600 dark:hover:text-rose-400 leading-none px-0.5 shrink-0"
+              >
+                ×
+              </button>
+            )}
+          </div>
+          {/* Notes filter (added 2026-06-08) on the row's Comments column. */}
+          <label className="flex items-center gap-2 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5">
+            <span className="text-xs text-neutral-500 dark:text-neutral-400 shrink-0">
+              {ts.filters.notesLabel}
+            </span>
+            <select
+              value={notesFilter}
+              onChange={(e) => setNotesFilter(e.target.value as NotesFilter)}
+              className="bg-white dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100 outline-none w-full text-sm"
+            >
+              <option value="any">{ts.filters.notesAny}</option>
+              <option value="with">{ts.filters.notesWith}</option>
+              <option value="without">{ts.filters.notesWithout}</option>
+            </select>
           </label>
         </div>
       </section>

@@ -33,6 +33,7 @@ ERR_CAT_DNS = "dns"
 ERR_CAT_RDAP = "rdap"
 ERR_CAT_DOMAINR = "domainr"
 ERR_CAT_WHOIS = "whois"
+ERR_CAT_WHOISFREAKS = "whoisfreaks"
 ERR_CAT_NETWORK = "network"
 ERR_CAT_QUOTA = "quota"
 ERR_CAT_PARSE = "parse"
@@ -41,7 +42,7 @@ ERR_CAT_PARSE = "parse"
 @dataclass
 class ProviderResult:
     """One provider's verdict on one domain check."""
-    provider: str  # 'dns' | 'rdap' | 'domainr' | 'whois'
+    provider: str  # 'dns' | 'rdap' | 'domainr' | 'whois' | 'whoisfreaks'
     status: str  # one of STATUS_*
     latency_ms: int = 0
     registrar: str = ""

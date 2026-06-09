@@ -974,9 +974,17 @@ def reset_share_defaults() -> dict:
 #   - CR.status='done' + verdict.status='error' + verdict.provider NOT in
 #     retry_providers → SKIP (operator opted out — usually to avoid
 #     burning paid Domainr units on a flaky run)
+# Canonical availability-cascade provider names — single source of truth so
+# the cascade order, per-provider enabled/rate-limit getters, the setting
+# validators, and the auto-retry whitelist all stay in lockstep. Adding a
+# provider = add it here + a dispatch branch in cascade.py + its defaults in
+# AVAILABILITY_DEFAULTS. 'whoisfreaks' added 2026-06-08 (live-WHOIS
+# availability via the Whois History key; paid, off by default).
+AVAILABILITY_PROVIDER_NAMES = ("dns", "rdap", "domainr", "whois", "whoisfreaks")
+
 _AVAILABILITY_AUTO_RETRY_KEY = "availability_auto_retry_config"
 # Valid retry_providers entries — matches the cascade's provider names.
-_AVAILABILITY_RETRY_PROVIDERS = ("dns", "rdap", "domainr", "whois")
+_AVAILABILITY_RETRY_PROVIDERS = AVAILABILITY_PROVIDER_NAMES
 DEFAULT_AVAILABILITY_AUTO_RETRY = {
     "enabled": True,
     # Conservative default: 2 attempts (vs Wayback's 3). Availability
@@ -1475,9 +1483,13 @@ AVAILABILITY_DEFAULTS: dict[str, str] = {
     "availability__rdap__enabled":        "true",
     "availability__domainr__enabled":     "false",
     "availability__whois__enabled":       "false",
+    # WhoisFreaks live-WHOIS availability (added 2026-06-08). Off by
+    # default — it's paid/metered (1 credit per lookup) and reuses the
+    # Whois History API key. Opt-in for ccTLDs the cheaper providers miss.
+    "availability__whoisfreaks__enabled": "false",
     # User-orderable cascade. Comma-separated list of providers to try
     # in order. Providers not enabled are silently skipped at runtime.
-    "availability__cascade_order":        "dns,rdap,domainr,whois",
+    "availability__cascade_order":        "dns,rdap,domainr,whois,whoisfreaks",
     # Per-provider rate limits (req/s + max concurrent).
     "availability__dns__rps":             "20",
     "availability__dns__max_concurrent":  "10",
@@ -1487,8 +1499,11 @@ AVAILABILITY_DEFAULTS: dict[str, str] = {
     "availability__domainr__max_concurrent": "4",
     "availability__whois__rps":           "1",
     "availability__whois__max_concurrent": "2",
-    # Domainr (via RapidAPI) API key — Fernet-encrypted at rest via the
-    # __api_key suffix detection in `_set`.
+    # WhoisFreaks live-WHOIS rate limits — conservative; it's a paid API.
+    "availability__whoisfreaks__rps":           "1",
+    "availability__whoisfreaks__max_concurrent": "2",
+    # Domainr (Fastly Domain Research API) token — Fernet-encrypted at rest
+    # via the __api_key suffix detection in `_set`.
     "availability__domainr__api_key":     "",
     # Cache TTL hours — cascade returns the prior result if its
     # checked_at is within this window. 24h is a reasonable default;
@@ -1610,19 +1625,19 @@ def get_availability_cascade_order() -> list[str]:
     order: list[str] = []
     for p in raw.split(","):
         p = p.strip().lower()
-        if p in ("dns", "rdap", "domainr", "whois") and p not in seen:
+        if p in AVAILABILITY_PROVIDER_NAMES and p not in seen:
             order.append(p)
             seen.add(p)
     # Append any missing providers at the end so a malformed config
     # still reaches them. Order in defaults wins.
-    for p in ("dns", "rdap", "domainr", "whois"):
+    for p in AVAILABILITY_PROVIDER_NAMES:
         if p not in seen:
             order.append(p)
     return order
 
 
 def is_provider_enabled(provider: str) -> bool:
-    if provider not in ("dns", "rdap", "domainr", "whois"):
+    if provider not in AVAILABILITY_PROVIDER_NAMES:
         return False
     return _availability_bool(
         f"availability__{provider}__enabled",
@@ -1633,7 +1648,7 @@ def is_provider_enabled(provider: str) -> bool:
 def get_provider_rate_limits(provider: str) -> dict[str, int]:
     """Returns {rps, max_concurrent} for the named provider, clamped to
     the AVAILABILITY_RPS_CEILING regardless of stored value."""
-    if provider not in ("dns", "rdap", "domainr", "whois"):
+    if provider not in AVAILABILITY_PROVIDER_NAMES:
         return {"rps": 1, "max_concurrent": 1}
     rps = _availability_int(
         f"availability__{provider}__rps",
@@ -1749,7 +1764,7 @@ def set_availability_setting(key: str, value: str) -> None:
         cleaned = []
         for p in value.split(","):
             p = p.strip().lower()
-            if p in ("dns", "rdap", "domainr", "whois") and p not in cleaned:
+            if p in AVAILABILITY_PROVIDER_NAMES and p not in cleaned:
                 cleaned.append(p)
         if not cleaned:
             raise ValueError("cascade order needs at least one provider")

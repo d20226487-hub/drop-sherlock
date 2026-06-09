@@ -4,12 +4,13 @@
 // control: `retry_providers` — a checkbox set that gates WHICH
 // provider's terminal failure makes an RD eligible for auto-retry.
 //
-// Why the extra control: the cascade has 4 providers (DNS / RDAP /
-// Domainr / WHOIS) and they don't have the same cost / failure
-// semantics. RDAP is free + reliable; Domainr is metered/paid;
-// WHOIS port-43 is free but rate-limited and often the slowest. The
-// user opted for "default to RDAP only" so the feature is auto-on
-// without surprise Domainr bills. Adding domainr / whois is opt-in.
+// Why the extra control: the cascade has 5 providers (DNS / RDAP /
+// Domainr / WHOIS / WhoisFreaks) and they don't have the same cost /
+// failure semantics. RDAP is free + reliable; Domainr (Fastly) and
+// WhoisFreaks are metered/paid; WHOIS port-43 is free but rate-limited
+// and often the slowest. The user opted for "default to RDAP only" so
+// the feature is auto-on without surprise paid-provider bills. Adding
+// domainr / whois / whoisfreaks is opt-in.
 
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
@@ -48,8 +49,9 @@ function projected_schedule(cfg: AutoRetryCfg): string[] {
 const PROVIDER_NOTES: Record<string, string> = {
   dns: "Free + fast. Usually only errors on local resolver problems.",
   rdap: "Free. Default — RDAP rate-limit / timeout failures are the most common retry-worthy case.",
-  domainr: "Metered / paid. Enabling auto-retry here can quietly spike your Domainr bill on a flaky run.",
+  domainr: "Metered / paid (Fastly Domain Research API). Enabling auto-retry here can quietly spike your bill on a flaky run.",
   whois: "Free but rate-limited; WHOIS port-43 is often the slowest provider. Auto-retry can lengthen the loop noticeably.",
+  whoisfreaks: "Metered / paid (1 WhoisFreaks credit per lookup, shared with Whois History). Auto-retry can quietly burn credits on a flaky run.",
 };
 
 export function AvailabilityAutoRetryEditor() {

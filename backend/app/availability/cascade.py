@@ -27,6 +27,7 @@ from . import dns as dns_provider
 from . import domainr as domainr_provider
 from . import rdap as rdap_provider
 from . import whois as whois_provider
+from . import whoisfreaks as whoisfreaks_provider
 from .common import (
     ProviderResult,
     STATUS_AVAILABLE,
@@ -81,6 +82,8 @@ async def _call_provider(
             return await domainr_provider.check(domain, client=client)
         if provider == "whois":
             return await whois_provider.check(domain)
+        if provider == "whoisfreaks":
+            return await whoisfreaks_provider.check(domain, client=client)
         return ProviderResult(
             provider=provider, status=STATUS_ERROR,
             error_message=f"unknown provider: {provider}",

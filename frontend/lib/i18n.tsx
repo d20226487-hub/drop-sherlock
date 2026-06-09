@@ -1817,7 +1817,7 @@ const messagesEn = {
       settingsProvidersHeading: "Providers",
       settingsCascadeHeading: "Cascade order",
       settingsCascadeHint:
-        "Providers are tried in this order. Disabled providers are skipped at runtime. RDAP is the authoritative source for .com / .net / .org; Domainr (RapidAPI) is a paid sanity check; WHOIS is a final fallback for TLDs without RDAP.",
+        "Providers are tried in this order. Disabled providers are skipped at runtime. RDAP is the authoritative source for .com / .net / .org; Domainr (Fastly Domain Research API) is a paid sanity check; WHOIS is a free port-43 fallback for TLDs without RDAP; WhoisFreaks is a paid live-WHOIS fallback that reuses your Whois History API key (off by default — useful for ccTLDs like .kz).",
       settingsRateLimitsHeading: "Rate limits",
       settingsRateLimitsHint:
         "Hard ceiling: 10 req/sec per provider regardless of value below.",
@@ -1834,9 +1834,9 @@ const messagesEn = {
       settingsRetentionDaysHint: "0 = keep forever by age.",
       settingsPerDomainKeepLabel: "Keep per domain:",
       settingsPerDomainKeepHint: "0 = unlimited (within the age window).",
-      settingsApiKeyHeading: "Domainr API key (RapidAPI)",
+      settingsApiKeyHeading: "Domainr — Fastly API token",
       settingsApiKeyHint:
-        "Free Basic tier on RapidAPI gives 10,000 lookups/month. Encrypted at rest.",
+        "Domainr runs on Fastly's Domain Research API. Paste a Fastly API token (control panel → Account → API tokens); the Domain Research API product must be enabled and the token needs at least read access. Encrypted at rest.",
       settingsStatsHeading: "Usage this month",
       settingsRecentHeading: "Recent checks",
       // Error categories
@@ -2317,6 +2317,19 @@ const messagesEn = {
         availabilityUnknown: "unknown",
         availabilityError: "error",
         availabilityNeverChecked: "(never checked)",
+        // Max-price range + notes filters (added 2026-06-08, mirror Database).
+        maxPriceRange: "Max $",
+        maxPriceMaxHelp:
+          "Keep only rows whose Max price falls within this USD range. Leave either field blank for an open-ended bound. Rows with no Max price set are hidden once either bound is filled.",
+        maxPriceMinPlaceholder: "from",
+        maxPriceMaxPlaceholder: "to",
+        maxPriceMinAria: "Max price lower bound (USD)",
+        maxPriceMaxAria: "Max price upper bound (USD)",
+        maxPriceClearAria: "Clear Max price filter",
+        notesLabel: "Notes",
+        notesAny: "Any",
+        notesWith: "With comments",
+        notesWithout: "Without comments",
       },
       selectedCount: (n: number) =>
         `${n} domain${n === 1 ? "" : "s"} selected`,
@@ -4307,7 +4320,7 @@ const messagesRu: Messages = {
       settingsProvidersHeading: "Провайдеры",
       settingsCascadeHeading: "Порядок каскада",
       settingsCascadeHint:
-        "Провайдеры опрашиваются по очереди. Отключённые пропускаются. RDAP — авторитетный источник для .com / .net / .org; Domainr (RapidAPI) — платная подстраховка; WHOIS — последний резерв для TLD без RDAP.",
+        "Провайдеры опрашиваются по очереди. Отключённые пропускаются. RDAP — авторитетный источник для .com / .net / .org; Domainr (Fastly Domain Research API) — платная подстраховка; WHOIS — бесплатный резерв через порт 43 для TLD без RDAP; WhoisFreaks — платный резерв live-WHOIS, использует ключ из Whois History (по умолчанию выключен — полезен для ccTLD вроде .kz).",
       settingsRateLimitsHeading: "Лимиты",
       settingsRateLimitsHint:
         "Жёсткий потолок: 10 запросов/сек на провайдера независимо от значения ниже.",
@@ -4324,9 +4337,9 @@ const messagesRu: Messages = {
       settingsRetentionDaysHint: "0 = по возрасту не чистить.",
       settingsPerDomainKeepLabel: "На домен оставлять:",
       settingsPerDomainKeepHint: "0 = без лимита (в пределах окна по возрасту).",
-      settingsApiKeyHeading: "API-ключ Domainr (RapidAPI)",
+      settingsApiKeyHeading: "Domainr — токен Fastly API",
       settingsApiKeyHint:
-        "Бесплатный Basic-тариф на RapidAPI даёт 10 000 запросов/мес. Шифруется в БД.",
+        "Domainr работает через Fastly Domain Research API. Вставьте токен Fastly API (панель Fastly → Account → API tokens); продукт Domain Research API должен быть включён, токену нужен хотя бы доступ на чтение. Шифруется в БД.",
       settingsStatsHeading: "Использование в этом месяце",
       settingsRecentHeading: "Недавние проверки",
       errorCatDns: "DNS",
@@ -4783,6 +4796,19 @@ const messagesRu: Messages = {
         availabilityUnknown: "неизвестно",
         availabilityError: "ошибка",
         availabilityNeverChecked: "(не проверялся)",
+        // Фильтры по макс. цене и заметкам (2026-06-08, как на Database).
+        maxPriceRange: "Макс $",
+        maxPriceMaxHelp:
+          "Оставить только строки, чья Макс. цена попадает в диапазон (USD). Оставьте поле пустым для открытой границы. Строки без заданной Макс. цены скрываются, как только заполнена любая из границ.",
+        maxPriceMinPlaceholder: "от",
+        maxPriceMaxPlaceholder: "до",
+        maxPriceMinAria: "Нижняя граница Макс. цены (USD)",
+        maxPriceMaxAria: "Верхняя граница Макс. цены (USD)",
+        maxPriceClearAria: "Сбросить фильтр Макс. цены",
+        notesLabel: "Заметки",
+        notesAny: "Любые",
+        notesWith: "С комментариями",
+        notesWithout: "Без комментариев",
       },
       selectedCount: (n) => {
         const last2 = n % 100;
