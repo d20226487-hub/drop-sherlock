@@ -646,6 +646,51 @@ function CriteriaPills({ criteria }: { criteria: Record<string, string> }) {
   );
 }
 
+// Availability verdict chip for the Run table (availability runs only,
+// added 2026-06-08). Surfaces the cascade's per-domain verdict
+// (`availability_status`) so the operator sees free vs. taken at a glance
+// without opening each domain page. 'available' (what the user is hunting
+// for) is the loud green + bold; 'registered' (taken) is muted grey;
+// empty = no verdict yet → em-dash. Tones mirror the Backlog/Database
+// availability column.
+function AvailabilityVerdictChip({ status }: { status: string }) {
+  const { t } = useT();
+  const a = t.pages.availability;
+  if (!status) {
+    return <span className="text-neutral-400 dark:text-neutral-500">—</span>;
+  }
+  const tone =
+    status === "available"
+      ? "bg-emerald-100 text-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-200 font-semibold"
+      : status === "registered"
+        ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
+        : status === "not_supported"
+          ? "bg-violet-100 text-violet-900 dark:bg-violet-950/60 dark:text-violet-200"
+          : status === "error"
+            ? "bg-rose-100 text-rose-900 dark:bg-rose-950/60 dark:text-rose-200"
+            : "bg-neutral-100 text-neutral-600 dark:bg-neutral-800/60 dark:text-neutral-400";
+  const label =
+    status === "available"
+      ? a.statusAvailable
+      : status === "registered"
+        ? a.statusRegistered
+        : status === "not_supported"
+          ? a.statusNotSupported
+          : status === "error"
+            ? a.statusError
+            : status === "unknown"
+              ? a.statusUnknown
+              : status;
+  return (
+    <span
+      className={`inline-block text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${tone}`}
+      title={label}
+    >
+      {label}
+    </span>
+  );
+}
+
 // Color tone for an AI verdict status: "done" | "failed" | "pending" | undefined
 function aiVerdictTone(status: string | undefined): string {
   if (status === "done")
@@ -2450,6 +2495,9 @@ function DomainsSection({
           {(() => {
             const isQuality = jobKind === "quality";
             const isBatch = jobKind === "ahrefs_batch_analysis";
+            // Availability runs get a dedicated verdict column (free /
+            // taken) right after Status — added 2026-06-08.
+            const isAvailability = jobKind === "availability";
             // Resolve {id,label} for the run's selected metrics, in
             // canonical order. Drives the dynamic metric columns.
             const batchCols = isBatch
@@ -2471,6 +2519,11 @@ function DomainsSection({
                   </th>
                   <th className="px-3 py-2 font-medium">{ts.cols.domain}</th>
                   <th className="px-3 py-2 font-medium">{ts.cols.status}</th>
+                  {isAvailability && (
+                    <th className="px-3 py-2 font-medium">
+                      {ts.cols.availability}
+                    </th>
+                  )}
                   {isQuality && (
                     <>
                       <th className="px-3 py-2 font-medium">{ts.cols.criteria}</th>
@@ -2567,6 +2620,13 @@ function DomainsSection({
                           )}
                         </div>
                       </td>
+                      {isAvailability && (
+                        <td className="px-3 py-2">
+                          <AvailabilityVerdictChip
+                            status={d.availability_status ?? ""}
+                          />
+                        </td>
+                      )}
                       {batchCols.map((m) => (
                         <td
                           key={m.id}
