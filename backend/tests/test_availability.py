@@ -532,3 +532,69 @@ def test_reconcile_orphaned_running_run_domains(fresh_db):
     # Idempotent — second call flips nothing
     flipped2 = _reconcile_orphaned_running_run_domains()
     assert flipped2 == 0
+
+
+# --- Registrable-domain trimming for availability jobs (2026-06-21) ----------
+
+def test_registrable_domain_trims_urls_to_etld1(fresh_db):
+    """`registrable_domain` reduces URLs / hosts / subdomains to the eTLD+1
+    that an availability check is meaningful for, preserving private + ICANN
+    multilabel suffixes and falling back to the host for unresolvable
+    inputs."""
+    from app.availability.suffix import registrable_domain
+    cases = {
+        "example.com": "example.com",
+        "https://example.com/page?q=1": "example.com",
+        "http://www.example.com/": "example.com",
+        "WWW.Example.COM": "example.com",
+        "blog.example.com": "example.com",
+        "https://shop.example.co.uk/cart?x=1": "example.co.uk",
+        "a.b.example.co.uk": "example.co.uk",
+        "user:pass@example.com:8443/x": "example.com",
+        "example.com?utm=1": "example.com",          # query, no path
+        "jcg.us.com": "jcg.us.com",                  # private suffix kept whole
+        "www.example.com.ua": "example.com.ua",      # ICANN multilabel kept
+        "": "",
+        "   ": "",
+        "localhost": "localhost",                    # PSL None → host fallback
+        "127.0.0.1": "127.0.0.1",
+    }
+    for raw, expected in cases.items():
+        got = registrable_domain(raw)
+        assert got == expected, f"{raw!r} -> {got!r}, expected {expected!r}"
+
+
+def test_submit_availability_job_trims_and_dedupes(fresh_db, monkeypatch):
+    """The availability submit endpoint stores TRIMMED, DEDUPED registrable
+    domains as RunDomains — not the raw URLs/subdomains the operator pasted."""
+    import asyncio
+    from app.models import Run, RunDomain
+    from app.routers import analyze
+    from app.routers.analyze import (
+        SubmitAvailabilityIn,
+        submit_availability_job,
+    )
+
+    session = fresh_db
+    # Don't spawn the real runner/cascade from the test.
+    monkeypatch.setattr(analyze, "dispatch_run", lambda run_id: None)
+
+    payload = SubmitAvailabilityIn(domains=[
+        "https://example.com/page?a=1",
+        "http://www.example.com/",       # dup of example.com
+        "blog.example.com",              # dup (subdomain → example.com)
+        "shop.example.co.uk/cart",
+        "  EXAMPLE.com  ",               # dup (whitespace + case)
+        "",                              # dropped (empty)
+    ])
+    out = asyncio.run(submit_availability_job(payload, db=session))
+
+    stored = sorted(
+        rd.domain for rd in
+        session.query(RunDomain).filter_by(run_id=out.run_id).all()
+    )
+    assert stored == ["example.co.uk", "example.com"], stored
+    # And the persisted spec carries the same trimmed set.
+    run = session.get(Run, out.run_id)
+    spec_domains = sorted(json.loads(run.spec_json)["domains"])
+    assert spec_domains == ["example.co.uk", "example.com"]

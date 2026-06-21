@@ -387,31 +387,32 @@ async def submit_availability_job(
     RunDomains, then dispatch. Mirrors `submit_whois_history_job` but
     the spec enables only the `availability` criterion and carries no
     AI provider."""
-    from .backlog import _normalize_domain
     from ..ban_filter import filter_banned
+    from ..availability.suffix import registrable_domain
 
-    cleaned_domains = [d.strip() for d in payload.domains if d.strip()]
-    if not cleaned_domains:
+    # Trim each input (URL / host / bare domain) to its registrable domain
+    # (eTLD+1) so ONLY domains are checked — not URLs or non-registrable
+    # subdomains, which the registry RDAP/WHOIS would 404 as false
+    # `available` (added 2026-06-21). Dedupe so many URLs of one site
+    # collapse to a single check; preserve first-seen order.
+    domains: list[str] = []
+    seen: set[str] = set()
+    for raw in payload.domains:
+        d = registrable_domain(raw)
+        if d and d not in seen:
+            seen.add(d)
+            domains.append(d)
+    if not domains:
         raise HTTPException(400, "at least one domain is required")
 
-    # Ban-list pre-filter — same shape + envelope as Quality / Whois
-    # submits so the frontend's `all_banned` handler matches.
-    normalized_for_check = [_normalize_domain(d) for d in cleaned_domains]
-    pairs = list(zip(cleaned_domains, normalized_for_check))
-    _, banned_normalized = filter_banned(
-        db, [n for n in normalized_for_check if n],
-    )
-    if banned_normalized:
-        skipped_banned = [
-            original for original, norm in pairs
-            if norm and norm in banned_normalized
-        ]
-        cleaned_domains = [
-            original for original, norm in pairs
-            if not (norm and norm in banned_normalized)
-        ]
-        if not cleaned_domains:
-            sample = sorted(banned_normalized)
+    # Ban-list pre-filter on the trimmed domains — same envelope as Quality
+    # / Whois submits so the frontend's `all_banned` handler matches.
+    _, banned = filter_banned(db, domains)
+    if banned:
+        skipped_banned = [d for d in domains if d in banned]
+        domains = [d for d in domains if d not in banned]
+        if not domains:
+            sample = sorted(banned)
             SAMPLE_CAP = 10
             raise HTTPException(
                 400,
@@ -430,7 +431,7 @@ async def submit_availability_job(
     # decision (b)). The runner re-reads this and passes it to the
     # cascade; we set it here for downstream visibility too.
     spec_dict = {
-        "domains": cleaned_domains,
+        "domains": domains,
         "criteria": {
             "backlinks": {"enabled": False},
             "refdomains": {"enabled": False},
@@ -453,7 +454,7 @@ async def submit_availability_job(
     norm_spec = AnalyzeSpec.model_validate(spec_dict)
     spec_json = norm_spec.model_dump_json()
 
-    name = (payload.name or "").strip() or _autoname(cleaned_domains)
+    name = (payload.name or "").strip() or _autoname(domains)
     notes = (payload.notes or "").strip()
 
     job = Job(
@@ -468,7 +469,7 @@ async def submit_availability_job(
     run = Run(job_id=job.id, status="pending", spec_json=spec_json)
     db.add(run)
     db.flush()
-    for d in cleaned_domains:
+    for d in domains:
         db.add(RunDomain(run_id=run.id, domain=d, status="pending"))
     db.commit()
 
