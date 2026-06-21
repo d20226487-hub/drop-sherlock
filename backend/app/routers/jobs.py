@@ -1161,13 +1161,11 @@ def get_run(
         raise HTTPException(404, "run not found")
 
     from ..app_settings import get_scoring_config
-    from ..tasks import is_reanalyzing_run, is_reanalyzing_run_domain
+    from ..tasks import is_reanalyzing_run_domain
     from .database import _bucket_for, _parse_final_confidence, _parse_final_score
     sc = get_scoring_config()
     good_t = sc["good_threshold"]
     mixed_t = sc["mixed_threshold"]
-    # Run-level reanalyze applies to every RD in the run.
-    run_reanalyzing = is_reanalyzing_run(run.id)
 
     # Total + filtered counts via cheap SQL aggregations — never load
     # all rows just to count them.
@@ -1367,7 +1365,7 @@ def get_run(
                 ),
                 final_partial=partial,
                 is_pinned=bool(d.is_pinned),
-                reanalyzing=run_reanalyzing or is_reanalyzing_run_domain(d.id),
+                reanalyzing=is_reanalyzing_run_domain(d.id),
                 primary_language=wbc_primary_language,
                 secondary_languages=wbc_secondary_languages,
                 language_confidence=wbc_language_confidence,
@@ -1558,7 +1556,7 @@ def get_run_progress(
             status=d.status,
             criteria=criteria,
             ai_status=ai_status,
-            reanalyzing=run_reanalyzing or is_reanalyzing_run_domain(d.id),
+            reanalyzing=is_reanalyzing_run_domain(d.id),
             last_analyzed_at=d.last_analyzed_at,
             availability_status=availability_status,
         ))
@@ -1918,7 +1916,7 @@ def get_run_domain_detail(
                 final_source_job_id = src_run.job_id if src_run else None
                 break
 
-    from ..tasks import is_reanalyzing_run, is_reanalyzing_run_domain
+    from ..tasks import is_reanalyzing_run_domain
     # Surface the run's spec.ai so the reanalyze picker can default to it.
     spec_ai_provider = ""
     spec_ai_model = ""
@@ -2067,8 +2065,7 @@ def get_run_domain_detail(
         "augments_run_id": augments_run_id,
         "augments_run_domain_id": augments_run_domain_id,
         "augments_job_id": augments_job_id,
-        "reanalyzing": is_reanalyzing_run_domain(rd.id)
-        or is_reanalyzing_run(rd.run_id),
+        "reanalyzing": is_reanalyzing_run_domain(rd.id),
         "spec_ai_provider": spec_ai_provider,
         "spec_ai_model": spec_ai_model,
         "note": note_row.note if note_row else "",
