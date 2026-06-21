@@ -579,6 +579,12 @@ def test_whois_history_is_pin_only_on_database(fresh_db):
         job_id=job.id, criterion="whois_history", run_id=run.id,
     ))
     session.commit()
+    # The Phase-1 read populated the rows snapshot cache; this raw pin add
+    # bypasses the endpoints that patch it, so drop the snapshot to force a
+    # fresh build that reflects the new pin. (In the app, pin mutations patch
+    # the cache directly via _patch_domains_in_cache.)
+    from app.routers.database import _rows_cache
+    _rows_cache.clear()
     resp = list_domains(db=session)
     row = next(r for r in resp.rows if r.domain == "pin-test.example")
     assert row.whois_dropped_confidence == 0.85
