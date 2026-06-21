@@ -646,18 +646,28 @@ async def process_availability_run(run_id: int) -> None:
     # live-coroutine count stays at `concurrency` regardless of run size.
     # Share one httpx client across the whole run for keep-alive reuse.
     from .app_settings import get_availability_outer_concurrency
-    from .tasks import is_canceled
+    from .tasks import is_canceled, is_paused
     concurrency = get_availability_outer_concurrency()
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             for i in range(0, len(rd_ids), _AV_WRITE_BATCH_SIZE):
-                # Cancel/ownership check at every chunk boundary. The
-                # pre-batching main path couldn't be interrupted at all —
+                # Cancel / PAUSE / ownership check at every chunk boundary.
+                # The pre-batching main path couldn't be interrupted at all —
                 # it ran every domain to completion before re-checking
-                # ownership — so a Cancel on a 60k run did nothing visible
-                # until the end. Now a Cancel takes effect within one
-                # chunk.
-                if is_canceled(run_id) or not _still_owns():
+                # ownership — so a Cancel/Pause on a 60k run did nothing
+                # visible until the end. Now they take effect within one
+                # chunk (≤ chunk_size/concurrency × latency).
+                #
+                # PAUSE (2026-06-21 fix): `pause_run_now` sets run.status=
+                # 'paused' + the `_PAUSED_RUNS` flag and relies on the worker
+                # exiting on `is_paused`. The quality runner's per-domain loop
+                # already does this; this batched availability loop did NOT,
+                # so a paused availability run kept processing chunks to the
+                # end (observed on run 157). Returning here leaves the run
+                # 'paused' (we never reach the done-flip below); `resume_run_
+                # now` resets the still-non-terminal rows to pending and
+                # re-dispatches.
+                if is_canceled(run_id) or is_paused(run_id) or not _still_owns():
                     return
                 chunk = rd_ids[i : i + _AV_WRITE_BATCH_SIZE]
                 live = await asyncio.to_thread(_av_batch_start, chunk)

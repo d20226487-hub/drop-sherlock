@@ -454,6 +454,69 @@ def test_process_availability_run_batched(fresh_db, monkeypatch):
             assert bd is None, f"{d} (available) should not create a backlog row"
 
 
+def test_process_availability_run_honors_pause(fresh_db, monkeypatch):
+    """A paused availability run must STOP at the next chunk boundary.
+    Regression for the 2026-06-21 bug where the batched runner's chunk loop
+    checked is_canceled + ownership but NOT is_paused, so a paused run kept
+    processing every chunk to the end (observed on run 157). Here pause trips
+    after the first chunk; the remaining domains stay pending and the run is
+    NOT finalized as done."""
+    from app import availability_runner as runner_mod
+    from app import tasks
+    from app.app_settings import set_availability_setting
+    from app.availability.common import ProviderResult, STATUS_AVAILABLE
+    from app.models import Run, RunDomain
+
+    set_availability_setting("availability__dns__enabled", "false")
+    set_availability_setting("availability__rdap__enabled", "true")
+    set_availability_setting("availability__domainr__enabled", "false")
+    set_availability_setting("availability__whois__enabled", "false")
+    set_availability_setting("availability__whoisfreaks__enabled", "false")
+
+    monkeypatch.setattr(runner_mod, "_AV_WRITE_BATCH_SIZE", 2)
+    monkeypatch.setattr(
+        runner_mod, "schedule_availability_auto_retry", lambda run_id: None,
+    )
+
+    # is_paused: False on the 1st chunk-boundary guard, True after — so the
+    # first chunk (2 domains) runs, then the run pauses. (The runner imports
+    # is_paused from .tasks at call time, so patching tasks.is_paused works.)
+    calls = {"n": 0}
+
+    def fake_is_paused(run_id):
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    monkeypatch.setattr(tasks, "is_paused", fake_is_paused)
+
+    async def fake_rdap(domain, client=None):
+        return ProviderResult(provider="rdap", status=STATUS_AVAILABLE)
+
+    monkeypatch.setattr("app.availability.rdap.check", fake_rdap)
+
+    session = fresh_db
+    run = Run(job_id=0, status="pending", spec_json="{}")
+    session.add(run)
+    session.flush()
+    for i in range(6):
+        session.add(
+            RunDomain(run_id=run.id, domain=f"p{i}.com", status="pending"))
+    session.commit()
+
+    asyncio.run(runner_mod.process_availability_run(run.id))
+
+    session.expire_all()
+    done = session.query(RunDomain).filter_by(
+        run_id=run.id, status="done").count()
+    pending = session.query(RunDomain).filter_by(
+        run_id=run.id, status="pending").count()
+    assert done == 2, f"expected only the first chunk done, got {done}"
+    assert pending == 4, f"expected the rest still pending, got {pending}"
+    assert session.get(Run, run.id).status != "done", (
+        "a paused run must not be finalized as done"
+    )
+
+
 def test_reconcile_orphaned_running_run_domains(fresh_db):
     """B12 (2026-05-17): on startup, RDs stuck in status='running' with
     a terminal parent Run are zombie cascades from a uvicorn-restart-
