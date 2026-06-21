@@ -108,10 +108,17 @@ export type AvailabilitySettings = {
   availability__whois__enabled: string;
   availability__whoisfreaks__enabled: string;
   availability__cascade_order: string;
+  // How many domains the runner processes concurrently (2026-06-15). The
+  // hard ceiling on throughput; raise it once RDAP egress is spread over
+  // a proxy pool. Read at run dispatch.
+  availability__outer_concurrency: string;
   availability__dns__rps: string;
   availability__dns__max_concurrent: string;
   availability__rdap__rps: string;
   availability__rdap__max_concurrent: string;
+  // Newline/comma-separated RDAP egress proxy list (2026-06-15). Empty =
+  // direct. RDAP-only — WhoisFreaks always runs direct.
+  availability__rdap__proxies: string;
   availability__domainr__rps: string;
   availability__domainr__max_concurrent: string;
   availability__whois__rps: string;
@@ -307,6 +314,12 @@ export type CriteriaSpec = {
     sample_count: number;
     sample_strategy: "even" | "anchor";
     sample_path_mode: "mixed" | "root";
+    // AI judge prompt variant (added 2026-06-07). "white" = default
+    // white-niche prompt; "grey" = grey-niche prompt (adult/gambling).
+    // Mirrors WaybackConfig.variant on the backend (schemas.py); the
+    // backend Literal defaults to "white" for legacy specs missing the
+    // field, so older saved specs round-trip cleanly.
+    variant?: "white" | "grey";
   };
   // wayback_classify (added 2026-05-09): combined language + theme + auto-
   // chained category classification, derived from the wayback CR's V2
@@ -317,6 +330,13 @@ export type CriteriaSpec = {
   wayback_classify: {
     enabled: boolean;
     language_mode: "ai" | "library";
+    // Prompt variant (added 2026-06-07). Same shape as
+    // WaybackConfig.variant — backend Pydantic defaults to "white" for
+    // legacy specs missing the field, so older saved specs round-trip
+    // cleanly. Routes all three chained classify prompts (combined /
+    // theme_only / category) to the matching _white or _grey slot at
+    // judge time.
+    variant?: "white" | "grey";
   };
   // Ahrefs Batch Analysis pillar (2026-06-02). Optional — only present
   // on ahrefs_batch_analysis-kind specs. Carries the metric selection +
@@ -796,6 +816,13 @@ export type RunDetail = {
   domains: RunDomainProgress[];
   total_count?: number;
   filtered_count?: number;
+  // Run-wide aggregates (added 2026-06-14) for the server-paginated Run
+  // page (availability / ahrefs_batch_analysis). In server mode the page
+  // only holds the current page of domains, so it reads these instead of
+  // scanning the full set. All run-wide (ignore the page/filter window).
+  last_analyzed_at_max?: string | null;
+  failed_domains?: number;
+  failed_criteria?: number;
   // Per-run scoring override (added 2026-05-13 wave J). null = run uses
   // global Settings weights; non-null = the override last applied via
   // the /recompute-final endpoints. The Run-page "Score weights" panel
@@ -1578,6 +1605,9 @@ export const api = {
       // becomes its own `?availability_status_filter=` query param so
       // FastAPI parses them as a list.
       availabilityStatuses?: string[];
+      // Server-side domain substring search (2026-06-14) — keeps the
+      // polled window aligned with an active search on the page.
+      domainFilter?: string;
     },
   ) => {
     const qs = new URLSearchParams();
@@ -1587,6 +1617,7 @@ export const api = {
     for (const s of opts?.availabilityStatuses ?? []) {
       qs.append("availability_status_filter", s);
     }
+    if (opts?.domainFilter) qs.set("domain_filter", opts.domainFilter);
     const suffix = qs.toString();
     return request<RunProgress>(
       `/runs/${runId}/progress${suffix ? `?${suffix}` : ""}`,
@@ -2064,6 +2095,9 @@ export const api = {
       offset?: number;
       status?: string;
       availabilityStatuses?: string[];
+      // Server-side domain substring search (2026-06-14). Used by the
+      // server-paginated Run page so search spans the whole run.
+      domainFilter?: string;
     },
   ) => {
     const qs = new URLSearchParams();
@@ -2073,8 +2107,32 @@ export const api = {
     for (const s of opts?.availabilityStatuses ?? []) {
       qs.append("availability_status_filter", s);
     }
+    if (opts?.domainFilter) qs.set("domain_filter", opts.domainFilter);
     const suffix = qs.toString();
     return request<RunDetail>(`/runs/${runId}${suffix ? `?${suffix}` : ""}`);
+  },
+
+  // All RunDomain ids matching the given filters (2026-06-14). Powers
+  // "select all matching" on the server-paginated Run page — the page no
+  // longer has the full set in memory, so it asks the server for the ids.
+  getRunDomainIds: (
+    runId: number,
+    opts?: {
+      status?: string;
+      availabilityStatuses?: string[];
+      domainFilter?: string;
+    },
+  ) => {
+    const qs = new URLSearchParams();
+    if (opts?.status) qs.set("status_filter", opts.status);
+    for (const s of opts?.availabilityStatuses ?? []) {
+      qs.append("availability_status_filter", s);
+    }
+    if (opts?.domainFilter) qs.set("domain_filter", opts.domainFilter);
+    const suffix = qs.toString();
+    return request<{ ids: number[]; count: number }>(
+      `/runs/${runId}/domain-ids${suffix ? `?${suffix}` : ""}`,
+    );
   },
 
   getRunDomain: (runDomainId: number) =>
@@ -2796,6 +2854,13 @@ export function ahrefsBatchAnalysisCsvUrl(runId: number): string {
   return `${BASE}/runs/${runId}/ahrefs-batch-analysis.csv`;
 }
 
+// Absolute URL for an availability run's verdict CSV (streamed by the
+// backend) — server-side counterpart of the old client CSV, used once the
+// availability Run page paginates server-side.
+export function availabilityCsvUrl(runId: number): string {
+  return `${BASE}/runs/${runId}/availability.csv`;
+}
+
 export type WhoisHistoryTestResult =
   | {
       ok: true;
@@ -2992,6 +3057,12 @@ export type BacklogImportRow = {
   // Domain age in years (added 2026-05-20). Same storage-only
   // contract as ahrefs_dr.
   domain_age_years?: number | null;
+  // Ahrefs Rank (added 2026-06-14). Storage-only, mirrors ahrefs_dr;
+  // integer (rank #1 = strongest). Not displayed anywhere yet.
+  ahrefs_rank?: number | null;
+  // Dofollow referring domains (added 2026-06-18). Storage-only, mirrors
+  // ahrefs_rank; whole-number count captured at import.
+  dofollow_refdomains?: number | null;
 };
 
 export type BacklogImportResult = {

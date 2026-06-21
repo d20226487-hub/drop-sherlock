@@ -246,6 +246,13 @@ const messagesEn = {
           mixed: "Mixed — use whatever URL each chosen CDX row points at",
           root: "Root — always fetch the snapshot of /",
         },
+        // Grey-site toggle (added 2026-06-07). When ticked the AI judge
+        // for this Wayback run reads `prompt__wayback_grey` instead of
+        // `prompt__wayback_white`. Edit both prompts under Settings →
+        // Brain → Wayback judge → tabs.
+        greyToggleLabel: "Grey site (adult / gambling)",
+        greyToggleHelp:
+          "Use the grey-niche Wayback judge prompt for this run. Settings → Brain → Wayback judge → Grey to tune the prompt. Only affects Wayback Quality — other criteria keep their default prompt.",
       },
       waybackClassify: {
         title: "Language + theme + category",
@@ -265,6 +272,12 @@ const messagesEn = {
         },
         autoEnableNote:
           "On submit: Wayback + page-content sampling will be auto-enabled (this criterion needs the V2 samples to work).",
+        // Grey-site toggle (added 2026-06-07). Same shape as the Wayback
+        // Quality card's checkbox; routes all three chained CLS prompts
+        // to their _grey slots.
+        greyToggleLabel: "Grey site (adult / gambling)",
+        greyToggleHelp:
+          "Use the grey-niche CLS prompts for this run. Settings → Brain → CLS judges → Grey tabs to tune them. Affects combined / theme-only / category prompts together; other criteria unchanged.",
       },
       sortFields: {
         domain_rating_source: "DR (source domain)",
@@ -1648,6 +1661,10 @@ const messagesEn = {
           refdomains: "Referring domains judge",
           anchors: "Anchors judge",
           keywords: "Organic keywords judge",
+          // Legacy single-key label kept for back-compat with any old
+          // call-site; the new grouped editor uses `prompts.wayback.*`
+          // instead. Render path no longer hits this for the wayback
+          // slot (dispatch happens before the lookup).
           wayback: "Wayback history judge",
           wayback_classify_combined:
             "Wayback classify — combined language + theme (AI mode)",
@@ -1659,6 +1676,41 @@ const messagesEn = {
           final: "Ahrefs final assessment",
           localize_ru:
             "Russian output directive (appended to every prompt on RU runs)",
+        },
+        // Grouped White|Grey editor metadata (added 2026-06-07).
+        // Indexed by `metaKey` (see WHITE_GREY_DISPATCH in
+        // `prompt-editors.tsx`). Each entry drives one collapsible card
+        // with a tab strip. Adding a new white/grey prompt pair = add
+        // an entry here + en+ru.
+        whiteGreyMeta: {
+          wayback: {
+            heading: "Wayback history judge",
+            whiteLabel: "White",
+            greyLabel: "Grey",
+            help:
+              "White = default white-niche prompt (used unless the Quality run flagged Grey site). Grey = adult / gambling niches where some signals invert polarity. Switch tabs to edit each variant; saves are independent.",
+          },
+          classify_combined: {
+            heading: "CLS — combined language + theme judge (AI mode)",
+            whiteLabel: "White",
+            greyLabel: "Grey",
+            help:
+              "Used when CLS language mode = AI. Grey-niche themes (adult / gambling) have different vocabulary + acceptable-theme semantics. The Quality run's Grey-site checkbox flips ALL three CLS prompts together.",
+          },
+          classify_theme_only: {
+            heading: "CLS — theme-only judge (library language mode)",
+            whiteLabel: "White",
+            greyLabel: "Grey",
+            help:
+              "Used when CLS language mode = Library (lingua detects language deterministically; AI handles theme alone). Same Grey-site checkbox routes this prompt.",
+          },
+          category: {
+            heading: "CLS — category classification",
+            whiteLabel: "White",
+            greyLabel: "Grey",
+            help:
+              "Chained step that assigns the theme into one of your predefined Settings categories. Editing here doesn't change the category list itself — Settings → Brain → Wayback classification owns that.",
+          },
         },
         custom: "Customized",
         default: "Default",
@@ -1822,6 +1874,12 @@ const messagesEn = {
       settingsRateLimitsHeading: "Rate limits",
       settingsRateLimitsHint:
         "Hard ceiling: 10 req/sec per provider regardless of value below.",
+      settingsOuterConcurrencyLabel: "Domain concurrency",
+      settingsOuterConcurrencyHint:
+        "How many domains process at once — the hard ceiling on throughput (a provider's max-concurrent can't beat this). Default 8; raise it (50+) only once RDAP egress is spread over a proxy pool. Takes effect on the next run / resume.",
+      settingsRdapProxiesHeading: "RDAP proxies",
+      settingsRdapProxiesHint:
+        "One proxy URL per line (http://, https:// or socks5://; bare host:port = http). RDAP rotates through them so bulk lookups spread across IPs and dodge the registries' per-IP throttle. Empty = direct. RDAP only — WhoisFreaks always runs direct. With N proxies, raise RDAP's max-concurrent (~N×) to turn the extra IPs into throughput.",
       settingsSkipHeading: "Skip-registered policy",
       settingsSkipHint:
         "When ON, registered domains whose expiration is beyond the horizon below are skipped during analysis — saves Ahrefs units. Domains about to drop still flow through.",
@@ -2410,6 +2468,8 @@ const messagesEn = {
           max_price: "Max price",
           ahrefs_dr: "Ahrefs DR (stored, hidden)",
           domain_age_years: "Age, years (stored, hidden)",
+          ahrefs_rank: "Ahrefs Rank (stored, hidden)",
+          dofollow_refdomains: "Dofollow domains (stored, hidden)",
         },
         previewHeading: "Preview (first 5 rows)",
         defaultsHeading: "3. Defaults for unmapped fields",
@@ -2698,6 +2758,9 @@ const messagesRu: Messages = {
           mixed: "Смешанно — использовать URL, на который указывает каждая выбранная CDX-строка",
           root: "Корень — всегда брать снимок /",
         },
+        greyToggleLabel: "Серый сайт (adult / gambling)",
+        greyToggleHelp:
+          "Использовать промпт серой ниши для судьи Wayback в этом запуске. Настройки → Мозг → Судья Wayback → вкладка «Серый» — для редактирования. Затрагивает только Wayback Quality; другие критерии используют свои стандартные промпты.",
       },
       waybackClassify: {
         title: "Язык + тематика + категория",
@@ -2717,6 +2780,9 @@ const messagesRu: Messages = {
         },
         autoEnableNote:
           "При отправке: Wayback + сэмплинг V2 будут включены автоматически (этот критерий требует V2-сэмплов).",
+        greyToggleLabel: "Серый сайт (adult / gambling)",
+        greyToggleHelp:
+          "Использовать промпты CLS для серых ниш в этом запуске. Настройки → Мозг → судьи CLS → вкладки «Серый» — для редактирования. Затрагивает одновременно promtы combined / theme-only / category; другие критерии не меняются.",
       },
       sortFields: {
         domain_rating_source: "DR (домен-источник)",
@@ -4145,6 +4211,36 @@ const messagesRu: Messages = {
           localize_ru:
             "Директива русского вывода (добавляется к каждому промпту в RU-запусках)",
         },
+        whiteGreyMeta: {
+          wayback: {
+            heading: "Судья истории Wayback",
+            whiteLabel: "Белый",
+            greyLabel: "Серый",
+            help:
+              "Белый — стандартный промпт для белых ниш (используется, если в Quality-запуске не отмечена галочка «Серый сайт»). Серый — для adult / gambling, где некоторые сигналы имеют обратную полярность. Переключайте вкладки для редактирования каждого варианта; сохранения независимые.",
+          },
+          classify_combined: {
+            heading: "CLS — общий судья язык + тематика (режим ИИ)",
+            whiteLabel: "Белый",
+            greyLabel: "Серый",
+            help:
+              "Используется когда режим языка CLS = ИИ. У серых ниш (adult / gambling) другая лексика и иная семантика «допустимой» тематики. Галочка «Серый сайт» в Quality-запуске переключает ВСЕ ТРИ промпта CLS одновременно.",
+          },
+          classify_theme_only: {
+            heading: "CLS — только тематика (режим библиотеки для языка)",
+            whiteLabel: "Белый",
+            greyLabel: "Серый",
+            help:
+              "Используется когда режим языка CLS = Библиотека (lingua детектит язык детерминированно; ИИ работает только над тематикой). Та же галочка «Серый сайт» маршрутизирует и этот промпт.",
+          },
+          category: {
+            heading: "CLS — классификация категории",
+            whiteLabel: "Белый",
+            greyLabel: "Серый",
+            help:
+              "Цепочный шаг, относящий тематику к одной из ваших предзаданных категорий из Настроек. Редактирование здесь не меняет сам список категорий — за него отвечает Настройки → Мозг → Классификация Wayback.",
+          },
+        },
         custom: "Кастомизирован",
         default: "По умолчанию",
         save: "Сохранить",
@@ -4326,6 +4422,12 @@ const messagesRu: Messages = {
       settingsRateLimitsHeading: "Лимиты",
       settingsRateLimitsHint:
         "Жёсткий потолок: 10 запросов/сек на провайдера независимо от значения ниже.",
+      settingsOuterConcurrencyLabel: "Параллельность доменов",
+      settingsOuterConcurrencyHint:
+        "Сколько доменов обрабатывается одновременно — жёсткий потолок пропускной способности (max-concurrent провайдера не может его превысить). По умолчанию 8; повышайте (50+) только когда RDAP идёт через пул прокси. Применяется при следующем запуске / возобновлении.",
+      settingsRdapProxiesHeading: "Прокси для RDAP",
+      settingsRdapProxiesHint:
+        "По одному URL прокси на строку (http://, https:// или socks5://; просто host:port = http). RDAP ротирует их, чтобы массовые запросы распределялись по IP и обходили лимит реестров по IP. Пусто = напрямую. Только RDAP — WhoisFreaks всегда напрямую. При N прокси поднимите max-concurrent у RDAP (~×N), чтобы превратить дополнительные IP в скорость.",
       settingsSkipHeading: "Политика «пропускать зарегистрированные»",
       settingsSkipHint:
         "Когда ВКЛ, зарегистрированные домены с истечением дальше горизонта ниже пропускаются при анализе — экономит юниты Ahrefs. Домены, скоро освобождающиеся, проходят анализ.",
@@ -4906,6 +5008,8 @@ const messagesRu: Messages = {
           max_price: "Макс. цена",
           ahrefs_dr: "Ahrefs DR (сохраняется, скрыт)",
           domain_age_years: "Возраст, лет (сохраняется, скрыт)",
+          ahrefs_rank: "Ahrefs Rank (сохраняется, скрыт)",
+          dofollow_refdomains: "Dofollow-домены (сохраняется, скрыт)",
         },
         previewHeading: "Предпросмотр (первые 5 строк)",
         defaultsHeading: "3. Значения по умолчанию для несопоставленных полей",

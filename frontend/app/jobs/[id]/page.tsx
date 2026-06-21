@@ -1,7 +1,7 @@
 "use client";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { use, useEffect, useState } from "react";
+import { use, useEffect, useRef, useState } from "react";
 import { useT } from "@/lib/i18n";
 import { api, type JobDetail, type RunSummary } from "@/lib/api";
 import { StatusPill } from "@/components/status-pill";
@@ -48,23 +48,51 @@ export default function JobDetailPage({
   const [notesDraft, setNotesDraft] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
 
+  // Single-flight guard: getJob recomputes the run's verdict roll-up
+  // (an O(domains) GROUP BY — ~1s on a 60k-domain availability run). The
+  // poll interval below MUST NOT fire a fresh call before the previous
+  // one returns, or slow calls stack in the backend's sync threadpool and
+  // snowball from ~1s to 20s+. This ref makes overlapping reloads no-ops.
+  const inFlightRef = useRef(false);
+  // Latest job snapshot, read by the poll tick to decide whether anything
+  // is still changing (avoids re-polling a fully-finished job forever).
+  const jobRef = useRef<JobDetail | null>(null);
+  useEffect(() => {
+    jobRef.current = job;
+  }, [job]);
+
   async function reload() {
     if (!jobIdValid) return;
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     try {
       const d = await api.getJob(jobId);
       setJob(d);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      inFlightRef.current = false;
     }
   }
 
   useEffect(() => {
     if (!jobIdValid) return;
     reload();
-    // Poll while any run is non-terminal so the user sees live progress
-    // without manual refresh. Polling the job-detail endpoint is cheap.
+    // Poll only while a run is still in progress so the user sees live
+    // progress without manual refresh. Once every run is terminal the
+    // roll-up can't change, so the tick becomes a no-op (no backend call)
+    // — that stops a finished 60k-domain job from re-scanning forever.
+    const TERMINAL = new Set(["done", "failed", "canceled"]);
     const id = window.setInterval(() => {
+      const j = jobRef.current;
+      if (
+        j &&
+        j.runs.length > 0 &&
+        j.runs.every((r) => TERMINAL.has(r.status))
+      ) {
+        return;
+      }
       reload();
     }, 3000);
     return () => window.clearInterval(id);

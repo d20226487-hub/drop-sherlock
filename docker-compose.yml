@@ -19,8 +19,33 @@ services:
     build: ./backend
     restart: unless-stopped
     env_file: .env
+    # Cap glibc's malloc arena count (added 2026-06-16). This is a single
+    # in-process uvicorn worker that runs multi-hour, tens-of-thousands-of-
+    # domain jobs in-process. glibc creates one malloc arena per thread (up
+    # to 8×CPU = 128 on this 16-core host) and does NOT return their freed
+    # pages to the OS, so RSS sticks at the job's high-water mark (observed
+    # 3-5 GB on a 60,977-domain availability run). Pinning ARENA_MAX=2
+    # bounds that per-thread fragmentation; the periodic malloc_trim(0) in
+    # main.py actively returns freed heap on top. Diagnosed via smaps:
+    # 3.85 GB private-dirty anon spread across ~35 64-128 MB glibc arenas.
+    environment:
+      MALLOC_ARENA_MAX: "2"
+    # Blast-radius cap so a runaway / stalled job can't consume host RAM
+    # (added 2026-06-16). Generous headroom over a healthy run's working
+    # set. If a legitimate large job gets OOM-killed at this ceiling, raise
+    # it rather than lowering — the container auto-restarts (restart:
+    # unless-stopped) and the runner auto-pauses any in-flight run, which is
+    # resumable from the UI, so the worst case is a pause, not data loss.
+    mem_limit: 4g
     volumes:
       - ./data:/data
+      # Dev iteration speed (2026-06-18): bind-mount the app source so a
+      # backend change applies with `docker compose restart api` (~5s)
+      # instead of a full image rebuild. The image still bakes its own
+      # copy (COPY app ./app) for prod/CI — this mount just shadows it on
+      # this box. PYTHONDONTWRITEBYTECODE=1 (Dockerfile) keeps the host
+      # tree free of .pyc clutter. Remove this line for a real prod deploy.
+      - ./backend/app:/app/app
     expose:
       - "8000"
     logging: *default-logging

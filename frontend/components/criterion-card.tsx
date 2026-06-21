@@ -1206,6 +1206,34 @@ export function WaybackCard({
             </div>
           </div>
         ) : null}
+        {/* Grey-site toggle (added 2026-06-07). When ticked, the AI
+            judge for this Wayback run reads the `wayback_grey` prompt
+            instead of `wayback_white` (Settings → Brain → Wayback
+            judge → Grey tab). Scope is Wayback Quality only — the other
+            criteria keep using their default prompt. The flag survives
+            in the spec snapshot on Run.spec_json so reruns and the
+            run-page header can show the variant accurately. */}
+        <div className="pt-2 border-t dark:border-neutral-800/60">
+          <label className="text-sm text-neutral-700 dark:text-neutral-300 inline-flex items-start gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={(cfg.variant || "white") === "grey"}
+              onChange={(e) =>
+                onChange({
+                  ...cfg,
+                  variant: e.target.checked ? "grey" : "white",
+                })
+              }
+              className="mt-0.5 rounded border-neutral-300 dark:border-neutral-700"
+            />
+            <span>
+              <span className="font-medium">{ts.greyToggleLabel}</span>
+              <span className="block text-xs text-neutral-500 dark:text-neutral-400 mt-0.5">
+                {ts.greyToggleHelp}
+              </span>
+            </span>
+          </label>
+        </div>
       </div>
     </CriterionShell>
   );
@@ -1296,6 +1324,34 @@ export function WaybackClassifyCard({
                 ? ts.languageModeHint.ai
                 : ts.languageModeHint.library}
             </p>
+          </div>
+          {/* Grey-site toggle (added 2026-06-07). Mirrors the Wayback
+              Quality card's checkbox: when ticked the AI judges read
+              the `_grey` slots of all three classify prompts
+              (combined / theme_only / category) instead of the
+              `_white` slots. Settings → Brain → CLS judges → Grey
+              tabs to edit. Scope is the CLS criterion only; other
+              criteria keep their default prompt. */}
+          <div className="pt-2 border-t dark:border-neutral-800/60">
+            <label className="text-sm text-neutral-700 dark:text-neutral-300 inline-flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={(cfg.variant || "white") === "grey"}
+                onChange={(e) =>
+                  onChange({
+                    ...cfg,
+                    variant: e.target.checked ? "grey" : "white",
+                  })
+                }
+                className="mt-0.5 rounded border-neutral-300 dark:border-neutral-700"
+              />
+              <span>
+                <span className="font-medium">{ts.greyToggleLabel}</span>
+                <span className="block text-xs text-neutral-500 dark:text-neutral-400 mt-0.5">
+                  {ts.greyToggleHelp}
+                </span>
+              </span>
+            </label>
           </div>
           {willAutoEnable && (
             <div className="text-xs rounded-md px-3 py-2 bg-amber-50 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">

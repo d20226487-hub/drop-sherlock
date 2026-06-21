@@ -116,14 +116,24 @@ def _patch_dispatch(monkeypatch):
             pass
 
     def fake_create_task(coro):
-        # The coroutine carries (rd_id, criteria, spec, track_set)
-        # — peek at its frame locals to record what was requested.
+        # Peek at the spawned coroutine's frame locals to record what would
+        # have been retried. Two dispatch shapes are supported:
+        #   - 2026-06-17+ bounded pool: one `_run_retry_pool(run_id,
+        #     failed_per_rd, spec)` coro carrying the whole {rd_id: criteria}
+        #     map — flatten it so assertions keep their (rd_id, criteria) form.
+        #   - legacy: one `_retry_failed_run_domain(run_domain_id, criteria,
+        #     …)` coro per RD.
         frame = coro.cr_frame
         if frame is not None:
-            spawned.append(
-                (frame.f_locals.get("run_domain_id"),
-                 list(frame.f_locals.get("criteria", []) or [])),
-            )
+            fpr = frame.f_locals.get("failed_per_rd")
+            if fpr is not None:
+                for rd_id, crits in fpr.items():
+                    spawned.append((rd_id, list(crits or [])))
+            else:
+                spawned.append(
+                    (frame.f_locals.get("run_domain_id"),
+                     list(frame.f_locals.get("criteria", []) or [])),
+                )
         coro.close()  # don't actually run
         return FakeTask()
 

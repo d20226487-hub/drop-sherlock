@@ -25,6 +25,7 @@ from typing import Any
 
 import httpx
 
+from . import proxies
 from .common import (
     ERR_CAT_NETWORK,
     ERR_CAT_PARSE,
@@ -42,6 +43,16 @@ IANA_BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
 _bootstrap_cache: dict[str, str] | None = None
 _bootstrap_fetched_at: float = 0.0
 _BOOTSTRAP_TTL_SEC = 86400.0  # refresh once per day
+
+# Per-request timeout for the RDAP domain lookup (2026-06-15). Separate
+# from the shared client's default (10s) and deliberately tight: under
+# bulk load the gTLD/ccTLD registries progressively rate-limit the source
+# IP, and a "successful" lookup that's been tarpitted can take 10-21s.
+# Waiting that long pins one of the few RDAP slots and starves throughput;
+# bailing at 5s lets the cascade fall over to WhoisFreaks (a paid API that
+# isn't registry-IP-throttled) far sooner. A healthy RDAP answers in
+# <2s, so 5s still gives a momentarily-slow registry room to respond.
+_RDAP_TIMEOUT = httpx.Timeout(5.0)
 
 
 async def _get_rdap_server(domain: str, client: httpx.AsyncClient) -> str | None:
@@ -149,22 +160,40 @@ async def check(domain: str, client: httpx.AsyncClient | None = None) -> Provide
                 error_category=ERR_CAT_RDAP,
             )
         url = f"{server}/domain/{domain}"
-        try:
-            r = await client.get(url, headers={"Accept": "application/rdap+json"})
-        except httpx.TimeoutException as e:
+        # Domain lookup, routed through the rotating proxy pool when one is
+        # configured (the IANA bootstrap above stays direct — it isn't
+        # throttled). Bounded failover: if a request fails at the transport
+        # layer THROUGH A PROXY (dead/blocked exit IP), cool that proxy down
+        # and retry via the next pick; ≤2 attempts so a domain can't stall.
+        # A direct (no-proxy) failure isn't retried — it falls through to
+        # the next cascade provider, same as before.
+        r = None
+        last_err: tuple[str, Exception] | None = None
+        for _attempt in range(2):
+            use_client, proxy_url = proxies.acquire_rdap_client(client)
+            try:
+                r = await use_client.get(
+                    url,
+                    headers={"Accept": "application/rdap+json"},
+                    timeout=_RDAP_TIMEOUT,
+                )
+                break
+            except httpx.TimeoutException as e:
+                last_err = ("RDAP timeout", e)
+            except httpx.HTTPError as e:
+                last_err = ("RDAP transport error", e)
+            # Reached only on an exception.
+            if proxy_url is not None:
+                proxies.report_proxy_failure(proxy_url)
+                continue  # try the next proxy / direct
+            break  # direct attempt failed — don't retry
+        if r is None:
+            label, exc = last_err or ("RDAP error", Exception("unknown"))
             return ProviderResult(
                 provider="rdap",
                 status=STATUS_ERROR,
                 latency_ms=int((time.monotonic() - started) * 1000),
-                error_message=f"RDAP timeout: {e}",
-                error_category=ERR_CAT_NETWORK,
-            )
-        except httpx.HTTPError as e:
-            return ProviderResult(
-                provider="rdap",
-                status=STATUS_ERROR,
-                latency_ms=int((time.monotonic() - started) * 1000),
-                error_message=f"RDAP transport error: {e}",
+                error_message=f"{label}: {exc}",
                 error_category=ERR_CAT_NETWORK,
             )
 

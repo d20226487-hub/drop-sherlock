@@ -123,6 +123,21 @@ class BacklogDomain(Base):
     # malformed cells. Column name encodes the unit so future "X age"
     # fields don't collide.
     domain_age_years: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Ahrefs Rank (added 2026-06-14) — the strength of a domain's backlink
+    # profile vs every other site in Ahrefs's index, rank #1 = strongest.
+    # Same storage-only contract as ahrefs_dr: captured at backlog-import
+    # time, mappable in the import wizard, but NOT surfaced in any UI yet.
+    # Integer (not Float): Ahrefs Rank is a whole-number position that runs
+    # into the tens of millions, so unlike DR it has no fractional form and
+    # no 0-100 bound.
+    ahrefs_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Dofollow referring domains (added 2026-06-18). Count of referring
+    # domains with ≥1 dofollow link — the "dofollow domains" signal an
+    # Ahrefs export carries. Same storage-only contract as ahrefs_dr /
+    # ahrefs_rank: captured at backlog-import, mappable in the wizard, not
+    # surfaced in any UI yet. Integer — a whole-number count that can reach
+    # tens of thousands, no fractional form and no upper bound.
+    dofollow_refdomains: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow

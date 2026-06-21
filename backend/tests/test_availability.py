@@ -355,6 +355,105 @@ def test_runner_preserves_terminal_verdict_across_cascade_retries(
     assert rd.status == "done"
 
 
+def test_process_availability_run_batched(fresh_db, monkeypatch):
+    """The batched main-run path (2026-06-21 throughput work). A run of N
+    domains spread across several write-chunks must: mark every RD `done`,
+    write exactly one availability CR (with the right verdict) + one trace
+    row per domain, and write expiration back to BacklogDomain for the
+    registered ones — i.e. the same observable result as the old
+    per-domain path, produced in bulk."""
+    from app import availability_runner as runner_mod
+    from app.app_settings import set_availability_setting
+    from app.availability.common import (
+        ProviderResult,
+        STATUS_AVAILABLE,
+        STATUS_REGISTERED,
+    )
+    from app.models import (
+        AvailabilityCheck,
+        BacklogDomain,
+        CriterionResult,
+        Run,
+        RunDomain,
+    )
+
+    # Single enabled provider → deterministic one-row trace per domain.
+    set_availability_setting("availability__dns__enabled", "false")
+    set_availability_setting("availability__rdap__enabled", "true")
+    set_availability_setting("availability__domainr__enabled", "false")
+    set_availability_setting("availability__whois__enabled", "false")
+    set_availability_setting("availability__whoisfreaks__enabled", "false")
+
+    # Tiny batch size so 5 domains span 3 chunks (exercises the chunk loop
+    # + the bulk writers across boundaries). Also stub the auto-retry
+    # scheduler so no background task outlives asyncio.run().
+    monkeypatch.setattr(runner_mod, "_AV_WRITE_BATCH_SIZE", 2)
+    monkeypatch.setattr(
+        runner_mod, "schedule_availability_auto_retry", lambda run_id: None,
+    )
+
+    session = fresh_db
+    run = Run(job_id=0, status="pending", spec_json="{}")
+    session.add(run)
+    session.flush()
+    domains = [f"d{i}.com" for i in range(5)]
+    rds = [
+        RunDomain(run_id=run.id, domain=d, status="pending") for d in domains
+    ]
+    session.add_all(rds)
+    session.commit()
+
+    def _idx(domain: str) -> int:
+        return int(domain.split(".", 1)[0][1:])
+
+    async def fake_rdap(domain, client=None):
+        # even index → registered (with expiry); odd → available.
+        if _idx(domain) % 2 == 0:
+            return ProviderResult(
+                provider="rdap", status=STATUS_REGISTERED,
+                registrar="R", expires_on=date(2030, 1, 1),
+            )
+        return ProviderResult(provider="rdap", status=STATUS_AVAILABLE)
+
+    monkeypatch.setattr("app.availability.rdap.check", fake_rdap)
+
+    asyncio.run(runner_mod.process_availability_run(run.id))
+
+    session.expire_all()
+    assert session.get(Run, run.id).status == "done"
+
+    for rd in session.query(RunDomain).filter_by(run_id=run.id).all():
+        assert rd.status == "done", f"{rd.domain} not done"
+        assert rd.finished_at is not None
+        cr = session.query(CriterionResult).filter_by(
+            run_domain_id=rd.id, criterion="availability",
+        ).one()
+        assert cr.status == "done"
+        body = json.loads(cr.data_json)
+        expected = (
+            STATUS_REGISTERED if _idx(rd.domain) % 2 == 0 else STATUS_AVAILABLE
+        )
+        assert body["verdict"]["status"] == expected
+        assert len(body["trace"]) == 1
+        assert body["trace"][0]["provider"] == "rdap"
+
+    # One trace row per domain, all linked to this run.
+    checks = session.query(AvailabilityCheck).all()
+    assert len(checks) == len(domains)
+    assert all(c.run_id == run.id for c in checks)
+
+    # Registered domains got their expiration written back; available ones
+    # have no expiry, so no backlog row is created for them.
+    for d in domains:
+        bd = session.query(BacklogDomain).filter_by(domain=d).one_or_none()
+        if _idx(d) % 2 == 0:
+            assert bd is not None, f"{d} should have a backlog row"
+            assert bd.expiration_date == date(2030, 1, 1)
+            assert bd.registrar == "R"
+        else:
+            assert bd is None, f"{d} (available) should not create a backlog row"
+
+
 def test_reconcile_orphaned_running_run_domains(fresh_db):
     """B12 (2026-05-17): on startup, RDs stuck in status='running' with
     a terminal parent Run are zombie cascades from a uvicorn-restart-

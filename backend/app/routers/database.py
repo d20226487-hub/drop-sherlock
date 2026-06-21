@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import threading
 import time
@@ -35,6 +36,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..db import SessionLocal, get_db
+
+log = logging.getLogger(__name__)
 from ..models import (
     CriterionResult,
     DomainNote,
@@ -438,12 +441,34 @@ def _bucket_for(
 
 # --- Endpoint ---------------------------------------------------------------
 
+def _canonical_row_sort_key(r: DomainRow) -> tuple:
+    """Default Database order: pinned rows first (by pinned finished_at
+    desc), then unpinned alphabetically. Shared by the full build and the
+    single-domain cache patch so a patched snapshot keeps identical order
+    to a fresh rebuild (the `sort=None` default view relies on it)."""
+    return (
+        0 if r.is_pinned else 1,
+        -(r.pinned_finished_at.timestamp() if r.pinned_finished_at else 0)
+        if r.is_pinned else 0,
+        r.domain,
+    )
+
+
 def _build_all_rows(
-    db: Session,
+    db: Session, *, only_domains: set[str] | None = None,
 ) -> tuple[list[DomainRow], dict[str, list[str]], set[str]]:
     """Heavy aggregation: one DomainRow per unique domain across all
     jobs/runs (fully sorted — pinned-first by finished_at desc, then
     alphabetical), plus the materialized filter-option universes.
+
+    `only_domains` (2026-06-21) restricts the build to the given domains —
+    used by `_patch_domains_in_cache` to re-synthesize ONLY the rows a
+    mutation touched, sharing this exact synthesis (no divergence between a
+    full rebuild and a patch). In that mode the returned
+    `filter_options`/`hide_candidates` cover only those domains; the patch
+    caller uses the rows and keeps the snapshot's existing universes (a new
+    filter value not surfacing until the next full background rebuild is the
+    accepted staleness).
 
     Each row's data comes from the explicitly-pinned RunDomain (if any).
     Domains with no pin still appear so the user can pin one — their cells
@@ -456,7 +481,16 @@ def _build_all_rows(
     `list_domains`; a short-TTL snapshot cache (`_get_all_rows`) absorbs
     page-flip + filter-toggle bursts so this doesn't re-run every
     request."""
-    all_rds: list[RunDomain] = db.query(RunDomain).all()
+    rd_q = db.query(RunDomain)
+    if only_domains is not None:
+        rd_q = rd_q.filter(RunDomain.domain.in_(only_domains))
+    all_rds: list[RunDomain] = rd_q.all()
+    # In single-domain patch mode, the two "load-all CRs" fallback queries
+    # below (availability / batch) get scoped to just these rds so a patch
+    # stays cheap; a full build leaves them unscoped (None).
+    scoped_rd_ids: list[int] | None = (
+        [rd.id for rd in all_rds] if only_domains is not None else None
+    )
     rds_by_domain: dict[str, list[RunDomain]] = defaultdict(list)
     rds_by_run_and_domain: dict[tuple[int, str], RunDomain] = {}
     for rd in all_rds:
@@ -644,12 +678,17 @@ def _build_all_rows(
     # availability never had the cross-job surprise problem whois did
     # (Availability has its own pillar runner; no Quality cascade
     # contamination since the 2026-05-16 aux_sources refactor).
-    availability_crs_by_rd_id: dict[int, CriterionResult] = {
-        cr.run_domain_id: cr
-        for cr in db.query(CriterionResult)
+    _av_fallback_q = (
+        db.query(CriterionResult)
         .filter(CriterionResult.criterion == "availability")
         .filter(CriterionResult.data_json != "")
-        .all()
+    )
+    if scoped_rd_ids is not None:
+        _av_fallback_q = _av_fallback_q.filter(
+            CriterionResult.run_domain_id.in_(scoped_rd_ids)
+        )
+    availability_crs_by_rd_id: dict[int, CriterionResult] = {
+        cr.run_domain_id: cr for cr in _av_fallback_q.all()
     }
 
     # Ahrefs batch-analysis CRs by rd (2026-06-02). Same preload shape as
@@ -657,12 +696,17 @@ def _build_all_rows(
     # most-recent run WITHOUT requiring a manual pin (user-confirmed: auto
     # is fine). A pin still wins when present (the aux-pin split runs
     # first); this is the fallback for the common pin-free workflow.
-    batch_crs_by_rd_id: dict[int, CriterionResult] = {
-        cr.run_domain_id: cr
-        for cr in db.query(CriterionResult)
+    _batch_fallback_q = (
+        db.query(CriterionResult)
         .filter(CriterionResult.criterion == "ahrefs_batch_analysis")
         .filter(CriterionResult.data_json != "")
-        .all()
+    )
+    if scoped_rd_ids is not None:
+        _batch_fallback_q = _batch_fallback_q.filter(
+            CriterionResult.run_domain_id.in_(scoped_rd_ids)
+        )
+    batch_crs_by_rd_id: dict[int, CriterionResult] = {
+        cr.run_domain_id: cr for cr in _batch_fallback_q.all()
     }
 
     # Notes: same IN-list pattern as backlog below. The notes table is
@@ -1625,15 +1669,9 @@ def _build_all_rows(
             sources_seen.add(backlog_row.registrar)
 
     # Sort: pinned rows first (by pinned_finished_at desc), then unpinned
-    # rows alphabetically.
-    rows.sort(
-        key=lambda r: (
-            0 if r.is_pinned else 1,
-            -(r.pinned_finished_at.timestamp() if r.pinned_finished_at else 0)
-            if r.is_pinned else 0,
-            r.domain,
-        ),
-    )
+    # rows alphabetically. Shared key so a single-domain cache patch can
+    # re-sort to the same canonical order.
+    rows.sort(key=_canonical_row_sort_key)
 
     filter_options: dict[str, list[str]] = {
             "ai_providers": sorted(providers),
@@ -1717,15 +1755,36 @@ _rows_cache_lock = threading.Lock()
 _rows_build_lock = threading.Lock()
 
 
-def _invalidate_rows_cache() -> None:
-    with _rows_cache_lock:
-        _rows_cache.clear()
+# Background-rebuild coordination (2026-06-21). The snapshot rebuild is the
+# ~tens-of-seconds load-everything aggregation; we never let it block a
+# request. `_get_all_rows` serves the existing snapshot (even stale) and
+# kicks a background rebuild instead of building inline — the ONLY inline
+# build is the cold start when no snapshot exists yet. This flag coalesces
+# rebuild requests so at most one background build runs at a time.
+_rebuild_pending = False
+_rebuild_flag_lock = threading.Lock()
+
+# Served by the route on a COLD start (no snapshot yet) while the first
+# background build runs — so a page load on a freshly-restarted process
+# never blocks on the ~tens-of-seconds aggregation (which can exceed proxy
+# timeouts on a large DB). Same keys `_build_all_rows` returns, all empty.
+_EMPTY_FILTER_OPTIONS: dict[str, list[str]] = {
+    "ai_providers": [],
+    "ai_models": [],
+    "verdicts": [],
+    "wayback_verdicts": [],
+    "languages": [],
+    "categories": [],
+    "whois_bands": [],
+    "availability_statuses": [],
+    "sources": [],
+}
 
 
 def _read_rows_cache(
     now: float,
 ) -> tuple[list[DomainRow], dict[str, list[str]], set[str]] | None:
-    """Return the unexpired snapshot, or None on miss/expiry."""
+    """Return the UNEXPIRED snapshot, or None on miss/expiry."""
     with _rows_cache_lock:
         ent = _rows_cache.get("all")
         if ent is not None and ent[0] > now:
@@ -1733,40 +1792,185 @@ def _read_rows_cache(
     return None
 
 
+def _peek_rows_cache() -> (
+    tuple[list[DomainRow], dict[str, list[str]], set[str]] | None
+):
+    """Return the snapshot IGNORING expiry — used to serve-stale while a
+    background rebuild runs. None only when nothing's been built yet."""
+    with _rows_cache_lock:
+        ent = _rows_cache.get("all")
+        if ent is not None:
+            return ent[1], ent[2], ent[3]
+    return None
+
+
+def _store_rows_cache(
+    rows: list[DomainRow],
+    options: dict[str, list[str]],
+    hide_candidates: set[str],
+) -> None:
+    with _rows_cache_lock:
+        _rows_cache["all"] = (
+            time.monotonic() + _ROWS_CACHE_TTL_SEC,
+            rows,
+            options,
+            hide_candidates,
+        )
+
+
+def _build_and_store_rows() -> None:
+    """Run the full aggregation in its OWN session and store it. Single-
+    flighted via `_rows_build_lock`; shared by the background rebuild thread
+    and the cold-start inline build."""
+    with _rows_build_lock:
+        db = SessionLocal()
+        try:
+            rows, options, hide_candidates = _build_all_rows(db)
+        finally:
+            db.close()
+        _store_rows_cache(rows, options, hide_candidates)
+
+
+def _trigger_background_rebuild() -> None:
+    """Spawn ONE background thread to rebuild the snapshot, unless one is
+    already pending. Non-blocking — the caller keeps serving the stale
+    snapshot. The thread uses its own session (never the request's)."""
+    global _rebuild_pending
+    with _rebuild_flag_lock:
+        if _rebuild_pending:
+            return
+        _rebuild_pending = True
+
+    def _worker() -> None:
+        global _rebuild_pending
+        try:
+            _build_and_store_rows()
+        except Exception:  # noqa: BLE001
+            log.exception("background rows-cache rebuild failed")
+        finally:
+            with _rebuild_flag_lock:
+                _rebuild_pending = False
+
+    threading.Thread(
+        target=_worker, name="rows-cache-rebuild", daemon=True,
+    ).start()
+
+
+def _invalidate_rows_cache() -> None:
+    """Mark the snapshot stale by kicking a BACKGROUND rebuild — but keep the
+    current snapshot servable so reads never block. (Pre-2026-06-21 this
+    CLEARED the cache, forcing the next request to pay the full
+    ~tens-of-seconds build inline — the Database-page stall.) In-router
+    mutations prefer `_patch_domains_in_cache` for instant per-row freshness;
+    this stays for coarse / external-change invalidation."""
+    _trigger_background_rebuild()
+
+
 def _get_all_rows(
-    db: Session, *, fresh: bool = False,
+    db: Session, *, fresh: bool = False, allow_building_empty: bool = False,
 ) -> tuple[list[DomainRow], dict[str, list[str]], set[str]]:
-    """Return (full sorted rows, filter_options, hide_candidates) from the
-    snapshot cache (`_ROWS_CACHE_TTL_SEC`). `fresh=True` forces a rebuild
-    (callers that must observe their own just-committed write). Builds are
-    SINGLE-FLIGHTED via `_rows_build_lock` so a burst of cold callers shares
-    one build instead of each running the multi-second aggregation."""
-    # Fast path: a warm cache hit returns WITHOUT touching the build lock,
-    # so concurrent cold builds never stall warm readers.
+    """Return (rows, filter_options, hide_candidates), NEVER blocking a
+    request on the heavy rebuild (2026-06-21):
+
+      - warm hit (not fresh)      → return it.
+      - snapshot exists (any age) → return it NOW + kick a background
+                                    rebuild when stale/fresh.
+      - no snapshot at all        → cold start. `allow_building_empty`
+        (the page route) serves an EMPTY snapshot + kicks the build so the
+        load doesn't hang on the first ~tens-of-seconds aggregation;
+        internal callers that need the data (default False) take a one-time
+        single-flighted blocking build.
+
+    `fresh=True` no longer blocks: in-router mutations patch the snapshot in
+    place (`_patch_domains_in_cache`) so their write is already reflected,
+    and bulk / external changes self-heal via the background rebuild within a
+    moment."""
+    now = time.monotonic()
     if not fresh:
-        hit = _read_rows_cache(time.monotonic())
+        hit = _read_rows_cache(now)
         if hit is not None:
             return hit
-    # Cold (or fresh) path — serialize builders.
+        stale = _peek_rows_cache()
+        if stale is not None:
+            _trigger_background_rebuild()
+            return stale
+    else:
+        snap = _peek_rows_cache()
+        if snap is not None:
+            _trigger_background_rebuild()
+            return snap
+
+    # Cold start — no snapshot exists yet.
+    if allow_building_empty:
+        snap = _peek_rows_cache()
+        if snap is not None:
+            return snap
+        # Only serve empty when a build is ALREADY running — which, in the
+        # real app, is always true on a cold page load: the startup pre-warm
+        # hook kicks the build during lifespan (before the server accepts
+        # requests), so `_rebuild_pending` is set by the time any request
+        # arrives. Serving empty then avoids hanging the load on the ~83s
+        # first build; the page self-heals when it lands. If NOTHING is
+        # building yet (no pre-warm — e.g. tests, or a direct call before
+        # boot finishes), fall through to a one-time inline build so the
+        # first caller still gets real data instead of a spurious empty.
+        with _rebuild_flag_lock:
+            building = _rebuild_pending
+        if building:
+            return [], dict(_EMPTY_FILTER_OPTIONS), set()
+    # Inline, single-flighted blocking build — internal callers that need
+    # the data, and the first page load when no background build is in
+    # flight.
     with _rows_build_lock:
-        # A peer may have built the snapshot while we waited for the lock.
-        # Non-fresh callers happily reuse it. Fresh callers always rebuild
-        # so the result reflects their own write (concurrent fresh callers
-        # therefore serialize — rare: one Refresh click / post-mutation
-        # reload — and that's an acceptable cost for guaranteed freshness).
-        if not fresh:
-            hit = _read_rows_cache(time.monotonic())
-            if hit is not None:
-                return hit
+        snap = _peek_rows_cache()
+        if snap is not None:
+            return snap
         rows, options, hide_candidates = _build_all_rows(db)
-        with _rows_cache_lock:
-            _rows_cache["all"] = (
-                time.monotonic() + _ROWS_CACHE_TTL_SEC,
-                rows,
-                options,
-                hide_candidates,
-            )
+        _store_rows_cache(rows, options, hide_candidates)
         return rows, options, hide_candidates
+
+
+def _patch_domains_in_cache(db: Session, domains: list[str] | set[str]) -> None:
+    """Re-synthesize ONLY `domains` (via `_build_all_rows(only_domains=...)`)
+    and splice the result into the cached snapshot in place — instant
+    per-row freshness after a mutation, with NO full rebuild. Shares the
+    exact synthesis of a full build, so a patched row is identical to what a
+    rebuild would produce. No-op when no snapshot exists yet (the next read
+    cold-builds with the mutation already committed).
+
+    A domain that no longer yields a row (all its rds deleted, or it was
+    banned → hidden) is simply dropped from the snapshot. filter-option /
+    hide universes for brand-new values refresh on the next background
+    rebuild (accepted minor staleness)."""
+    want = {d for d in domains if d}
+    if not want:
+        return
+    if _peek_rows_cache() is None:
+        return  # nothing to patch; next read builds fresh
+    try:
+        new_rows, _opts, new_hide = _build_all_rows(db, only_domains=want)
+    except Exception:  # noqa: BLE001
+        log.exception("rows-cache patch failed for %s; rebuilding", want)
+        _trigger_background_rebuild()
+        return
+    new_by_domain = {r.domain: r for r in new_rows}
+    with _rows_cache_lock:
+        ent = _rows_cache.get("all")
+        if ent is None:
+            return
+        expiry, rows, options, hide = ent
+        kept = [r for r in rows if r.domain not in want]
+        for d in want:
+            nr = new_by_domain.get(d)
+            if nr is not None:
+                kept.append(nr)
+        kept.sort(key=_canonical_row_sort_key)
+        new_hide_set = set(hide)
+        for d in want:
+            new_hide_set.discard(d)
+            if d in new_hide:
+                new_hide_set.add(d)
+        _rows_cache["all"] = (expiry, kept, options, new_hide_set)
 
 
 # --- Server-side filter / sort / search (2026-06-02) -----------------------
@@ -1966,6 +2170,7 @@ def list_domains(
     limit: int | None = None,
     include_options: bool = True,
     fresh: bool = False,
+    allow_building_empty: bool = False,
     verdicts: list[str] | None = None,
     wayback_verdicts: list[str] | None = None,
     whois_bands: list[str] | None = None,
@@ -2001,7 +2206,9 @@ def list_domains(
     inline-rechecked domains, and noted domains are never in that set.
     Internal callers (e.g. /translate-verdicts) leave it False, which is
     correct — those domains carry no Quality verdict to translate anyway."""
-    all_rows, filter_options, hide_candidates = _get_all_rows(db, fresh=fresh)
+    all_rows, filter_options, hide_candidates = _get_all_rows(
+        db, fresh=fresh, allow_building_empty=allow_building_empty,
+    )
 
     # Base visibility universe: drop availability-only-taken domains unless
     # the operator asked to see them. Applied BEFORE filters/search so
@@ -2157,6 +2364,8 @@ def _run_list_domains(
             limit=limit,
             include_options=include_options,
             fresh=fresh,
+            # Page route: never hang the load on the first cold build.
+            allow_building_empty=True,
             verdicts=verdict,
             wayback_verdicts=wayback_verdict,
             whois_bands=whois_band,
@@ -2246,7 +2455,7 @@ def pin_domain(
                     ex.run_id = run.id
                     ex.updated_at = now
     db.commit()
-    _invalidate_rows_cache()
+    _patch_domains_in_cache(db, [domain])
     return PinOut(domain=domain, pinned_run_domain_id=rd.id)
 
 
@@ -2284,7 +2493,7 @@ def unpin_domain(domain: str, db: Session = Depends(get_db)) -> dict:
         .delete(synchronize_session=False)
     )
     db.commit()
-    _invalidate_rows_cache()
+    _patch_domains_in_cache(db, [domain])
     return {"unpinned": domain, "count": int(n)}
 
 
@@ -2353,7 +2562,9 @@ def delete_domains(
         synchronize_session=False
     )
     db.commit()
-    _invalidate_rows_cache()
+    # Deleted domains lose all their rds → re-synthesis yields no row, so
+    # the patch drops them from the snapshot.
+    _patch_domains_in_cache(db, cleaned)
     return DeleteDomainsOut(
         deleted_run_domains=deleted_run_domains,
         deleted_runs=deleted_runs,
@@ -2398,7 +2609,7 @@ def upsert_note(
         row.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(row)
-    _invalidate_rows_cache()
+    _patch_domains_in_cache(db, [domain])
     return NoteOut(domain=row.domain, note=row.note, updated_at=row.updated_at)
 
 
@@ -2408,6 +2619,7 @@ def delete_note(domain: str, db: Session = Depends(get_db)) -> dict:
     if row is not None:
         db.delete(row)
         db.commit()
+        _patch_domains_in_cache(db, [domain])
     return {"deleted": domain}
 
 
@@ -2543,6 +2755,9 @@ def bulk_ban_domains(
     from .banlist import _snapshot_and_delete_backlog
     _snapshot_and_delete_backlog(db, new_bans_by_domain)
     db.commit()
+    # Newly-banned domains are hidden from Database (their re-synthesis
+    # yields no row); patch them out of the snapshot immediately.
+    _patch_domains_in_cache(db, normalized)
     return BulkBanOut(added=added, already_banned=already, invalid=invalid)
 
 
@@ -2695,6 +2910,7 @@ def set_backlog_status(
         existing.status = payload.status
         existing.updated_at = now
         db.commit()
+        _patch_domains_in_cache(db, [normalized])
         return BacklogStatusOut(
             domain=normalized,
             backlog_id=existing.id,
@@ -2718,6 +2934,7 @@ def set_backlog_status(
     )
     db.add(row)
     db.commit()
+    _patch_domains_in_cache(db, [normalized])
     return BacklogStatusOut(
         domain=normalized,
         backlog_id=row.id,
@@ -2812,6 +3029,7 @@ def bulk_set_backlog_status(
             ))
             created += 1
     db.commit()
+    _patch_domains_in_cache(db, normalized)
     return BulkBacklogStatusOut(
         updated=updated,
         created=created,

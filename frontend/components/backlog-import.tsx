@@ -31,7 +31,13 @@ type TargetField =
   | "ahrefs_dr"
   // Domain age in years (added 2026-05-20). Same storage-only contract
   // as ahrefs_dr.
-  | "domain_age_years";
+  | "domain_age_years"
+  // Ahrefs Rank (added 2026-06-14). Same storage-only contract as
+  // ahrefs_dr — mappable on import, persisted, not displayed yet.
+  | "ahrefs_rank"
+  // Dofollow referring domains (added 2026-06-18). Same storage-only
+  // contract as ahrefs_dr — mappable on import, persisted, not displayed.
+  | "dofollow_refdomains";
 
 const TARGET_FIELDS: TargetField[] = [
   "skip",
@@ -45,6 +51,8 @@ const TARGET_FIELDS: TargetField[] = [
   "max_price",
   "ahrefs_dr",
   "domain_age_years",
+  "ahrefs_rank",
+  "dofollow_refdomains",
 ];
 
 const DATE_FORMAT_OPTIONS: DateFormat[] = [
@@ -87,6 +95,24 @@ const HEADER_HINTS: { needle: string; field: TargetField }[] = [
   { needle: "domain_age", field: "domain_age_years" },
   { needle: "site age", field: "domain_age_years" },
   { needle: "age", field: "domain_age_years" },
+  // Ahrefs Rank auto-map. Listed AFTER the DR hints so a "Domain Rating"
+  // header still wins DR (it contains no "rank"), and before "domain" so
+  // a "Domain Rank" header maps to rank, not the domain column. "ar" is
+  // deliberately NOT a needle — too short, it collides with "registrar".
+  { needle: "ahrefs rank", field: "ahrefs_rank" },
+  { needle: "ahrefs_rank", field: "ahrefs_rank" },
+  { needle: "rank", field: "ahrefs_rank" },
+  // Dofollow referring domains auto-map (added 2026-06-18). MUST precede
+  // the bare "domain" needle below — these headers ("Dofollow ref domains",
+  // "Ref domains dofollow") contain "domain". Specific phrases only: there
+  // is deliberately NO bare "dofollow" needle, so a "Dofollow backlinks"
+  // column can't hijack this. Placed after the rank hints so a plain "Rank"
+  // header still maps to rank.
+  { needle: "dofollow ref", field: "dofollow_refdomains" },
+  { needle: "ref domains dofollow", field: "dofollow_refdomains" },
+  { needle: "refdomains dofollow", field: "dofollow_refdomains" },
+  { needle: "ref domains (follow)", field: "dofollow_refdomains" },
+  { needle: "dofollow domains", field: "dofollow_refdomains" },
   { needle: "domain", field: "domain" },
   { needle: "name", field: "domain" },
 ];
@@ -135,6 +161,31 @@ function parseAge(raw: string): number | null {
   const n = parseFloat(cleaned);
   if (!Number.isFinite(n)) return null;
   if (n < 0 || n > 100) return null;
+  return n;
+}
+
+// Ahrefs Rank. Whole-number position (rank #1 = strongest) with no upper
+// bound — so, unlike DR, no 0-100 clamp and we round to an integer.
+// Anything < 1 or unparseable becomes null (treated as optional metadata,
+// never fails the row). Strip thousands separators ("1,234,567" → 1234567).
+function parseRank(raw: string): number | null {
+  const cleaned = raw.replace(/[^\d.-]/g, "");
+  if (!cleaned) return null;
+  const n = Math.round(parseFloat(cleaned));
+  if (!Number.isFinite(n) || n < 1) return null;
+  return n;
+}
+
+// Dofollow referring domains. Whole-number count with no upper bound (big
+// sites have tens of thousands). Mirrors parseRank but allows 0 — "0
+// dofollow refdomains" is a real value, unlike Rank's 1-based position.
+// Optional metadata: unparseable / negative cells become null, never
+// failing the row. Strips thousands separators ("1,234" → 1234).
+function parseRefdomains(raw: string): number | null {
+  const cleaned = raw.replace(/[^\d.-]/g, "");
+  if (!cleaned) return null;
+  const n = Math.round(parseFloat(cleaned));
+  if (!Number.isFinite(n) || n < 0) return null;
   return n;
 }
 
@@ -287,6 +338,10 @@ export function BacklogImport({
           out.ahrefs_dr = parseDr(cell);
         } else if (target === "domain_age_years") {
           out.domain_age_years = parseAge(cell);
+        } else if (target === "ahrefs_rank") {
+          out.ahrefs_rank = parseRank(cell);
+        } else if (target === "dofollow_refdomains") {
+          out.dofollow_refdomains = parseRefdomains(cell);
         }
       }
       // Apply defaults for unmapped fields.

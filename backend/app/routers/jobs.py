@@ -11,7 +11,16 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import bindparam, case, func as sqla_func, literal, select, text
+from sqlalchemy import (
+    and_,
+    bindparam,
+    case,
+    func as sqla_func,
+    literal,
+    or_,
+    select,
+    text,
+)
 from sqlalchemy.orm import Session, aliased, selectinload
 
 from ..db import SessionLocal, get_db
@@ -178,6 +187,20 @@ class RunDetail(BaseModel):
     # see the same numbers, so existing tests + integrations keep working.
     total_count: int = 0
     filtered_count: int = 0
+    # Run-wide aggregates (added 2026-06-14) for the server-paginated Run
+    # page (availability / ahrefs_batch_analysis): in server mode the
+    # frontend no longer holds every domain in memory, so it can't compute
+    # these by scanning `domains`. All three are RUN-WIDE (ignore the
+    # offset/limit/status/domain filters) so they match what the
+    # client-side full-set scan produced before.
+    #   last_analyzed_at_max — newest last_analyzed_at across the run
+    #     (header "last analyzed" badge).
+    #   failed_domains / failed_criteria — mirror the frontend `failedCount`
+    #     scan (CR.status='failed' + CR.ai_verdict_error) used by the
+    #     "Retry Failed" button label / enabled state.
+    last_analyzed_at_max: datetime | None = None
+    failed_domains: int = 0
+    failed_criteria: int = 0
     # Per-run scoring override (added 2026-05-13 wave J). None = run uses
     # global Settings weights; dict = {"weights": {<criterion>: <float>}}
     # with the override that was last applied via the recompute endpoints.
@@ -525,6 +548,47 @@ def _bucket_counts_for_run(
     return {bucket: int(cnt) for bucket, cnt in rows if bucket}
 
 
+# Short-TTL cache for the per-run verdict roll-up. The Job page polls
+# /jobs/{id} every few seconds while a run is live, and each call ran the
+# O(domains) GROUP BY above — ~1s on a 60k-domain availability run, and it
+# stacked badly across the poll herd + concurrent tabs. The roll-up only
+# needs to feel live, not be exact-to-the-second, so we memoize it for a
+# few seconds. Keyed by (run_id, run.status, thresholds) so a status
+# transition (running → done) busts the cache and shows final counts at
+# once; a terminal run's counts never change so the stale window is moot.
+import time as _time  # noqa: E402
+
+_BUCKET_CACHE_TTL = 8.0
+_bucket_counts_cache: dict[tuple, tuple[float, dict]] = {}
+
+
+def _bucket_counts_cached(
+    db: Session,
+    run: Run,
+    *,
+    kind: str,
+    good_threshold: float,
+    mixed_threshold: float,
+) -> dict:
+    key = (run.id, run.status, kind, good_threshold, mixed_threshold)
+    now = _time.monotonic()
+    hit = _bucket_counts_cache.get(key)
+    if hit is not None and now - hit[0] < _BUCKET_CACHE_TTL:
+        return hit[1]
+    counts = _bucket_counts_for_run(
+        db, run,
+        kind=kind,
+        good_threshold=good_threshold,
+        mixed_threshold=mixed_threshold,
+    )
+    # Bound the dict so a long-lived process that has viewed many jobs
+    # doesn't grow it without limit (each run leaves ≤ a couple of keys).
+    if len(_bucket_counts_cache) > 512:
+        _bucket_counts_cache.clear()
+    _bucket_counts_cache[key] = (now, counts)
+    return counts
+
+
 # --- Job endpoints ----------------------------------------------------------
 
 @router.get("/")
@@ -613,7 +677,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)) -> JobDetail:
     source_run = pinned_run or latest_run
     counts: dict[str, int] = {}
     if source_run is not None:
-        counts = _bucket_counts_for_run(
+        counts = _bucket_counts_cached(
             db, source_run,
             kind=(job.kind or "quality"),
             good_threshold=good_t,
@@ -996,6 +1060,73 @@ def _apply_availability_filter(filter_q, buckets: list[str]):
     return filter_q.filter(bucket_expr.in_(requested))
 
 
+def _run_domain_filter_q(
+    db: Session,
+    run_id: int,
+    *,
+    status_filter: str | None = None,
+    availability_status_filter: list[str] | None = None,
+    domain_filter: str | None = None,
+):
+    """Build the `RunDomain` query for a run with the standard Run-page
+    filters applied (status + availability verdict + domain substring).
+    Shared by `get_run`, `get_run_progress`, and `get_run_domain_ids` so
+    the three stay in lock-step — the domain-ids endpoint MUST match the
+    table's filtered view exactly for "select all matching" to be correct.
+
+    `domain_filter` (added 2026-06-14) is a case-insensitive substring
+    match on the domain — the server-side equivalent of the Run page's
+    client-side search box, needed once the page paginates server-side and
+    no longer holds every domain in memory."""
+    q = db.query(RunDomain).filter(RunDomain.run_id == run_id)
+    if status_filter:
+        q = q.filter(RunDomain.status == status_filter)
+    if availability_status_filter:
+        q = _apply_availability_filter(q, availability_status_filter)
+    if domain_filter and domain_filter.strip():
+        q = q.filter(RunDomain.domain.ilike(f"%{domain_filter.strip()}%"))
+    return q
+
+
+# Criteria the frontend `failedCount` scan counts toward the "Retry
+# Failed" button. Mirrored here so the server-side aggregate matches the
+# client's number exactly. NOTE: deliberately matches the frontend list
+# (ahrefs_batch_analysis is NOT in it — the client never counted it, so a
+# batch run shows 0 failed criteria, same as before).
+_FAILED_CRITERIA_KEYS = (
+    "backlinks", "refdomains", "anchors", "keywords",
+    "wayback", "wayback_classify", "whois_history", "availability",
+)
+
+
+def _run_failed_aggregates(db: Session, run_id: int) -> tuple[int, int]:
+    """Run-wide failed-criteria / failed-domains counts mirroring the
+    frontend `failedCount` scan. A CR counts as failed if its fetch
+    `status == 'failed'` OR it carries an `ai_verdict_error`; the two are
+    counted SEPARATELY (a CR that's both fetch- and AI-failed adds 2 to
+    the criteria total, matching the client loop). `failed_domains` is the
+    distinct RunDomains with at least one such failure."""
+    base = (
+        db.query(CriterionResult)
+        .join(RunDomain, CriterionResult.run_domain_id == RunDomain.id)
+        .filter(RunDomain.run_id == run_id)
+        .filter(CriterionResult.criterion.in_(_FAILED_CRITERIA_KEYS))
+    )
+    ai_failed = and_(
+        CriterionResult.ai_verdict_error.isnot(None),
+        CriterionResult.ai_verdict_error != "",
+    )
+    failed_fetch = base.filter(CriterionResult.status == "failed").count()
+    failed_ai = base.filter(ai_failed).count()
+    failed_domains = (
+        base.filter(or_(CriterionResult.status == "failed", ai_failed))
+        .with_entities(CriterionResult.run_domain_id)
+        .distinct()
+        .count()
+    )
+    return failed_domains, failed_fetch + failed_ai
+
+
 def get_run(
     run_id: int,
     db: Session = Depends(get_db),
@@ -1004,6 +1135,7 @@ def get_run(
     offset: int = 0,
     status_filter: str | None = None,
     availability_status_filter: list[str] | None = None,
+    domain_filter: str | None = None,
 ) -> RunDetail:
     """Run detail endpoint, now paginated (added 2026-05-16).
 
@@ -1041,21 +1173,16 @@ def get_run(
         .filter(RunDomain.run_id == run.id)
         .count()
     )
-    filter_q = db.query(RunDomain).filter(RunDomain.run_id == run.id)
-    if status_filter:
-        filter_q = filter_q.filter(RunDomain.status == status_filter)
-    # Availability-verdict filter (2026-05-16, revised second-pass).
-    # Multi-select. Matches the chip's bucket vocabulary 1:1 so picking
-    # "без вердикта" returns the SAME rows the chip counts in its
-    # no_verdict bucket — including cascade-orphaned rows (CR missing
-    # or status='failed'/'running'/'pending' with empty data_json).
-    # Previous implementation used INNER JOIN + verdict.status filter
-    # and was unreachable for the no_verdict bucket; the user's
-    # "Неизвестно returned 0 but chip showed 8" bug.
-    if availability_status_filter:
-        filter_q = _apply_availability_filter(
-            filter_q, availability_status_filter,
-        )
+    # Status + availability-verdict + domain-substring filters, built via
+    # the shared helper so /runs/{id}, /progress and /domain-ids stay in
+    # lock-step (the "select all matching" feature relies on /domain-ids
+    # returning exactly the rows this query would page through).
+    filter_q = _run_domain_filter_q(
+        db, run.id,
+        status_filter=status_filter,
+        availability_status_filter=availability_status_filter,
+        domain_filter=domain_filter,
+    )
     filtered_count = filter_q.with_entities(RunDomain.id).count()
 
     # Domain slice — apply pagination AT THE DB layer. `limit=0` is the
@@ -1253,6 +1380,18 @@ def get_run(
                 batch_metrics=batch_metrics,
             )
         )
+    # Run-wide aggregates (2026-06-14) — computed once per full reload so
+    # the server-paginated Run page doesn't need every domain in memory to
+    # render the "last analyzed" badge and the "Retry Failed" counts. Cheap
+    # SQL (a MAX + a few COUNTs); skipped cost on the 2s slim poll because
+    # that hits /progress, not this endpoint.
+    last_analyzed_at_max = (
+        db.query(sqla_func.max(RunDomain.last_analyzed_at))
+        .filter(RunDomain.run_id == run.id)
+        .scalar()
+    )
+    failed_domains, failed_criteria = _run_failed_aggregates(db, run.id)
+
     from ..tasks import get_run_scoring_override
     return RunDetail(
         id=run.id,
@@ -1268,6 +1407,9 @@ def get_run(
         domains=progress,
         total_count=total_count,
         filtered_count=filtered_count,
+        last_analyzed_at_max=last_analyzed_at_max,
+        failed_domains=failed_domains,
+        failed_criteria=failed_criteria,
         scoring_override=get_run_scoring_override(run.id),
     )
 
@@ -1279,6 +1421,7 @@ async def _get_run_route(
     offset: int = 0,
     status_filter: str | None = None,
     availability_status_filter: list[str] | None = Query(None),
+    domain_filter: str | None = None,
 ) -> RunDetail:
     """Async wrapper for `get_run`. Off-loads the eager-loaded query +
     per-domain JSON walk to `asyncio.to_thread` so the event loop stays
@@ -1290,10 +1433,12 @@ async def _get_run_route(
     pending/running/done/failed/canceled enum values.
     `availability_status_filter` (multi-valued, 2026-05-16) narrows to
     rows whose latest availability CR has verdict.status in the set —
-    only meaningful for availability-pillar runs."""
+    only meaningful for availability-pillar runs. `domain_filter`
+    (2026-06-14) is the server-side domain substring search used by the
+    server-paginated Run page."""
     return await asyncio.to_thread(
         _run_get_run, run_id, limit, offset, status_filter,
-        availability_status_filter,
+        availability_status_filter, domain_filter,
     )
 
 
@@ -1303,6 +1448,7 @@ def _run_get_run(
     offset: int = 0,
     status_filter: str | None = None,
     availability_status_filter: list[str] | None = None,
+    domain_filter: str | None = None,
 ) -> RunDetail:
     db = SessionLocal()
     try:
@@ -1310,6 +1456,7 @@ def _run_get_run(
             run_id, db=db,
             limit=limit, offset=offset, status_filter=status_filter,
             availability_status_filter=availability_status_filter,
+            domain_filter=domain_filter,
         )
     finally:
         db.close()
@@ -1323,6 +1470,7 @@ def get_run_progress(
     offset: int = 0,
     status_filter: str | None = None,
     availability_status_filter: list[str] | None = None,
+    domain_filter: str | None = None,
 ) -> RunProgress:
     """Slim companion to `get_run` for the Run-page polling loop. Returns
     just the fields that change every tick: per-domain status pills,
@@ -1356,15 +1504,15 @@ def get_run_progress(
             counts[status] = int(cnt)
     counts["total"] = total
 
-    # Domain slice.
-    filter_q = db.query(RunDomain).filter(RunDomain.run_id == run.id)
-    if status_filter:
-        filter_q = filter_q.filter(RunDomain.status == status_filter)
-    # Availability-verdict filter — see get_run for the rationale.
-    if availability_status_filter:
-        filter_q = _apply_availability_filter(
-            filter_q, availability_status_filter,
-        )
+    # Domain slice — same shared filter as /runs/{id} (status +
+    # availability verdict + domain substring) so a search active in the
+    # page narrows the polled window too.
+    filter_q = _run_domain_filter_q(
+        db, run.id,
+        status_filter=status_filter,
+        availability_status_filter=availability_status_filter,
+        domain_filter=domain_filter,
+    )
     filtered_count = filter_q.with_entities(RunDomain.id).count()
     page_q = filter_q.order_by(RunDomain.id.asc())
     if limit > 0:
@@ -1433,6 +1581,7 @@ async def _get_run_progress_route(
     offset: int = 0,
     status_filter: str | None = None,
     availability_status_filter: list[str] | None = Query(None),
+    domain_filter: str | None = None,
 ) -> RunProgress:
     """Async wrapper for the slim progress endpoint. Off-loads the
     eager-loaded query to asyncio.to_thread so the polling loop can
@@ -1440,7 +1589,7 @@ async def _get_run_progress_route(
     each tick."""
     return await asyncio.to_thread(
         _run_get_run_progress, run_id, limit, offset, status_filter,
-        availability_status_filter,
+        availability_status_filter, domain_filter,
     )
 
 
@@ -1450,6 +1599,7 @@ def _run_get_run_progress(
     offset: int = 0,
     status_filter: str | None = None,
     availability_status_filter: list[str] | None = None,
+    domain_filter: str | None = None,
 ) -> RunProgress:
     db = SessionLocal()
     try:
@@ -1457,6 +1607,7 @@ def _run_get_run_progress(
             run_id, db=db,
             limit=limit, offset=offset, status_filter=status_filter,
             availability_status_filter=availability_status_filter,
+            domain_filter=domain_filter,
         )
     finally:
         db.close()
@@ -3155,14 +3306,26 @@ def get_run_status(run_id: int, db: Session = Depends(get_db)) -> RunStatus:
     run = db.get(Run, run_id)
     if run is None:
         raise HTTPException(404, "run not found")
+    # SQL GROUP BY instead of hydrating run.domains (2026-06-17). This is a
+    # 1-2s polling endpoint; the ORM walk loaded every RunDomain of a 60k+
+    # run on each poll (~290 MB of unreclaimable pymalloc per call). Counts
+    # straight off the (run_id, status) index instead.
     counts = {"pending": 0, "running": 0, "done": 0, "failed": 0}
-    for d in run.domains:
-        counts[d.status] = counts.get(d.status, 0) + 1
+    total = 0
+    for status, cnt in (
+        db.query(RunDomain.status, sqla_func.count(RunDomain.id))
+        .filter(RunDomain.run_id == run_id)
+        .group_by(RunDomain.status)
+        .all()
+    ):
+        n = int(cnt)
+        total += n
+        counts[status] = counts.get(status, 0) + n
     from ..tasks import is_reanalyzing_run
     return RunStatus(
         id=run.id,
         status=run.status,
-        total=len(run.domains),
+        total=total,
         reanalyzing=is_reanalyzing_run(run.id),
         **counts,
     )
@@ -3266,6 +3429,116 @@ def export_ahrefs_batch_analysis_csv(run_id: int, db: Session = Depends(get_db))
     )
 
 
+@runs_router.get("/{run_id}/availability.csv")
+def export_availability_csv(run_id: int, db: Session = Depends(get_db)):
+    """Stream an availability run's domain × verdict table as CSV.
+    Streamed + chunked at the DB layer (1000 rows/page) so a 100k-domain
+    run exports without loading every row into memory — the server-side
+    counterpart of the old client-side CSV, needed now that the
+    availability Run page paginates server-side and never holds the full
+    set. Verdict comes from the LATEST availability CR per domain (same
+    `max(cr.id)` duplicate-guard the page uses)."""
+    import csv
+    import io
+
+    from fastapi.responses import StreamingResponse
+
+    run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+
+    header = ["domain", "status", "availability_status", "error"]
+
+    def _rows():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+
+        def _flush() -> str:
+            out = buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            return out
+
+        writer.writerow(header)
+        yield _flush()
+
+        PAGE = 1000
+        offset = 0
+        while True:
+            page = (
+                db.query(RunDomain)
+                .filter(RunDomain.run_id == run_id)
+                .order_by(RunDomain.id.asc())
+                .options(selectinload(RunDomain.results))
+                .offset(offset)
+                .limit(PAGE)
+                .all()
+            )
+            if not page:
+                break
+            for rd in page:
+                latest = max(
+                    (cr for cr in rd.results if cr.criterion == "availability"),
+                    key=lambda cr: cr.id,
+                    default=None,
+                )
+                verdict_status = ""
+                if latest is not None and latest.data_json:
+                    try:
+                        body = json.loads(latest.data_json)
+                        v = body.get("verdict")
+                        if isinstance(v, dict) and isinstance(
+                            v.get("status"), str
+                        ):
+                            verdict_status = v["status"]
+                    except json.JSONDecodeError:
+                        pass
+                writer.writerow(
+                    [rd.domain, rd.status, verdict_status, rd.error or ""]
+                )
+            yield _flush()
+            offset += PAGE
+
+    filename = f"availability-run-{run_id}.csv"
+    return StreamingResponse(
+        _rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@runs_router.get("/{run_id}/domain-ids")
+def get_run_domain_ids(
+    run_id: int,
+    db: Session = Depends(get_db),
+    status_filter: str | None = None,
+    availability_status_filter: list[str] | None = Query(None),
+    domain_filter: str | None = None,
+) -> dict:
+    """Every RunDomain id matching the current Run-page filters (status +
+    availability verdict + domain substring), in stable id order. Powers
+    "select all matching" on the server-paginated Run page, where the
+    frontend can no longer derive the full matching set from the in-memory
+    page. Ids-only keeps it light (~400 KB even at 100k rows) and it's
+    fetched lazily — only when the user clicks the link."""
+    run = db.query(Run).filter(Run.id == run_id).one_or_none()
+    if run is None:
+        raise HTTPException(404, "run not found")
+    q = _run_domain_filter_q(
+        db, run.id,
+        status_filter=status_filter,
+        availability_status_filter=availability_status_filter,
+        domain_filter=domain_filter,
+    )
+    ids = [
+        rid
+        for (rid,) in q.with_entities(RunDomain.id)
+        .order_by(RunDomain.id.asc())
+        .all()
+    ]
+    return {"ids": ids, "count": len(ids)}
+
+
 @runs_router.get("/{run_id}/events")
 async def stream_run_events(run_id: int):
     """Server-Sent Events stream of run status. Wraps `get_run_status`
@@ -3306,15 +3579,27 @@ async def stream_run_events(run_id: int):
                 if run is None:
                     yield f"event: error\ndata: {_json.dumps({'detail': 'run not found'})}\n\n"
                     return
+                # SQL GROUP BY instead of hydrating run.domains every tick
+                # (2026-06-17). This SSE loop re-counted by walking the full
+                # ORM collection on each push — a per-tick 60k-row hydration
+                # for the life of the stream.
                 counts = {
                     "pending": 0, "running": 0, "done": 0, "failed": 0,
                 }
-                for d in run.domains:
-                    counts[d.status] = counts.get(d.status, 0) + 1
+                total = 0
+                for status, cnt in (
+                    db.query(RunDomain.status, sqla_func.count(RunDomain.id))
+                    .filter(RunDomain.run_id == run_id)
+                    .group_by(RunDomain.status)
+                    .all()
+                ):
+                    n = int(cnt)
+                    total += n
+                    counts[status] = counts.get(status, 0) + n
                 payload = {
                     "id": run.id,
                     "status": run.status,
-                    "total": len(run.domains),
+                    "total": total,
                     "reanalyzing": is_reanalyzing_run(run.id),
                     **counts,
                 }

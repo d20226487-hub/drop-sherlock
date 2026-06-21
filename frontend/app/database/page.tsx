@@ -1136,7 +1136,26 @@ export default function DatabasePage() {
         updated: r.updated,
         created: r.created,
       });
-      reload({ silent: true, fresh: true });
+      // Cheaper-fix (2026-06-17): a backlog-status change does NOT
+      // invalidate the server's heavy whole-DB aggregation snapshot, so
+      // forcing fresh=true here re-ran the ~20s `_build_all_rows` rebuild
+      // and pegged the API at ~100% CPU on large sources (60k+ domains).
+      // Patch the affected rows' status chips locally instead — no rebuild,
+      // no spike. Off-page rows / the backlog-status filter reflect the
+      // change on the next manual Refresh or 5-min cache expiry.
+      const marked = new Set(list);
+      setData((prev) =>
+        prev
+          ? {
+              ...prev,
+              rows: prev.rows.map((row) =>
+                marked.has(row.domain)
+                  ? { ...row, backlog_status: r.status }
+                  : row,
+              ),
+            }
+          : prev,
+      );
     } catch (e) {
       setBulkBacklogResult({
         status,

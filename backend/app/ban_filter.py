@@ -19,6 +19,15 @@ from sqlalchemy.orm import Session
 
 from .models import DomainBan
 
+# SQLite caps the number of bound parameters in a single statement
+# (SQLITE_MAX_VARIABLE_NUMBER — 999 on old builds, 32766 on 3.32+). A
+# bulk backlog import can pass hundreds of thousands / millions of
+# domains, so the IN-list below MUST be chunked or it raises
+# "too many SQL variables" and 500s the whole import. 900 is safe on
+# every SQLite version; the extra round-trips are negligible next to the
+# rest of a large import.
+_IN_CHUNK = 900
+
 
 def filter_banned(
     db: Session, domains: list[str],
@@ -37,16 +46,22 @@ def filter_banned(
     """
     if not domains:
         return [], set()
-    # IN-list against the (small) subset relevant to this call.
+    # IN-list against the (small) subset relevant to this call, chunked so
+    # a million-domain import doesn't overflow SQLite's bound-parameter
+    # limit. For the common ≤900-domain caller this is a single query —
+    # identical to the pre-chunking behavior.
     unique = list({d for d in domains if d})
     if not unique:
         return [], set()
-    banned = {
-        b.domain
-        for b in db.query(DomainBan)
-        .filter(DomainBan.domain.in_(unique))
-        .all()
-    }
+    banned: set[str] = set()
+    for i in range(0, len(unique), _IN_CHUNK):
+        chunk = unique[i : i + _IN_CHUNK]
+        banned.update(
+            b.domain
+            for b in db.query(DomainBan.domain)
+            .filter(DomainBan.domain.in_(chunk))
+            .all()
+        )
     if not banned:
         return list(domains), set()
     allowed = [d for d in domains if d and d not in banned]

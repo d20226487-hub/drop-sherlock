@@ -280,6 +280,12 @@ async def classify_wayback_for_domain(
     resolved_model: str,
     judge_limit_ctx,
     lang: str = "en",
+    # Prompt variant (added 2026-06-07). All three chained classify
+    # prompts (combined / theme_only / category) get a white|grey
+    # split; this kwarg picks which slot the runner reads. Defaults to
+    # "white" so callers that don't set it (legacy specs, internal
+    # tests) keep their old behavior. See WaybackClassifyConfig.variant.
+    variant: str = "white",
 ) -> tuple[dict, list[dict]]:
     """Run the wayback_classify pipeline for one domain. Returns
     `(combined_verdict, usages)` where `combined_verdict` is the merged
@@ -307,17 +313,20 @@ async def classify_wayback_for_domain(
         lingua_result = _detect_language_with_lingua(samples)
 
     # --- Step 1: language + theme (or theme only) AI call -------------------
+    # Prompt slot depends on BOTH `language_mode` (combined vs theme_only)
+    # AND `variant` (white vs grey, 2026-06-07). Normalise unexpected
+    # variant values to "white" so a typo in a hand-edited spec can't
+    # silently route to a non-existent slot.
+    safe_variant = "grey" if variant == "grey" else "white"
     if language_mode == "library":
-        system_prompt = localize_prompt(
-            get_ai_prompt("wayback_classify_theme_only"), lang
-        )
+        primary_key = f"wayback_classify_theme_only_{safe_variant}"
+        system_prompt = localize_prompt(get_ai_prompt(primary_key), lang)
         user_msg = build_classify_user_message(
             domain=domain, samples=samples, lingua_hint=lingua_result,
         )
     else:
-        system_prompt = localize_prompt(
-            get_ai_prompt("wayback_classify_combined"), lang
-        )
+        primary_key = f"wayback_classify_combined_{safe_variant}"
+        system_prompt = localize_prompt(get_ai_prompt(primary_key), lang)
         user_msg = build_classify_user_message(
             domain=domain, samples=samples, lingua_hint=None,
         )
@@ -364,7 +373,9 @@ async def classify_wayback_for_domain(
         )
         return parsed_classify, usages
 
-    category_prompt = localize_prompt(get_ai_prompt("wayback_category"), lang)
+    category_prompt = localize_prompt(
+        get_ai_prompt(f"wayback_category_{safe_variant}"), lang,
+    )
     category_user_msg = build_category_user_message(
         theme_verdict=parsed_classify, categories=categories,
     )

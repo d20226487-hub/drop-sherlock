@@ -4,6 +4,10 @@ sqlalchemy==2.0.36
 pydantic==2.10.3
 pydantic-settings==2.6.1
 httpx==0.28.1
+# SOCKS proxy support for httpx (RDAP egress proxy pool). httpx 0.28
+# auto-detects socksio for socks5:// proxy URLs; HTTP/HTTPS proxies need
+# no extra dep. ~30 KB, pure-Python.
+socksio==1.0.0
 apscheduler==3.10.4
 python-multipart==0.0.20
 # Deterministic language detector — used by the wayback_classify

@@ -36,7 +36,19 @@ from .common import (
     STATUS_REGISTERED,
     normalize_domain,
 )
-from .suffix import is_private_suffix_domain
+from .suffix import (
+    is_multilabel_public_suffix_domain,
+    is_private_suffix_domain,
+)
+
+# Provider the cascade is pinned to for "double extension" domains
+# (multi-label ICANN suffixes like com.ua / net.uk / co.uk). RDAP is
+# unreliable for these ccTLD second levels, so they're checked with one
+# provider that handles them well. Switched WhoisFreaks → Domainr
+# (2026-06-16): WhoisFreaks credits ran out (401), and Domainr (Fastly)
+# resolves these ccTLDs correctly, is faster (~0.8s), and has a much
+# higher rate ceiling (clean to ≥48 concurrent / ~39 rps in testing).
+_DOUBLE_EXTENSION_PROVIDER = "domainr"
 
 
 @dataclass
@@ -49,6 +61,18 @@ class AvailabilityResult:
     provider: str = ""  # which provider produced the terminal answer
     from_cache: bool = False
     checked_at: datetime | None = None
+
+
+@dataclass
+class CascadeOutcome:
+    """Network-only cascade result: the caller-facing verdict PLUS the raw
+    provider trace, with NO DB side effects. Returned by
+    `run_cascade_network`. The single-domain/Recheck path
+    (`check_availability_async`) persists the trace row-by-row via
+    `_persist`; the batched availability runner bulk-inserts the whole
+    chunk's traces in one transaction (2026-06-21 throughput work)."""
+    result: AvailabilityResult
+    provider_results: list[ProviderResult]
 
 
 # Per-provider semaphores cap concurrent in-flight requests. Lazily
@@ -67,6 +91,28 @@ def _get_semaphore(provider: str) -> asyncio.Semaphore:
     return _semaphores[provider]
 
 
+# Dedicated httpx client for the metered HTTP providers (Domainr, live
+# WhoisFreaks). Kept SEPARATE from the runner's shared client (added
+# 2026-06-16): RDAP — whether direct or proxied — can hang for tens of
+# seconds, and when Domainr shared that one client/pool the slow RDAP
+# requests starved it (~1s in isolation degraded to 10-14s timeouts in a
+# live run). These providers always go direct (no proxy), are fast, and
+# benefit from their own keep-alive pool to Fastly / WhoisFreaks. Module-
+# global + lazily (re)created; lives for the process like the proxy pool.
+_metered_client: httpx.AsyncClient | None = None
+_METERED_TIMEOUT = httpx.Timeout(12.0)
+_METERED_LIMITS = httpx.Limits(max_connections=128, max_keepalive_connections=64)
+
+
+def _metered_provider_client() -> httpx.AsyncClient:
+    global _metered_client
+    if _metered_client is None or _metered_client.is_closed:
+        _metered_client = httpx.AsyncClient(
+            timeout=_METERED_TIMEOUT, limits=_METERED_LIMITS,
+        )
+    return _metered_client
+
+
 async def _call_provider(
     provider: str, domain: str, client: httpx.AsyncClient,
 ) -> ProviderResult:
@@ -79,11 +125,18 @@ async def _call_provider(
         if provider == "rdap":
             return await rdap_provider.check(domain, client=client)
         if provider == "domainr":
-            return await domainr_provider.check(domain, client=client)
+            # Dedicated client — isolate fast Domainr from slow RDAP (see
+            # `_metered_provider_client`).
+            return await domainr_provider.check(
+                domain, client=_metered_provider_client(),
+            )
         if provider == "whois":
             return await whois_provider.check(domain)
         if provider == "whoisfreaks":
-            return await whoisfreaks_provider.check(domain, client=client)
+            # Metered + direct, same isolation rationale as Domainr.
+            return await whoisfreaks_provider.check(
+                domain, client=_metered_provider_client(),
+            )
         return ProviderResult(
             provider=provider, status=STATUS_ERROR,
             error_message=f"unknown provider: {provider}",
@@ -142,6 +195,118 @@ def _persist(
         None,
     )
     return terminal
+
+
+def _psl_not_supported_result() -> ProviderResult:
+    """The single trace row emitted for a domain under a PRIVATE
+    multi-label PSL suffix (e.g. jcg.us.com) — the gTLD/ccTLD registry
+    can't authoritatively confirm it, so we refuse to guess `available`.
+    Shared by both the persisting and network-only entry points."""
+    return ProviderResult(
+        provider="psl",
+        status=STATUS_NOT_SUPPORTED,
+        error_message=(
+            "registered under a private multi-label suffix; "
+            "the gTLD/ccTLD registry can't authoritatively "
+            "confirm availability"
+        ),
+    )
+
+
+def _build_availability_result(
+    domain: str,
+    results: list[ProviderResult],
+    terminal: ProviderResult | None,
+) -> AvailabilityResult:
+    """Translate a finished provider walk into the caller-facing verdict.
+    Shared by `check_availability_async` (persisting) and
+    `run_cascade_network` (batched) so both produce identical verdicts.
+
+    When nothing answered terminally, prefer the first error result so the
+    user sees a real reason; fall back to 'unknown' when even errors are
+    absent."""
+    if terminal is None:
+        for r in results:
+            if r.status == STATUS_ERROR:
+                return AvailabilityResult(
+                    domain=domain,
+                    status=STATUS_ERROR,
+                    provider=r.provider,
+                    checked_at=datetime.utcnow(),
+                )
+        return AvailabilityResult(
+            domain=domain,
+            status="unknown",
+            provider=results[-1].provider if results else "",
+            checked_at=datetime.utcnow(),
+        )
+    return AvailabilityResult(
+        domain=domain,
+        status=terminal.status,
+        registrar=terminal.registrar,
+        expires_on=terminal.expires_on,
+        provider=terminal.provider,
+        from_cache=False,
+        checked_at=datetime.utcnow(),
+    )
+
+
+async def run_cascade_network(
+    domain: str, *, client: httpx.AsyncClient,
+) -> CascadeOutcome:
+    """Walk the configured cascade for one domain over the NETWORK ONLY —
+    no cache read, no persistence, no DB session at all. Returns the
+    verdict + the provider trace so a batched caller can bulk-write every
+    row of a chunk in a single transaction.
+
+    The private-suffix guard and the multilabel-suffix provider pinning
+    are pure local PSL lookups (microseconds), so they still apply here.
+    `check_availability_async` wraps this with the cache short-circuit and
+    the per-row `_persist` for the single-domain / Recheck path; the
+    availability runner calls it directly and owns the bulk write."""
+    domain = normalize_domain(domain)
+    if not domain:
+        return CascadeOutcome(
+            AvailabilityResult(
+                domain="", status=STATUS_ERROR, provider="",
+                checked_at=datetime.utcnow(),
+            ),
+            [],
+        )
+
+    # Private-suffix guard — refuse to guess (see `_psl_not_supported_result`).
+    if is_private_suffix_domain(domain):
+        psl_result = _psl_not_supported_result()
+        return CascadeOutcome(
+            AvailabilityResult(
+                domain=domain,
+                status=STATUS_NOT_SUPPORTED,
+                provider="psl",
+                from_cache=False,
+                checked_at=datetime.utcnow(),
+            ),
+            [psl_result],
+        )
+
+    order = get_availability_cascade_order()
+    # Double-extension domains (com.ua / net.uk / co.uk …) get pinned to a
+    # single provider — RDAP + the rest are unreliable for these ccTLD
+    # second levels.
+    if is_multilabel_public_suffix_domain(domain):
+        order = [_DOUBLE_EXTENSION_PROVIDER]
+    results: list[ProviderResult] = []
+    terminal: ProviderResult | None = None
+    for provider in order:
+        if not is_provider_enabled(provider):
+            continue
+        r = await _call_provider(provider, domain, client)
+        results.append(r)
+        if r.is_terminal:
+            terminal = r
+            break
+    return CascadeOutcome(
+        _build_availability_result(domain, results, terminal), results,
+    )
 
 
 async def check_availability_async(
@@ -205,15 +370,7 @@ async def check_availability_async(
         # rather than cache. We still persist one row so the verdict
         # surfaces in the Database/Backlog column + per-run trace.
         if is_private_suffix_domain(domain):
-            psl_result = ProviderResult(
-                provider="psl",
-                status=STATUS_NOT_SUPPORTED,
-                error_message=(
-                    "registered under a private multi-label suffix; "
-                    "the gTLD/ccTLD registry can't authoritatively "
-                    "confirm availability"
-                ),
-            )
+            psl_result = _psl_not_supported_result()
             s, owned = _open_session()
             try:
                 _persist(s, domain, [psl_result], run_id)
@@ -247,56 +404,20 @@ async def check_availability_async(
                     checked_at=cached.checked_at,
                 )
 
-        # --- Phase 2: live cascade (NO session held across provider awaits)
-        order = get_availability_cascade_order()
-        results: list[ProviderResult] = []
-        terminal: ProviderResult | None = None
-        for provider in order:
-            if not is_provider_enabled(provider):
-                continue
-            r = await _call_provider(provider, domain, client)
-            results.append(r)
-            if r.is_terminal:
-                terminal = r
-                break
+        # --- Phase 2: live cascade (NO session held across provider awaits).
+        # The provider walk + verdict-building is shared with the batched
+        # runner via `run_cascade_network` (no DB access inside).
+        outcome = await run_cascade_network(domain, client=client)
 
-        # --- Phase 3: persist (short session, no await held)
+        # --- Phase 3: persist the trace (short session, no await held).
         s, owned = _open_session()
         try:
-            _persist(s, domain, results, run_id)
+            _persist(s, domain, outcome.provider_results, run_id)
         finally:
             if owned:
                 s.close()
 
-        # Pick the return value based on what came back from the cascade.
-        if terminal is None:
-            # Nothing responded terminally — prefer the first error
-            # result so the user sees a real reason; fall back to
-            # 'unknown' when even errors are absent.
-            for r in results:
-                if r.status == STATUS_ERROR:
-                    return AvailabilityResult(
-                        domain=domain,
-                        status=STATUS_ERROR,
-                        provider=r.provider,
-                        checked_at=datetime.utcnow(),
-                    )
-            return AvailabilityResult(
-                domain=domain,
-                status="unknown",
-                provider=results[-1].provider if results else "",
-                checked_at=datetime.utcnow(),
-            )
-
-        return AvailabilityResult(
-            domain=domain,
-            status=terminal.status,
-            registrar=terminal.registrar,
-            expires_on=terminal.expires_on,
-            provider=terminal.provider,
-            from_cache=False,
-            checked_at=datetime.utcnow(),
-        )
+        return outcome.result
     finally:
         if own_client:
             await client.aclose()

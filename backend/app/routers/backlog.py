@@ -112,6 +112,11 @@ class BulkDeleteIn(BaseModel):
 _IMPORT_MAX_DOMAIN_LEN = 512
 _IMPORT_MAX_REGISTRAR_LEN = 256
 _IMPORT_MAX_COMMENTS_LEN = 4000
+# Max domains per IN-list when looking up existing rows during import.
+# SQLite limits bound parameters per statement; a million-row import must
+# chunk its IN queries or it raises "too many SQL variables". 900 is safe
+# on every SQLite build.
+_IN_CHUNK = 900
 
 
 class ImportRowIn(BaseModel):
@@ -134,6 +139,14 @@ class ImportRowIn(BaseModel):
     # Domain age in years captured at import (added 2026-05-20). Same
     # storage-only contract as ahrefs_dr.
     domain_age_years: float | None = None
+    # Ahrefs Rank captured at import (added 2026-06-14). Storage-only,
+    # mirrors ahrefs_dr; integer with no upper bound. The frontend parser
+    # drops invalid cells to None.
+    ahrefs_rank: int | None = None
+    # Dofollow referring-domains count captured at import (2026-06-18).
+    # Storage-only, mirrors ahrefs_rank; whole-number count, no upper bound.
+    # The frontend parser drops invalid / negative cells to None.
+    dofollow_refdomains: int | None = None
 
 
 class ImportIn(BaseModel):
@@ -1373,36 +1386,59 @@ def import_rows(payload: ImportIn, db: Session = Depends(get_db)) -> ImportResul
                 kept.append(r)
         valid = kept
 
-    # One query to find which of the payload's domains are already in the
-    # DB — vastly faster than per-row INSERT-with-IntegrityError-catch.
+    # Find which of the payload's domains are already in the DB — vastly
+    # faster than per-row INSERT-with-IntegrityError-catch. Chunked so a
+    # million-row import doesn't overflow SQLite's bound-parameter limit
+    # ("too many SQL variables"); _IN_CHUNK (900) is safe on every SQLite.
     domains = [r.domain for r in valid]
-    existing = {
-        d
-        for (d,) in db.query(BacklogDomain.domain)
-        .filter(BacklogDomain.domain.in_(domains))
-        .all()
-    } if domains else set()
+    existing: set[str] = set()
+    for i in range(0, len(domains), _IN_CHUNK):
+        chunk = domains[i : i + _IN_CHUNK]
+        existing.update(
+            d
+            for (d,) in db.query(BacklogDomain.domain)
+            .filter(BacklogDomain.domain.in_(chunk))
+            .all()
+        )
     db_dupes = 0
-    inserted = 0
+    # Build plain dict mappings for the non-duplicate rows, then insert in
+    # chunks via bulk_insert_mappings. The previous per-row `db.add` built
+    # one ORM instance per row + a unit-of-work flush — fine at a few
+    # thousand rows but at a million it pins ~GBs of identity-map state and
+    # is the slow path. bulk_insert_mappings skips that overhead; chunking
+    # the executemany keeps the per-statement parameter count bounded.
+    # created_at/updated_at are set explicitly because bulk mappings don't
+    # invoke the model's Python-side column defaults.
+    now = datetime.utcnow()
+    to_insert: list[dict] = []
     for r in valid:
         if r.domain in existing:
             db_dupes += 1
             continue
-        db.add(
-            BacklogDomain(
-                domain=r.domain,
-                status=r.status or "backlog",
-                registrar=r.registrar or "",
-                expiration_date=r.expiration_date,
-                project=r.project or "",
-                comments=r.comments or "",
-                desired_price=r.desired_price,
-                max_price=r.max_price,
-                ahrefs_dr=r.ahrefs_dr,
-                domain_age_years=r.domain_age_years,
-            )
+        to_insert.append(
+            {
+                "domain": r.domain,
+                "status": r.status or "backlog",
+                "registrar": r.registrar or "",
+                "expiration_date": r.expiration_date,
+                "project": r.project or "",
+                "comments": r.comments or "",
+                "desired_price": r.desired_price,
+                "max_price": r.max_price,
+                "ahrefs_dr": r.ahrefs_dr,
+                "domain_age_years": r.domain_age_years,
+                "ahrefs_rank": r.ahrefs_rank,
+                "dofollow_refdomains": r.dofollow_refdomains,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
-        inserted += 1
+    inserted = len(to_insert)
+    _INSERT_CHUNK = 5000
+    for i in range(0, len(to_insert), _INSERT_CHUNK):
+        db.bulk_insert_mappings(
+            BacklogDomain, to_insert[i : i + _INSERT_CHUNK]
+        )
     db.commit()
 
     skipped_filtered_total = sum(skipped_filtered.values())

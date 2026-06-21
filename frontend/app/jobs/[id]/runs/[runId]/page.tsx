@@ -4,10 +4,12 @@ import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useT } from "@/lib/i18n";
 import {
   ahrefsBatchAnalysisCsvUrl,
+  availabilityCsvUrl,
   AHREFS_BATCH_METRICS,
   api,
   AIProvider,
   formatBatchMetric,
+  JobKind,
   RecomputeFinalResult,
   RunCost,
   RunDetail,
@@ -15,7 +17,10 @@ import {
   RunStatus,
 } from "@/lib/api";
 import { StatusPill } from "@/components/status-pill";
-import { usePaginatedSearch } from "@/lib/use-paginated-search";
+import {
+  usePaginatedSearch,
+  type PaginatedSearch,
+} from "@/lib/use-paginated-search";
 import {
   PaginationBottomBar,
   PaginationTopBar,
@@ -820,12 +825,37 @@ export default function RunDetailPage({
   // (`POLL_WINDOW_LIMIT` rows max) keyed off the visible page —
   // see pollWindowRef + the syncing useEffect after search hook init.
   // Cuts per-tick payload from ~26k rows to ~200 on the offending run.
-  const SERVER_PAGE_LIMIT = 0;
-  const serverOffset = 0;
   // Cap on rows the slim poll asks for per tick. 200 covers the common
   // PAGE_SIZE_OPTIONS (20/50/100) with headroom; on a user who jumps
   // pageSize to 100 we still send only ~2 pages worth per tick.
   const POLL_WINDOW_LIMIT = 200;
+
+  // --- True server-side pagination (2026-06-14) ---------------------------
+  // Only availability + ahrefs_batch_analysis runs paginate server-side —
+  // they're the kinds that grow to 10k–100k domains and froze the page when
+  // it loaded every row. Quality/whois keep loading everything (limit=0) so
+  // their rich client-side search/filter/CSV is unchanged.
+  //
+  // Chicken-and-egg: we only learn `job_kind` from the run fetch itself, so
+  // the FIRST load is a cheap "probe" (one page worth) for ALL kinds; once
+  // the kind is known, client-mode runs do a follow-up limit=0 reload while
+  // server-mode runs stay paginated. `jobKind == null` == not-yet-probed.
+  const [jobKind, setJobKind] = useState<JobKind | null>(null);
+  const serverPaginated =
+    jobKind === "availability" || jobKind === "ahrefs_batch_analysis";
+  // Server-mode page state (drives the limit/offset the parent fetches and
+  // the PaginatedSearch-shaped object handed to DomainsSection).
+  const [srvPage, setSrvPage] = useState(1);
+  const [srvPageSize, setSrvPageSize] = useState(20);
+  const [srvQuery, setSrvQuery] = useState("");
+  // Debounced search → the value actually sent to the backend, so typing
+  // doesn't fire a fetch per keystroke.
+  const [debouncedSrvQuery, setDebouncedSrvQuery] = useState("");
+  useEffect(() => {
+    const h = setTimeout(() => setDebouncedSrvQuery(srvQuery), 300);
+    return () => clearTimeout(h);
+  }, [srvQuery]);
+
   // Status filter declaration hoisted up here so `reload()` below can
   // pass it to the backend. Originally lived deeper in the file next to
   // the other table filters; moved 2026-05-16 to break the TDZ on the
@@ -846,15 +876,23 @@ export default function RunDetailPage({
     // resets the 5s cooldown the slim path checks before re-firing.
     lastFullReloadRef.current = Date.now();
     try {
+      // Limit policy: server-mode kinds fetch one page; the first probe
+      // (kind unknown) fetches one page too (cheap for any run size);
+      // client-mode kinds fetch everything (limit=0) once the kind is known.
+      const serverMode = serverPaginated;
+      const probing = jobKind == null;
       const opts = {
-        limit: SERVER_PAGE_LIMIT,
-        offset: serverOffset,
+        limit: serverMode || probing ? srvPageSize : 0,
+        offset: serverMode ? (srvPage - 1) * srvPageSize : 0,
         status:
           statusFilter !== "all" && typeof statusFilter === "string"
             ? statusFilter
             : undefined,
         availabilityStatuses:
           availabilityFilter.length > 0 ? availabilityFilter : undefined,
+        domainFilter: serverMode
+          ? debouncedSrvQuery.trim() || undefined
+          : undefined,
       };
       const [d, s, c] = await Promise.all([
         api.getRun(runId, opts),
@@ -862,6 +900,10 @@ export default function RunDetailPage({
         api.getRunCost(runId).catch(() => null),
       ]);
       setRun(d);
+      // Learn the kind from the payload. Setting it flips serverPaginated;
+      // for client-mode kinds the `[jobKind]` effect below fires the
+      // follow-up limit=0 reload that loads the full set.
+      setJobKind((d.job_kind ?? "quality") as JobKind);
       if (s) setStatus(s);
       if (c) setCost(c);
       setError(null);
@@ -898,6 +940,11 @@ export default function RunDetailPage({
             : undefined,
         availabilityStatuses:
           availabilityFilter.length > 0 ? availabilityFilter : undefined,
+        // Keep the polled window aligned with an active server-side search
+        // so the merge-by-id covers the rows actually on screen.
+        domainFilter: serverPaginated
+          ? debouncedSrvQuery.trim() || undefined
+          : undefined,
       };
       const [p, s, c] = await Promise.all([
         api.getRunProgress(runId, opts),
@@ -1200,6 +1247,15 @@ export default function RunDetailPage({
   // button label.
   const failedCount = useMemo(() => {
     if (!run) return { criteria: 0, domains: 0 };
+    // Server-paginated runs only hold the current page in memory, so the
+    // scan below would undercount. Use the run-wide aggregate the backend
+    // computes (mirrors this exact scan over the whole run).
+    if (serverPaginated) {
+      return {
+        criteria: run.failed_criteria ?? 0,
+        domains: run.failed_domains ?? 0,
+      };
+    }
     const ALL = [
       "backlinks", "refdomains", "anchors", "keywords",
       "wayback", "wayback_classify", "whois_history", "availability",
@@ -1218,7 +1274,7 @@ export default function RunDetailPage({
       }
     }
     return { criteria, domains };
-  }, [run]);
+  }, [run, serverPaginated]);
 
   // Per-RD retry/reanalyze progress. Drives the in-flight "Retrying X of Y"
   // label and disables the button until the batch drains. Includes the
@@ -1228,7 +1284,46 @@ export default function RunDetailPage({
     if (!run) return 0;
     return run.domains.filter((d) => d.reanalyzing).length;
   }, [run]);
-  const anyReanalyzing = reanalyzingCount > 0;
+  // In server-paginated mode the page only holds the current slice, so a
+  // cross-page bulk retry's in-flight rows may be off-screen. Fall back to
+  // the run-level `reanalyzing` flag (true while ANY domain is reanalyzing)
+  // so the settle detector still fires when the whole batch drains.
+  const anyReanalyzing = serverPaginated
+    ? reanalyzingCount > 0 || !!status?.reanalyzing
+    : reanalyzingCount > 0;
+
+  // A `PaginatedSearch`-shaped object backed by SERVER state, handed to
+  // DomainsSection in server mode so PaginationTopBar/BottomBar (which only
+  // know how to render a PaginatedSearch<T>) work unchanged. `paged` is the
+  // already-server-paged + already-server-filtered slice; `filteredAll` is
+  // just that page (server-mode CSV + "select all matching" go through
+  // dedicated endpoints, not this field). null in client mode → the section
+  // falls back to its own usePaginatedSearch.
+  const serverSearch = useMemo<PaginatedSearch<RunDomainProgress> | null>(() => {
+    if (!serverPaginated || !run) return null;
+    const total = run.total_count ?? run.domains.length;
+    const filteredTotal = run.filtered_count ?? run.domains.length;
+    const pageCount = Math.max(1, Math.ceil(filteredTotal / srvPageSize));
+    const startIdx = (srvPage - 1) * srvPageSize;
+    return {
+      query: srvQuery,
+      setQuery: (q: string) => setSrvQuery(q),
+      pageSize: srvPageSize,
+      setPageSize: (n: number) => {
+        setSrvPageSize(n);
+        setSrvPage(1);
+      },
+      page: srvPage,
+      setPage: setSrvPage,
+      total,
+      filteredTotal,
+      filteredAll: run.domains,
+      pageCount,
+      paged: run.domains,
+      start: run.domains.length === 0 ? 0 : startIdx + 1,
+      end: startIdx + run.domains.length,
+    };
+  }, [serverPaginated, run, srvPage, srvPageSize, srvQuery]);
 
   // Watch the batch settle. Two-phase: (1) wait until we've actually seen
   // some RD report `reanalyzing` (in case dispatch is faster than the
@@ -1354,15 +1449,44 @@ export default function RunDetailPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
 
-  // Refetch when a server-side filter changes (status / availability).
-  // Pagination state lives entirely in PaginationBottomBar's client-side
-  // search hook — no `serverOffset` bumps to react to anymore (see the
-  // SERVER_PAGE_LIMIT=0 rollback note above).
+  // Once the probe reveals a CLIENT-mode kind (quality/whois), do the
+  // follow-up full reload (limit=0) so client-side search/filter/CSV have
+  // every row. Server-mode kinds skip this — they stay paginated.
   useEffect(() => {
-    if (!run) return;
+    if (!run || jobKind == null) return;
+    if (serverPaginated) return;
+    if ((run.total_count ?? 0) > run.domains.length) reloadRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobKind]);
+
+  // CLIENT-mode: refetch when a server-side filter changes (status /
+  // availability). Server-mode handles filters in its own effect below.
+  useEffect(() => {
+    if (!run || serverPaginated) return;
     reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [statusFilter, availabilityFilter]);
+
+  // SERVER-mode: any filter/search change snaps back to page 1...
+  useEffect(() => {
+    if (!serverPaginated) return;
+    setSrvPage(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusFilter, availabilityFilter, debouncedSrvQuery]);
+  // ...and any page/size/search/filter change fetches that page. (Reads
+  // through reloadRef so it always sees the latest filter state.)
+  useEffect(() => {
+    if (!serverPaginated) return;
+    reloadRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    serverPaginated,
+    srvPage,
+    srvPageSize,
+    debouncedSrvQuery,
+    statusFilter,
+    availabilityFilter,
+  ]);
 
   // Refresh when the tab regains focus. Catches state changes the user
   // made in another tab — particularly scoring_override toggled on/off
@@ -1582,12 +1706,16 @@ export default function RunDetailPage({
           )}
           {(() => {
             // "Last analyzed" = max(last_analyzed_at across all domains).
-            // Distinct from finished_at — survives reanalyze.
-            const lastTs = run.domains
-              .map((d) => d.last_analyzed_at)
-              .filter((s): s is string => !!s)
-              .sort()
-              .pop();
+            // Distinct from finished_at — survives reanalyze. Server-mode
+            // runs read the backend's run-wide max (the page slice in
+            // memory can't see the newest row on another page).
+            const lastTs = serverPaginated
+              ? run.last_analyzed_at_max || undefined
+              : run.domains
+                  .map((d) => d.last_analyzed_at)
+                  .filter((s): s is string => !!s)
+                  .sort()
+                  .pop();
             return lastTs ? (
               <span className="px-2 py-0.5 rounded-md font-medium bg-blue-100 text-blue-800 dark:bg-blue-950/60 dark:text-blue-300">
                 <span className="opacity-70 mr-1">Last analyzed</span>
@@ -1841,6 +1969,8 @@ export default function RunDetailPage({
         filteredCount={run.filtered_count ?? run.domains.length}
         pollWindowRef={pollWindowRef}
         pollWindowLimit={POLL_WINDOW_LIMIT}
+        serverPaginated={serverPaginated}
+        serverSearch={serverSearch}
       />
     </div>
   );
@@ -1993,6 +2123,12 @@ function DomainsSection({
   // hook's page/pageSize change — see useEffect below `usePaginatedSearch`.
   pollWindowRef,
   pollWindowLimit,
+  // Server-side pagination (2026-06-14). When `serverPaginated`, the
+  // parent owns page/search state and hands a ready PaginatedSearch in
+  // `serverSearch`; this section renders it instead of paginating the
+  // in-memory list client-side. Null/false → unchanged client behavior.
+  serverPaginated = false,
+  serverSearch = null,
 }: {
   domains: RunDomainProgress[];
   jobId: number;
@@ -2009,6 +2145,8 @@ function DomainsSection({
   filteredCount: number;
   pollWindowRef: React.MutableRefObject<{ limit: number; offset: number }>;
   pollWindowLimit: number;
+  serverPaginated?: boolean;
+  serverSearch?: PaginatedSearch<RunDomainProgress> | null;
 }) {
   const { t } = useT();
   const ts = t.pages.jobs.run;
@@ -2126,7 +2264,14 @@ function DomainsSection({
     (d: RunDomainProgress, q: string) => d.domain.toLowerCase().includes(q),
     [],
   );
-  const search = usePaginatedSearch<RunDomainProgress>(filtered, matchDomain);
+  // Client-side search/pagination over the in-memory list. Always called
+  // (hooks can't be conditional); in server mode we ignore it and render
+  // the parent-supplied `serverSearch` instead.
+  const clientSearch = usePaginatedSearch<RunDomainProgress>(
+    filtered,
+    matchDomain,
+  );
+  const search = serverSearch ?? clientSearch;
 
   // Sync the slim-poll window with whichever client-side page the
   // user is currently looking at (Option A, 2026-05-18). Cap at
@@ -2158,8 +2303,27 @@ function DomainsSection({
     });
   }
   // "Select all matching filter" — across pages, but only the filtered
-  // (and searched) set.
-  function selectAllMatching() {
+  // (and searched) set. Client mode has the full set in memory; server
+  // mode asks the backend for every matching id (the page can't see other
+  // pages' rows).
+  async function selectAllMatching() {
+    if (serverPaginated) {
+      try {
+        const r = await api.getRunDomainIds(runId, {
+          status:
+            statusFilter !== "all" && typeof statusFilter === "string"
+              ? statusFilter
+              : undefined,
+          availabilityStatuses:
+            availabilityFilter.length > 0 ? availabilityFilter : undefined,
+          domainFilter: search.query.trim() || undefined,
+        });
+        setSelected(new Set(r.ids));
+      } catch {
+        // Leave the selection unchanged on failure — non-destructive.
+      }
+      return;
+    }
     setSelected(new Set(search.filteredAll.map((d) => d.id)));
   }
 
@@ -2222,13 +2386,25 @@ function DomainsSection({
             {jobKind === "ahrefs_batch_analysis" ? (
               // Server-streamed full CSV (domain × selected metrics, all
               // rows) — the client-side export below is quality-shaped
-              // and wouldn't carry the dynamic metric columns.
+              // and wouldn't carry the dynamic metric columns. Count is
+              // run-wide (`totalCount`); `domains` is only the page now.
               <a
                 href={ahrefsBatchAnalysisCsvUrl(runId)}
                 className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
                 title={ts.exportAllHelp}
               >
-                {ts.exportAll(domains.length)}
+                {ts.exportAll(totalCount)}
+              </a>
+            ) : jobKind === "availability" ? (
+              // Availability also paginates server-side, so the client CSV
+              // (which reads the in-memory page) would be incomplete —
+              // stream the full verdict table from the backend instead.
+              <a
+                href={availabilityCsvUrl(runId)}
+                className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                title={ts.exportAllHelp}
+              >
+                {ts.exportAll(totalCount)}
               </a>
             ) : (
               <>

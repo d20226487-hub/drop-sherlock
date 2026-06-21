@@ -229,6 +229,18 @@ class WaybackConfig(BaseModel):
     # content; root keeps comparisons apples-to-apples but misses
     # subpage-only sites.
     sample_path_mode: Literal["mixed", "root"] = "mixed"
+    # AI judge prompt variant (added 2026-06-07). "white" = default
+    # white-niche prompt; "grey" = grey-niche prompt (adult / gambling
+    # drops, where some signals carry inverted polarity — adult content
+    # may be expected rather than a red flag). Routed at judge-time via
+    # `get_ai_prompt(f"wayback_{variant}")` in `tasks._judge_one_
+    # criterion`. The cache key bakes in the full system prompt text, so
+    # a variant flip produces a fresh AI call (no stale-cache risk).
+    # Scope: Wayback Quality ONLY — the other criteria (backlinks /
+    # refdomains / anchors / keywords / wayback_classify / final) and
+    # the other pillars (Whois / Availability / Ahrefs Batch) are
+    # untouched in this wave.
+    variant: Literal["white", "grey"] = "white"
 
 
 class WaybackClassifyConfig(BaseModel):
@@ -252,6 +264,16 @@ class WaybackClassifyConfig(BaseModel):
     when their predefined category list changes."""
     enabled: bool = False
     language_mode: Literal["ai", "library"] = "ai"
+    # AI judge prompt variant (added 2026-06-07). Mirrors
+    # `WaybackConfig.variant`. "white" = default white-niche prompts;
+    # "grey" = grey-niche prompts (adult / gambling). Applies to ALL
+    # THREE chained classify prompts (combined / theme_only / category)
+    # — flipping the toggle on the Check → Quality CLS card routes
+    # every classify AI call to its `_grey` slot. The cache key bakes
+    # in the full prompt text via `compute_wayback_classify_prompt_hash`
+    # in `tasks.py`, so a variant flip naturally invalidates prior
+    # verdicts (no stale-cache risk).
+    variant: Literal["white", "grey"] = "white"
 
 
 class WhoisHistoryConfig(BaseModel):

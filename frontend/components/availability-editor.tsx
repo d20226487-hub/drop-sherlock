@@ -156,6 +156,19 @@ export function AvailabilityEditor() {
             {a.settingsRateLimitsHint}
           </p>
         </header>
+        <div className="flex items-center gap-3">
+          <span className="text-sm font-medium">
+            {a.settingsOuterConcurrencyLabel}
+          </span>
+          <NumberInput
+            value={cfg.availability__outer_concurrency}
+            disabled={busy}
+            onSave={(v) => setOne("availability__outer_concurrency", v)}
+          />
+        </div>
+        <p className="text-xs text-neutral-600 dark:text-neutral-400">
+          {a.settingsOuterConcurrencyHint}
+        </p>
         <table className="text-sm border-collapse">
           <thead>
             <tr className="text-left text-xs uppercase text-neutral-500 dark:text-neutral-400">
@@ -188,6 +201,23 @@ export function AvailabilityEditor() {
             ))}
           </tbody>
         </table>
+      </section>
+
+      {/* RDAP egress proxies */}
+      <section className="space-y-2">
+        <header>
+          <h3 className="text-base font-semibold">
+            {a.settingsRdapProxiesHeading}
+          </h3>
+          <p className="text-xs text-neutral-600 dark:text-neutral-400">
+            {a.settingsRdapProxiesHint}
+          </p>
+        </header>
+        <ProxiesEditor
+          value={cfg.availability__rdap__proxies || ""}
+          busy={busy}
+          onSave={(v) => setOne("availability__rdap__proxies", v)}
+        />
       </section>
 
       {/* Cache TTL */}
@@ -274,6 +304,48 @@ export function AvailabilityEditor() {
 
       {/* Usage stats + recent log */}
       <UsageSection />
+    </div>
+  );
+}
+
+// Multi-line editor for the RDAP egress proxy list. One proxy URL per
+// line; explicit Save (not blur) since blur-to-save is surprising on a
+// textarea. The Save button is disabled until the text differs from the
+// persisted value.
+function ProxiesEditor({
+  value,
+  busy,
+  onSave,
+}: {
+  value: string;
+  busy: boolean;
+  onSave: (v: string) => void;
+}) {
+  const [local, setLocal] = useState(value);
+  useEffect(() => {
+    setLocal(value);
+  }, [value]);
+  const dirty = local !== value;
+  return (
+    <div className="space-y-2">
+      <textarea
+        value={local}
+        disabled={busy}
+        rows={4}
+        onChange={(e) => setLocal(e.target.value)}
+        placeholder={
+          "http://user:pass@host:port\nhost:port\nsocks5://host:1080"
+        }
+        className="w-full max-w-xl px-2 py-1 text-sm rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 font-mono"
+      />
+      <button
+        type="button"
+        disabled={busy || !dirty}
+        onClick={() => onSave(local)}
+        className="text-xs px-3 py-1 rounded border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+      >
+        Save
+      </button>
     </div>
   );
 }

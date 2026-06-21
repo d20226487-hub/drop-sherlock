@@ -133,6 +133,13 @@ def _migrate_sqlite_columns() -> None:
         # Domain age in years captured at import time (added 2026-05-20).
         # Same storage-only contract as ahrefs_dr.
         ("backlog_domains", "domain_age_years", "REAL"),
+        # Ahrefs Rank captured at import time (added 2026-06-14). Storage-
+        # only, mirrors ahrefs_dr; INTEGER because Ahrefs Rank is a whole
+        # number with no 0-100 bound.
+        ("backlog_domains", "ahrefs_rank", "INTEGER"),
+        # Dofollow referring-domains count captured at import (2026-06-18).
+        # Storage-only, mirrors ahrefs_rank. INTEGER (whole-number count).
+        ("backlog_domains", "dofollow_refdomains", "INTEGER"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding
@@ -218,6 +225,16 @@ def _migrate_sqlite_columns() -> None:
          "run_domain_id, criterion"),
         ("ix_availability_checks_domain_checked_at", "availability_checks",
          "domain, checked_at DESC"),
+        # Added 2026-06-15 (perf): the per-run status roll-up
+        # (`SELECT status, COUNT(*) ... WHERE run_id=? GROUP BY status`) on
+        # the Job page + run status/progress endpoints was reading every
+        # row for the run and grouping via a TEMP B-TREE (EXPLAIN: "USE TEMP
+        # B-TREE FOR GROUP BY") — ~0.8s on a 60k-domain run, run on every
+        # 3s poll. This covering composite lets SQLite count straight off
+        # the index, no row reads, no temp tree. Makes the single-column
+        # ix_run_domains_run_id redundant for these queries, but it's left
+        # in place (harmless; still used by other run_id-only lookups).
+        ("ix_run_domains_run_id_status", "run_domains", "run_id, status"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in additions:
@@ -712,6 +729,83 @@ def _backfill_ahrefs_batch_pins() -> None:
         db.close()
 
 
+def _migrate_prompt_to_white_variant(legacy_key: str) -> None:
+    """One-time migration (2026-06-07): a prompt that's been split into
+    white | grey variants. Any pre-split customisation the user wrote
+    against `legacy_key` belongs in the `<legacy_key>_white` slot —
+    copy it forward so their working prompt isn't silently abandoned
+    on upgrade.
+
+    Idempotent on three axes:
+      • Skip if `prompt__<legacy_key>_white` already has a value (the
+        migration ran before, OR the user already typed something into
+        the white tab).
+      • Skip if `prompt__<legacy_key>` has no row / is blank (clean
+        install — nothing to migrate).
+      • Leaves `prompt__<legacy_key>` in place. The runner no longer
+        reads it, but keeping it costs a few KB and means a manual
+        rollback can recover the original. A future cleanup pass can
+        drop these legacy rows.
+
+    Does NOT seed `prompt__<legacy_key>_grey` — the corresponding
+    `<KEY>_GREY` default (same content as white) is already returned
+    by `get_ai_prompt` when no DB row exists, and we want the
+    "default" badge to read correctly in the Settings UI.
+    """
+    import logging
+    from .models import AppSetting
+
+    log = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        white_key = f"prompt__{legacy_key}_white"
+        legacy_db_key = f"prompt__{legacy_key}"
+        white = (
+            db.query(AppSetting)
+            .filter(AppSetting.key == white_key)
+            .one_or_none()
+        )
+        if white is not None and (white.value or "").strip():
+            return  # already migrated / user already customised the white slot
+        legacy = (
+            db.query(AppSetting)
+            .filter(AppSetting.key == legacy_db_key)
+            .one_or_none()
+        )
+        if legacy is None or not (legacy.value or "").strip():
+            return  # clean install — nothing to migrate
+        if white is None:
+            db.add(AppSetting(key=white_key, value=legacy.value))
+        else:
+            white.value = legacy.value
+        db.commit()
+        log.info(
+            "migrated %s (%s chars) → %s",
+            legacy_db_key, len(legacy.value or ""), white_key,
+        )
+    finally:
+        db.close()
+
+
+def _migrate_wayback_prompt_to_variants() -> None:
+    """Back-compat shim — first wave (Wayback Quality) called this name
+    directly. Now a thin wrapper over the generalised helper."""
+    _migrate_prompt_to_white_variant("wayback")
+
+
+def _migrate_classify_prompts_to_variants() -> None:
+    """Second wave (CLS, 2026-06-07): three classify prompts each split
+    into white | grey variants. Mirrors `_migrate_wayback_prompt_to_
+    variants`, just applied to three legacy keys instead of one. Order
+    is irrelevant — each invocation is independent + idempotent."""
+    for legacy in (
+        "wayback_classify_combined",
+        "wayback_classify_theme_only",
+        "wayback_category",
+    ):
+        _migrate_prompt_to_white_variant(legacy)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
@@ -725,6 +819,8 @@ async def lifespan(_: FastAPI):
     _backfill_job_kind()
     _migrate_legacy_pins_to_criterion_pins()
     _backfill_ahrefs_batch_pins()
+    _migrate_wayback_prompt_to_variants()
+    _migrate_classify_prompts_to_variants()
     # Phase 2 — start capturing every error from any logger into error_log.
     # Idempotent so reload-on-edit dev scenarios don't double-attach.
     install_db_log_handler()
@@ -766,6 +862,62 @@ async def lifespan(_: FastAPI):
         db.close()
     sched = get_scheduler()
     sched.start()
+
+    # Pre-warm the Database-page snapshot in the background (2026-06-21).
+    # `_build_all_rows` is the heaviest read in the app (~tens of seconds at
+    # scale — ~83s on the 68k-domain prod DB). Building it at boot, off the
+    # request path, means the first Database visit after a restart usually
+    # finds a ready snapshot instead of the page route serving its empty
+    # "still building" fallback. Best-effort + fully backgrounded (own thread
+    # + session), so it never blocks startup or delays other endpoints.
+    try:
+        from .routers.database import _trigger_background_rebuild
+        _trigger_background_rebuild()
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).debug(
+            "Database snapshot pre-warm kick failed at startup", exc_info=True,
+        )
+
+    # Periodic glibc heap trim (added 2026-06-16). This is a single
+    # in-process uvicorn worker: large multi-hour jobs (e.g. a
+    # 60,977-domain availability run) churn enough allocation to grow
+    # glibc's malloc arenas to the job's peak, and glibc never returns
+    # those free pages to the OS on its own — RSS sticks at the high-water
+    # mark (observed 3-5 GB, ~3.85 GB of it private-dirty anon spread
+    # across dozens of 64-128 MB arenas). `malloc_trim(0)` walks every
+    # arena and releases free pages back to the kernel; running it on an
+    # interval keeps steady-state RSS close to the live working set
+    # without a restart. Paired with MALLOC_ARENA_MAX=2 in compose (caps
+    # how many arenas can form in the first place). No-op / guarded on a
+    # non-glibc libc (musl) so a future Alpine base can't crash the
+    # scheduler. The sync callable runs in APScheduler's executor thread,
+    # but malloc_trim trims ALL arenas regardless of caller thread.
+    def _malloc_trim() -> None:
+        import ctypes
+        import ctypes.util
+        try:
+            libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).debug(
+                "malloc_trim unavailable on this libc", exc_info=True,
+            )
+
+    # One immediate trim at boot, then every 5 minutes.
+    try:
+        _malloc_trim()
+    except Exception:  # noqa: BLE001
+        pass
+    sched.add_job(
+        _malloc_trim,
+        "interval",
+        minutes=5,
+        id="malloc_trim",
+        replace_existing=True,
+    )
+
     # Daily auto-prune of error rows past their retention window. Two
     # complementary sweeps share one scheduled job + one retention
     # setting:

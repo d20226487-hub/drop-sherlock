@@ -1490,11 +1490,25 @@ AVAILABILITY_DEFAULTS: dict[str, str] = {
     # User-orderable cascade. Comma-separated list of providers to try
     # in order. Providers not enabled are silently skipped at runtime.
     "availability__cascade_order":        "dns,rdap,domainr,whois,whoisfreaks",
+    # Outer fan-out cap — how many domains the availability runner
+    # processes concurrently (added 2026-06-15). The HARD ceiling on
+    # throughput: per-provider max_concurrent can't exceed this because
+    # each domain runs the cascade serially. Default 8; raise it (e.g.
+    # 50+) once RDAP egress is spread across a proxy pool so the extra
+    # provider concurrency actually has domains to feed it. Read at run
+    # dispatch, so a change takes effect on the next run / resume.
+    "availability__outer_concurrency":    "8",
     # Per-provider rate limits (req/s + max concurrent).
     "availability__dns__rps":             "20",
     "availability__dns__max_concurrent":  "10",
     "availability__rdap__rps":            "3",
     "availability__rdap__max_concurrent": "4",
+    # RDAP egress proxies (added 2026-06-15). Newline/comma-separated list
+    # of HTTP/HTTPS/SOCKS5 proxy URLs the RDAP provider rotates through, so
+    # bulk lookups spread across many source IPs and don't trip the
+    # registries' per-IP throttle. Empty = direct (current behavior).
+    # Applies to RDAP ONLY — WhoisFreaks is a paid API and stays direct.
+    "availability__rdap__proxies":        "",
     "availability__domainr__rps":         "5",
     "availability__domainr__max_concurrent": "4",
     "availability__whois__rps":           "1",
@@ -1664,6 +1678,83 @@ def get_provider_rate_limits(provider: str) -> dict[str, int]:
     }
 
 
+AVAILABILITY_OUTER_CONCURRENCY_MAX = 256
+
+
+def get_availability_outer_concurrency() -> int:
+    """How many domains the availability runner fans out concurrently.
+    Clamped to 1..AVAILABILITY_OUTER_CONCURRENCY_MAX so a typo can't spawn
+    a runaway number of task stacks."""
+    v = _availability_int(
+        "availability__outer_concurrency",
+        int(AVAILABILITY_DEFAULTS["availability__outer_concurrency"]),
+    )
+    return max(1, min(v, AVAILABILITY_OUTER_CONCURRENCY_MAX))
+
+
+def get_rdap_proxies() -> list[str]:
+    """Parsed, normalized list of RDAP egress proxy URLs (added
+    2026-06-15). The raw setting is a free-form list separated by
+    newlines / commas / whitespace; each entry is normalized to a full
+    proxy URL the RDAP pool can hand to httpx:
+
+      - bare ``host:port``            → ``http://host:port``
+      - ``http://`` / ``https://`` / ``socks5://`` / ``socks5h://``  → kept
+      - anything else (unparseable scheme) is dropped
+
+    Order is preserved and duplicates removed so the round-robin is
+    deterministic. Empty config → [] (RDAP runs direct)."""
+    raw = _availability_str("availability__rdap__proxies", "")
+    if not raw.strip():
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    # Split on any whitespace OR comma; tolerates one-per-line or CSV.
+    import re as _re
+    for tok in _re.split(r"[\s,]+", raw.strip()):
+        tok = tok.strip()
+        if not tok:
+            continue
+        url = _normalize_proxy_token(tok)
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def _normalize_proxy_token(tok: str) -> str | None:
+    """Normalize one proxy entry to a URL httpx accepts, or None to drop
+    it. Handles the formats proxy providers actually export:
+
+      - ``http://…`` / ``https://…`` / ``socks5://…`` / ``socks5h://…``
+        → kept as-is.
+      - ``user:pass@host:port``      → ``http://user:pass@host:port``.
+      - ``host:port``                → ``http://host:port``.
+      - ``host:port:user:pass``      → ``http://user:pass@host:port``
+        (the super-common colon-separated export, e.g. Webshare/IPRoyal;
+        password may itself contain ``:``). Credentials are URL-encoded so
+        special characters don't break the URL.
+
+    Anything else (unsupported scheme, 1- or 3-part tokens) → None."""
+    from urllib.parse import quote
+    low = tok.lower()
+    if low.startswith(("http://", "https://", "socks5://", "socks5h://")):
+        return tok
+    if "://" in tok:
+        return None  # some scheme we don't support
+    if "@" in tok:
+        return f"http://{tok}"  # already creds@host:port
+    parts = tok.split(":")
+    if len(parts) == 2:
+        host, port = parts
+        return f"http://{host}:{port}"
+    if len(parts) >= 4:
+        host, port, user = parts[0], parts[1], parts[2]
+        pwd = ":".join(parts[3:])  # tolerate ':' inside the password
+        return f"http://{quote(user, safe='')}:{quote(pwd, safe='')}@{host}:{port}"
+    return None  # 1 or 3 parts → ambiguous, skip
+
+
 def get_cache_ttl_hours() -> int:
     return max(_availability_int(
         "availability__cache_ttl_hours",
@@ -1778,6 +1869,21 @@ def set_availability_setting(key: str, value: str) -> None:
             raise ValueError(f"{key} must be ≥ 0 (0 = unlimited)")
         if n > AVAILABILITY_PER_DOMAIN_KEEP_MAX:
             n = AVAILABILITY_PER_DOMAIN_KEEP_MAX
+        value = str(n)
+    elif key == "availability__rdap__proxies":
+        # Free-form list — stored raw (just trim outer whitespace).
+        # Per-line normalization + validation happens at read time in
+        # `get_rdap_proxies()` so a malformed line can't 400 the whole save.
+        value = value.strip()
+    elif key == "availability__outer_concurrency":
+        try:
+            n = int(value)
+        except ValueError as e:
+            raise ValueError(f"{key} must be an integer") from e
+        if n < 1:
+            raise ValueError(f"{key} must be ≥ 1")
+        if n > AVAILABILITY_OUTER_CONCURRENCY_MAX:
+            n = AVAILABILITY_OUTER_CONCURRENCY_MAX
         value = str(n)
     db = SessionLocal()
     try:

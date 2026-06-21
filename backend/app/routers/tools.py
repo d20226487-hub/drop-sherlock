@@ -367,6 +367,195 @@ async def ahrefs_batch_analysis_tool(
     )
 
 
+# --- SERP Overview (bulk per-keyword ranking-URL probe) -------------------
+#
+# Mirrors Ahrefs's SERP Overview API (/v3/serp-overview/serp-overview).
+# One call per keyword. To keep unit spend at the floor we SELECT only
+# `url` (the URL of a ranking page) — the cheapest possible column set
+# (cost_row = 1). The `positions` array Ahrefs returns is already in
+# SERP order, so we just flatten it to a list of ranking-page URLs per
+# keyword. SERP features without a page (url = null) are dropped.
+#
+# Cost shape: each keyword has Ahrefs's universal 50-unit floor; at
+# small `top_positions` the row count (× cost_row 1) stays under 50, so
+# the practical cost is ~50 units/keyword. No persistence — results live
+# only for the duration of the HTTP response (same contract as the
+# Ahrefs batch probe above).
+
+# Free testing keywords — Ahrefs does NOT bill SERP Overview requests
+# whose keyword is exactly "ahrefs" or "wordcount". Surfaced here only
+# as documentation; no special-casing is needed in the code.
+_SERP_FREE_KEYWORDS = ("ahrefs", "wordcount")
+
+
+class SerpOverviewToolIn(BaseModel):
+    """Request body for the /tools/ahrefs-serp-overview probe."""
+    # One Ahrefs call per keyword at a ~50-unit floor each — cap the
+    # batch so a paste typo can't kick off thousands of units of spend.
+    keywords: list[str] = Field(min_length=1, max_length=500)
+    # Two-letter ISO-3166-1 alpha-2 country code (Ahrefs accepts lower-
+    # or upper-case; we lower-case before sending). Required by the API.
+    country: str = Field(min_length=2, max_length=2)
+    # Number of top organic SERP positions to return. None = all
+    # available (more rows = potentially more cost above the floor), so
+    # the frontend defaults this to a small number. Bounded 1..100.
+    top_positions: int | None = Field(default=10, ge=1, le=100)
+    # Concurrency cap on the Ahrefs side — same conservative default as
+    # the keywords-history probe (matches the RPM 60 / max-concurrent 4
+    # rate-limit row).
+    concurrency: int = Field(default=4, ge=1, le=10)
+
+
+class SerpUrlRow(BaseModel):
+    """A single ranking-page URL for a keyword (in SERP order)."""
+    url: str
+
+
+class SerpOverviewKeywordResult(BaseModel):
+    """Per-keyword result + cost breakdown."""
+    keyword: str
+    http_status: int
+    cost_row: int | None = None
+    cost_total: int | None = None
+    cost_actual: int | None = None
+    # Total positions Ahrefs returned BEFORE we drop the null-url
+    # (SERP-feature) rows. Lets the UI tell apart two zero-URL cases:
+    #   positions_count == 0  → Ahrefs has no SERP snapshot for this
+    #                            keyword/country at all (still billed the
+    #                            50-unit floor).
+    #   positions_count > 0   → it had positions but none carried a
+    #                            ranking-page URL (all SERP features).
+    positions_count: int = 0
+    urls: list[SerpUrlRow] = Field(default_factory=list)
+    error: str = ""
+
+
+class SerpOverviewToolOut(BaseModel):
+    """Aggregate result + grand totals across all probed keywords."""
+    country: str
+    top_positions: int | None = None
+    results: list[SerpOverviewKeywordResult]
+    totals: dict[str, int]
+
+
+async def _probe_serp_one(
+    keyword: str,
+    country: str,
+    top_positions: int | None,
+    sem: asyncio.Semaphore,
+    client: AhrefsClient,
+) -> SerpOverviewKeywordResult:
+    """One Ahrefs /serp-overview call per keyword. Errors are returned
+    in the result object (not raised) so a single bad keyword doesn't
+    fail the batch. SELECT is fixed to `url` (cheapest column set); the
+    response's `positions` array is already SERP-ordered."""
+    params: dict[str, str | int] = {
+        "select": "url",
+        "country": country,
+        "keyword": keyword,
+        "output": "json",
+    }
+    if top_positions is not None:
+        params["top_positions"] = top_positions
+    url = (
+        "https://api.ahrefs.com/v3/serp-overview/serp-overview?"
+        + urlencode(params)
+    )
+    async with sem:
+        try:
+            status, body, units = await client.fetch_url(url)
+        except Exception as e:  # noqa: BLE001
+            return SerpOverviewKeywordResult(
+                keyword=keyword,
+                http_status=0,
+                error=f"{type(e).__name__}: {e}",
+            )
+    if status != 200:
+        return SerpOverviewKeywordResult(
+            keyword=keyword,
+            http_status=status,
+            cost_total=int(units.get("cost_total") or 0) or None,
+            error=f"HTTP {status}",
+        )
+    body_json = body if isinstance(body, dict) else json.loads(body)
+    raw = body_json.get("positions") if isinstance(body_json, dict) else None
+    raw_list = raw if isinstance(raw, list) else []
+    rows: list[SerpUrlRow] = []
+    for r in raw_list:
+        if not isinstance(r, dict):
+            continue
+        u = r.get("url")
+        # Drop SERP features that have no ranking page (url = null)
+        # — they carry no URL, which is the only thing we display.
+        if isinstance(u, str) and u:
+            rows.append(SerpUrlRow(url=u))
+    return SerpOverviewKeywordResult(
+        keyword=keyword,
+        http_status=status,
+        cost_row=int(units["cost_row"]) if units.get("cost_row") is not None else None,
+        cost_total=int(units["cost_total"]) if units.get("cost_total") is not None else None,
+        cost_actual=int(units["cost_actual"]) if units.get("cost_actual") is not None else None,
+        positions_count=len(raw_list),
+        urls=rows,
+    )
+
+
+@router.post("/ahrefs-serp-overview", response_model=SerpOverviewToolOut)
+async def ahrefs_serp_overview_tool(
+    payload: SerpOverviewToolIn,
+) -> SerpOverviewToolOut:
+    """Bulk Ahrefs SERP Overview probe — one /serp-overview call per
+    keyword under a shared asyncio.Semaphore. Returns per-keyword
+    ranking-page URLs (in SERP order) + cost breakdown + grand totals.
+    No persistence; results are discarded after the response is sent."""
+    country = payload.country.strip().lower()
+    if len(country) != 2 or not country.isalpha():
+        raise HTTPException(400, "country must be a two-letter code")
+
+    # Normalize + dedupe keywords (lower-cased + stripped, preserving
+    # input order). Ahrefs SERPs are case-insensitive, so dedupe folds
+    # case; skip empties.
+    seen: set[str] = set()
+    keywords: list[str] = []
+    for raw in payload.keywords:
+        k = (raw or "").strip().lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        keywords.append(k)
+    if not keywords:
+        raise HTTPException(400, "no valid keywords after normalization")
+
+    sem = asyncio.Semaphore(payload.concurrency)
+    async with AhrefsClient() as client:
+        results = await asyncio.gather(
+            *(
+                _probe_serp_one(
+                    k, country, payload.top_positions, sem, client,
+                )
+                for k in keywords
+            )
+        )
+
+    total_list = sum((r.cost_total or 0) for r in results)
+    total_billed = sum((r.cost_actual or 0) for r in results)
+    total_urls = sum(len(r.urls) for r in results)
+    successes = sum(1 for r in results if r.http_status == 200)
+
+    return SerpOverviewToolOut(
+        country=country,
+        top_positions=payload.top_positions,
+        results=results,
+        totals={
+            "keywords_total": len(results),
+            "keywords_ok": successes,
+            "urls": total_urls,
+            "cost_list_price": total_list,
+            "cost_billed_actual": total_billed,
+        },
+    )
+
+
 # --- Wayback Sparkline (bulk total-capture-count probe) -------------------
 #
 # Persistent flow because target scale is 100k domains/batch (~2-4h

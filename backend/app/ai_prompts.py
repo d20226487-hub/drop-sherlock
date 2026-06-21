@@ -150,7 +150,14 @@ KEYWORDS_PROMPT = (
     + CRITERION_JSON_SCHEMA
 )
 
-WAYBACK_PROMPT = (
+# Wayback judge prompt — split into white + grey variants 2026-06-07.
+# Both keys default to the SAME content (the original WAYBACK_PROMPT).
+# The user maintains a separate text per variant on Settings → Brain →
+# Wayback judge; the Quality runner picks at submit time based on the
+# `criteria.wayback.variant` selection on Check → Quality. `WAYBACK_
+# PROMPT` is kept as a backward-compat alias for any internal caller
+# that still imports it.
+WAYBACK_PROMPT_WHITE = (
     "You are an SEO analyst evaluating the WAYBACK MACHINE HISTORY of a "
     "domain. You'll receive raw rows from the Wayback CDX API — one row "
     "per indexed snapshot of any URL on the domain.\n\n"
@@ -218,7 +225,14 @@ DEFAULT_CRITERION_PROMPTS = {
     "refdomains": REFDOMAINS_PROMPT,
     "anchors": ANCHORS_PROMPT,
     "keywords": KEYWORDS_PROMPT,
-    "wayback": WAYBACK_PROMPT,
+    # The legacy `wayback` slot in this dict is retained so any caller
+    # that still looks up "wayback" gets the white default. The actual
+    # `PROMPT_KEYS` registry below uses the explicit `_white` / `_grey`
+    # keys per the 2026-06-07 variant split. Use `WAYBACK_PROMPT_WHITE`
+    # directly here because the `WAYBACK_PROMPT` back-compat alias is
+    # defined further down the file (Python top-to-bottom — referring
+    # to it here would NameError at import time).
+    "wayback": WAYBACK_PROMPT_WHITE,
 }
 
 
@@ -261,7 +275,28 @@ _CLASSIFY_DRIFT_RULES = (
     "non-200 errors with little body content to judge.\n"
 )
 
-WAYBACK_CLASSIFY_COMBINED_PROMPT = (
+# Grey variant — defaults to the white text as a scaffold so the user
+# starts from familiar ground and edits the niche-specific bits (adult /
+# gambling sites flip the polarity on certain red flags — adult content
+# may be expected rather than a penalty, etc.). User-customised text
+# lands in `prompt__wayback_grey` via the Settings UI.
+WAYBACK_PROMPT_GREY = WAYBACK_PROMPT_WHITE
+
+# Back-compat alias — any caller still importing the legacy name gets
+# the white prompt. Don't add new callers; use the explicit variant.
+WAYBACK_PROMPT = WAYBACK_PROMPT_WHITE
+
+# Wayback classify prompts — split into white | grey variants 2026-06-07
+# (same pattern as the Wayback Quality judge above). Three prompts power
+# the criterion: combined (language+theme, AI mode), theme_only (theme
+# alone, library mode for language), and category (chained category
+# assignment). Each gets a _WHITE and _GREY pair; default content is
+# identical (grey starts as a scaffold copy of white) so the user types
+# the niche-specific divergence into the grey tab on Settings.
+# Back-compat aliases at the bottom of this block map the original
+# names to the white variants so any caller that hasn't been updated
+# still gets the white default.
+WAYBACK_CLASSIFY_COMBINED_PROMPT_WHITE = (
     "You are an SEO analyst classifying the LANGUAGE and THEME of a "
     "domain from its archived Wayback Machine page samples. You'll receive "
     "a chronologically-sorted list of snapshots — each entry has the "
@@ -312,7 +347,11 @@ WAYBACK_CLASSIFY_COMBINED_PROMPT = (
     "No prose around the JSON. No markdown fences.\n"
 )
 
-WAYBACK_CLASSIFY_THEME_ONLY_PROMPT = (
+# Grey variant defaults to the white text — user differentiates via
+# Settings → Brain → CLS combined judge → Grey tab.
+WAYBACK_CLASSIFY_COMBINED_PROMPT_GREY = WAYBACK_CLASSIFY_COMBINED_PROMPT_WHITE
+
+WAYBACK_CLASSIFY_THEME_ONLY_PROMPT_WHITE = (
     "You are an SEO analyst classifying the THEME of a domain from its "
     "archived Wayback Machine page samples. Language has already been "
     "detected by a deterministic library — DO NOT include language fields "
@@ -349,7 +388,11 @@ WAYBACK_CLASSIFY_THEME_ONLY_PROMPT = (
     "No prose around the JSON. No markdown fences.\n"
 )
 
-WAYBACK_CATEGORY_PROMPT = (
+# Grey variant defaults to the white text — user differentiates via
+# Settings → Brain → CLS theme-only judge → Grey tab.
+WAYBACK_CLASSIFY_THEME_ONLY_PROMPT_GREY = WAYBACK_CLASSIFY_THEME_ONLY_PROMPT_WHITE
+
+WAYBACK_CATEGORY_PROMPT_WHITE = (
     "You are categorizing a domain into ONE of a predefined list of site "
     "categories, given the theme that's already been detected from its "
     "Wayback page samples.\n\n"
@@ -382,6 +425,19 @@ WAYBACK_CATEGORY_PROMPT = (
     "Omit category_was + category_was_confidence keys when there's no "
     "drift. No prose around the JSON. No markdown fences.\n"
 )
+
+# Grey variant defaults to the white text — user differentiates via
+# Settings → Brain → CLS category judge → Grey tab.
+WAYBACK_CATEGORY_PROMPT_GREY = WAYBACK_CATEGORY_PROMPT_WHITE
+
+# Back-compat aliases — any caller still importing the legacy names
+# gets the white variants. Do NOT add new callers; use the explicit
+# `_WHITE` constants directly. These also fix a Python-ordering trap
+# if any module-scope dict uses the legacy names (Python evaluates
+# top-to-bottom and would NameError before the aliases were defined).
+WAYBACK_CLASSIFY_COMBINED_PROMPT = WAYBACK_CLASSIFY_COMBINED_PROMPT_WHITE
+WAYBACK_CLASSIFY_THEME_ONLY_PROMPT = WAYBACK_CLASSIFY_THEME_ONLY_PROMPT_WHITE
+WAYBACK_CATEGORY_PROMPT = WAYBACK_CATEGORY_PROMPT_WHITE
 
 
 DEFAULT_FINAL_PROMPT = (
@@ -552,10 +608,28 @@ PROMPT_KEYS: dict[str, str] = {
     "refdomains": REFDOMAINS_PROMPT,
     "anchors": ANCHORS_PROMPT,
     "keywords": KEYWORDS_PROMPT,
-    "wayback": WAYBACK_PROMPT,
-    "wayback_classify_combined": WAYBACK_CLASSIFY_COMBINED_PROMPT,
-    "wayback_classify_theme_only": WAYBACK_CLASSIFY_THEME_ONLY_PROMPT,
-    "wayback_category": WAYBACK_CATEGORY_PROMPT,
+    # Wayback Quality judge — split into white | grey variants 2026-06-07.
+    # The runner picks based on `criteria.wayback.variant` at submit time
+    # (see tasks.py `_judge_one_criterion`). The PromptEditors UI groups
+    # both keys under a single "Wayback judge" card with a tab strip.
+    # Legacy `wayback` key is gone — startup auto-migrates any existing
+    # `prompt__wayback` row to `prompt__wayback_white` (see main.py
+    # `_migrate_wayback_prompt_to_variants`).
+    "wayback_white": WAYBACK_PROMPT_WHITE,
+    "wayback_grey": WAYBACK_PROMPT_GREY,
+    # CLS (wayback_classify) prompts — same white | grey split, second
+    # wave 2026-06-07. Three logical prompts each get a pair:
+    # combined (language+theme AI mode), theme_only (library mode),
+    # category (chained category assignment). The runner reads
+    # `criteria.wayback_classify.variant` at submit time. All three
+    # legacy keys are gone — startup auto-migrates any existing custom
+    # row to the matching _white slot.
+    "wayback_classify_combined_white": WAYBACK_CLASSIFY_COMBINED_PROMPT_WHITE,
+    "wayback_classify_combined_grey": WAYBACK_CLASSIFY_COMBINED_PROMPT_GREY,
+    "wayback_classify_theme_only_white": WAYBACK_CLASSIFY_THEME_ONLY_PROMPT_WHITE,
+    "wayback_classify_theme_only_grey": WAYBACK_CLASSIFY_THEME_ONLY_PROMPT_GREY,
+    "wayback_category_white": WAYBACK_CATEGORY_PROMPT_WHITE,
+    "wayback_category_grey": WAYBACK_CATEGORY_PROMPT_GREY,
     "whois_history_judge": WHOIS_HISTORY_JUDGE_PROMPT,
     "final": DEFAULT_FINAL_PROMPT,
     # Output-language directive appended to every system prompt on RU

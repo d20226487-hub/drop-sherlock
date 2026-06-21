@@ -100,6 +100,11 @@ const DEFAULT_CRITERIA: CriteriaSpec = {
     sample_count: 6,
     sample_strategy: "even",
     sample_path_mode: "mixed",
+    // Wayback judge prompt variant (added 2026-06-07). "white" = default
+    // white-niche prompt; "grey" = grey-niche prompt (adult / gambling).
+    // The "Grey site" checkbox on WaybackCard flips this; the runner
+    // reads `get_ai_prompt(f"wayback_{variant}")` at judge time.
+    variant: "white",
   },
   // wayback_classify (added 2026-05-09): combined language + theme + auto-
   // chained category. Opt-in. When enabled, submit auto-flips wayback +
@@ -107,6 +112,11 @@ const DEFAULT_CRITERIA: CriteriaSpec = {
   wayback_classify: {
     enabled: false,
     language_mode: "ai",
+    // Prompt variant (added 2026-06-07). Mirrors the Wayback Quality
+    // variant — routes all three chained classify prompts (combined /
+    // theme_only / category) to their _white or _grey slots at AI
+    // judge time. Flipped by the "Grey site" checkbox on the CLS card.
+    variant: "white",
   },
 };
 

@@ -9,6 +9,15 @@ engine = create_engine(
     settings.database_url,
     connect_args={"check_same_thread": False} if _is_sqlite else {},
     pool_pre_ping=True,
+    # Larger pool (2026-06-21): the availability/runner DB phases now run in
+    # worker threads (via asyncio.to_thread) so their synchronous commits
+    # don't block the event loop during a large run. Each threaded phase
+    # checks out a connection, so a 50-wide run + FE polling can want
+    # dozens at once; the old 5+10 default starved and serialized them.
+    # SQLite connections are cheap, and `check_same_thread=False` already
+    # permits cross-thread use (each thread still uses its own session).
+    pool_size=20,
+    max_overflow=30,
 )
 
 if _is_sqlite:

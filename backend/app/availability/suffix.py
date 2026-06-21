@@ -68,3 +68,31 @@ def is_private_suffix_domain(domain: str) -> bool:
     if full is None or icann is None:
         return False
     return full != icann
+
+
+def is_multilabel_public_suffix_domain(domain: str) -> bool:
+    """True when `domain`'s ICANN public suffix has MORE THAN ONE label —
+    a "double extension" like ``com.ua`` / ``net.uk`` / ``co.uk`` /
+    ``com.br`` / ``com.au``.
+
+    These are legitimate ICANN-delegated ccTLD second levels (NOT the
+    private reseller suffixes `is_private_suffix_domain` flags), but RDAP
+    coverage for them is patchy and inconsistent — many ccTLD registries
+    either don't run RDAP for the second level or return answers the
+    cascade mis-reads — so the orchestrator routes them to WhoisFreaks
+    only (see cascade.py).
+
+    Returns False for single-label TLDs (``example.ua`` → ``ua``,
+    ``example.uk`` → ``uk``, ``example.com`` → ``com``), deep subdomains
+    of a normal registrable domain (``a.b.example.com`` → ``com``), and
+    unknown TLDs (suffix is None). Domains under a PRIVATE multi-label
+    suffix resolve to a SINGLE-label ICANN suffix (``jcg.us.com`` →
+    ``com``) so they are NOT flagged here — they're handled one phase
+    earlier by `is_private_suffix_domain`.
+    """
+    if not domain or "." not in domain:
+        return False
+    icann = _icann_psl().publicsuffix(domain, accept_unknown=False)
+    if not icann:
+        return False
+    return "." in icann

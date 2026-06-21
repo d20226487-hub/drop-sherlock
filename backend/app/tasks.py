@@ -20,7 +20,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.orm import Session, selectinload
 
 from .ai_judge import AI_PROVIDERS, _resolve_model, judge
 from .ai_prompts import localize_prompt
@@ -41,6 +42,56 @@ from .schemas import AnalyzeSpec
 from .scoring import compute_final
 
 log = logging.getLogger(__name__)
+
+
+# Memory: how many RunDomain rows to hold in the Session identity map at
+# once when a path needs to examine every domain of a (possibly 100k-row)
+# run. `for rd in run.domains:` loads the WHOLE collection — ~290 MB of
+# CPython pymalloc fragmentation per pass on a 60k-domain run that neither
+# gc, malloc_trim, nor MALLOC_ARENA_MAX can reclaim (only a process
+# restart does). Chunked + expunged iteration caps the working set to one
+# chunk and lets pymalloc reuse the arenas between chunks. (Added
+# 2026-06-17 after the run-150 OOM investigation.)
+_RD_CHUNK = 1000
+
+
+def _iter_run_domains_chunked(
+    db: Session,
+    run_id: int,
+    *,
+    ids: list[int] | None = None,
+    with_results: bool = True,
+):
+    """Yield this run's RunDomain rows in id-ordered chunks of `_RD_CHUNK`,
+    expunging each chunk from the Session before loading the next so the
+    identity map never holds more than one chunk. Drop-in replacement for
+    `for rd in run.domains:` on the large-run paths.
+
+    `ids` restricts to a caller-supplied subset (batch retry). `with_results`
+    eager-loads `rd.results` via selectinload so the caller can read the
+    per-criterion rows without an N+1 (and without a later lazy-load after
+    the row is expunged). Callers MUST extract scalars (ids, statuses,
+    parsed values) during iteration — the yielded rows are detached after
+    their chunk, so stashing the ORM objects themselves is unsafe."""
+    if ids is not None:
+        rd_ids = list(ids)
+    else:
+        rd_ids = [
+            i for (i,) in
+            db.query(RunDomain.id).filter(RunDomain.run_id == run_id).all()
+        ]
+    for start in range(0, len(rd_ids), _RD_CHUNK):
+        chunk = rd_ids[start:start + _RD_CHUNK]
+        if not chunk:
+            continue
+        q = db.query(RunDomain).filter(RunDomain.id.in_(chunk))
+        if with_results:
+            q = q.options(selectinload(RunDomain.results))
+        rows = q.all()
+        for rd in rows:
+            yield rd
+        for rd in rows:
+            db.expunge(rd)
 
 
 # Per-criterion field-trim list passed to the AI. Order matters for
@@ -175,6 +226,11 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
         spec_provider = ""
         spec_model = ""
         spec_language_mode = "ai"
+        # Prompt variants for the two grey-niche-aware criteria (added
+        # 2026-06-07). Legacy specs lack the field — default to "white"
+        # so the preview always points at a real prompt slot.
+        spec_classify_variant = "white"
+        spec_wayback_variant = "white"
         spec_lang = "en"
         if run is not None:
             try:
@@ -182,8 +238,14 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
                 ai = sj.get("ai") or {}
                 spec_provider = ai.get("provider") or ""
                 spec_model = ai.get("model") or ""
-                wbc_cfg = (sj.get("criteria") or {}).get("wayback_classify") or {}
+                crits = sj.get("criteria") or {}
+                wbc_cfg = crits.get("wayback_classify") or {}
                 spec_language_mode = wbc_cfg.get("language_mode") or "ai"
+                if wbc_cfg.get("variant") == "grey":
+                    spec_classify_variant = "grey"
+                wb_cfg = crits.get("wayback") or {}
+                if wb_cfg.get("variant") == "grey":
+                    spec_wayback_variant = "grey"
                 # Output-language directive carried on the run's spec; the
                 # preview should show the EXACT system prompt the runner
                 # would use (RU directive included on RU runs).
@@ -279,12 +341,14 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
     if criterion == "wayback_classify":
         from .wayback_classify import build_classify_user_message
         from .app_settings import get_categories
-        # Pick the right prompt based on the run's stored language_mode.
-        prompt_key = (
+        # Pick the right prompt based on the run's stored language_mode
+        # AND prompt variant (white | grey, added 2026-06-07).
+        primary_base = (
             "wayback_classify_theme_only"
             if spec_language_mode == "library"
             else "wayback_classify_combined"
         )
+        prompt_key = f"{primary_base}_{spec_classify_variant}"
         system_prompt = localize_prompt(get_ai_prompt(prompt_key), spec_lang)
         # The combined / theme-only prompts read full V2 samples — pass
         # them through the same trim function the runner uses so the
@@ -294,7 +358,7 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
             domain=domain, samples=trimmed_samples, lingua_hint=None,
         )
         category_prompt = localize_prompt(
-            get_ai_prompt("wayback_category"), spec_lang
+            get_ai_prompt(f"wayback_category_{spec_classify_variant}"), spec_lang
         )
         # If a verdict already landed, render the EXACT category user-msg
         # the runner would have built. Otherwise render a placeholder so
@@ -342,7 +406,20 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
 
     trimmed = _trim_rows_for_ai(criterion, rows)
     fields_sent = AI_FIELD_TRIM.get(criterion, [])
-    system_prompt = localize_prompt(get_ai_prompt(criterion), spec_lang)
+    # 2026-06-07: route the Wayback Quality preview through the
+    # `_white` / `_grey` variant slot. Before this fix the preview
+    # called `get_ai_prompt("wayback")`, but the bare `wayback` key was
+    # removed from PROMPT_KEYS in the variant split — the call
+    # returned "" and the preview pane rendered an empty system prompt
+    # ("doesn't work" in the user's words). Same code shape as the
+    # wayback_classify branch above.
+    preview_prompt_key = (
+        f"wayback_{spec_wayback_variant}"
+        if criterion == "wayback" else criterion
+    )
+    system_prompt = localize_prompt(
+        get_ai_prompt(preview_prompt_key), spec_lang,
+    )
     wayback_samples_for_ai: list[dict] | None = None
     if criterion == "wayback" and wayback_samples_raw:
         wayback_samples_for_ai = _trim_samples_for_ai(wayback_samples_raw)
@@ -596,22 +673,32 @@ def resume_run_now(run_id: int) -> dict:
             }
         _clear_pause(run_id)
         _clear_cancel(run_id)
-        # Reset domains that didn't reach a terminal state.
-        for d in run.domains:
-            if d.status in ("running", "pending"):
-                d.status = "pending"
-                d.started_at = None
-                d.finished_at = None
-                # Drop any partial CriterionResult rows (status != done) —
-                # they may have been mid-write when the pause hit. The
-                # worker will recreate them. Done rows are preserved.
-                still_done = [cr for cr in d.results if cr.status == "done"]
-                to_delete = [cr for cr in d.results if cr.status != "done"]
-                for cr in to_delete:
-                    db.delete(cr)
-                # SQLAlchemy needs a flush here to actually remove them
-                # before we add new rows in the same session.
-                d.results = still_done
+        # Reset domains that didn't reach a terminal state — bulk SQL
+        # instead of hydrating `run.domains` (2026-06-17; the ORM walk
+        # loaded every RunDomain + its CriterionResults into the identity
+        # map, ~290 MB of unreclaimable pymalloc on a 60k-domain run).
+        # Order matters: delete the half-written (non-done) CriterionResult
+        # rows of the still-non-terminal domains FIRST — their selecting
+        # predicate keys off the domains' CURRENT status — then flip those
+        # domains back to pending. Done rows + done domains are untouched.
+        non_terminal_ids = (
+            select(RunDomain.id)
+            .where(RunDomain.run_id == run_id)
+            .where(RunDomain.status.in_(("running", "pending")))
+        )
+        db.execute(
+            delete(CriterionResult)
+            .where(CriterionResult.status != "done")
+            .where(CriterionResult.run_domain_id.in_(non_terminal_ids))
+            .execution_options(synchronize_session=False)
+        )
+        db.execute(
+            update(RunDomain)
+            .where(RunDomain.run_id == run_id)
+            .where(RunDomain.status.in_(("running", "pending")))
+            .values(status="pending", started_at=None, finished_at=None)
+            .execution_options(synchronize_session=False)
+        )
         run.status = "pending"
         run.started_at = None
         run.finished_at = None
@@ -1007,11 +1094,13 @@ def retry_run_batch_now(
 
         # Per-RD retry list. Resample-only and the normal failed-retry
         # path use different selection criteria — see the helpers'
-        # docstrings for the rationale.
+        # docstrings for the rationale. Only the user-picked rd_id_set is
+        # loaded (chunked), instead of hydrating the whole run and skipping
+        # the rest (2026-06-17 memory fix).
         failed_per_rd: dict[int, list[str]] = {}
-        for rd in run.domains:
-            if rd.id not in rd_id_set:
-                continue
+        for rd in _iter_run_domains_chunked(
+            db, run_id, ids=sorted(rd_id_set)
+        ):
             if wayback_resample_only:
                 failed = _collect_resample_candidates(rd, spec)
             else:
@@ -1044,15 +1133,15 @@ def retry_run_batch_now(
                 "wait for it to finish"
             ),
         }
-    for rd_id, crits in failed_per_rd.items():
-        task = asyncio.create_task(
-            _retry_failed_run_domain(
-                rd_id, crits, spec, track_set=True,
-                resample_only=wayback_resample_only,
-            )
+    # Bounded pool (2026-06-17) — see retry_failed_run_now / _run_retry_pool.
+    task = asyncio.create_task(
+        _run_retry_pool(
+            run_id, failed_per_rd, spec,
+            resample_only=wayback_resample_only,
         )
-        _REANALYZING_RUN_DOMAINS.add_task(rd_id, task)
-        _track(task)
+    )
+    _REANALYZING_RUNS.add_task(run_id, task)
+    _track(task)
     return {
         "id": run_id, "found": True, "status": "started",
         "domains": len(failed_per_rd),
@@ -1110,9 +1199,11 @@ def retry_failed_run_now(
 
         # Snapshot the per-RD failed-criteria map BEFORE leaving the DB
         # session — we'll close it before scheduling tasks so the workers
-        # get fresh sessions of their own.
+        # get fresh sessions of their own. Chunked iteration (2026-06-17)
+        # so a 60k-domain run doesn't hydrate every RunDomain + results at
+        # once (the pymalloc-fragmentation balloon).
         failed_per_rd: dict[int, list[str]] = {}
-        for rd in run.domains:
+        for rd in _iter_run_domains_chunked(db, run_id):
             failed = _collect_failed_criteria(rd, spec)
             if failed:
                 failed_per_rd[rd.id] = failed
@@ -1141,12 +1232,12 @@ def retry_failed_run_now(
             ),
         }
 
-    for rd_id, criteria in failed_per_rd.items():
-        task = asyncio.create_task(
-            _retry_failed_run_domain(rd_id, criteria, spec, track_set=True)
-        )
-        _REANALYZING_RUN_DOMAINS.add_task(rd_id, task)
-        _track(task)
+    # Bounded pool (2026-06-17) instead of one fire-and-forget task per RD
+    # — caps concurrent retries (and their per-RD httpx clients) so a big
+    # Retry-failed can't balloon the API to OOM.
+    task = asyncio.create_task(_run_retry_pool(run_id, failed_per_rd, spec))
+    _REANALYZING_RUNS.add_task(run_id, task)
+    _track(task)
 
     total_criteria = sum(len(v) for v in failed_per_rd.values())
     return {
@@ -1216,6 +1307,72 @@ async def _retry_failed_run_domain(
     finally:
         if track_set:
             _REANALYZING_RUN_DOMAINS.discard(run_domain_id)
+
+
+async def _run_retry_pool(
+    run_id: int,
+    failed_per_rd: dict[int, list[str]],
+    spec: AnalyzeSpec,
+    *,
+    resample_only: bool = False,
+) -> None:
+    """Run per-RD retries through a BOUNDED worker pool instead of spawning
+    one `_retry_failed_run_domain` task per RD up front (2026-06-17).
+
+    Why this exists: the old dispatch did `for rd_id: asyncio.create_task(...)`
+    over the whole failed set. On a large run that's thousands of concurrent
+    retry coroutines — and for the availability criterion each one opens its
+    OWN `httpx.AsyncClient` (see `_reanalyze_run_domain_criterion`), so a
+    2,600-domain Retry-failed spun up ~2,600 concurrent clients and pinned
+    the API at multi-GB / OOM. The pool caps concurrent retries (and thus
+    concurrent clients + cascade working sets) to the availability
+    outer-concurrency knob, the same cap the main runner uses.
+
+    Tracking: each RD is registered in `_REANALYZING_RUN_DOMAINS` only while
+    a worker is actually processing it (not while queued), so the UI's
+    per-domain `reanalyzing` pill and the double-dispatch guard stay
+    accurate. The whole pool is registered under `_REANALYZING_RUNS[run_id]`
+    so a second Retry-failed call short-circuits with "already in progress",
+    and `cancel_retry_failed_now` can cancel it. Honors `is_canceled(run_id)`
+    between picks for a fast clean stop."""
+    from .app_settings import get_availability_outer_concurrency
+
+    # Clear any stale cancel flag left by a prior canceled retry of this run
+    # (the retry entry points don't clear it, and a leftover flag makes every
+    # worker below skip its domain via the `is_canceled` check — silent
+    # zero-throughput). Mirrors resume_run_now / dispatch_run, which also
+    # clear cancel before (re)starting work. (2026-06-21)
+    _clear_cancel(run_id)
+    _REANALYZING_RUNS.add_task(run_id, asyncio.current_task())
+    queue: asyncio.Queue[tuple[int, list[str]]] = asyncio.Queue()
+    for rd_id, crits in failed_per_rd.items():
+        queue.put_nowait((rd_id, crits))
+
+    async def _worker() -> None:
+        while True:
+            try:
+                rd_id, crits = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if is_canceled(run_id):
+                queue.task_done()
+                continue
+            _REANALYZING_RUN_DOMAINS.add_task(rd_id, asyncio.current_task())
+            try:
+                await _retry_failed_run_domain(
+                    rd_id, crits, spec, track_set=False,
+                    resample_only=resample_only,
+                )
+            finally:
+                _REANALYZING_RUN_DOMAINS.discard(rd_id)
+                queue.task_done()
+
+    try:
+        concurrency = max(1, get_availability_outer_concurrency())
+        n_workers = min(concurrency, queue.qsize()) or 1
+        await asyncio.gather(*(_worker() for _ in range(n_workers)))
+    finally:
+        _REANALYZING_RUNS.discard(run_id)
 
 
 def cancel_retry_failed_now(run_id: int) -> dict:
@@ -1457,7 +1614,10 @@ def _collect_wayback_retry_candidates(
             wb_cfg is not None
             and bool(getattr(wb_cfg, "sample_pages", False))
         )
-        for rd in run.domains:
+        # Chunked iteration (2026-06-17) — same memory fix as the
+        # availability auto-retry collector: don't hydrate the whole run
+        # into the identity map just to inspect each rd's wayback CRs.
+        for rd in _iter_run_domains_chunked(db, run_id):
             if rd.status == "canceled":
                 continue
             crs = {cr.criterion: cr for cr in rd.results}
@@ -2088,21 +2248,40 @@ def cancel_run_now(run_id: int) -> dict:
             }
         request_cancel(run_id)
         _clear_pause(run_id)
+        now = datetime.utcnow()
         run.status = "canceled"
-        run.finished_at = datetime.utcnow()
+        run.finished_at = now
         if not run.error:
             run.error = "Canceled by user."
-        for d in run.domains:
-            if d.status in ("pending", "running"):
-                d.status = "canceled"
-                d.finished_at = datetime.utcnow()
-                if not d.error:
-                    d.error = "Canceled by user."
-            for cr in d.results:
-                if cr.status in ("pending", "running"):
-                    cr.status = "canceled"
-                    if not cr.error:
-                        cr.error = "Canceled by user."
+        # Bulk SQL instead of hydrating `run.domains` + each rd.results
+        # (2026-06-17). Cancel the non-terminal domains and the
+        # non-terminal CriterionResult rows of this run. The
+        # COALESCE(NULLIF(error,''), …) keeps any pre-existing real error
+        # message — same intent as the old `if not d.error` / `if not
+        # cr.error` guards.
+        _cancel_msg = "Canceled by user."
+        db.execute(
+            update(RunDomain)
+            .where(RunDomain.run_id == run_id)
+            .where(RunDomain.status.in_(("pending", "running")))
+            .values(
+                status="canceled",
+                finished_at=now,
+                error=func.coalesce(func.nullif(RunDomain.error, ""), _cancel_msg),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        run_rd_ids = select(RunDomain.id).where(RunDomain.run_id == run_id)
+        db.execute(
+            update(CriterionResult)
+            .where(CriterionResult.run_domain_id.in_(run_rd_ids))
+            .where(CriterionResult.status.in_(("pending", "running")))
+            .values(
+                status="canceled",
+                error=func.coalesce(func.nullif(CriterionResult.error, ""), _cancel_msg),
+            )
+            .execution_options(synchronize_session=False)
+        )
         db.commit()
         return {"id": run_id, "found": True, "status": "canceled"}
     finally:
@@ -2552,7 +2731,9 @@ async def _run_availability_for_domain(
     # the BacklogDomain row. Helper extracted 2026-05-17 so the
     # standalone Availability pillar runner shares the same code path.
     from .availability.backlog_upsert import upsert_backlog_expiration
-    upsert_backlog_expiration(domain, result.expires_on, result.registrar)
+    await _offload(
+        upsert_backlog_expiration, domain, result.expires_on, result.registrar,
+    )
 
     # `not_supported` = a "double domain" under a private multi-label
     # suffix (e.g. jcg.us.com) we can't verify. These are almost always
@@ -2561,19 +2742,11 @@ async def _run_availability_for_domain(
     # horizon check (we have no reliable expiry). Mirrors the
     # skip-registered short-circuit below.
     if result.status == STATUS_NOT_SUPPORTED:
-        db = SessionLocal()
-        try:
-            rd = db.get(RunDomain, run_domain_id)
-            if rd is not None:
-                rd.status = "done"
-                rd.finished_at = datetime.utcnow()
-                rd.skip_reason = (
-                    "not supported (private multi-label suffix — "
-                    "availability can't be verified)"
-                )
-                db.commit()
-        finally:
-            db.close()
+        await _offload(
+            _mark_domain_done_skipped, run_domain_id,
+            "not supported (private multi-label suffix — "
+            "availability can't be verified)",
+        )
         return
 
     # Skip policy: registered + expires beyond horizon → no Ahrefs.
@@ -2585,18 +2758,29 @@ async def _run_availability_for_domain(
     ):
         horizon = _date.today() + timedelta(days=policy["horizon_days"])
         if result.expires_on > horizon:
-            db = SessionLocal()
-            try:
-                rd = db.get(RunDomain, run_domain_id)
-                if rd is not None:
-                    rd.status = "done"
-                    rd.finished_at = datetime.utcnow()
-                    rd.skip_reason = (
-                        f"registered, expires {result.expires_on.isoformat()}"
-                    )
-                    db.commit()
-            finally:
-                db.close()
+            await _offload(
+                _mark_domain_done_skipped, run_domain_id,
+                f"registered, expires {result.expires_on.isoformat()}",
+            )
+
+
+async def _offload(fn, /, *args, **kwargs):
+    """Run a synchronous DB helper in a worker thread so its commit doesn't
+    block the event loop.
+
+    The quality runner's per-domain helpers (`_begin_domain`,
+    `_create_criterion_row`, `_finish_criterion_row`, `_store_ai_verdict`,
+    `_finish_domain`, …) each open a short-lived session and COMMIT. Called
+    inline from the async run path they execute ON the loop, so under a large
+    run — especially >300 wayback, whose CDX fetches are serial
+    (`max_concurrent=1`) so the loop has little else to do but these commits
+    — they serialize on SQLite's single writer and freeze page-serving +
+    `/status` ("the tool becomes unusable during large runs"). `to_thread`
+    moves them off the loop, exactly as the availability runner was fixed on
+    2026-06-21. The helpers are unchanged and stay synchronously callable
+    from the retry/reanalyze paths + tests; only these run-path call sites
+    await the threaded version."""
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 async def _process_domain(
@@ -2618,10 +2802,10 @@ async def _process_domain(
         return
     # Already finished in a previous worker iteration (e.g. pause+resume) —
     # nothing to redo.
-    domain_status = _get_domain_status(run_domain_id)
+    domain_status = await _offload(_get_domain_status, run_domain_id)
     if domain_status in ("done", "failed", "canceled"):
         return
-    domain = _begin_domain(run_domain_id)
+    domain = await _offload(_begin_domain, run_domain_id)
     if domain is None:
         return
 
@@ -2639,7 +2823,7 @@ async def _process_domain(
             )
             # _run_availability_for_domain may set RunDomain.skip_reason
             # + status='done'. Re-check status to bail out cleanly.
-            post_status = _get_domain_status(run_domain_id)
+            post_status = await _offload(_get_domain_status, run_domain_id)
             if post_status in ("done", "failed", "canceled"):
                 return
         except Exception as e:  # noqa: BLE001
@@ -2655,7 +2839,7 @@ async def _process_domain(
 
     # Map of already-completed criteria for this domain — used to skip
     # refetching after a resume. Key = criterion name, value = (cr_id, rows).
-    already_done = _completed_criteria(run_domain_id)
+    already_done = await _offload(_completed_criteria, run_domain_id)
 
     # Build the URLs for THIS specific domain (build_preview only emits the
     # first one; reuse the same builder by calling it with a one-element list).
@@ -2706,11 +2890,11 @@ async def _process_domain(
                     and not is_canceled(run_id)
                     and not is_paused(run_id)
                 ):
-                    cr_id_existing = _criterion_row_ids(
-                        run_domain_id
-                    ).get("wayback")
-                    if cr_id_existing is not None and not _load_wayback_samples(
-                        cr_id_existing
+                    cr_id_existing = (await _offload(
+                        _criterion_row_ids, run_domain_id
+                    )).get("wayback")
+                    if cr_id_existing is not None and not await _offload(
+                        _load_wayback_samples, cr_id_existing
                     ):
                         picks = _pick_wayback_samples(
                             cached_rows,
@@ -2723,7 +2907,9 @@ async def _process_domain(
                             samples = await _fetch_wayback_samples(
                                 samples=picks
                             )
-                            _attach_wayback_samples(cr_id_existing, samples)
+                            await _offload(
+                                _attach_wayback_samples, cr_id_existing, samples,
+                            )
             continue
         # Per-job cache: when the spec hash matches a prior run's row, copy
         # data forward without hitting Ahrefs. The user opted into this via
@@ -2736,7 +2922,8 @@ async def _process_domain(
         if cache_enabled and params_hash and (
             cache_job_scope is not None or spec.cross_job_cache
         ):
-            cached = _try_serve_data_from_cache(
+            cached = await _offload(
+                _try_serve_data_from_cache,
                 run_domain_id=run_domain_id,
                 domain=domain,
                 criterion=req.criterion,
@@ -2748,13 +2935,16 @@ async def _process_domain(
                 _, _, rows = cached
                 fetched_rows[req.criterion] = rows
                 continue
-        cr_id = _create_criterion_row(
-            run_domain_id, req.criterion, req.url, params_hash
+        cr_id = await _offload(
+            _create_criterion_row,
+            run_domain_id, req.criterion, req.url, params_hash,
         )
         ok, http_status, body, err, units = await _fetch_criterion(
             req.url, criterion=req.criterion,
         )
-        _finish_criterion_row(cr_id, ok, http_status, body, err, units)
+        await _offload(
+            _finish_criterion_row, cr_id, ok, http_status, body, err, units,
+        )
         if ok and isinstance(body, dict):
             for v in body.values():
                 if isinstance(v, list):
@@ -2788,7 +2978,7 @@ async def _process_domain(
                 )
                 if picks:
                     samples = await _fetch_wayback_samples(samples=picks)
-                    _attach_wayback_samples(cr_id, samples)
+                    await _offload(_attach_wayback_samples, cr_id, samples)
 
     # wayback_classify is enabled — make sure its CR row exists before the
     # AI step. The row is non-fetching (no URL); it just acts as a slot to
@@ -2796,7 +2986,7 @@ async def _process_domain(
     # Status starts "pending" — the AI step flips it to done/failed.
     wbc_cfg = getattr(spec.criteria, "wayback_classify", None)
     if wbc_cfg is not None and wbc_cfg.enabled:
-        existing_ids = _criterion_row_ids(run_domain_id)
+        existing_ids = await _offload(_criterion_row_ids, run_domain_id)
         if "wayback_classify" not in existing_ids:
             # params_hash must be the real classify-config hash (added
             # 2026-05-13 with Option 1) so the cross-job verdict cache can
@@ -2805,12 +2995,13 @@ async def _process_domain(
             wbc_params_hash = compute_params_hash(
                 "wayback_classify", wbc_cfg,
             )
-            cr_id_wbc = _create_criterion_row(
+            cr_id_wbc = await _offload(
+                _create_criterion_row,
                 run_domain_id, "wayback_classify", "", wbc_params_hash,
             )
             # _create_criterion_row defaults status to "running" — flip
             # back to pending until the AI step actually starts on it.
-            _set_criterion_status(cr_id_wbc, "pending")
+            await _offload(_set_criterion_status, cr_id_wbc, "pending")
 
     # AI step — skip if no provider selected or if Ahrefs failed for everything.
     ai_provider = (spec.ai.provider if spec.ai else None) if spec.ai else None
@@ -2831,7 +3022,7 @@ async def _process_domain(
 
     if is_canceled(run_id) or is_paused(run_id):
         return
-    _finish_domain(run_domain_id, success=not any_failed)
+    await _offload(_finish_domain, run_domain_id, success=not any_failed)
 
 
 async def _judge_one_criterion(
@@ -2910,7 +3101,20 @@ async def _judge_one_criterion(
         sub_verdicts[criterion] = cached_verdicts[criterion]
         return
 
-    system_prompt = localize_prompt(get_ai_prompt(criterion), spec.lang)
+    # Wayback Quality (2026-06-07): white | grey prompt variants.
+    # The `WaybackConfig.variant` field on the submitted spec picks which
+    # prompt slot to pull. Defaults to "white" via Pydantic so legacy
+    # specs (pre-2026-06-07, no field) keep their old behavior. Other
+    # criteria (backlinks/refdomains/anchors/keywords/wayback_classify/
+    # final) and the other pillars are NOT variant-aware in this wave —
+    # they use the plain `criterion` key as before.
+    prompt_key = criterion
+    if criterion == "wayback":
+        wb_variant = getattr(
+            getattr(spec.criteria, "wayback", None), "variant", "white",
+        )
+        prompt_key = f"wayback_{wb_variant}"
+    system_prompt = localize_prompt(get_ai_prompt(prompt_key), spec.lang)
     prompt_hash = compute_prompt_hash(
         system_prompt,
         provider,
@@ -2924,7 +3128,8 @@ async def _judge_one_criterion(
         cache_job_scope is not None or spec.cross_job_cache
     ):
         params_hash = _get_criterion_params_hash(cr_id)
-        verdict = _try_serve_verdict_from_cache(
+        verdict = await _offload(
+            _try_serve_verdict_from_cache,
             cr_id=cr_id,
             domain=domain,
             criterion=criterion,
@@ -2965,7 +3170,8 @@ async def _judge_one_criterion(
     except ProviderConfigError as e:
         log.warning("AI verdict failed for run_domain=%s criterion=%s: %s",
                     run_domain_id, criterion, e)
-        _store_ai_verdict(
+        await _offload(
+            _store_ai_verdict,
             cr_id, None, error=f"{type(e).__name__}: {e}",
             prompt_hash=prompt_hash,
             provider=provider, model=model_override or "",
@@ -2980,7 +3186,8 @@ async def _judge_one_criterion(
                 model_override=resolved_model,
             )
         sub_verdicts[criterion] = parsed
-        _store_ai_verdict(
+        await _offload(
+            _store_ai_verdict,
             cr_id, parsed, error="",
             prompt_hash=prompt_hash,
             provider=provider, model=resolved_model,
@@ -2989,7 +3196,8 @@ async def _judge_one_criterion(
     except (ProviderConfigError, ProviderError, ValueError) as e:
         log.warning("AI verdict failed for run_domain=%s criterion=%s: %s",
                     run_domain_id, criterion, e)
-        _store_ai_verdict(
+        await _offload(
+            _store_ai_verdict,
             cr_id, None, error=f"{type(e).__name__}: {e}",
             prompt_hash=prompt_hash,
             provider=provider, model=resolved_model,
@@ -2997,7 +3205,8 @@ async def _judge_one_criterion(
     except Exception as e:  # noqa: BLE001
         log.exception("AI verdict crashed for run_domain=%s criterion=%s",
                       run_domain_id, criterion)
-        _store_ai_verdict(
+        await _offload(
+            _store_ai_verdict,
             cr_id, None, error=f"unexpected: {e!r}",
             prompt_hash=prompt_hash,
             provider=provider, model=resolved_model,
@@ -3095,7 +3304,7 @@ async def _run_ai_for_domain(
 
     if is_canceled(run_id) or is_paused(run_id):
         if cr_id_by_criterion:
-            _stamp_last_analyzed(run_domain_id)
+            await _offload(_stamp_last_analyzed, run_domain_id)
         return
 
     # Phase 2 — wayback_classify. Fires unconditionally when configured
@@ -3120,7 +3329,7 @@ async def _run_ai_for_domain(
 
     if is_canceled(run_id) or is_paused(run_id):
         if cr_id_by_criterion:
-            _stamp_last_analyzed(run_domain_id)
+            await _offload(_stamp_last_analyzed, run_domain_id)
         return
 
     # Phase 3 — Ahrefs B/D/A/K judges. Each reads classify_context from
@@ -3132,7 +3341,7 @@ async def _run_ai_for_domain(
             continue
         if is_canceled(run_id) or is_paused(run_id):
             if cr_id_by_criterion:
-                _stamp_last_analyzed(run_domain_id)
+                await _offload(_stamp_last_analyzed, run_domain_id)
             return
         await _judge_one_criterion(
             criterion=criterion, rows=fetched_rows[criterion], **judge_kwargs,
@@ -3168,16 +3377,18 @@ async def _run_ai_for_domain(
                 "summary": "",
                 "recommendation": "",
             }
-            _store_final_assessment(run_domain_id, partial_stub, "")
+            await _offload(
+                _store_final_assessment, run_domain_id, partial_stub, "",
+            )
         if cr_id_by_criterion:
-            _stamp_last_analyzed(run_domain_id)
+            await _offload(_stamp_last_analyzed, run_domain_id)
         return
 
     if not sub_verdicts:
         # Defensive: no enabled criteria at all (shouldn't happen — the
         # submit endpoint rejects this — but don't crash if it does).
         if cr_id_by_criterion:
-            _stamp_last_analyzed(run_domain_id)
+            await _offload(_stamp_last_analyzed, run_domain_id)
         return
     # Resume idempotency: if a final was already produced, don't redo it.
     if _existing_final_assessment(run_domain_id):
@@ -3231,7 +3442,8 @@ async def _run_ai_for_domain(
         parsed["model"] = final_resolved_model
     final_label = str(parsed.get("final") or "").strip()
     if score is not None or parsed:
-        _store_final_assessment(
+        await _offload(
+            _store_final_assessment,
             run_domain_id, parsed, final_label,
             usage=final_usage,
             provider=provider,
@@ -3334,14 +3546,15 @@ async def _run_wayback_classify_for_domain(
     cr_id = rd_crs.get("wayback_classify")
     wbc_params_hash = compute_params_hash("wayback_classify", wbc_cfg)
     if cr_id is None:
-        cr_id = _create_criterion_row(
+        cr_id = await _offload(
+            _create_criterion_row,
             run_domain_id, "wayback_classify", "", wbc_params_hash,
         )
 
     # Resume: reuse a verdict saved in a prior paused worker.
     if "wayback_classify" in cached_verdicts:
         sub_verdicts["wayback_classify"] = cached_verdicts["wayback_classify"]
-        _set_criterion_status(cr_id, "done")
+        await _offload(_set_criterion_status, cr_id, "done")
         return
 
     # Cross-job AI verdict cache lookup (added 2026-05-13). Brings classify
@@ -3352,16 +3565,22 @@ async def _run_wayback_classify_for_domain(
     # calls. The cache key includes BOTH chained prompts (primary +
     # category) hashed together, so editing either prompt invalidates.
     language_mode = getattr(wbc_cfg, "language_mode", "ai")
-    primary_prompt_key = (
+    # Prompt variant (white | grey, added 2026-06-07). Normalise to
+    # "white" on any unexpected value so the cache key always points
+    # at a real prompt slot.
+    wbc_variant_raw = getattr(wbc_cfg, "variant", "white")
+    wbc_variant = "grey" if wbc_variant_raw == "grey" else "white"
+    primary_base = (
         "wayback_classify_theme_only"
         if language_mode == "library"
         else "wayback_classify_combined"
     )
+    primary_prompt_key = f"{primary_base}_{wbc_variant}"
     primary_prompt = localize_prompt(
         get_ai_prompt(primary_prompt_key), spec.lang,
     )
     category_prompt = localize_prompt(
-        get_ai_prompt("wayback_category"), spec.lang,
+        get_ai_prompt(f"wayback_category_{wbc_variant}"), spec.lang,
     )
     # Encode the category prompt's hash into `fields_sent` as a sentinel
     # so changing it busts the cache without needing to extend
@@ -3382,7 +3601,8 @@ async def _run_wayback_classify_for_domain(
             cache_job_scope: int | None = None
         else:
             cache_job_scope = _resolve_job_id(run_id)
-        verdict_from_cache = _try_serve_verdict_from_cache(
+        verdict_from_cache = await _offload(
+            _try_serve_verdict_from_cache,
             cr_id=cr_id,
             domain=domain,
             criterion="wayback_classify",
@@ -3393,7 +3613,7 @@ async def _run_wayback_classify_for_domain(
         )
         if verdict_from_cache is not None:
             sub_verdicts["wayback_classify"] = verdict_from_cache
-            _set_criterion_status(cr_id, "done")
+            await _offload(_set_criterion_status, cr_id, "done")
             return
 
     # Find the wayback CR row + its samples. Failing here surfaces a
@@ -3402,7 +3622,8 @@ async def _run_wayback_classify_for_domain(
     # check defensively).
     wb_cr_id = rd_crs.get("wayback")
     if wb_cr_id is None:
-        _store_ai_verdict(
+        await _offload(
+            _store_ai_verdict,
             cr_id, None,
             error=(
                 "wayback_classify needs the wayback criterion enabled — "
@@ -3410,11 +3631,12 @@ async def _run_wayback_classify_for_domain(
             ),
             provider=provider, model=resolved_model,
         )
-        _set_criterion_status(cr_id, "failed")
+        await _offload(_set_criterion_status, cr_id, "failed")
         return
     samples = _load_wayback_samples(wb_cr_id)
     if not samples:
-        _store_ai_verdict(
+        await _offload(
+            _store_ai_verdict,
             cr_id, None,
             error=(
                 "wayback_classify needs Wayback V2 page samples — none on "
@@ -3424,10 +3646,10 @@ async def _run_wayback_classify_for_domain(
             ),
             provider=provider, model=resolved_model,
         )
-        _set_criterion_status(cr_id, "failed")
+        await _offload(_set_criterion_status, cr_id, "failed")
         return
 
-    _set_criterion_status(cr_id, "running")
+    await _offload(_set_criterion_status, cr_id, "running")
     from .wayback_classify import classify_wayback_for_domain
     try:
         verdict, usages = await classify_wayback_for_domain(
@@ -3438,27 +3660,33 @@ async def _run_wayback_classify_for_domain(
             resolved_model=resolved_model,
             judge_limit_ctx=limit,
             lang=spec.lang,
+            # White | grey prompt slot (added 2026-06-07). `wbc_variant`
+            # was normalised above to a known value; pass it down so the
+            # runner reads the matching `_white` / `_grey` prompts.
+            variant=wbc_variant,
         )
     except (ProviderConfigError, ProviderError, ValueError) as e:
         log.warning(
             "wayback_classify failed for run_domain=%s: %s",
             run_domain_id, e,
         )
-        _store_ai_verdict(
+        await _offload(
+            _store_ai_verdict,
             cr_id, None, error=f"{type(e).__name__}: {e}",
             provider=provider, model=resolved_model,
         )
-        _set_criterion_status(cr_id, "failed")
+        await _offload(_set_criterion_status, cr_id, "failed")
         return
     except Exception as e:  # noqa: BLE001
         log.exception(
             "wayback_classify crashed for run_domain=%s", run_domain_id,
         )
-        _store_ai_verdict(
+        await _offload(
+            _store_ai_verdict,
             cr_id, None, error=f"unexpected: {e!r}",
             provider=provider, model=resolved_model,
         )
-        _set_criterion_status(cr_id, "failed")
+        await _offload(_set_criterion_status, cr_id, "failed")
         return
 
     # Aggregate token usage from the chained calls (combined/theme +
@@ -3469,13 +3697,14 @@ async def _run_wayback_classify_for_domain(
         total_usage["input_tokens"] += int(u.get("input_tokens") or 0)
         total_usage["output_tokens"] += int(u.get("output_tokens") or 0)
 
-    _store_ai_verdict(
+    await _offload(
+        _store_ai_verdict,
         cr_id, verdict, error="",
         prompt_hash=wbc_prompt_hash,
         provider=provider, model=resolved_model,
         usage=total_usage,
     )
-    _set_criterion_status(cr_id, "done")
+    await _offload(_set_criterion_status, cr_id, "done")
     sub_verdicts["wayback_classify"] = verdict
 
 
@@ -3673,8 +3902,20 @@ def _reevaluate_domain_and_run_status(run_domain_id: int) -> None:
             return
         if run.status != "failed":
             return  # only ever flip failed → done
-        all_done = all(d.status == "done" for d in run.domains)
-        if all_done:
+        # Existence check instead of `all(d.status == "done" for d in
+        # run.domains)` (2026-06-17). This helper runs once per
+        # reanalyzed/retried RD, so the ORM walk hydrated every RunDomain of
+        # the run on EVERY call — the single biggest driver of the
+        # retry-time memory balloon (each pass ≈ 290 MB of unreclaimable
+        # pymalloc on a 60k-domain run). One indexed `WHERE status != 'done'
+        # LIMIT 1` answers the same question in O(1).
+        has_unfinished = (
+            db.query(RunDomain.id)
+            .filter(RunDomain.run_id == rd.run_id)
+            .filter(RunDomain.status != "done")
+            .first()
+        )
+        if has_unfinished is None:
             run.status = "done"
             run.error = ""
             db.commit()
@@ -5006,6 +5247,23 @@ def _finish_domain(run_domain_id: int, success: bool) -> None:
         rd.status = "done" if success else "failed"
         rd.finished_at = datetime.utcnow()
         db.commit()
+    finally:
+        db.close()
+
+
+def _mark_domain_done_skipped(run_domain_id: int, skip_reason: str) -> None:
+    """Mark a domain `done` with a `skip_reason` (the availability
+    skip-registered / not-supported short-circuits). Extracted from the two
+    inline session blocks in `_run_availability_for_domain` so they can be
+    off-loaded off the event loop like the rest of the per-domain writes."""
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is not None:
+            rd.status = "done"
+            rd.finished_at = datetime.utcnow()
+            rd.skip_reason = skip_reason
+            db.commit()
     finally:
         db.close()
 
