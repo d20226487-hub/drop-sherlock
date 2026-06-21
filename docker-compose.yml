@@ -36,7 +36,16 @@ services:
     # it rather than lowering — the container auto-restarts (restart:
     # unless-stopped) and the runner auto-pauses any in-flight run, which is
     # resumable from the UI, so the worst case is a pause, not data loss.
-    mem_limit: 4g
+    # 2026-06-21: 4g -> 5g. At ~142k distinct domains the Database snapshot
+    # build (`_build_all_rows` loads ALL run_domains) spikes ~1-2 GB; during
+    # a large concurrent availability run that hit the 4g cap and thrashed.
+    # 5g is a BAND-AID — host has only ~2 GB free (VM cap 7.6 GB), so this is
+    # near the safe ceiling. The durable fix is memory-bounding that build
+    # (SQL-paginate, don't load 146k ORM rows); raising RAM won't scale as
+    # the domain count keeps growing. Live-applied to the running container
+    # via `docker update --memory 5g` (no recreate) so an in-flight run
+    # wasn't interrupted.
+    mem_limit: 5g
     volumes:
       - ./data:/data
       # Dev iteration speed (2026-06-18): bind-mount the app source so a
