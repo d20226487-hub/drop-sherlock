@@ -589,3 +589,67 @@ def test_whois_history_is_pin_only_on_database(fresh_db):
     row = next(r for r in resp.rows if r.domain == "pin-test.example")
     assert row.whois_dropped_confidence == 0.85
     assert row.whois_band == "dropped"  # > 0.80 → 'dropped' band
+
+
+def test_criterion_pin_endpoints_refresh_database_cache(fresh_db):
+    """Pinning / unpinning a criterion via the jobs.py endpoints must refresh
+    the Database rows snapshot so /database reflects it WITHOUT a manual cache
+    clear — the gap behind the 8baf50e test fix. Unlike
+    test_whois_history_is_pin_only_on_database (which adds the pin with a raw
+    session.add and so must clear the cache by hand), this drives the pin
+    through set_criterion_pin / clear_criterion_pin and never touches the
+    cache directly."""
+    from app.models import CriterionResult, Job, Run, RunDomain
+    from app.routers.database import list_domains
+    from app.routers.jobs import (
+        CriterionPinIn,
+        clear_criterion_pin,
+        set_criterion_pin,
+    )
+    session, _ = fresh_db
+    now = datetime.utcnow()
+    job = Job(name="whois-only", kind="whois_history", spec_json="{}")
+    session.add(job)
+    session.flush()
+    run = Run(job_id=job.id, status="done", spec_json="{}", finished_at=now)
+    session.add(run)
+    session.flush()
+    rd = RunDomain(run_id=run.id, domain="endpoint-pin.example",
+                   status="done", finished_at=now)
+    session.add(rd)
+    session.flush()
+    session.add(CriterionResult(
+        run_domain_id=rd.id, criterion="whois_history", status="done",
+        data_json="{}",
+        ai_verdict_json=json.dumps(
+            {"dropped_confidence": 0.85, "summary": "drop signals"}),
+    ))
+    session.commit()
+
+    # Phase 1 — read once (no pin) to PRIME the rows snapshot cache.
+    resp = list_domains(db=session)
+    row = next(r for r in resp.rows if r.domain == "endpoint-pin.example")
+    assert row.whois_dropped_confidence is None
+
+    # Phase 2 — pin via the ENDPOINT; no manual cache clear. The endpoint
+    # patches the snapshot, so the very next read reflects it.
+    set_criterion_pin(
+        job.id,
+        CriterionPinIn(criterion="whois_history", run_id=run.id),
+        db=session,
+    )
+    resp = list_domains(db=session)
+    row = next(r for r in resp.rows if r.domain == "endpoint-pin.example")
+    assert row.whois_dropped_confidence == 0.85, (
+        "set_criterion_pin did not refresh the Database rows-snapshot cache"
+    )
+    assert row.whois_band == "dropped"
+
+    # Phase 3 — clear via the ENDPOINT; the column blanks again, still no
+    # manual cache clear.
+    clear_criterion_pin(job.id, "whois_history", db=session)
+    resp = list_domains(db=session)
+    row = next(r for r in resp.rows if r.domain == "endpoint-pin.example")
+    assert row.whois_dropped_confidence is None, (
+        "clear_criterion_pin did not refresh the Database rows-snapshot cache"
+    )

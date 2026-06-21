@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -34,6 +35,8 @@ from ..models import (
 )
 from ..schemas import AnalyzeSpec
 from ..tasks import cancel_run_now, dispatch_run, pause_run_now, resume_run_now
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 runs_router = APIRouter(prefix="/runs", tags=["runs"])
@@ -3150,6 +3153,59 @@ def list_criterion_pins(
     return CriterionPinsListOut(job_id=job_id, pins=items)
 
 
+# Above this many affected domains, an inline re-synthesis would stall the
+# pin endpoint (a 25k-domain run's patch ≈ a near-full rebuild), so we fall
+# back to a non-blocking background rebuild instead. Below it, the inline
+# patch makes the pin show on /database instantly. ~1000 domains
+# re-synthesizes in ~1-2s — an acceptable cost for a deliberate pin click.
+_MAX_SYNC_PATCH_DOMAINS = 1000
+
+
+def _patch_database_cache_for_runs(db: Session, run_ids: set[int]) -> None:
+    """After a criterion-pin change here, refresh the Database rows snapshot
+    for exactly the domains whose row synthesis the change touches — those in
+    the affected runs (the newly-pinned run, and any run a pin moved AWAY
+    from, whose domains now resolve that criterion elsewhere). Mirrors
+    `database.py:pin_domain`/`unpin_domain`, which patch their own per-domain
+    pins; without this, a Jobs-page pin change only shows on /database after
+    the ~tens-of-seconds background rebuild.
+
+    For a modest number of affected domains the patch is inline (instant on
+    /database). Beyond `_MAX_SYNC_PATCH_DOMAINS` it would stall the endpoint
+    (re-synthesizing tens of thousands of rows ≈ a full rebuild), so it falls
+    back to a non-blocking background rebuild — the pin then lands on the next
+    snapshot, same as any external change.
+
+    Best-effort: a failure just leaves the snapshot to self-heal on its TTL /
+    next background rebuild — never break the pin write over a cache refresh."""
+    run_ids = {r for r in run_ids if r}
+    if not run_ids:
+        return
+    try:
+        domains = [
+            d for (d,) in db.query(RunDomain.domain)
+            .filter(RunDomain.run_id.in_(run_ids))
+            .distinct()
+            .all()
+        ]
+        if not domains:
+            return
+        from .database import (
+            _patch_domains_in_cache,
+            _trigger_background_rebuild,
+        )
+        if len(domains) > _MAX_SYNC_PATCH_DOMAINS:
+            # Too many to re-synthesize inline without stalling the request.
+            _trigger_background_rebuild()
+            return
+        _patch_domains_in_cache(db, domains)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "Database rows-cache patch after pin change failed (run_ids=%s); "
+            "snapshot will self-heal on the next background rebuild", run_ids,
+        )
+
+
 @router.post(
     "/{job_id}/criterion-pins", response_model=CriterionPinOut
 )
@@ -3183,6 +3239,7 @@ def set_criterion_pin(
         .filter(JobCriterionPin.criterion == payload.criterion)
         .one_or_none()
     )
+    prev_run_id = existing.run_id if existing is not None else 0
     if existing is None:
         db.add(JobCriterionPin(
             job_id=job_id,
@@ -3193,6 +3250,13 @@ def set_criterion_pin(
         existing.run_id = payload.run_id
         existing.updated_at = datetime.utcnow()
     db.commit()
+    # Reflect the pin on /database immediately: patch the newly-pinned run's
+    # domains, plus the run this pin moved away from (their criterion source
+    # flips), instead of waiting for the background rebuild.
+    affected = {payload.run_id}
+    if prev_run_id and prev_run_id != payload.run_id:
+        affected.add(prev_run_id)
+    _patch_database_cache_for_runs(db, affected)
     return CriterionPinOut(
         job_id=job_id,
         criterion=payload.criterion,
@@ -3220,6 +3284,9 @@ def clear_criterion_pin(
     if existing is not None:
         db.delete(existing)
         db.commit()
+        # Reflect the unpin on /database immediately: the formerly-pinned
+        # run's domains re-resolve this criterion (fallback or blank).
+        _patch_database_cache_for_runs(db, {prev_run_id})
     return CriterionPinOut(
         job_id=job_id, criterion=criterion, run_id=prev_run_id, pinned=False,
     )
@@ -3280,16 +3347,21 @@ def pin_run_all_criteria(
     )
     existing_by_crit: dict[str, JobCriterionPin] = {p.criterion: p for p in existing}
     replaced = 0
+    replaced_run_ids: set[int] = set()
     now = datetime.utcnow()
     for c in crit_set:
         ex = existing_by_crit.get(c)
         if ex is None:
             db.add(JobCriterionPin(job_id=run.job_id, criterion=c, run_id=run_id))
         elif ex.run_id != run_id:
+            replaced_run_ids.add(ex.run_id)
             ex.run_id = run_id
             ex.updated_at = now
             replaced += 1
     db.commit()
+    # Reflect on /database immediately: this run's domains, plus any runs
+    # whose criterion-pins were overwritten here.
+    _patch_database_cache_for_runs(db, {run_id} | replaced_run_ids)
     return PinRunCriteriaOut(
         run_id=run_id,
         job_id=run.job_id,
