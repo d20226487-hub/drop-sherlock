@@ -1277,6 +1277,8 @@ const messagesEn = {
       selectedCount: (n: number) =>
         `${n} domain${n === 1 ? "" : "s"} selected`,
       clearSelection: "Clear",
+      sendFilteredConfirm: (n: number) =>
+        `Send all ${n} filtered domain${n === 1 ? "" : "s"} to analysis? This uses the entire filtered set across all pages, not just the visible rows — for Quality / Whois that can be a large, billable job.`,
       deleteSelected: (n: number) =>
         `Delete ${n} domain${n === 1 ? "" : "s"}`,
       deleting: "Deleting…",
@@ -3785,6 +3787,8 @@ const messagesRu: Messages = {
         return `выбрано ${n} ${word}`;
       },
       clearSelection: "Очистить",
+      sendFilteredConfirm: (n) =>
+        `Отправить все ${n} отфильтрованных доменов в анализ? Будет использован весь отфильтрованный набор со всех страниц, а не только видимые строки — для Quality / Whois это может быть большой платный запуск.`,
       deleteSelected: (n) => {
         const last2 = n % 100;
         const last1 = n % 10;

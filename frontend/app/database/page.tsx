@@ -1098,6 +1098,67 @@ export default function DatabasePage() {
     }
   }
 
+  // Send ALL filtered domains (every page, not just the loaded one) to a
+  // pillar's /check page (2026-06-22) — the "all-filtered" analog of
+  // handleSendToPillar, mirroring the Backlog page's all-filtered bar.
+  // Resolves the full filtered set with the SAME per_page=0 fetch the CSV
+  // export uses (so the set matches exactly what the filters show), then
+  // hands the domains off via sessionStorage. Even Quality goes through the
+  // sessionStorage handoff here (not its ?domains= URL path) because a
+  // tens-of-thousands-domain set won't fit in a URL — /check/quality already
+  // drains sessionStorage on from_backlog=1.
+  async function handleSendFilteredToPillar(pillar: Pillar) {
+    if (filteredTotal === 0 || sendingPillar !== null) return;
+    if (!window.confirm(ts.sendFilteredConfirm(filteredTotal))) return;
+    setSendingPillar(pillar);
+    try {
+      const d = await api.listDatabaseDomains({
+        per_page: 0,
+        include_options: false,
+        verdict: verdicts,
+        wayback_verdict: waybackVerdicts,
+        whois_band: whoisBands,
+        availability: availabilityFilter,
+        language: languages,
+        category: categories,
+        criterion: criteria,
+        notes: notesFilter,
+        source: sourceFilter,
+        status: statusFilter,
+        wayback_conf_min: waybackConfMin,
+        ahrefs_conf_min: ahrefsConfMin,
+        dr_min: drMin,
+        ref_domains_min: refDomainsMin,
+        whois_cycles_max: whoisCyclesMax,
+        max_price_min: maxPriceMin,
+        max_price_max: maxPriceMax,
+        search,
+        show_taken: showTaken,
+      });
+      const domains = d.rows.map((r) => r.domain);
+      if (domains.length === 0) {
+        setSendingPillar(null);
+        return;
+      }
+      sessionStorage.setItem(
+        BACKLOG_HANDOFF_KEY,
+        JSON.stringify({ domains }),
+      );
+      router.push(
+        pillar === "quality"
+          ? "/check/quality?from_backlog=1"
+          : pillar === "whois"
+            ? "/check/whois-history?from_backlog=1"
+            : pillar === "ahrefs_batch"
+              ? "/check/ahrefs-batch-analysis?from_backlog=1"
+              : "/check/availability?from_backlog=1",
+      );
+    } catch (e) {
+      setError((e as Error).message);
+      setSendingPillar(null);
+    }
+  }
+
   async function handleDeleteSelected() {
     if (selected.size === 0) return;
     const list = Array.from(selected);
@@ -2107,6 +2168,50 @@ export default function DatabasePage() {
 
       <PaginationTopBar state={searchState} searchPlaceholder={ts.searchPlaceholder} />
 
+      {/* All-filtered send bar (2026-06-22) — dispatch the ENTIRE filtered
+          set (every page) to a pillar, mirroring the Backlog page. Shown
+          only when nothing is hand-selected, so it never stacks with the
+          blue selection toolbar below; pick rows for a subset, or use this
+          for "everything matching the current filters". */}
+      {filteredTotal > 0 && selected.size === 0 && (
+        <div className="rounded-md border border-emerald-300 dark:border-emerald-900/60 bg-emerald-50 dark:bg-emerald-950/30 px-3 py-2 text-sm">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <span className="text-emerald-800 dark:text-emerald-300">
+              {t.pages.backlog.sendToPicker.allFilteredLabel(filteredTotal)}
+            </span>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => handleSendFilteredToPillar("quality")}
+                disabled={deleting || sendingPillar !== null}
+                className="text-xs px-3 py-1 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                title={t.pages.backlog.sendToPicker.qualityHint}
+              >
+                {t.pages.backlog.sendToPicker.quality}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSendFilteredToPillar("whois")}
+                disabled={deleting || sendingPillar !== null}
+                className="text-xs px-3 py-1 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                title={t.pages.backlog.sendToPicker.whoisHint}
+              >
+                {t.pages.backlog.sendToPicker.whois}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSendFilteredToPillar("ahrefs_batch")}
+                disabled={deleting || sendingPillar !== null}
+                className="text-xs px-3 py-1 rounded-md bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+                title={t.pages.backlog.sendToPicker.ahrefsBatchHint}
+              >
+                {t.pages.backlog.sendToPicker.ahrefsBatch}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {selected.size > 0 && (
         <div className="rounded-md border border-blue-300 dark:border-blue-900/60 bg-blue-50 dark:bg-blue-950/40 px-3 py-2 text-sm space-y-2">
           <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -2410,7 +2515,7 @@ export default function DatabasePage() {
                   rowNumber={startIdx + i + 1}
                   selected={selected.has(r.domain)}
                   onToggle={() => toggleOne(r.domain)}
-                  onBacklogUpdated={() => reload({ silent: true, fresh: true })}
+                  onBacklogUpdated={() => reload({ silent: true })}
                   onNoteSaved={(note) => {
                     // Optimistic merge so the new note is visible
                     // immediately without a full /database/domains
