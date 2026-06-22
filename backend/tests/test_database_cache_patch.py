@@ -214,3 +214,58 @@ def test_fresh_get_all_rows_serves_snapshot_without_blocking(fresh_db):
     finally:
         d2._trigger_background_rebuild = orig
     assert {r.domain for r in rows} == {"a.com"}
+
+
+def test_rebuild_does_not_clobber_concurrent_patch(fresh_db):
+    """Regression for the "discard applies, then goes off" race (2026-06-22).
+
+    A full rebuild reads the DB at its start and stores ~tens of seconds
+    later, overwriting the whole snapshot. A backlog-status patch that lands
+    DURING that build must NOT be reverted when the (older) build stores. The
+    guard records domains patched mid-build and re-applies them after the
+    store. Without it, this test sees 'order' (clobbered); with it, 'discarded'.
+    """
+    from datetime import datetime as _dt
+
+    from app.models import BacklogDomain
+    from app.routers import database as dbmod
+
+    _seed(fresh_db, ["a.com", "b.com"])
+    fresh_db.add(BacklogDomain(
+        domain="a.com", status="order",
+        created_at=_dt.utcnow(), updated_at=_dt.utcnow(),
+    ))
+    fresh_db.commit()
+
+    # Warm the snapshot — a.com shows 'order'.
+    dbmod._build_and_store_rows()
+    by = {r.domain: r for r in dbmod._peek_rows_cache()[0]}
+    assert by["a.com"].backlog_status == "order"
+
+    # Wrap _build_all_rows so the FULL build reads stale rows first, then a
+    # backlog patch commits + patches the cache mid-build (exactly what
+    # set_backlog_status does), then the stale rows are returned for storing.
+    real_build = dbmod._build_all_rows
+
+    def racing_build(db, *, only_domains=None):
+        rows = real_build(db, only_domains=only_domains)  # read BEFORE the commit
+        if only_domains is None:
+            bl = (
+                db.query(BacklogDomain)
+                .filter(BacklogDomain.domain == "a.com")
+                .one()
+            )
+            bl.status = "discarded"
+            db.commit()
+            dbmod._patch_domains_in_cache(db, ["a.com"])
+        return rows
+
+    dbmod._build_all_rows = racing_build
+    try:
+        dbmod._build_and_store_rows()  # stores stale rows, then re-applies
+    finally:
+        dbmod._build_all_rows = real_build
+
+    by = {r.domain: r for r in dbmod._peek_rows_cache()[0]}
+    assert by["a.com"].backlog_status == "discarded"  # patch survived
+    assert by["b.com"].backlog_status is None         # untouched

@@ -1760,6 +1760,20 @@ _rows_cache_lock = threading.Lock()
 # check below — so an in-progress 38s build never blocks a cache hit.
 _rows_build_lock = threading.Lock()
 
+# Stale-rebuild clobber guard (2026-06-22). A full background rebuild reads the
+# DB at its start and stores ~tens of seconds later via `_store_rows_cache`,
+# which overwrites the ENTIRE snapshot. An in-router mutation that patches the
+# snapshot DURING that window (e.g. a backlog-status change) would be silently
+# reverted when the older rebuild stores — the "discard applies, then goes off"
+# bug. `_build_and_store_rows` sets `_build_in_progress` for its duration;
+# `_patch_domains_in_cache` records every domain it patches while that flag is
+# set; the rebuild re-applies exactly those domains right after it stores
+# (their committed state postdates the rebuild's reads, so only those rows are
+# stale in the freshly-stored snapshot).
+_build_track_lock = threading.Lock()
+_build_in_progress = False
+_patched_during_build: set[str] = set()
+
 
 # Background-rebuild coordination (2026-06-21). The snapshot rebuild is the
 # ~tens-of-seconds load-everything aggregation; we never let it block a
@@ -1827,14 +1841,40 @@ def _store_rows_cache(
 def _build_and_store_rows() -> None:
     """Run the full aggregation in its OWN session and store it. Single-
     flighted via `_rows_build_lock`; shared by the background rebuild thread
-    and the cold-start inline build."""
+    and the cold-start inline build.
+
+    Clobber guard (2026-06-22): track domains patched DURING this build and
+    re-apply them after storing, so a mutation that committed mid-build (which
+    this build's older DB reads don't reflect) isn't reverted by the store.
+    See `_build_in_progress` above."""
+    global _build_in_progress
     with _rows_build_lock:
-        db = SessionLocal()
+        with _build_track_lock:
+            _build_in_progress = True
+            _patched_during_build.clear()
         try:
-            rows, options, hide_candidates = _build_all_rows(db)
+            db = SessionLocal()
+            try:
+                rows, options, hide_candidates = _build_all_rows(db)
+            finally:
+                db.close()
+            _store_rows_cache(rows, options, hide_candidates)
         finally:
-            db.close()
-        _store_rows_cache(rows, options, hide_candidates)
+            with _build_track_lock:
+                stale = set(_patched_during_build)
+                _patched_during_build.clear()
+                _build_in_progress = False
+        # Re-apply patches that raced this build (they committed after the
+        # build's DB reads, so the snapshot we just stored is stale for them).
+        # Done after clearing the flag so a patch racing THIS re-apply is
+        # tracked for the next build rather than lost. Only reached on a
+        # successful store — a build that raised propagates past here.
+        if stale:
+            db2 = SessionLocal()
+            try:
+                _patch_domains_in_cache(db2, stale)
+            finally:
+                db2.close()
 
 
 def _trigger_background_rebuild() -> None:
@@ -1977,6 +2017,13 @@ def _patch_domains_in_cache(db: Session, domains: list[str] | set[str]) -> None:
             if d in new_hide:
                 new_hide_set.add(d)
         _rows_cache["all"] = (expiry, kept, options, new_hide_set)
+
+    # If a full rebuild is mid-flight, remember these domains so the rebuild
+    # re-applies them after it stores — otherwise its older DB read clobbers
+    # this patch (the "discard goes off" race). See `_build_in_progress`.
+    with _build_track_lock:
+        if _build_in_progress:
+            _patched_during_build.update(want)
 
 
 # --- Server-side filter / sort / search (2026-06-02) -----------------------
