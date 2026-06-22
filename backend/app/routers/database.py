@@ -954,13 +954,15 @@ def _build_all_rows(
             rows.append(DomainRow(
                 domain=domain,
                 is_pinned=False,
-                criteria={
-                    c: CriterionSummary(
-                        enabled=False, rows=0, cached_from_run_id=None,
-                        ai_cached_from_run_id=None, sort_fields=[],
-                    )
-                    for c in CRITERIA
-                },
+                # Empty criteria dict (2026-06-21 memory fix). A criterion
+                # absent from this map renders identically to the old
+                # explicit `enabled=False` placeholder: every frontend read
+                # is `row.criteria.X?.enabled` / `if (c && …)` and the only
+                # backend reader is `r.criteria.get(k)`. Materializing all 9
+                # CriterionSummary objects on every one of ~142k rows cost
+                # ~1.78 GB and was the dominant driver of the _build_all_rows
+                # OOM that left the whole Database page empty at this scale.
+                criteria={},
                 total_runs=len(domain_rds),
                 any_cached=False,
                 note=(note_row.note if note_row else ""),
@@ -1044,10 +1046,14 @@ def _build_all_rows(
             # pin-walk split above.
             src = per_crit_sources.get(c) or aux_sources.get(c)
             if src is None:
-                criteria_summary[c] = CriterionSummary(
-                    enabled=False, rows=0, cached_from_run_id=None,
-                    ai_cached_from_run_id=None, sort_fields=[],
-                )
+                # Omit absent criteria entirely (2026-06-21 memory fix —
+                # see the empty-row branch above). No `enabled=False`
+                # placeholder; the key is simply left out of
+                # criteria_summary. Frontend (`?.enabled`, `if (c && …)`)
+                # and backend (`r.criteria.get(k)`) treat a missing key the
+                # same as the old placeholder, but we save ~1.78 GB across
+                # ~142k rows by not building ~1.28M throwaway Pydantic
+                # CriterionSummary objects.
                 continue
             src_rd, src_run, src_job = src
             src_spec = specs_by_run.get(src_run.id)
