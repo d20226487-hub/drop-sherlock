@@ -270,8 +270,12 @@ def test_partial_rds_are_skipped(fresh_db):
         fresh_db, sub_verdicts=sub_verdicts, final_parsed=partial_stub,
     )
 
+    # refdomains carries weight AND is one of the failed criteria, so this is
+    # a GENUINE partial (a weighted signal is missing) → stays skipped. (A
+    # partial whose only failures are zero-weight is now re-scored — see
+    # test_zero_weight_only_partial_is_rescored.)
     new_weights = {
-        "backlinks": 0.5, "refdomains": 0.0, "anchors": 0.5,
+        "backlinks": 0.4, "refdomains": 0.3, "anchors": 0.3,
         "keywords": 0.0, "wayback": 0.0, "wayback_classify": 0.0,
     }
     result = recompute_run_finals(run_id, new_weights, preview=False)
@@ -286,6 +290,76 @@ def test_partial_rds_are_skipped(fresh_db):
     # Partial stub untouched — no `final` key got injected.
     assert parsed.get("partial") is True
     assert "final" not in parsed
+
+
+def test_zero_weight_only_partial_is_rescored(fresh_db):
+    """A partial whose ONLY failed criterion is zero-weight (e.g.
+    wayback_classify with no archive samples) is fully scoreable — recompute
+    must produce a score and clear the stub, not leave an em-dash (2026-06-22).
+    The weighted criteria (backlinks/anchors) all have verdicts."""
+    from app.models import RunDomain
+    from app.tasks import recompute_run_finals
+
+    sub_verdicts = {
+        "backlinks": _verdict("high_quality", 0.9),  # weighted
+        "anchors":   _verdict("low_quality", 0.5),   # weighted
+    }
+    # wayback_classify failed (no Wayback samples) — but it has weight 0.
+    partial_stub = {
+        "partial": True,
+        "succeeded": ["backlinks", "anchors", "wayback"],
+        "failed": ["wayback_classify"],
+        "summary": "", "recommendation": "",
+        "provider": "gemini", "model": "",
+    }
+    run_id, rd_id = _build_rd(
+        fresh_db, sub_verdicts=sub_verdicts, final_parsed=partial_stub,
+    )
+
+    new_weights = {
+        "backlinks": 0.5, "refdomains": 0.0, "anchors": 0.5,
+        "keywords": 0.0, "wayback": 0.0, "wayback_classify": 0.0,
+    }
+    result = recompute_run_finals(run_id, new_weights, preview=False)
+    row = result["rows"][0]
+    assert row["partial"] is False              # re-scored, not skipped
+    assert row["score_new"] is not None
+
+    fresh_db.expire_all()
+    rd = fresh_db.get(RunDomain, rd_id)
+    parsed = json.loads(rd.final_assessment_json)
+    assert "partial" not in parsed              # stub cleared
+    assert isinstance(parsed.get("final"), (int, float))
+
+
+def test_empty_final_scoreable_rd_gets_scored(fresh_db):
+    """A terminal rd whose synth never wrote ANY assessment (empty
+    final_assessment_json) but which has scoreable Ahrefs verdicts — e.g. a
+    domain that aborted on a failed zero-weight wayback fetch — should get a
+    final created by recompute, not be left blank (2026-06-22)."""
+    from app.models import RunDomain
+    from app.tasks import recompute_run_finals
+
+    sub_verdicts = {
+        "backlinks": _verdict("high_quality", 0.9),
+        "anchors":   _verdict("mixed", 0.7),
+    }
+    # No preset final_assessment_json at all (synth never ran).
+    run_id, rd_id = _build_rd(
+        fresh_db, sub_verdicts=sub_verdicts, final_parsed=None,
+    )
+    assert fresh_db.get(RunDomain, rd_id).final_assessment_json == ""
+
+    result = recompute_run_finals(run_id, None, preview=False)
+    row = result["rows"][0]
+    assert row["score_new"] is not None
+
+    fresh_db.expire_all()
+    rd = fresh_db.get(RunDomain, rd_id)
+    assert rd.final_assessment_json  # created, no longer empty
+    parsed = json.loads(rd.final_assessment_json)
+    assert isinstance(parsed.get("final"), (int, float))
+    assert "partial" not in parsed
 
 
 def test_excluding_a_criterion_via_weight_zero_renormalizes(fresh_db):

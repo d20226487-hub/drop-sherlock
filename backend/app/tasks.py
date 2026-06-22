@@ -3364,7 +3364,19 @@ async def _run_ai_for_domain(
     ]
     failed_in_ai = [c for c in enabled_criteria if c not in sub_verdicts]
     succeeded_in_ai = [c for c in enabled_criteria if c in sub_verdicts]
-    if failed_in_ai:
+    # Only a WEIGHTED criterion failing blocks the score (2026-06-22). A
+    # zero-weight criterion (wayback / wayback_classify, default weight 0)
+    # contributes nothing to compute_final, so its failure can't change or
+    # mislead the score — don't hide the whole assessment over it (a domain
+    # with no Wayback archive history must still get its Ahrefs score). When
+    # only zero-weight criteria failed, fall through and synthesize below.
+    from .app_settings import get_scoring_config
+    _partial_weights = get_scoring_config().get("weights") or {}
+    blocking_failed = [
+        c for c in failed_in_ai
+        if float(_partial_weights.get(c, 0) or 0) > 0
+    ]
+    if blocking_failed:
         if not _existing_final_assessment(run_domain_id):
             partial_stub = {
                 "partial": True,
@@ -4263,7 +4275,23 @@ def recompute_run_finals(
             is_partial = bool(
                 isinstance(old_parsed, dict) and old_parsed.get("partial")
             )
+            # A partial whose ONLY failed criteria are zero-weight (e.g.
+            # wayback_classify with no archive samples) is still fully
+            # scoreable — its weighted criteria all have verdicts. Re-score it
+            # and clear the stub instead of leaving an em-dash (2026-06-22,
+            # mirrors the synth's weighted-only partial rule). A partial that
+            # is missing a WEIGHTED criterion stays skipped — a score there
+            # would be invented from genuinely incomplete data.
+            scoreable_partial = False
             if is_partial:
+                _failed = old_parsed.get("failed") or []
+                _failed_weighted = [
+                    c for c in _failed
+                    if isinstance(c, str)
+                    and float(effective_weights.get(c, 0) or 0) > 0
+                ]
+                scoreable_partial = not _failed_weighted
+            if is_partial and not scoreable_partial:
                 rows_out.append({
                     "run_domain_id": rd.id,
                     "domain": rd.domain,
@@ -4296,13 +4324,25 @@ def recompute_run_finals(
                 "partial": False,
             })
 
-            if not preview and isinstance(old_parsed, dict):
+            if not preview and (
+                isinstance(old_parsed, dict) or new_score_rounded is not None
+            ):
                 # Mutate in place — keep the AI's prose (summary,
                 # recommendation, provider, model) and replace just the
                 # numeric fields. compute_final's renormalization makes
-                # missing-criterion behavior identical to weight=0.
+                # missing-criterion behavior identical to weight=0. When the
+                # synth never wrote an assessment (old_parsed is None) but the
+                # rd is still scoreable from its Ahrefs verdicts — e.g. a
+                # domain that aborted on a failed zero-weight wayback fetch —
+                # create one so it isn't left blank (2026-06-22).
+                if not isinstance(old_parsed, dict):
+                    old_parsed = {}
                 if new_score_rounded is not None:
                     old_parsed["final"] = new_score_rounded
+                    # Clear the partial stub once we have a real score (a
+                    # zero-weight-only partial that's now scored) so the UI
+                    # shows the number instead of the "partial" banner.
+                    old_parsed.pop("partial", None)
                 else:
                     old_parsed.pop("final", None)
                 if new_conf_rounded is not None:
