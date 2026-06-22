@@ -373,6 +373,11 @@ function AnalyzePageInner() {
   // refresh doesn't re-trigger.
   useEffect(() => {
     if (!fromBacklog) return;
+    // Honour cross_cache=1 on the sessionStorage handoff too (the Database
+    // "send all filtered → Quality" path). The ?domains= path sets this in
+    // the prefill effect above; without it here, a Database-originated batch
+    // would re-fetch Ahrefs/Wayback instead of reusing prior jobs' results.
+    setCrossJobCache(fromDatabaseCrossCache);
     let domains: string[] = [];
     try {
       const raw = sessionStorage.getItem(BACKLOG_HANDOFF_KEY);

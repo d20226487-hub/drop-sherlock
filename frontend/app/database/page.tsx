@@ -1145,8 +1145,11 @@ export default function DatabasePage() {
         JSON.stringify({ domains }),
       );
       router.push(
+        // cross_cache=1: domains sent from the Database have been analyzed
+        // before (often in other jobs), so reuse prior Ahrefs/Wayback results
+        // instead of re-fetching. Mirrors the row-selection "Quality" send.
         pillar === "quality"
-          ? "/check/quality?from_backlog=1"
+          ? "/check/quality?from_backlog=1&cross_cache=1"
           : pillar === "whois"
             ? "/check/whois-history?from_backlog=1"
             : pillar === "ahrefs_batch"
