@@ -820,6 +820,12 @@ def delete_job(job_id: int, db: Session = Depends(get_db)) -> dict:
     db.query(JobCriterionPin).filter(
         JobCriterionPin.job_id == job.id
     ).delete(synchronize_session=False)
+    # linked_domain_rows likewise has no FK cascade — bulk-delete by the
+    # denormalized job_id so a linked_domains job's output rows don't leak.
+    from ..models import LinkedDomainRow
+    db.query(LinkedDomainRow).filter(
+        LinkedDomainRow.job_id == job.id
+    ).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
     for rid in run_ids:
@@ -866,6 +872,11 @@ def bulk_delete_jobs(
     if found_ids:
         db.query(JobCriterionPin).filter(
             JobCriterionPin.job_id.in_(found_ids)
+        ).delete(synchronize_session=False)
+        # Same for linked_domain_rows (no FK cascade) — bulk-delete by job_id.
+        from ..models import LinkedDomainRow
+        db.query(LinkedDomainRow).filter(
+            LinkedDomainRow.job_id.in_(found_ids)
         ).delete(synchronize_session=False)
     for j in found:
         db.delete(j)
@@ -2336,7 +2347,11 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
     # relying on NULL-units, because that's clearer + future-proof
     # against accidentally counting some non-Ahrefs criterion.
     AHREFS_CRITERIA = frozenset(
-        ("backlinks", "refdomains", "anchors", "keywords")
+        # linked_domains added 2026-07-02 — its per-target CRs carry
+        # units_cost_* exactly like B/D/A/K (cached_from_run_id always NULL,
+        # so every one counts as a fresh Ahrefs call), so the Linked Domains
+        # Checker's spend surfaces in the run cost.
+        ("backlinks", "refdomains", "anchors", "keywords", "linked_domains")
     )
     ahrefs_units_billed = 0
     ahrefs_units_list = 0
@@ -2550,6 +2565,12 @@ def delete_run_route(run_id: int, db: Session = Depends(get_db)) -> dict:
                 f"run is a data source for run(s) {preview}{more} — "
                 f"delete those first",
             )
+    # linked_domain_rows has no FK cascade — bulk-delete this run's output
+    # rows by the denormalized run_id before dropping the run.
+    from ..models import LinkedDomainRow
+    db.query(LinkedDomainRow).filter(
+        LinkedDomainRow.run_id == run_id
+    ).delete(synchronize_session=False)
     db.delete(run)
     db.commit()
     from ..tasks import _clear_cancel, _clear_pause
@@ -3491,6 +3512,62 @@ def export_ahrefs_batch_analysis_csv(run_id: int, db: Session = Depends(get_db))
             offset += PAGE
 
     filename = f"ahrefs-batch-analysis-run-{run_id}.csv"
+    return StreamingResponse(
+        _rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@runs_router.get("/{run_id}/linked-domains.csv")
+def export_linked_domains_csv(run_id: int, db: Session = Depends(get_db)):
+    """Stream the UNIQUE linked domains found across all targets of a
+    linked_domains run as a single-column CSV. Deduped + sorted via the
+    (run_id, linked_domain) composite index and streamed with yield_per so
+    a ~1M-row run exports without loading every row into memory."""
+    import csv
+    import io
+
+    from fastapi.responses import StreamingResponse
+
+    from ..models import LinkedDomainRow
+
+    run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+
+    def _rows():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+
+        def _flush() -> str:
+            out = buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            return out
+
+        writer.writerow(["linked_domain"])
+        yield _flush()
+
+        # DISTINCT + ORDER BY served straight off the (run_id, linked_domain)
+        # composite index; yield_per streams a server-side cursor so memory
+        # stays flat regardless of the run's size.
+        q = (
+            db.query(LinkedDomainRow.linked_domain)
+            .filter(LinkedDomainRow.run_id == run_id)
+            .distinct()
+            .order_by(LinkedDomainRow.linked_domain)
+            .yield_per(1000)
+        )
+        n = 0
+        for (dom,) in q:
+            writer.writerow([dom])
+            n += 1
+            if n % 1000 == 0:
+                yield _flush()
+        yield _flush()
+
+    filename = f"linked-domains-run-{run_id}.csv"
     return StreamingResponse(
         _rows(),
         media_type="text/csv",

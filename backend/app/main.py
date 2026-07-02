@@ -1079,12 +1079,25 @@ async def lifespan(_: FastAPI):
             threshold = int(_backups.BACKUP_INTERVAL_HOURS * 3600 * 1.1)
             if age is None or age >= threshold:
                 import logging
+                import threading
                 logging.getLogger(__name__).info(
                     "boot catch-up backup: last snapshot age=%s sec, "
-                    "threshold=%s sec — running now",
+                    "threshold=%s sec — running in background",
                     age, threshold,
                 )
-                _backups.scheduled_backup()
+                # Run OFF the event loop in a daemon thread. Gzipping the
+                # whole SQLite DB (1+ GB) across the Windows bind mount can
+                # take minutes; doing it synchronously here blocked lifespan
+                # startup, so the app served nothing and Docker's healthcheck
+                # flipped it 'unhealthy' — the "can't access after an
+                # overnight sleep" symptom (observed ~7 min, 2026-07-02).
+                # scheduled_backup already runs in APScheduler's executor
+                # thread on the 24h cadence, so it's safe off the loop.
+                threading.Thread(
+                    target=_backups.scheduled_backup,
+                    name="boot-catchup-backup",
+                    daemon=True,
+                ).start()
         except Exception:
             import logging
             logging.getLogger(__name__).exception(

@@ -8,7 +8,7 @@ when AI step 7 runs the verdicts."""
 
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -485,6 +485,53 @@ class CriterionResult(Base):
     ai_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     run_domain: Mapped[RunDomain] = relationship(back_populates="results")
+
+
+# --- Linked Domains Checker (added 2026-07-02) -----------------------------
+#
+# Output store for the `linked_domains` Job kind. Each row is one external
+# domain that an input target (a RunDomain) links out to, pulled from
+# Ahrefs /site-explorer/linked-domains (one call per target). Per-target
+# status + Ahrefs unit accounting live on a
+# CriterionResult(criterion='linked_domains') for that RunDomain, exactly
+# like ahrefs_batch_analysis; THIS table holds only the variable-length
+# domain list so a 1000-target run (up to ~1M rows) stays queryable and
+# streamable for the unique-domains CSV export.
+
+class LinkedDomainRow(Base):
+    """One linked (outgoing) domain for a linked_domains-job target.
+
+    `run_id` + `job_id` are denormalized alongside the `run_domain_id` FK
+    so the export can `SELECT DISTINCT linked_domain WHERE run_id = ?`
+    straight off the (run_id, linked_domain) composite index without
+    joining back through run_domains.
+
+    Cleanup: SQLite FK enforcement is OFF (db.py sets no
+    PRAGMA foreign_keys=ON), so `ondelete=CASCADE` here is advisory only.
+    Rows are removed explicitly — the runner deletes a target's rows
+    before re-inserting on resume/refetch, and the run/job delete paths
+    bulk-delete by run_id/job_id."""
+    __tablename__ = "linked_domain_rows"
+    __table_args__ = (
+        Index("ix_linked_domain_rows_run_domain", "run_id", "linked_domain"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_domain_id: Mapped[int] = mapped_column(
+        ForeignKey("run_domains.id", ondelete="CASCADE"), index=True
+    )
+    # Denormalized parents. run_id is covered by the composite index above
+    # (leftmost); job_id gets its own index for job-level cleanup / any
+    # future cross-run dedup.
+    run_id: Mapped[int] = mapped_column(Integer)
+    job_id: Mapped[int] = mapped_column(Integer, index=True)
+    # The external domain the target links to, lowercased as Ahrefs returns
+    # it. Covered by the (run_id, linked_domain) composite for the DISTINCT
+    # export.
+    linked_domain: Mapped[str] = mapped_column(String(512))
+    # DR of the linked domain — only populated if the run selected it
+    # (non-default; the cost-optimal mode is domain-only). NULL otherwise.
+    domain_rating: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 # --- Error log + dismissals -------------------------------------------------

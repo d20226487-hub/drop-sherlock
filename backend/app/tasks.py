@@ -565,6 +565,9 @@ def dispatch_run(run_id: int) -> asyncio.Task:
         return asyncio.create_task(
             process_ahrefs_batch_analysis_run(run_id)
         )
+    if kind == "linked_domains":
+        from .linked_domains_runner import process_linked_domains_run
+        return asyncio.create_task(process_linked_domains_run(run_id))
     return asyncio.create_task(process_run(run_id))
 
 

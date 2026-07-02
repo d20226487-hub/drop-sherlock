@@ -100,6 +100,20 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
                 "country": getattr(cfg, "country", None) or None,
             }).encode("utf-8")
         ).hexdigest()
+    # linked_domains (2026-07-02): no quality-style `limit`/`filters`/`sort`.
+    # The request shape is defined by root_only + min_dr + per_target_limit.
+    # Like the other pillars the runner forces use_cache=False, so this is
+    # mainly for consistency + so the boot-time `_backfill_params_hash` sweep
+    # doesn't choke on a config that has no `.limit` attribute.
+    if criterion == "linked_domains":
+        return hashlib.sha256(
+            _stable_json({
+                "c": criterion,
+                "root_only": bool(getattr(cfg, "root_only", True)),
+                "min_dr": getattr(cfg, "min_dr", None),
+                "per_target_limit": getattr(cfg, "per_target_limit", None),
+            }).encode("utf-8")
+        ).hexdigest()
     payload: dict[str, Any] = {
         "c": criterion,
         "limit": cfg.limit,

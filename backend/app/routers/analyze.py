@@ -626,3 +626,256 @@ async def submit_ahrefs_batch_analysis_job(
     return SubmitAhrefsBatchAnalysisOut(
         job_id=job.id, run_id=run.id, skipped_banned=skipped_banned,
     )
+
+
+# --- Linked Domains Checker submit (added 2026-07-02) ----------------------
+#
+# Parallel to /analyze/ahrefs-batch-analysis but for the linked_domains
+# pillar. Carries the checker knobs (root_only / min_dr / per_target_limit /
+# unit_budget) on the spec; no AI, use_cache=False. The runner fetches one
+# Ahrefs /site-explorer/linked-domains call per target and stores the
+# returned domains in linked_domain_rows for the unique-domains CSV export.
+
+_LINKED_MAX_DOMAINS = 1000
+
+
+class SubmitLinkedDomainsIn(BaseModel):
+    domains: list[str]
+    # Keep only root linked domains (drop subdomains). Default OFF — opt-in
+    # (adds ~1 unit/row and rarely removes many rows, so it raises cost).
+    root_only: bool = False
+    # Optional DR floor (0-100) applied as a server-side filter; None = none.
+    min_dr: int | None = None
+    # Cap linked domains fetched per target (1-5000); None = 5000 (default).
+    per_target_limit: int | None = None
+    # Optional per-run Ahrefs unit budget; None = uncapped.
+    unit_budget: int | None = None
+    name: str | None = None
+    notes: str | None = None
+
+
+class SubmitLinkedDomainsOut(BaseModel):
+    job_id: int
+    run_id: int
+    skipped_banned: list[str]
+
+
+@router.post("/linked-domains", response_model=SubmitLinkedDomainsOut)
+async def submit_linked_domains_job(
+    payload: SubmitLinkedDomainsIn, db: Session = Depends(get_db)
+) -> SubmitLinkedDomainsOut:
+    """Mint a Job(kind='linked_domains') + first Run + per-domain RunDomains,
+    then dispatch the per-target runner. Mirrors submit_ahrefs_batch_analysis
+    but carries the linked-domains knobs on the spec instead of metrics."""
+    from .backlog import _normalize_domain
+    from ..ban_filter import filter_banned
+
+    cleaned_domains = [d.strip() for d in payload.domains if d.strip()]
+    if not cleaned_domains:
+        raise HTTPException(400, "at least one domain is required")
+    if len(cleaned_domains) > _LINKED_MAX_DOMAINS:
+        raise HTTPException(
+            400,
+            f"max {_LINKED_MAX_DOMAINS:,} domains per run "
+            f"(you have {len(cleaned_domains):,})",
+        )
+
+    # Validate knob ranges (mirror the LinkedDomainsConfig field bounds so a
+    # direct API caller gets a clean 400 instead of a pydantic 422 downstream).
+    min_dr = payload.min_dr
+    if min_dr is not None and not (0 <= min_dr <= 100):
+        raise HTTPException(400, "min_dr must be between 0 and 100")
+    per_target_limit = payload.per_target_limit
+    if per_target_limit is not None and not (1 <= per_target_limit <= 5000):
+        raise HTTPException(400, "per_target_limit must be between 1 and 5000")
+    unit_budget = payload.unit_budget
+    if unit_budget is not None and unit_budget < 1:
+        raise HTTPException(400, "unit_budget must be >= 1")
+
+    # Ban-list pre-filter — same envelope as the other pillar submits.
+    normalized_for_check = [_normalize_domain(d) for d in cleaned_domains]
+    pairs = list(zip(cleaned_domains, normalized_for_check))
+    _, banned_normalized = filter_banned(
+        db, [n for n in normalized_for_check if n],
+    )
+    if banned_normalized:
+        skipped_banned = [
+            original for original, norm in pairs
+            if norm and norm in banned_normalized
+        ]
+        cleaned_domains = [
+            original for original, norm in pairs
+            if not (norm and norm in banned_normalized)
+        ]
+        if not cleaned_domains:
+            sample = sorted(banned_normalized)
+            SAMPLE_CAP = 10
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "all_banned",
+                    "count": len(sample),
+                    "sample": sample[:SAMPLE_CAP],
+                    "truncated": len(sample) > SAMPLE_CAP,
+                },
+            )
+    else:
+        skipped_banned = []
+
+    # Canonical spec: only the linked_domains criterion enabled. No AI.
+    # use_cache=False — a Job is an explicit "fetch fresh now" ask (mirrors
+    # the other pillar submits; keeps spec_json shape uniform).
+    spec_dict = {
+        "domains": cleaned_domains,
+        "criteria": {
+            "backlinks": {"enabled": False},
+            "refdomains": {"enabled": False},
+            "anchors": {"enabled": False},
+            "keywords": {"enabled": False},
+            "wayback": {"enabled": False},
+            "wayback_classify": {"enabled": False},
+            "whois_history": {"enabled": False},
+            "availability": {"enabled": False},
+            "ahrefs_batch_analysis": {"enabled": False},
+            "linked_domains": {
+                "enabled": True,
+                "root_only": payload.root_only,
+                "min_dr": min_dr,
+                "per_target_limit": per_target_limit,
+                "unit_budget": unit_budget,
+            },
+        },
+        "ai": {"provider": None, "model": None},
+        "use_cache": False,
+        "cross_job_cache": False,
+        "lang": "en",
+    }
+    norm_spec = AnalyzeSpec.model_validate(spec_dict)
+    spec_json = norm_spec.model_dump_json()
+
+    name = (payload.name or "").strip() or _autoname(cleaned_domains)
+    notes = (payload.notes or "").strip()
+
+    job = Job(
+        name=name,
+        notes=notes,
+        spec_json=spec_json,
+        kind="linked_domains",
+    )
+    db.add(job)
+    db.flush()
+
+    run = Run(job_id=job.id, status="pending", spec_json=spec_json)
+    db.add(run)
+    db.flush()
+
+    # Bulk-insert RunDomains (sub-second even at the 1000 cap).
+    db.bulk_insert_mappings(
+        RunDomain,
+        [
+            {"run_id": run.id, "domain": d, "status": "pending"}
+            for d in cleaned_domains
+        ],
+    )
+    db.commit()
+
+    dispatch_run(run.id)
+    return SubmitLinkedDomainsOut(
+        job_id=job.id, run_id=run.id, skipped_banned=skipped_banned,
+    )
+
+
+class LinkedDomainsRunSummary(BaseModel):
+    job_id: int
+    run_id: int
+    name: str
+    status: str
+    created_at: datetime
+    targets_total: int
+    targets_done: int
+    targets_failed: int
+    unique_domains: int
+    units_billed: int
+
+
+@router.get(
+    "/linked-domains/runs", response_model=list[LinkedDomainsRunSummary]
+)
+def list_linked_domains_runs(
+    limit: int = 50, db: Session = Depends(get_db)
+) -> list[LinkedDomainsRunSummary]:
+    """Recent linked_domains runs for the Tools-page history (most-recent
+    first). Per run: RunDomain status counts, the unique linked-domain count
+    (= CSV size), and Ahrefs units billed. All from data already stored, so
+    a run stays revisitable after leaving the page."""
+    from sqlalchemy import distinct, func as sfunc
+
+    from ..models import CriterionResult, Job, LinkedDomainRow, RunDomain
+
+    rows = (
+        db.query(Run, Job)
+        .join(Job, Run.job_id == Job.id)
+        .filter(Job.kind == "linked_domains")
+        .order_by(Run.id.desc())
+        .limit(max(1, min(limit, 200)))
+        .all()
+    )
+    if not rows:
+        return []
+    run_ids = [r.id for r, _ in rows]
+
+    status_counts: dict[int, dict[str, int]] = {}
+    for rid, status, cnt in (
+        db.query(RunDomain.run_id, RunDomain.status, sfunc.count(RunDomain.id))
+        .filter(RunDomain.run_id.in_(run_ids))
+        .group_by(RunDomain.run_id, RunDomain.status)
+        .all()
+    ):
+        status_counts.setdefault(rid, {})[status] = cnt
+
+    unique_by_run = {
+        rid: int(cnt)
+        for rid, cnt in (
+            db.query(
+                LinkedDomainRow.run_id,
+                sfunc.count(distinct(LinkedDomainRow.linked_domain)),
+            )
+            .filter(LinkedDomainRow.run_id.in_(run_ids))
+            .group_by(LinkedDomainRow.run_id)
+            .all()
+        )
+    }
+
+    units_by_run = {
+        rid: int(total or 0)
+        for rid, total in (
+            db.query(
+                RunDomain.run_id,
+                sfunc.sum(CriterionResult.units_cost_actual),
+            )
+            .join(CriterionResult, CriterionResult.run_domain_id == RunDomain.id)
+            .filter(
+                RunDomain.run_id.in_(run_ids),
+                CriterionResult.criterion == "linked_domains",
+            )
+            .group_by(RunDomain.run_id)
+            .all()
+        )
+    }
+
+    out: list[LinkedDomainsRunSummary] = []
+    for run, job in rows:
+        sc = status_counts.get(run.id, {})
+        out.append(LinkedDomainsRunSummary(
+            job_id=job.id,
+            run_id=run.id,
+            name=job.name or "",
+            status=run.status,
+            created_at=run.started_at or job.created_at,
+            targets_total=sum(sc.values()),
+            targets_done=sc.get("done", 0),
+            targets_failed=sc.get("failed", 0),
+            unique_domains=unique_by_run.get(run.id, 0),
+            units_billed=units_by_run.get(run.id, 0),
+        ))
+    return out

@@ -325,6 +325,42 @@ class AhrefsBatchAnalysisConfig(BaseModel):
     country: str | None = None
 
 
+class LinkedDomainsConfig(BaseModel):
+    """Linked Domains Checker criterion config (added 2026-07-02).
+
+    Pulls the external domains each target links out to (Ahrefs
+    /site-explorer/linked-domains — one API call per target). Knobs shape
+    both cost and output:
+
+    - `root_only`: keep only root linked domains (drops subdomains like
+      blog.example.com). Applied as an `is_root_domain=true` server-side
+      filter. Default False — enabling costs ~1 extra unit/row and (per
+      testing) rarely removes enough rows to offset that, so it's an opt-in
+      for cleaner lists, not a savings.
+    - `min_dr`: optional Domain Rating floor (0-100). Applied as a
+      `domain_rating >= min_dr` server-side filter — filters WITHOUT
+      selecting DR, so it costs no extra units. None = no floor.
+    - `per_target_limit`: cap linked domains fetched per target (Ahrefs
+      `limit`, 1-5000; None = 5000, the default — fetch everything per
+      domain up to the ceiling). Lower = cheaper/smaller; the per-run unit
+      budget is the guardrail against a high-outlink target at the 5000
+      default.
+
+    Output is domain-only (`select=domain`, 1 unit/row); the runner writes
+    the returned domains to the linked_domain_rows table and per-target
+    status/units to a CriterionResult(criterion='linked_domains').
+    Dispatched per-Job by job.kind, like the other pillars."""
+
+    enabled: bool = False
+    root_only: bool = False
+    min_dr: int | None = Field(default=None, ge=0, le=100)
+    per_target_limit: int | None = Field(default=None, ge=1, le=5000)
+    # Optional per-run Ahrefs unit budget. When set, the runner auto-pauses
+    # the run (resumable) once cumulative billed units cross this ceiling —
+    # the cost safety net for a large multi-target submit. None = uncapped.
+    unit_budget: int | None = Field(default=None, ge=1)
+
+
 class CriteriaSpec(BaseModel):
     backlinks: BacklinksConfig = Field(default_factory=BacklinksConfig)
     refdomains: RefdomainsConfig = Field(default_factory=RefdomainsConfig)
@@ -343,6 +379,9 @@ class CriteriaSpec(BaseModel):
     ahrefs_batch_analysis: AhrefsBatchAnalysisConfig = Field(
         default_factory=AhrefsBatchAnalysisConfig
     )
+    linked_domains: LinkedDomainsConfig = Field(
+        default_factory=LinkedDomainsConfig
+    )
 
 
 # Pillar-only criteria — Quality runs' per-domain loop never dispatches
@@ -353,6 +392,7 @@ class CriteriaSpec(BaseModel):
 # (2026-05-24 — caused runs 124/126's whois "stuck running" cohort).
 PILLAR_ONLY_CRITERIA: tuple[str, ...] = (
     "whois_history", "availability", "ahrefs_batch_analysis",
+    "linked_domains",
 )
 
 

@@ -386,6 +386,8 @@ export function HeaderShell() {
             items={[
               { href: "/tools/ahrefs-batch-analysis", label: "Ahrefs" },
               { href: "/tools/wayback", label: "Wayback" },
+              { href: "/tools/linked-domains", label: "Linked Domains" },
+              { href: "/tools/serp-overview", label: "SERP Overview" },
             ]}
           />
           <Link href="/errors" className={linkClass("/errors")}>
