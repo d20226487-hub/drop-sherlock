@@ -1,0 +1,14 @@
+# The image builds its own Linux node_modules in the deps stage and its own
+# .next in the build stage — copying the host's (Windows-built) copies into
+# the build context is wrong AND bloats COPY . . to hundreds of MB, which was
+# OOM-crashing the Docker Desktop WSL2 engine mid-build.
+node_modules
+.next
+.git
+.gitignore
+npm-debug.log*
+yarn-error.log*
+*.local
+.DS_Store
+Dockerfile
+.dockerignore

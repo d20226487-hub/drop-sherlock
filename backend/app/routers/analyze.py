@@ -650,6 +650,11 @@ class SubmitLinkedDomainsIn(BaseModel):
     per_target_limit: int | None = None
     # Optional per-run Ahrefs unit budget; None = uncapped.
     unit_budget: int | None = None
+    # When True, drop domains that already completed (status='done') as a
+    # target in ANY prior linked_domains run — skip re-checking what you've
+    # already pulled. Off by default so a normal run never silently drops
+    # domains. Failed prior targets stay re-checkable.
+    skip_checked: bool = False
     name: str | None = None
     notes: str | None = None
 
@@ -658,6 +663,9 @@ class SubmitLinkedDomainsOut(BaseModel):
     job_id: int
     run_id: int
     skipped_banned: list[str]
+    # Domains dropped because skip_checked was on and they already completed
+    # in a prior run. Empty when skip_checked is off / nothing matched.
+    skipped_already_checked: list[str] = []
 
 
 @router.post("/linked-domains", response_model=SubmitLinkedDomainsOut)
@@ -722,6 +730,44 @@ async def submit_linked_domains_job(
     else:
         skipped_banned = []
 
+    # Skip-already-checked pre-filter (opt-in). Drop domains that already
+    # completed (status='done') as a target in ANY prior linked_domains run,
+    # so the user doesn't re-spend on domains they've already pulled. Matched
+    # on the normalized form (same normalizer as the ban filter). Failed
+    # prior targets are NOT skipped — they still need a real result.
+    skipped_already_checked: list[str] = []
+    if payload.skip_checked and cleaned_domains:
+        prior_done = (
+            db.query(RunDomain.domain)
+            .join(Run, RunDomain.run_id == Run.id)
+            .join(Job, Run.job_id == Job.id)
+            .filter(
+                Job.kind == "linked_domains",
+                RunDomain.status == "done",
+            )
+            .distinct()
+            .all()
+        )
+        checked_norm = {
+            _normalize_domain(row[0]) for row in prior_done if row[0]
+        }
+        if checked_norm:
+            kept: list[str] = []
+            for d in cleaned_domains:
+                if _normalize_domain(d) in checked_norm:
+                    skipped_already_checked.append(d)
+                else:
+                    kept.append(d)
+            cleaned_domains = kept
+            if not cleaned_domains:
+                raise HTTPException(
+                    400,
+                    detail={
+                        "code": "all_already_checked",
+                        "count": len(skipped_already_checked),
+                    },
+                )
+
     # Canonical spec: only the linked_domains criterion enabled. No AI.
     # use_cache=False — a Job is an explicit "fetch fresh now" ask (mirrors
     # the other pillar submits; keeps spec_json shape uniform).
@@ -782,6 +828,7 @@ async def submit_linked_domains_job(
     dispatch_run(run.id)
     return SubmitLinkedDomainsOut(
         job_id=job.id, run_id=run.id, skipped_banned=skipped_banned,
+        skipped_already_checked=skipped_already_checked,
     )
 
 

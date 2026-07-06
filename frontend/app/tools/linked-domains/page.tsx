@@ -78,6 +78,10 @@ export default function LinkedDomainsToolPage() {
   const [status, setStatus] = useState<LinkedRunStatus | null>(null);
   const [cost, setCost] = useState<LinkedCost | null>(null);
   const [skippedBanned, setSkippedBanned] = useState<string[]>([]);
+  const [skipChecked, setSkipChecked] = useState(false);
+  const [skippedAlreadyChecked, setSkippedAlreadyChecked] = useState<string[]>(
+    [],
+  );
   const [history, setHistory] = useState<LinkedRunHistoryItem[]>([]);
 
   function parseDomains(): string[] {
@@ -180,6 +184,7 @@ export default function LinkedDomainsToolPage() {
     setStatus(null);
     setCost(null);
     setSkippedBanned([]);
+    setSkippedAlreadyChecked([]);
     setRunId(null);
     try {
       const res = await fetch("/api/analyze/linked-domains", {
@@ -191,14 +196,30 @@ export default function LinkedDomainsToolPage() {
           min_dr: minDrNum,
           per_target_limit: limitNum,
           unit_budget: budgetNum,
+          skip_checked: skipChecked,
         }),
       });
       if (!res.ok) {
         const t = await res.text();
+        let code = "";
+        let count = 0;
+        try {
+          const j = JSON.parse(t);
+          code = j?.detail?.code ?? "";
+          count = j?.detail?.count ?? 0;
+        } catch {
+          code = "";
+        }
+        if (code === "all_already_checked") {
+          throw new Error(
+            `All ${count} domain(s) were already checked in a previous run — nothing new to run.`,
+          );
+        }
         throw new Error(`HTTP ${res.status}: ${t.slice(0, 300)}`);
       }
       const data = await res.json();
       setSkippedBanned(data.skipped_banned || []);
+      setSkippedAlreadyChecked(data.skipped_already_checked || []);
       setRunId(data.run_id);
       loadHistory();
     } catch (e) {
@@ -336,6 +357,22 @@ export default function LinkedDomainsToolPage() {
           </label>
         </div>
 
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            checked={skipChecked}
+            onChange={(e) => setSkipChecked(e.target.checked)}
+            disabled={busy}
+            className="mt-0.5"
+          />
+          <span className="text-sm font-medium">
+            Skip already-checked domains
+            <span className="block text-xs font-normal text-neutral-500 dark:text-neutral-400">
+              drop domains that already completed in a previous run
+            </span>
+          </span>
+        </label>
+
         <label className="block sm:max-w-xs">
           <span className="text-sm font-medium block mb-1">
             Unit budget (optional)
@@ -372,6 +409,15 @@ export default function LinkedDomainsToolPage() {
           Skipped {skippedBanned.length} banned domain(s):{" "}
           {skippedBanned.slice(0, 5).join(", ")}
           {skippedBanned.length > 5 ? "…" : ""}
+        </p>
+      )}
+
+      {skippedAlreadyChecked.length > 0 && (
+        <p className="text-xs text-sky-700 dark:text-sky-300">
+          Skipped {skippedAlreadyChecked.length} already-checked domain
+          {skippedAlreadyChecked.length === 1 ? "" : "s"} (from previous runs):{" "}
+          {skippedAlreadyChecked.slice(0, 5).join(", ")}
+          {skippedAlreadyChecked.length > 5 ? "…" : ""}
         </p>
       )}
 
