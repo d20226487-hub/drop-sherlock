@@ -652,9 +652,12 @@ class SubmitLinkedDomainsIn(BaseModel):
     unit_budget: int | None = None
     # When True, drop domains that already completed (status='done') as a
     # target in ANY prior linked_domains run — skip re-checking what you've
-    # already pulled. Off by default so a normal run never silently drops
-    # domains. Failed prior targets stay re-checkable.
-    skip_checked: bool = False
+    # already pulled. ON by default (2026-07-07, user request): re-checking
+    # a domain re-bills its full row count, so the safe default is to skip;
+    # the response reports exactly what was dropped. Failed prior targets
+    # stay re-checkable either way. Untick in the UI / send false to force
+    # a re-check.
+    skip_checked: bool = True
     name: str | None = None
     notes: str | None = None
 

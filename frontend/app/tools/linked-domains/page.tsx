@@ -78,7 +78,7 @@ export default function LinkedDomainsToolPage() {
   const [status, setStatus] = useState<LinkedRunStatus | null>(null);
   const [cost, setCost] = useState<LinkedCost | null>(null);
   const [skippedBanned, setSkippedBanned] = useState<string[]>([]);
-  const [skipChecked, setSkipChecked] = useState(false);
+  const [skipChecked, setSkipChecked] = useState(true);
   const [skippedAlreadyChecked, setSkippedAlreadyChecked] = useState<string[]>(
     [],
   );
