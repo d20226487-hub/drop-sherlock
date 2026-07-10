@@ -103,28 +103,48 @@ class VertexAIClient(BaseProvider):
     async def _test_api_key(
         self, api_key: str, *, default_model: str,
     ) -> dict:
+        # Probe a MODEL-SCOPED RPC, not the models list. Probed live
+        # 2026-07-10: the global (Express) endpoint has no
+        # `publishers/google/models` list route (plain HTML 404 — the
+        # bug the user hit), and the metadata GETs reject API keys
+        # outright (401 "API keys are not supported by this API").
+        # `:countTokens` is free, takes `?key=`, and exercises the exact
+        # URL shape + auth the judge uses (`:generateContent` on the same
+        # path) — so a green test actually predicts a working run.
+        model = default_model or "gemini-2.5-flash"
         url = (
             "https://aiplatform.googleapis.com/v1/"
-            "publishers/google/models"
+            f"publishers/google/models/{model}:countTokens"
         )
+        body = {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}
         try:
-            r = await self.client.get(url, params={"key": api_key})
+            r = await self.client.post(
+                url, params={"key": api_key}, json=body,
+            )
         except Exception as e:
             raise ProviderError(f"network error: {e}") from e
         if r.status_code in (401, 403):
             raise ProviderConfigError(
                 f"Vertex AI rejected the API key ({r.status_code})"
             )
+        if r.status_code == 404:
+            # Key was accepted as an auth mechanism but the model path is
+            # wrong — the actionable fix is the model id, not the key.
+            raise ProviderConfigError(
+                f"Vertex AI: model '{model}' not found on the Express "
+                "endpoint — set a valid default_model "
+                "(e.g. gemini-2.5-flash)"
+            )
         if r.status_code >= 400:
             raise ProviderError(
                 f"Vertex AI returned {r.status_code}: {r.text[:200]}"
             )
         data = r.json() or {}
-        models = data.get("publisherModels") or data.get("models") or []
         return {
             "ok": True,
             "provider": "vertex_ai",
             "mode": "express",
-            "model_count": len(models),
+            "model": model,
+            "total_tokens": data.get("totalTokens"),
             "default_model": default_model or None,
         }
