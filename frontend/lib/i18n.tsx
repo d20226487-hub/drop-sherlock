@@ -1337,6 +1337,7 @@ const messagesEn = {
         availability: "Domain availability",
         whoisHistory: "Whois History",
         domainFilter: "Domain Filter",
+        serpOverview: "SERP Overview",
         others: "Others",
       },
       domainFilter: {
@@ -3869,6 +3870,7 @@ const messagesRu: Messages = {
         availability: "Доступность домена",
         whoisHistory: "История Whois",
         domainFilter: "Фильтр доменов",
+        serpOverview: "SERP Overview",
         others: "Прочее",
       },
       domainFilter: {

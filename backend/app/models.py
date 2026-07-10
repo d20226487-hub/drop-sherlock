@@ -566,6 +566,11 @@ class SerpOverviewRow(Base):
     __tablename__ = "serp_overview_rows"
     __table_args__ = (
         Index("ix_serp_overview_rows_run_kw", "run_id", "keyword"),
+        # Serves the GLOBAL unique ranking-domains export (ordered DISTINCT
+        # on `domain` across all runs) — same pattern as
+        # ix_linked_domain_rows_domain_run. Added 2026-07-10 alongside the
+        # `domain` column; existing DBs get both via main's migrations.
+        Index("ix_serp_overview_rows_domain", "domain"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -577,6 +582,12 @@ class SerpOverviewRow(Base):
     keyword: Mapped[str] = mapped_column(String(512))
     position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     url: Mapped[str] = mapped_column(Text, default="")
+    # Ranking-page domain derived from `url` at write time (hostname,
+    # lowercased, leading `www.` stripped). Stored so the global
+    # unique-domains export is an indexed DISTINCT instead of a
+    # full-scan URL parse. Backfilled once at startup for rows created
+    # before the column existed (main._backfill_serp_row_domains).
+    domain: Mapped[str] = mapped_column(String(512), default="")
 
 
 # --- Error log + dismissals -------------------------------------------------

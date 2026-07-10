@@ -52,6 +52,8 @@ type LinkedRunHistoryItem = {
 
 const LINKED_TERMINAL = ["done", "failed", "canceled", "paused"];
 
+const HISTORY_PAGE_SIZE = 20;
+
 // Render an ISO timestamp as a compact local date+time. Falls back to
 // the raw string if it doesn't parse.
 function fmtDate(iso: string): string {
@@ -110,7 +112,14 @@ export default function LinkedDomainsToolPage() {
   );
   const [copied, setCopied] = useState<string | null>(null);
   const [copiedAll, setCopiedAll] = useState<string | null>(null);
+  const [jobName, setJobName] = useState("");
   const [history, setHistory] = useState<LinkedRunHistoryItem[]>([]);
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [renamingJobId, setRenamingJobId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [renameBusy, setRenameBusy] = useState(false);
 
   function parseDomains(): string[] {
     return domainsRaw
@@ -124,14 +133,20 @@ export default function LinkedDomainsToolPage() {
   // submit, and whenever the active run reaches a terminal state.
   const loadHistory = useCallback(async () => {
     try {
-      const res = await fetch("/api/analyze/linked-domains/runs?limit=50");
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(HISTORY_PAGE_SIZE),
+      });
+      if (search.trim()) params.set("q", search.trim());
+      const res = await fetch(`/api/analyze/linked-domains/runs?${params}`);
       if (!res.ok) return;
-      const data: LinkedRunHistoryItem[] = await res.json();
-      setHistory(Array.isArray(data) ? data : []);
+      const data = await res.json();
+      setHistory(Array.isArray(data.runs) ? data.runs : []);
+      setTotal(typeof data.total === "number" ? data.total : 0);
     } catch {
       return; // transient — history refreshes on the next trigger
     }
-  }, []);
+  }, [search, page]);
 
   useEffect(() => {
     loadHistory();
@@ -225,6 +240,7 @@ export default function LinkedDomainsToolPage() {
           per_target_limit: limitNum,
           unit_budget: budgetNum,
           skip_checked: skipChecked,
+          name: jobName.trim() || null,
         }),
       });
       if (!res.ok) {
@@ -342,6 +358,34 @@ export default function LinkedDomainsToolPage() {
       setCopiedAll("Copy failed");
     }
     setTimeout(() => setCopiedAll(null), 2500);
+  }
+
+  // Inline job rename from the history table (PATCH /jobs/{id}).
+  function startRename(h: LinkedRunHistoryItem) {
+    setRenamingJobId(h.job_id);
+    setRenameValue(h.name || "");
+  }
+
+  async function saveRename() {
+    if (renamingJobId == null) return;
+    const name = renameValue.trim();
+    if (!name) return;
+    setRenameBusy(true);
+    try {
+      const res = await fetch(`/api/jobs/${renamingJobId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      if (res.ok) {
+        setRenamingJobId(null);
+        loadHistory();
+      }
+    } catch {
+      // stay in edit mode — the user can retry or cancel
+    } finally {
+      setRenameBusy(false);
+    }
   }
 
   const isActive = status != null && !LINKED_TERMINAL.includes(status.status);
@@ -471,6 +515,20 @@ export default function LinkedDomainsToolPage() {
           <span className="text-xs text-neutral-500 dark:text-neutral-400 block mt-1">
             Pauses the run (resumable) once Ahrefs spend crosses this ceiling.
           </span>
+        </label>
+
+        <label className="block sm:max-w-xs">
+          <span className="text-sm font-medium block mb-1">
+            Job name (optional)
+          </span>
+          <input
+            type="text"
+            value={jobName}
+            onChange={(e) => setJobName(e.target.value)}
+            placeholder="auto-named from first domain"
+            className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
+            disabled={busy}
+          />
         </label>
 
         <button
@@ -616,10 +674,47 @@ export default function LinkedDomainsToolPage() {
             </button>
           </div>
         </div>
+
+        {/* Search by job name + pagination */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setPage(1);
+            }}
+            placeholder="Search by job name…"
+            className="rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-xs w-56"
+          />
+          <div className="ml-auto flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+            <span>
+              {total} run{total === 1 ? "" : "s"} · page {page}/
+              {Math.max(1, Math.ceil(total / HISTORY_PAGE_SIZE))}
+            </span>
+            <button
+              type="button"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              className="rounded border dark:border-neutral-700 px-2 py-1 disabled:opacity-40"
+            >
+              Prev
+            </button>
+            <button
+              type="button"
+              disabled={page >= Math.ceil(total / HISTORY_PAGE_SIZE)}
+              onClick={() => setPage((p) => p + 1)}
+              className="rounded border dark:border-neutral-700 px-2 py-1 disabled:opacity-40"
+            >
+              Next
+            </button>
+          </div>
+        </div>
+
         <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 overflow-x-auto">
           {history.length === 0 ? (
             <p className="text-sm text-neutral-500 dark:text-neutral-400 px-4 py-6">
-              No runs yet.
+              {search.trim() ? "No matching runs." : "No runs yet."}
             </p>
           ) : (
             <table className="w-full text-sm">
@@ -652,7 +747,44 @@ export default function LinkedDomainsToolPage() {
                     <td className="px-3 py-2 whitespace-nowrap text-neutral-600 dark:text-neutral-300">
                       {fmtDate(h.created_at)}
                     </td>
-                    <td className="px-3 py-2">{h.name || `Run #${h.run_id}`}</td>
+                    <td className="px-3 py-2">
+                      {renamingJobId === h.job_id ? (
+                        <span className="flex items-center gap-1">
+                          <input
+                            autoFocus
+                            type="text"
+                            value={renameValue}
+                            onChange={(e) => setRenameValue(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                saveRename();
+                              }
+                              if (e.key === "Escape") setRenamingJobId(null);
+                            }}
+                            disabled={renameBusy}
+                            className="rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-1.5 py-0.5 text-xs w-44"
+                          />
+                          <button
+                            type="button"
+                            onClick={saveRename}
+                            disabled={renameBusy || !renameValue.trim()}
+                            className="text-xs text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setRenamingJobId(null)}
+                            className="text-xs text-neutral-500 dark:text-neutral-400 hover:underline"
+                          >
+                            ✕
+                          </button>
+                        </span>
+                      ) : (
+                        h.name || `Run #${h.run_id}`
+                      )}
+                    </td>
                     <td className="px-3 py-2 uppercase tracking-wide text-xs">
                       {h.status}
                     </td>
@@ -679,6 +811,13 @@ export default function LinkedDomainsToolPage() {
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
                           View
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => startRename(h)}
+                          className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
+                        >
+                          Rename
                         </button>
                         <a
                           href={`/api/runs/${h.run_id}/linked-domains.csv?scope=new`}

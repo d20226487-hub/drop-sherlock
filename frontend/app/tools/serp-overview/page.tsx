@@ -74,6 +74,8 @@ type SerpRunHistoryItem = {
 
 const SERP_TERMINAL = ["done", "failed", "canceled", "paused"];
 
+const HISTORY_PAGE_SIZE = 20;
+
 // Render an ISO timestamp as a compact local date+time. Falls back to
 // the raw string if it doesn't parse.
 function fmtDate(iso: string): string {
@@ -125,7 +127,17 @@ export default function SerpOverviewToolPage() {
   const [status, setStatus] = useState<SerpRunStatus | null>(null);
   const [cost, setCost] = useState<SerpCost | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  const [copiedAll, setCopiedAll] = useState<string | null>(null);
+  const [recheck, setRecheck] = useState(false);
+  const [skippedDuplicates, setSkippedDuplicates] = useState<string[]>([]);
+  const [jobName, setJobName] = useState("");
   const [history, setHistory] = useState<SerpRunHistoryItem[]>([]);
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [renamingJobId, setRenamingJobId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [renameBusy, setRenameBusy] = useState(false);
 
   function parseKeywords(): string[] {
     return keywordsRaw
@@ -139,14 +151,20 @@ export default function SerpOverviewToolPage() {
   // submit, and whenever the active run reaches a terminal state.
   const loadHistory = useCallback(async () => {
     try {
-      const res = await fetch("/api/analyze/serp-overview/runs?limit=50");
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(HISTORY_PAGE_SIZE),
+      });
+      if (search.trim()) params.set("q", search.trim());
+      const res = await fetch(`/api/analyze/serp-overview/runs?${params}`);
       if (!res.ok) return;
-      const data: SerpRunHistoryItem[] = await res.json();
-      setHistory(Array.isArray(data) ? data : []);
+      const data = await res.json();
+      setHistory(Array.isArray(data.runs) ? data.runs : []);
+      setTotal(typeof data.total === "number" ? data.total : 0);
     } catch {
       return; // transient — history refreshes on the next trigger
     }
-  }, []);
+  }, [search, page]);
 
   useEffect(() => {
     loadHistory();
@@ -213,6 +231,7 @@ export default function SerpOverviewToolPage() {
     setBusy(true);
     setStatus(null);
     setCost(null);
+    setSkippedDuplicates([]);
     setRunId(null);
     try {
       const res = await fetch("/api/analyze/serp-overview", {
@@ -223,13 +242,34 @@ export default function SerpOverviewToolPage() {
           country,
           top_positions: topNum,
           unit_budget: budgetNum,
+          recheck_keywords: recheck,
+          name: jobName.trim() || null,
         }),
       });
       if (!res.ok) {
         const t = await res.text();
+        let code = "";
+        let count = 0;
+        let windowDays = 0;
+        try {
+          const j = JSON.parse(t);
+          code = j?.detail?.code ?? "";
+          count = j?.detail?.count ?? 0;
+          windowDays = j?.detail?.window_days ?? 0;
+        } catch {
+          code = "";
+        }
+        if (code === "all_duplicates") {
+          throw new Error(
+            `All ${count} keyword(s) were already checked with the same ` +
+              `country & result count within the last ${windowDays} days — ` +
+              `tick "Recheck keywords" to force a re-check.`,
+          );
+        }
         throw new Error(`HTTP ${res.status}: ${t.slice(0, 300)}`);
       }
       const data = await res.json();
+      setSkippedDuplicates(data.skipped_duplicates || []);
       setRunId(data.run_id);
       loadHistory();
     } catch (e) {
@@ -258,6 +298,30 @@ export default function SerpOverviewToolPage() {
     setCost(null);
     setCopied(null);
     setRunId(id);
+  }
+
+  // Copy the GLOBAL unique ranking-domain set (every run ever, deduped).
+  async function copyAllDomains() {
+    try {
+      const res = await fetch("/api/analyze/serp-overview/domains.csv");
+      if (!res.ok) {
+        setCopiedAll("Copy failed");
+      } else {
+        const text = await res.text();
+        const domains = text
+          .split(/\r?\n/)
+          .slice(1)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const ok = await copyText(domains.join("\n"));
+        setCopiedAll(
+          ok ? `Copied ${domains.length.toLocaleString()} ✓` : "Copy failed",
+        );
+      }
+    } catch {
+      setCopiedAll("Copy failed");
+    }
+    setTimeout(() => setCopiedAll(null), 2500);
   }
 
   // Copy the run's unique ranking domains (newline-joined) — fetches the
@@ -298,6 +362,34 @@ export default function SerpOverviewToolPage() {
     loadHistory();
   }
 
+  // Inline job rename from the history table (PATCH /jobs/{id}).
+  function startRename(h: SerpRunHistoryItem) {
+    setRenamingJobId(h.job_id);
+    setRenameValue(h.name || "");
+  }
+
+  async function saveRename() {
+    if (renamingJobId == null) return;
+    const name = renameValue.trim();
+    if (!name) return;
+    setRenameBusy(true);
+    try {
+      const res = await fetch(`/api/jobs/${renamingJobId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      if (res.ok) {
+        setRenamingJobId(null);
+        loadHistory();
+      }
+    } catch {
+      // stay in edit mode — the user can retry or cancel
+    } finally {
+      setRenameBusy(false);
+    }
+  }
+
   const isActive = status != null && !SERP_TERMINAL.includes(status.status);
   const isTerminal = status != null && SERP_TERMINAL.includes(status.status);
   const processed = status ? status.done + status.failed : 0;
@@ -317,8 +409,11 @@ export default function SerpOverviewToolPage() {
           positions. Runs as a <strong>persistent, resumable job</strong> —
           survives restarts, and past runs stay downloadable below. Only the{" "}
           <code>url</code> column is fetched to keep spend at the{" "}
-          <strong>~50 units/keyword</strong> floor. Tip: keyword{" "}
-          <code>ahrefs</code> or <code>wordcount</code> probes for free.
+          <strong>~50 units/keyword</strong> floor. Keywords already checked
+          with the <strong>same country &amp; result count</strong> are
+          skipped by default for the window set in Settings → SERP Overview
+          (30 days out of the box). Tip: keyword <code>ahrefs</code> or{" "}
+          <code>wordcount</code> probes for free.
         </p>
       </header>
 
@@ -390,6 +485,37 @@ export default function SerpOverviewToolPage() {
           </label>
         </div>
 
+        <label className="block sm:max-w-xs">
+          <span className="text-sm font-medium block mb-1">
+            Job name (optional)
+          </span>
+          <input
+            type="text"
+            value={jobName}
+            onChange={(e) => setJobName(e.target.value)}
+            placeholder="auto-named from first keyword"
+            className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
+            disabled={busy}
+          />
+        </label>
+
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            checked={recheck}
+            onChange={(e) => setRecheck(e.target.checked)}
+            disabled={busy}
+            className="mt-0.5"
+          />
+          <span className="text-sm font-medium">
+            Recheck keywords
+            <span className="block text-xs font-normal text-neutral-500 dark:text-neutral-400">
+              check again even if a keyword was already checked with the same
+              country &amp; result count within the ignore window
+            </span>
+          </span>
+        </label>
+
         <button
           type="submit"
           disabled={busy || keywords.length === 0}
@@ -402,6 +528,16 @@ export default function SerpOverviewToolPage() {
           <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
         )}
       </form>
+
+      {skippedDuplicates.length > 0 && (
+        <p className="text-xs text-sky-700 dark:text-sky-300">
+          Skipped {skippedDuplicates.length} previously-checked keyword
+          {skippedDuplicates.length === 1 ? "" : "s"} (same country &amp;
+          result count, within the ignore window):{" "}
+          {skippedDuplicates.slice(0, 5).join(", ")}
+          {skippedDuplicates.length > 5 ? "…" : ""}
+        </p>
+      )}
 
       {status && (
         <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 p-4 space-y-3">
@@ -497,11 +633,66 @@ export default function SerpOverviewToolPage() {
       {/* Recent runs — persistent history so past runs can be re-opened
           and downloaded even after a page reload. */}
       <section className="space-y-2">
-        <h2 className="text-lg font-semibold">Recent runs</h2>
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <h2 className="text-lg font-semibold">Recent runs</h2>
+          {/* Global export — every run ever, deduped across runs. */}
+          <div className="flex items-center gap-2">
+            <a
+              href="/api/analyze/serp-overview/domains.csv"
+              className="rounded border dark:border-neutral-700 px-3 py-1.5 text-xs font-medium"
+            >
+              Download all unique domains (all runs)
+            </a>
+            <button
+              type="button"
+              onClick={copyAllDomains}
+              className="rounded border dark:border-neutral-700 px-3 py-1.5 text-xs font-medium"
+            >
+              {copiedAll ?? "Copy all"}
+            </button>
+          </div>
+        </div>
+
+        {/* Search by job name + pagination */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setPage(1);
+            }}
+            placeholder="Search by job name…"
+            className="rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-xs w-56"
+          />
+          <div className="ml-auto flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+            <span>
+              {total} run{total === 1 ? "" : "s"} · page {page}/
+              {Math.max(1, Math.ceil(total / HISTORY_PAGE_SIZE))}
+            </span>
+            <button
+              type="button"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              className="rounded border dark:border-neutral-700 px-2 py-1 disabled:opacity-40"
+            >
+              Prev
+            </button>
+            <button
+              type="button"
+              disabled={page >= Math.ceil(total / HISTORY_PAGE_SIZE)}
+              onClick={() => setPage((p) => p + 1)}
+              className="rounded border dark:border-neutral-700 px-2 py-1 disabled:opacity-40"
+            >
+              Next
+            </button>
+          </div>
+        </div>
+
         <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 overflow-x-auto">
           {history.length === 0 ? (
             <p className="text-sm text-neutral-500 dark:text-neutral-400 px-4 py-6">
-              No runs yet.
+              {search.trim() ? "No matching runs." : "No runs yet."}
             </p>
           ) : (
             <table className="w-full text-sm">
@@ -532,7 +723,44 @@ export default function SerpOverviewToolPage() {
                     <td className="px-3 py-2 whitespace-nowrap text-neutral-600 dark:text-neutral-300">
                       {fmtDate(h.created_at)}
                     </td>
-                    <td className="px-3 py-2">{h.name || `Run #${h.run_id}`}</td>
+                    <td className="px-3 py-2">
+                      {renamingJobId === h.job_id ? (
+                        <span className="flex items-center gap-1">
+                          <input
+                            autoFocus
+                            type="text"
+                            value={renameValue}
+                            onChange={(e) => setRenameValue(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                saveRename();
+                              }
+                              if (e.key === "Escape") setRenamingJobId(null);
+                            }}
+                            disabled={renameBusy}
+                            className="rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-1.5 py-0.5 text-xs w-44"
+                          />
+                          <button
+                            type="button"
+                            onClick={saveRename}
+                            disabled={renameBusy || !renameValue.trim()}
+                            className="text-xs text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setRenamingJobId(null)}
+                            className="text-xs text-neutral-500 dark:text-neutral-400 hover:underline"
+                          >
+                            ✕
+                          </button>
+                        </span>
+                      ) : (
+                        h.name || `Run #${h.run_id}`
+                      )}
+                    </td>
                     <td className="px-3 py-2 uppercase tracking-wide text-xs">
                       {h.status}
                     </td>
@@ -559,6 +787,13 @@ export default function SerpOverviewToolPage() {
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
                           View
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => startRename(h)}
+                          className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
+                        >
+                          Rename
                         </button>
                         <a
                           href={`/api/runs/${h.run_id}/serp-overview.csv`}

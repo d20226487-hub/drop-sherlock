@@ -457,6 +457,43 @@ def update_availability_auto_retry_route(payload: AvailabilityAutoRetryIn):
     }
 
 
+# --- SERP Overview settings (added 2026-07-10) ------------------------------
+# One knob today: the dedup window — how many days a completed
+# (keyword, country, top_positions) check suppresses re-checking the same
+# triple at submit time on the SERP Overview tool.
+
+class SerpOverviewSettingsIn(BaseModel):
+    dedup_window_days: int = Field(ge=1, le=3650)
+
+
+@router.get("/serp-overview")
+def get_serp_overview_settings_route():
+    from ..app_settings import (
+        DEFAULT_SERP_DEDUP_WINDOW_DAYS,
+        get_serp_dedup_window_days,
+    )
+    return {
+        "dedup_window_days": get_serp_dedup_window_days(),
+        "default_days": DEFAULT_SERP_DEDUP_WINDOW_DAYS,
+    }
+
+
+@router.put("/serp-overview")
+def update_serp_overview_settings_route(payload: SerpOverviewSettingsIn):
+    from ..app_settings import (
+        DEFAULT_SERP_DEDUP_WINDOW_DAYS,
+        set_serp_dedup_window_days,
+    )
+    try:
+        v = set_serp_dedup_window_days(payload.dedup_window_days)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "dedup_window_days": v,
+        "default_days": DEFAULT_SERP_DEDUP_WINDOW_DAYS,
+    }
+
+
 @router.put("/scoring")
 def update_scoring_route(payload: ScoringConfigIn):
     raw = payload.model_dump(exclude_unset=True)

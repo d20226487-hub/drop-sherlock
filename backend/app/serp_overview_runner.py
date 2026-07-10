@@ -32,7 +32,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from sqlalchemy.orm import Session
 
@@ -194,6 +194,15 @@ async def process_serp_overview_run(run_id: int) -> None:
                     u = r.get("url")
                     if isinstance(u, str) and u:
                         n += 1
+                        # Derive the ranking-page domain at write time so
+                        # the global unique-domains export is an indexed
+                        # DISTINCT (hostname, lowercased, www. stripped).
+                        try:
+                            host = (urlsplit(u).hostname or "").lower()
+                        except ValueError:
+                            host = ""
+                        if host.startswith("www."):
+                            host = host[4:]
                         rows.append({
                             "run_domain_id": rd_id,
                             "run_id": run_id,
@@ -201,6 +210,7 @@ async def process_serp_overview_run(run_id: int) -> None:
                             "keyword": keyword,
                             "position": n,
                             "url": u,
+                            "domain": host,
                         })
 
             async with spent_lock:

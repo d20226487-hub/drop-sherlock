@@ -17,6 +17,7 @@ import { ImportLimitEditor } from "@/components/import-limit-editor";
 import { AvailabilityEditor } from "@/components/availability-editor";
 import { WhoisHistoryEditor } from "@/components/whois-history-editor";
 import { DomainFilterEditor } from "@/components/domain-filter-editor";
+import { SerpOverviewEditor } from "@/components/serp-overview-editor";
 
 type SettingsTab =
   | "api"
@@ -25,6 +26,7 @@ type SettingsTab =
   | "availability"
   | "whoisHistory"
   | "domainFilter"
+  | "serpOverview"
   | "others";
 
 const TABS: SettingsTab[] = [
@@ -41,6 +43,8 @@ const TABS: SettingsTab[] = [
   // categories (spam-keywords, banned-substrings, …) without touching
   // the schema or this enum.
   "domainFilter",
+  // 2026-07-10: SERP Overview tool settings (duplicate-ignore window).
+  "serpOverview",
   "others",
 ];
 
@@ -251,6 +255,8 @@ export default function SettingsPage() {
               </section>
             </div>
           )}
+
+          {tab === "serpOverview" && <SerpOverviewEditor />}
 
           {tab === "others" && (
             <div className="space-y-8">

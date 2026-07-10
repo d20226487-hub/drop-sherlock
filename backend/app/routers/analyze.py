@@ -848,30 +848,52 @@ class LinkedDomainsRunSummary(BaseModel):
     units_billed: int
 
 
+class LinkedDomainsRunsPage(BaseModel):
+    runs: list[LinkedDomainsRunSummary]
+    total: int
+    page: int
+    page_size: int
+
+
 @router.get(
-    "/linked-domains/runs", response_model=list[LinkedDomainsRunSummary]
+    "/linked-domains/runs", response_model=LinkedDomainsRunsPage
 )
 def list_linked_domains_runs(
-    limit: int = 50, db: Session = Depends(get_db)
-) -> list[LinkedDomainsRunSummary]:
-    """Recent linked_domains runs for the Tools-page history (most-recent
-    first). Per run: RunDomain status counts, the unique linked-domain count
-    (= CSV size), and Ahrefs units billed. All from data already stored, so
-    a run stays revisitable after leaving the page."""
+    q: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    db: Session = Depends(get_db),
+) -> LinkedDomainsRunsPage:
+    """Linked-domains runs history (most-recent first), paginated +
+    searchable by job name (`q` = case-insensitive substring). Per run:
+    RunDomain status counts, the unique linked-domain count (= CSV size),
+    and Ahrefs units billed — all from data already stored, so a run stays
+    revisitable after leaving the page."""
     from sqlalchemy import distinct, func as sfunc
 
     from ..models import CriterionResult, Job, LinkedDomainRow, RunDomain
 
-    rows = (
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    base = (
         db.query(Run, Job)
         .join(Job, Run.job_id == Job.id)
         .filter(Job.kind == "linked_domains")
-        .order_by(Run.id.desc())
-        .limit(max(1, min(limit, 200)))
+    )
+    term = q.strip()
+    if term:
+        base = base.filter(Job.name.ilike(f"%{term}%"))
+    total = base.count()
+    rows = (
+        base.order_by(Run.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
         .all()
     )
     if not rows:
-        return []
+        return LinkedDomainsRunsPage(
+            runs=[], total=total, page=page, page_size=page_size,
+        )
     run_ids = [r.id for r, _ in rows]
 
     status_counts: dict[int, dict[str, int]] = {}
@@ -928,7 +950,9 @@ def list_linked_domains_runs(
             unique_domains=unique_by_run.get(run.id, 0),
             units_billed=units_by_run.get(run.id, 0),
         ))
-    return out
+    return LinkedDomainsRunsPage(
+        runs=out, total=total, page=page, page_size=page_size,
+    )
 
 
 @router.get("/linked-domains/domains.csv")
@@ -1001,6 +1025,11 @@ class SubmitSerpOverviewIn(BaseModel):
     top_positions: int | None = 10
     # Optional per-run Ahrefs unit budget; None = uncapped.
     unit_budget: int | None = None
+    # When False (the default), keywords whose EXACT (keyword, country,
+    # top_positions) triple already completed within the dedup window
+    # (Settings → SERP Overview, default 30 days) are dropped before
+    # submitting — no Ahrefs call, no credits. True = recheck everything.
+    recheck_keywords: bool = False
     name: str | None = None
     notes: str | None = None
 
@@ -1008,6 +1037,10 @@ class SubmitSerpOverviewIn(BaseModel):
 class SubmitSerpOverviewOut(BaseModel):
     job_id: int
     run_id: int
+    # Keywords dropped by the duplicate-skip rule (same country +
+    # top_positions checked within the window). Empty when
+    # recheck_keywords was True or nothing matched.
+    skipped_duplicates: list[str] = []
 
 
 @router.post("/serp-overview", response_model=SubmitSerpOverviewOut)
@@ -1045,6 +1078,65 @@ async def submit_serp_overview_job(
             f"max {_SERP_MAX_KEYWORDS:,} keywords per run "
             f"(you have {len(keywords):,})",
         )
+
+    # Duplicate-skip (default ON; "Recheck keywords" bypasses). A keyword
+    # is a duplicate when the EXACT same (keyword, country, top_positions)
+    # triple completed (rd.status='done') within the configurable window.
+    # Prior runs' country/top_positions live in their spec_json — the runs
+    # table is small, so parsing each spec once is cheap; the RunDomain
+    # lookup below is index-served.
+    skipped_duplicates: list[str] = []
+    if not payload.recheck_keywords and keywords:
+        from datetime import timedelta
+
+        from ..app_settings import get_serp_dedup_window_days
+
+        window_days = get_serp_dedup_window_days()
+        cutoff = datetime.utcnow() - timedelta(days=window_days)
+        prior_runs = (
+            db.query(Run)
+            .join(Job, Run.job_id == Job.id)
+            .filter(Job.kind == "serp_overview")
+            .all()
+        )
+        matching_run_ids: list[int] = []
+        for pr in prior_runs:
+            try:
+                pcfg = AnalyzeSpec.model_validate_json(
+                    pr.spec_json or "{}"
+                ).criteria.serp_overview
+            except Exception:  # noqa: BLE001
+                continue
+            if (
+                (pcfg.country or "").strip().lower() == country
+                and pcfg.top_positions == top_positions
+            ):
+                matching_run_ids.append(pr.id)
+        if matching_run_ids:
+            dup_rows = (
+                db.query(RunDomain.domain)
+                .filter(
+                    RunDomain.run_id.in_(matching_run_ids),
+                    RunDomain.status == "done",
+                    RunDomain.finished_at >= cutoff,
+                    RunDomain.domain.in_(keywords),
+                )
+                .distinct()
+                .all()
+            )
+            dups = {r[0] for r in dup_rows}
+            if dups:
+                skipped_duplicates = [k for k in keywords if k in dups]
+                keywords = [k for k in keywords if k not in dups]
+                if not keywords:
+                    raise HTTPException(
+                        400,
+                        detail={
+                            "code": "all_duplicates",
+                            "count": len(skipped_duplicates),
+                            "window_days": window_days,
+                        },
+                    )
 
     spec_dict = {
         "domains": keywords,
@@ -1100,7 +1192,10 @@ async def submit_serp_overview_job(
     db.commit()
 
     dispatch_run(run.id)
-    return SubmitSerpOverviewOut(job_id=job.id, run_id=run.id)
+    return SubmitSerpOverviewOut(
+        job_id=job.id, run_id=run.id,
+        skipped_duplicates=skipped_duplicates,
+    )
 
 
 class SerpOverviewRunSummary(BaseModel):
@@ -1116,29 +1211,51 @@ class SerpOverviewRunSummary(BaseModel):
     units_billed: int
 
 
+class SerpOverviewRunsPage(BaseModel):
+    runs: list[SerpOverviewRunSummary]
+    total: int
+    page: int
+    page_size: int
+
+
 @router.get(
-    "/serp-overview/runs", response_model=list[SerpOverviewRunSummary]
+    "/serp-overview/runs", response_model=SerpOverviewRunsPage
 )
 def list_serp_overview_runs(
-    limit: int = 50, db: Session = Depends(get_db)
-) -> list[SerpOverviewRunSummary]:
-    """Recent serp_overview runs for the Tools-page history (most-recent
-    first) — same contract as the linked-domains history: everything is
-    already stored, so a run stays revisitable after leaving the page."""
+    q: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    db: Session = Depends(get_db),
+) -> SerpOverviewRunsPage:
+    """SERP Overview runs history (most-recent first), paginated +
+    searchable by job name (`q` = case-insensitive substring) — same
+    contract as the linked-domains history: everything is already stored,
+    so a run stays revisitable after leaving the page."""
     from sqlalchemy import func as sfunc
 
     from ..models import CriterionResult, Job, RunDomain, SerpOverviewRow
 
-    rows = (
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    base = (
         db.query(Run, Job)
         .join(Job, Run.job_id == Job.id)
         .filter(Job.kind == "serp_overview")
-        .order_by(Run.id.desc())
-        .limit(max(1, min(limit, 200)))
+    )
+    term = q.strip()
+    if term:
+        base = base.filter(Job.name.ilike(f"%{term}%"))
+    total = base.count()
+    rows = (
+        base.order_by(Run.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
         .all()
     )
     if not rows:
-        return []
+        return SerpOverviewRunsPage(
+            runs=[], total=total, page=page, page_size=page_size,
+        )
     run_ids = [r.id for r, _ in rows]
 
     status_counts: dict[int, dict[str, int]] = {}
@@ -1192,4 +1309,57 @@ def list_serp_overview_runs(
             urls_total=urls_by_run.get(run.id, 0),
             units_billed=units_by_run.get(run.id, 0),
         ))
-    return out
+    return SerpOverviewRunsPage(
+        runs=out, total=total, page=page, page_size=page_size,
+    )
+
+
+@router.get("/serp-overview/domains.csv")
+def export_all_serp_domains_csv(db: Session = Depends(get_db)):
+    """GLOBAL unique ranking-domains export: every distinct domain that has
+    ever ranked in any serp_overview run, sorted A→Z, one column. Same
+    safety profile as the linked-domains global export: ordered DISTINCT
+    served by ix_serp_overview_rows_domain (domains are stored per row at
+    write time — no URL parsing at read time), streamed via yield_per."""
+    import csv
+    import io
+
+    from fastapi.responses import StreamingResponse
+
+    from ..models import SerpOverviewRow
+
+    def _rows():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+
+        def _flush() -> str:
+            out = buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            return out
+
+        writer.writerow(["domain"])
+        yield _flush()
+        q = (
+            db.query(SerpOverviewRow.domain)
+            .filter(SerpOverviewRow.domain != "")
+            .distinct()
+            .order_by(SerpOverviewRow.domain)
+            .yield_per(1000)
+        )
+        n = 0
+        for (dom,) in q:
+            writer.writerow([dom])
+            n += 1
+            if n % 1000 == 0:
+                yield _flush()
+        yield _flush()
+
+    return StreamingResponse(
+        _rows(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition":
+                'attachment; filename="serp-overview-domains-all-runs.csv"',
+        },
+    )

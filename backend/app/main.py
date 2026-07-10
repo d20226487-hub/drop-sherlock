@@ -140,6 +140,11 @@ def _migrate_sqlite_columns() -> None:
         # Dofollow referring-domains count captured at import (2026-06-18).
         # Storage-only, mirrors ahrefs_rank. INTEGER (whole-number count).
         ("backlog_domains", "dofollow_refdomains", "INTEGER"),
+        # Ranking-page domain derived from url at write time (2026-07-10).
+        # Drives the global unique ranking-domains export. Rows created
+        # before the column existed are derived once at startup by
+        # _backfill_serp_row_domains().
+        ("serp_overview_rows", "domain", "VARCHAR(512) DEFAULT ''"),
     ]
     # Indexes added after the table existed in production. SQLAlchemy's
     # create_all only creates indexes alongside the table; adding
@@ -244,6 +249,9 @@ def _migrate_sqlite_columns() -> None:
         # model's __table_args__.
         ("ix_linked_domain_rows_domain_run", "linked_domain_rows",
          "linked_domain, run_id"),
+        # Added 2026-07-10 — serves the SERP global unique ranking-domains
+        # export (ordered DISTINCT on domain across all runs).
+        ("ix_serp_overview_rows_domain", "serp_overview_rows", "domain"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in additions:
@@ -316,6 +324,43 @@ def _backfill_params_hash() -> None:
             db.commit()
             logging.getLogger(__name__).info(
                 "backfilled params_hash on %s criterion_result row(s)", n
+            )
+    finally:
+        db.close()
+
+
+def _backfill_serp_row_domains() -> None:
+    """One-shot: derive `domain` for serp_overview_rows created before the
+    column existed (2026-07-10). Hostname, lowercased, leading www.
+    stripped — same rule the runner applies at insert. Idempotent — only
+    touches rows with an empty domain and a non-empty url."""
+    import logging
+    from urllib.parse import urlsplit
+
+    from .models import SerpOverviewRow
+
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(SerpOverviewRow)
+            .filter(SerpOverviewRow.domain == "", SerpOverviewRow.url != "")
+            .all()
+        )
+        n = 0
+        for r in rows:
+            try:
+                host = (urlsplit(r.url).hostname or "").lower()
+            except ValueError:
+                host = ""
+            if host.startswith("www."):
+                host = host[4:]
+            if host:
+                r.domain = host
+                n += 1
+        if n:
+            db.commit()
+            logging.getLogger(__name__).info(
+                "backfilled domain on %s serp_overview_rows row(s)", n
             )
     finally:
         db.close()
@@ -820,6 +865,7 @@ async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     _migrate_sqlite_columns()
     _backfill_params_hash()
+    _backfill_serp_row_domains()
     _backfill_augmentation()
     _migrate_wayback_concurrency_default()
     _reconcile_stale_failed_statuses()

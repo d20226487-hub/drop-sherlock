@@ -1264,6 +1264,41 @@ def set_error_retention_days(value: int | None) -> int | None:
     return value
 
 
+# --- SERP Overview dedup window (added 2026-07-10) --------------------------
+# How long a completed (keyword, country, top_positions) check suppresses
+# re-checking the same triple at submit time. The "Recheck keywords" toggle
+# on the tool bypasses it per-run. Plain integer days, 1..3650.
+SERP_DEDUP_WINDOW_KEY = "serp_dedup_window_days"
+DEFAULT_SERP_DEDUP_WINDOW_DAYS = 30
+
+
+def get_serp_dedup_window_days() -> int:
+    db = SessionLocal()
+    try:
+        raw = (_get(db, SERP_DEDUP_WINDOW_KEY) or "").strip()
+    finally:
+        db.close()
+    try:
+        v = int(raw)
+    except ValueError:
+        return DEFAULT_SERP_DEDUP_WINDOW_DAYS
+    return v if 1 <= v <= 3650 else DEFAULT_SERP_DEDUP_WINDOW_DAYS
+
+
+def set_serp_dedup_window_days(value: int) -> int:
+    v = int(value)
+    if not (1 <= v <= 3650):
+        raise ValueError(
+            "serp_dedup_window_days must be between 1 and 3650"
+        )
+    db = SessionLocal()
+    try:
+        _set(db, SERP_DEDUP_WINDOW_KEY, str(v))
+    finally:
+        db.close()
+    return v
+
+
 # --- Backlog CSV import row cap (added 2026-05-09) ------------------------
 # User-configurable upper bound on rows accepted by `POST /backlog/import`
 # (and the matching guard in the frontend CSV parser). Defaults to 50k —
