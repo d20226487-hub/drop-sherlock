@@ -494,6 +494,44 @@ def update_serp_overview_settings_route(payload: SerpOverviewSettingsIn):
     }
 
 
+# --- Allowed TLDs (added 2026-07-10) ----------------------------------------
+# Shared allowlist consumed by the Linked Domains fetch filter and the
+# SERP Overview domains exports. Default = the DSF openly-registrable list.
+
+class AllowedTldsIn(BaseModel):
+    # Full replacement list. `reset=True` (or an empty list) restores the
+    # built-in default.
+    tlds: list[str] | None = None
+    reset: bool = False
+
+
+@router.get("/allowed-tlds")
+def get_allowed_tlds_route():
+    from ..allowed_tlds import DEFAULT_ALLOWED_TLDS
+    from ..app_settings import get_allowed_tlds
+    tlds = get_allowed_tlds()
+    return {
+        "tlds": tlds,
+        "count": len(tlds),
+        "default_count": len(DEFAULT_ALLOWED_TLDS),
+    }
+
+
+@router.put("/allowed-tlds")
+def update_allowed_tlds_route(payload: AllowedTldsIn):
+    from ..allowed_tlds import DEFAULT_ALLOWED_TLDS
+    from ..app_settings import set_allowed_tlds
+    try:
+        tlds = set_allowed_tlds(None if payload.reset else payload.tlds)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "tlds": tlds,
+        "count": len(tlds),
+        "default_count": len(DEFAULT_ALLOWED_TLDS),
+    }
+
+
 @router.put("/scoring")
 def update_scoring_route(payload: ScoringConfigIn):
     raw = payload.model_dump(exclude_unset=True)

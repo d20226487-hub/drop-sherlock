@@ -87,15 +87,26 @@ def _normalize_target(domain: str) -> str:
     return d.split("/", 1)[0]
 
 
-def _build_url(target: str, *, root_only: bool, min_dr: int | None, limit_n: int) -> str:
+def _build_url(
+    target: str, *, root_only: bool, min_dr: int | None, limit_n: int,
+    tlds: list[str] | None = None,
+) -> str:
     """Compose the linked-domains GET URL. `where` uses the same
     `{"and":[{"field":..,"is":[op,val]}]}` shape as ahrefs_requests, encoded
-    with urlencode so reserved chars match what httpx puts on the wire."""
+    with urlencode so reserved chars match what httpx puts on the wire.
+
+    `tlds` becomes an OR of `domain suffix ".{tld}"` clauses — free per row
+    (domain is the already-selected column) and it CUTS billed rows. Probed
+    2026-07-10: the full 563-entry default list fits one GET (46KB URL)."""
     clauses: list[dict] = []
     if root_only:
         clauses.append({"field": "is_root_domain", "is": ["eq", True]})
     if min_dr is not None:
         clauses.append({"field": "domain_rating", "is": ["gte", min_dr]})
+    if tlds:
+        clauses.append({"or": [
+            {"field": "domain", "is": ["suffix", f".{t}"]} for t in tlds
+        ]})
     params: list[tuple[str, str]] = [
         ("limit", str(limit_n)),
         ("select", "domain"),
@@ -144,8 +155,10 @@ async def process_linked_domains_run(run_id: int) -> None:
             min_dr = cfg.min_dr
             per_target = min(int(cfg.per_target_limit or _DEFAULT_PER_TARGET), _MAX_PER_TARGET)
             unit_budget = cfg.unit_budget
+            tlds = list(cfg.tlds) if cfg.tlds else None
         except Exception:  # noqa: BLE001
             root_only, min_dr, per_target, unit_budget = False, None, _DEFAULT_PER_TARGET, None
+            tlds = None
         rd_rows: list[tuple[int, str]] = [
             (r.id, r.domain)
             for r in (
@@ -200,7 +213,8 @@ async def process_linked_domains_run(run_id: int) -> None:
 
             target = _normalize_target(domain)
             url = _build_url(
-                target, root_only=root_only, min_dr=min_dr, limit_n=per_target,
+                target, root_only=root_only, min_dr=min_dr,
+                limit_n=per_target, tlds=tlds,
             )
 
             # Rate-limited Ahrefs call — token held only for the HTTP I/O.

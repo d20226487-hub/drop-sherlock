@@ -3666,13 +3666,16 @@ def export_serp_overview_csv(run_id: int, db: Session = Depends(get_db)):
 
 @runs_router.get("/{run_id}/serp-overview-domains.csv")
 def export_serp_overview_domains_csv(
-    run_id: int, db: Session = Depends(get_db)
+    run_id: int, tlds: str = "all", db: Session = Depends(get_db)
 ):
     """Unique ranking DOMAINS across every keyword of a serp_overview run —
     the 'just give me the domains' companion to the full keyword/position/url
     export. Domain = URL hostname, lowercased, leading `www.` stripped
     (no public-suffix collapsing — blog.example.com stays distinct from
-    example.com). Deduped across the whole run, sorted A→Z."""
+    example.com). Deduped across the whole run, sorted A→Z.
+
+    `tlds=allowed` keeps only domains whose TLD is in the Settings
+    allowed-TLDs list (read-time filter — stored data stays complete)."""
     import csv
     import io
     from urllib.parse import urlsplit
@@ -3681,9 +3684,16 @@ def export_serp_overview_domains_csv(
 
     from ..models import SerpOverviewRow
 
+    if tlds not in ("all", "allowed"):
+        raise HTTPException(400, "tlds must be 'all' or 'allowed'")
     run = db.get(Run, run_id)
     if run is None:
         raise HTTPException(404, "run not found")
+    matcher = None
+    if tlds == "allowed":
+        from ..allowed_tlds import make_tld_matcher
+        from ..app_settings import get_allowed_tlds
+        matcher = make_tld_matcher(get_allowed_tlds())
 
     def _rows():
         hosts: set[str] = set()
@@ -3699,7 +3709,7 @@ def export_serp_overview_domains_csv(
                 host = ""
             if host.startswith("www."):
                 host = host[4:]
-            if host:
+            if host and (matcher is None or matcher(host)):
                 hosts.add(host)
 
         buf = io.StringIO()

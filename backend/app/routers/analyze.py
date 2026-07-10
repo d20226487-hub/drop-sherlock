@@ -658,6 +658,10 @@ class SubmitLinkedDomainsIn(BaseModel):
     # stay re-checkable either way. Untick in the UI / send false to force
     # a re-check.
     skip_checked: bool = True
+    # When True, only linked domains whose TLD is in the Settings
+    # allowed-TLDs list are fetched (server-side suffix filter — free per
+    # row, cuts billed rows). The list is snapshotted into the run's spec.
+    allowed_tlds_only: bool = False
     name: str | None = None
     notes: str | None = None
 
@@ -771,6 +775,13 @@ async def submit_linked_domains_job(
                     },
                 )
 
+    # Snapshot the allowed-TLD list into the spec when requested, so the
+    # run stays reproducible even if the Settings list changes later.
+    tlds: list[str] | None = None
+    if payload.allowed_tlds_only:
+        from ..app_settings import get_allowed_tlds
+        tlds = get_allowed_tlds()
+
     # Canonical spec: only the linked_domains criterion enabled. No AI.
     # use_cache=False — a Job is an explicit "fetch fresh now" ask (mirrors
     # the other pillar submits; keeps spec_json shape uniform).
@@ -792,6 +803,7 @@ async def submit_linked_domains_job(
                 "min_dr": min_dr,
                 "per_target_limit": per_target_limit,
                 "unit_budget": unit_budget,
+                "tlds": tlds,
             },
         },
         "ai": {"provider": None, "model": None},
@@ -1372,18 +1384,31 @@ def list_serp_overview_runs(
 
 
 @router.get("/serp-overview/domains.csv")
-def export_all_serp_domains_csv(db: Session = Depends(get_db)):
+def export_all_serp_domains_csv(
+    tlds: str = "all", db: Session = Depends(get_db)
+):
     """GLOBAL unique ranking-domains export: every distinct domain that has
     ever ranked in any serp_overview run, sorted A→Z, one column. Same
     safety profile as the linked-domains global export: ordered DISTINCT
     served by ix_serp_overview_rows_domain (domains are stored per row at
-    write time — no URL parsing at read time), streamed via yield_per."""
+    write time — no URL parsing at read time), streamed via yield_per.
+
+    `tlds=allowed` keeps only domains whose TLD is in the Settings
+    allowed-TLDs list (read-time filter — stored data stays complete)."""
     import csv
     import io
 
     from fastapi.responses import StreamingResponse
 
     from ..models import SerpOverviewRow
+
+    if tlds not in ("all", "allowed"):
+        raise HTTPException(400, "tlds must be 'all' or 'allowed'")
+    matcher = None
+    if tlds == "allowed":
+        from ..allowed_tlds import make_tld_matcher
+        from ..app_settings import get_allowed_tlds
+        matcher = make_tld_matcher(get_allowed_tlds())
 
     def _rows():
         buf = io.StringIO()
@@ -1406,6 +1431,8 @@ def export_all_serp_domains_csv(db: Session = Depends(get_db)):
         )
         n = 0
         for (dom,) in q:
+            if matcher is not None and not matcher(dom):
+                continue
             writer.writerow([dom])
             n += 1
             if n % 1000 == 0:

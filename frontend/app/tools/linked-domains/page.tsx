@@ -96,8 +96,6 @@ async function copyText(text: string): Promise<boolean> {
 
 export default function LinkedDomainsToolPage() {
   const [domainsRaw, setDomainsRaw] = useState("");
-  const [rootOnly, setRootOnly] = useState(false);
-  const [minDr, setMinDr] = useState("");
   const [perTargetLimit, setPerTargetLimit] = useState("");
   const [unitBudget, setUnitBudget] = useState("");
   const [busy, setBusy] = useState(false);
@@ -107,6 +105,7 @@ export default function LinkedDomainsToolPage() {
   const [cost, setCost] = useState<LinkedCost | null>(null);
   const [skippedBanned, setSkippedBanned] = useState<string[]>([]);
   const [skipChecked, setSkipChecked] = useState(true);
+  const [allowedTldsOnly, setAllowedTldsOnly] = useState(false);
   const [skippedAlreadyChecked, setSkippedAlreadyChecked] = useState<string[]>(
     [],
   );
@@ -201,14 +200,6 @@ export default function LinkedDomainsToolPage() {
       setError(`Max 1000 domains per run (you have ${domains.length})`);
       return;
     }
-    const minDrNum = minDr.trim() === "" ? null : Number(minDr);
-    if (
-      minDrNum != null &&
-      (Number.isNaN(minDrNum) || minDrNum < 0 || minDrNum > 100)
-    ) {
-      setError("Min DR must be between 0 and 100");
-      return;
-    }
     const limitNum =
       perTargetLimit.trim() === "" ? null : Number(perTargetLimit);
     if (
@@ -235,11 +226,10 @@ export default function LinkedDomainsToolPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           domains,
-          root_only: rootOnly,
-          min_dr: minDrNum,
           per_target_limit: limitNum,
           unit_budget: budgetNum,
           skip_checked: skipChecked,
+          allowed_tlds_only: allowedTldsOnly,
           name: jobName.trim() || null,
         }),
       });
@@ -407,10 +397,9 @@ export default function LinkedDomainsToolPage() {
           <strong>persistent, resumable job</strong> — safe to leave running,
           and it survives restarts. Export the <strong>unique</strong> linked
           domains across all inputs as CSV. Only the <code>domain</code>{" "}
-          column is fetched to keep spend near the{" "}
-          <strong>~50 units/domain</strong> floor; DR and root-only apply as
-          server-side filters. Tip: domain <code>ahrefs.com</code> probes for
-          free.
+          column is fetched — 1 unit per returned domain, with a{" "}
+          <strong>~50 units/domain</strong> floor. Tip: domain{" "}
+          <code>ahrefs.com</code> probes for free.
         </p>
       </header>
 
@@ -435,53 +424,21 @@ export default function LinkedDomainsToolPage() {
           </span>
         </label>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <label className="flex items-start gap-2">
-            <input
-              type="checkbox"
-              checked={rootOnly}
-              onChange={(e) => setRootOnly(e.target.checked)}
-              disabled={busy}
-              className="mt-0.5"
-            />
-            <span className="text-sm font-medium">
-              Root domains only
-              <span className="block text-xs font-normal text-neutral-500 dark:text-neutral-400">
-                exclude subdomains
-              </span>
-            </span>
-          </label>
-          <label className="block">
-            <span className="text-sm font-medium block mb-1">
-              Min DR (optional)
-            </span>
-            <input
-              type="number"
-              min={0}
-              max={100}
-              value={minDr}
-              onChange={(e) => setMinDr(e.target.value)}
-              placeholder="e.g. 20"
-              className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
-              disabled={busy}
-            />
-          </label>
-          <label className="block">
-            <span className="text-sm font-medium block mb-1">
-              Per-target limit (optional)
-            </span>
-            <input
-              type="number"
-              min={1}
-              max={5000}
-              value={perTargetLimit}
-              onChange={(e) => setPerTargetLimit(e.target.value)}
-              placeholder="5000 (default)"
-              className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
-              disabled={busy}
-            />
-          </label>
-        </div>
+        <label className="block sm:max-w-xs">
+          <span className="text-sm font-medium block mb-1">
+            Per-target limit (optional)
+          </span>
+          <input
+            type="number"
+            min={1}
+            max={5000}
+            value={perTargetLimit}
+            onChange={(e) => setPerTargetLimit(e.target.value)}
+            placeholder="5000 (default)"
+            className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
+            disabled={busy}
+          />
+        </label>
 
         <label className="flex items-start gap-2">
           <input
@@ -495,6 +452,23 @@ export default function LinkedDomainsToolPage() {
             Skip already-checked domains
             <span className="block text-xs font-normal text-neutral-500 dark:text-neutral-400">
               drop domains that already completed in a previous run
+            </span>
+          </span>
+        </label>
+
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            checked={allowedTldsOnly}
+            onChange={(e) => setAllowedTldsOnly(e.target.checked)}
+            disabled={busy}
+            className="mt-0.5"
+          />
+          <span className="text-sm font-medium">
+            Allowed TLDs only
+            <span className="block text-xs font-normal text-neutral-500 dark:text-neutral-400">
+              fetch only linked domains whose TLD is in the Settings
+              allowlist — filtered rows aren&apos;t billed
             </span>
           </span>
         </label>

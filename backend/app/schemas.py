@@ -359,6 +359,13 @@ class LinkedDomainsConfig(BaseModel):
     # the run (resumable) once cumulative billed units cross this ceiling —
     # the cost safety net for a large multi-target submit. None = uncapped.
     unit_budget: int | None = Field(default=None, ge=1)
+    # Allowed-TLD suffixes snapshotted at submit time when the user ticked
+    # "allowed TLDs only" (from Settings → allowed_tlds). Applied server-
+    # side as an OR of `domain suffix ".{tld}"` clauses — probed 2026-07-10:
+    # all 563 default entries fit one GET (46KB URL, HTTP 200) and the
+    # filter costs nothing per row (domain is the already-selected column).
+    # None = no TLD filtering.
+    tlds: list[str] | None = None
 
 
 class SerpOverviewConfig(BaseModel):

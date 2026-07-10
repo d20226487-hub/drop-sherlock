@@ -119,6 +119,9 @@ export default function SerpOverviewToolPage() {
   const [cost, setCost] = useState<SerpCost | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [copiedAll, setCopiedAll] = useState<string | null>(null);
+  // Applies the Settings allowed-TLDs list to the domain exports/copy
+  // (read-time filter — stored data stays complete, untick for raw).
+  const [tldFiltered, setTldFiltered] = useState(true);
   const [recheck, setRecheck] = useState(false);
   const [dupNotices, setDupNotices] = useState<string[]>([]);
   const [multiNotice, setMultiNotice] = useState<string | null>(null);
@@ -352,7 +355,11 @@ export default function SerpOverviewToolPage() {
   // Copy the GLOBAL unique ranking-domain set (every run ever, deduped).
   async function copyAllDomains() {
     try {
-      const res = await fetch("/api/analyze/serp-overview/domains.csv");
+      const res = await fetch(
+        `/api/analyze/serp-overview/domains.csv${
+          tldFiltered ? "?tlds=allowed" : ""
+        }`,
+      );
       if (!res.ok) {
         setCopiedAll("Copy failed");
       } else {
@@ -378,7 +385,11 @@ export default function SerpOverviewToolPage() {
   async function copyDomains() {
     if (runId == null) return;
     try {
-      const res = await fetch(`/api/runs/${runId}/serp-overview-domains.csv`);
+      const res = await fetch(
+        `/api/runs/${runId}/serp-overview-domains.csv${
+          tldFiltered ? "?tlds=allowed" : ""
+        }`,
+      );
       if (!res.ok) {
         setCopied("Copy failed");
       } else {
@@ -706,7 +717,9 @@ export default function SerpOverviewToolPage() {
                 Download CSV (keyword · position · URL)
               </a>
               <a
-                href={`/api/runs/${status.id}/serp-overview-domains.csv`}
+                href={`/api/runs/${status.id}/serp-overview-domains.csv${
+                  tldFiltered ? "?tlds=allowed" : ""
+                }`}
                 className="inline-block rounded border dark:border-neutral-700 px-4 py-2 text-sm font-medium"
               >
                 Download unique domains CSV
@@ -730,8 +743,18 @@ export default function SerpOverviewToolPage() {
           <h2 className="text-lg font-semibold">Recent runs</h2>
           {/* Global export — every run ever, deduped across runs. */}
           <div className="flex items-center gap-2">
+            <label className="flex items-center gap-1.5 text-xs text-neutral-600 dark:text-neutral-300">
+              <input
+                type="checkbox"
+                checked={tldFiltered}
+                onChange={(e) => setTldFiltered(e.target.checked)}
+              />
+              Allowed TLDs only
+            </label>
             <a
-              href="/api/analyze/serp-overview/domains.csv"
+              href={`/api/analyze/serp-overview/domains.csv${
+                tldFiltered ? "?tlds=allowed" : ""
+              }`}
               className="rounded border dark:border-neutral-700 px-3 py-1.5 text-xs font-medium"
             >
               Download all unique domains (all runs)
@@ -895,7 +918,9 @@ export default function SerpOverviewToolPage() {
                           Download CSV
                         </a>
                         <a
-                          href={`/api/runs/${h.run_id}/serp-overview-domains.csv`}
+                          href={`/api/runs/${h.run_id}/serp-overview-domains.csv${
+                            tldFiltered ? "?tlds=allowed" : ""
+                          }`}
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
                           Domains CSV

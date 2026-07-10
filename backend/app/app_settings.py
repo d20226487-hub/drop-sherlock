@@ -1299,6 +1299,59 @@ def set_serp_dedup_window_days(value: int) -> int:
     return v
 
 
+# --- Allowed TLDs (added 2026-07-10) ----------------------------------------
+# Editable allowlist of TLD suffixes shared by the Linked Domains fetch
+# filter and the SERP Overview domains exports. Default = the Domain Spam
+# Filter's openly-registrable list (allowed_tlds.DEFAULT_ALLOWED_TLDS, 563
+# entries). Stored as a JSON array under one key; empty/absent row =
+# default (so "Reset to default" just clears the override).
+ALLOWED_TLDS_KEY = "allowed_tlds"
+
+
+def get_allowed_tlds() -> list[str]:
+    import json as _json
+
+    from .allowed_tlds import DEFAULT_ALLOWED_TLDS
+    db = SessionLocal()
+    try:
+        raw = (_get(db, ALLOWED_TLDS_KEY) or "").strip()
+    finally:
+        db.close()
+    if not raw:
+        return list(DEFAULT_ALLOWED_TLDS)
+    try:
+        vals = _json.loads(raw)
+    except _json.JSONDecodeError:
+        return list(DEFAULT_ALLOWED_TLDS)
+    if not isinstance(vals, list) or not vals:
+        return list(DEFAULT_ALLOWED_TLDS)
+    return [str(v) for v in vals]
+
+
+def set_allowed_tlds(tlds: list[str] | None) -> list[str]:
+    """Persist a normalized, deduped list. None (or a list that's empty
+    after normalization) clears the override row = reset to default."""
+    import json as _json
+
+    from .allowed_tlds import DEFAULT_ALLOWED_TLDS, normalize_tld
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for t in (tlds or []):
+        n = normalize_tld(str(t))
+        if not n or n in seen:
+            continue
+        if not all(c.isalnum() or c in ".-" for c in n):
+            raise ValueError(f"invalid TLD entry: {t!r}")
+        seen.add(n)
+        cleaned.append(n)
+    db = SessionLocal()
+    try:
+        _set(db, ALLOWED_TLDS_KEY, _json.dumps(cleaned) if cleaned else "")
+    finally:
+        db.close()
+    return cleaned or list(DEFAULT_ALLOWED_TLDS)
+
+
 # --- Backlog CSV import row cap (added 2026-05-09) ------------------------
 # User-configurable upper bound on rows accepted by `POST /backlog/import`
 # (and the matching guard in the frontend CSV parser). Defaults to 50k —

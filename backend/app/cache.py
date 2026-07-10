@@ -112,6 +112,8 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
                 "root_only": bool(getattr(cfg, "root_only", True)),
                 "min_dr": getattr(cfg, "min_dr", None),
                 "per_target_limit": getattr(cfg, "per_target_limit", None),
+                # None when no TLD filter — keeps pre-feature hashes stable.
+                "tlds": sorted(getattr(cfg, "tlds", None) or []) or None,
             }).encode("utf-8")
         ).hexdigest()
     # serp_overview (2026-07-10): same pillar contract as linked_domains —
