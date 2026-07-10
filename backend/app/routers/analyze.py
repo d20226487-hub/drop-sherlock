@@ -1019,11 +1019,16 @@ _SERP_MAX_KEYWORDS = 500
 
 class SubmitSerpOverviewIn(BaseModel):
     keywords: list[str]
-    # Two-letter ISO-3166-1 alpha-2 country code (required by the API).
-    country: str
+    # Two-letter ISO-3166-1 alpha-2 country codes. One Job+Run is created
+    # PER country — every keyword is checked in every selected country's
+    # SERP. `country` (single, legacy) is honored when `countries` is
+    # absent; `countries` wins when both are sent.
+    countries: list[str] | None = None
+    country: str | None = None
     # Cap on top organic positions per keyword (1-100); None = all.
     top_positions: int | None = 10
-    # Optional per-run Ahrefs unit budget; None = uncapped.
+    # Optional per-run Ahrefs unit budget; None = uncapped. Applies to
+    # EACH created run (a per-run ceiling, not per-submit).
     unit_budget: int | None = None
     # When False (the default), keywords whose EXACT (keyword, country,
     # top_positions) triple already completed within the dedup window
@@ -1034,25 +1039,63 @@ class SubmitSerpOverviewIn(BaseModel):
     notes: str | None = None
 
 
-class SubmitSerpOverviewOut(BaseModel):
+class SerpOverviewCreatedRun(BaseModel):
+    country: str
     job_id: int
     run_id: int
-    # Keywords dropped by the duplicate-skip rule (same country +
-    # top_positions checked within the window). Empty when
-    # recheck_keywords was True or nothing matched.
+    # Keywords dropped for THIS country by the duplicate-skip rule.
     skipped_duplicates: list[str] = []
+
+
+class SerpOverviewSkippedCountry(BaseModel):
+    """A country for which EVERY keyword was a duplicate — no run created."""
+    country: str
+    count: int
+
+
+class SubmitSerpOverviewOut(BaseModel):
+    runs: list[SerpOverviewCreatedRun] = []
+    skipped_countries: list[SerpOverviewSkippedCountry] = []
+
+
+_SERP_MAX_COUNTRIES = 30
 
 
 @router.post("/serp-overview", response_model=SubmitSerpOverviewOut)
 async def submit_serp_overview_job(
     payload: SubmitSerpOverviewIn, db: Session = Depends(get_db)
 ) -> SubmitSerpOverviewOut:
-    """Mint a Job(kind='serp_overview') + first Run + one RunDomain per
-    keyword, then dispatch the per-keyword runner. Mirrors
-    submit_linked_domains_job minus the ban filter (keywords, not domains)."""
-    country = (payload.country or "").strip().lower()
-    if len(country) != 2 or not country.isalpha():
-        raise HTTPException(400, "country must be a two-letter code")
+    """Mint one Job(kind='serp_overview') + Run PER selected country, each
+    with one RunDomain per keyword, then dispatch the per-keyword runner
+    for each. The duplicate-skip is evaluated per country (the dedup key
+    is the (keyword, country, top_positions) triple); a country whose
+    keywords are ALL duplicates gets no run and is reported in
+    skipped_countries instead. Multi-country jobs get a ' · {cc}' name
+    suffix so the history rows stay tellable-apart."""
+    # Countries: prefer the list; fall back to the legacy single field.
+    raw_countries = payload.countries if payload.countries else (
+        [payload.country] if payload.country else []
+    )
+    countries: list[str] = []
+    seen_c: set[str] = set()
+    for rc in raw_countries:
+        c = (rc or "").strip().lower()
+        if not c or c in seen_c:
+            continue
+        if len(c) != 2 or not c.isalpha():
+            raise HTTPException(
+                400, f"country '{rc}' must be a two-letter code",
+            )
+        seen_c.add(c)
+        countries.append(c)
+    if not countries:
+        raise HTTPException(400, "at least one country is required")
+    if len(countries) > _SERP_MAX_COUNTRIES:
+        raise HTTPException(
+            400,
+            f"max {_SERP_MAX_COUNTRIES} countries per submit "
+            f"(you have {len(countries)})",
+        )
     top_positions = payload.top_positions
     if top_positions is not None and not (1 <= top_positions <= 100):
         raise HTTPException(400, "top_positions must be between 1 and 100")
@@ -1079,44 +1122,43 @@ async def submit_serp_overview_job(
             f"(you have {len(keywords):,})",
         )
 
-    # Duplicate-skip (default ON; "Recheck keywords" bypasses). A keyword
-    # is a duplicate when the EXACT same (keyword, country, top_positions)
-    # triple completed (rd.status='done') within the configurable window.
-    # Prior runs' country/top_positions live in their spec_json — the runs
-    # table is small, so parsing each spec once is cheap; the RunDomain
-    # lookup below is index-served.
-    skipped_duplicates: list[str] = []
-    if not payload.recheck_keywords and keywords:
+    # Duplicate-skip (default ON; "Recheck keywords" bypasses), evaluated
+    # PER COUNTRY: a keyword is a duplicate for a country when the exact
+    # (keyword, country, top_positions) triple completed (rd.status='done')
+    # within the configurable window. Prior runs' spec_json is parsed ONCE
+    # into a country→run_ids map (the runs table is small); the RunDomain
+    # lookups are index-served.
+    dups_by_country: dict[str, set[str]] = {c: set() for c in countries}
+    window_days = 0
+    if not payload.recheck_keywords:
         from datetime import timedelta
 
         from ..app_settings import get_serp_dedup_window_days
 
         window_days = get_serp_dedup_window_days()
         cutoff = datetime.utcnow() - timedelta(days=window_days)
-        prior_runs = (
+        wanted = set(countries)
+        run_ids_by_country: dict[str, list[int]] = {}
+        for pr in (
             db.query(Run)
             .join(Job, Run.job_id == Job.id)
             .filter(Job.kind == "serp_overview")
             .all()
-        )
-        matching_run_ids: list[int] = []
-        for pr in prior_runs:
+        ):
             try:
                 pcfg = AnalyzeSpec.model_validate_json(
                     pr.spec_json or "{}"
                 ).criteria.serp_overview
             except Exception:  # noqa: BLE001
                 continue
-            if (
-                (pcfg.country or "").strip().lower() == country
-                and pcfg.top_positions == top_positions
-            ):
-                matching_run_ids.append(pr.id)
-        if matching_run_ids:
+            pc = (pcfg.country or "").strip().lower()
+            if pc in wanted and pcfg.top_positions == top_positions:
+                run_ids_by_country.setdefault(pc, []).append(pr.id)
+        for c, rids in run_ids_by_country.items():
             dup_rows = (
                 db.query(RunDomain.domain)
                 .filter(
-                    RunDomain.run_id.in_(matching_run_ids),
+                    RunDomain.run_id.in_(rids),
                     RunDomain.status == "done",
                     RunDomain.finished_at >= cutoff,
                     RunDomain.domain.in_(keywords),
@@ -1124,77 +1166,92 @@ async def submit_serp_overview_job(
                 .distinct()
                 .all()
             )
-            dups = {r[0] for r in dup_rows}
-            if dups:
-                skipped_duplicates = [k for k in keywords if k in dups]
-                keywords = [k for k in keywords if k not in dups]
-                if not keywords:
-                    raise HTTPException(
-                        400,
-                        detail={
-                            "code": "all_duplicates",
-                            "count": len(skipped_duplicates),
-                            "window_days": window_days,
-                        },
-                    )
+            dups_by_country[c] = {r[0] for r in dup_rows}
 
-    spec_dict = {
-        "domains": keywords,
-        "criteria": {
-            "backlinks": {"enabled": False},
-            "refdomains": {"enabled": False},
-            "anchors": {"enabled": False},
-            "keywords": {"enabled": False},
-            "wayback": {"enabled": False},
-            "wayback_classify": {"enabled": False},
-            "whois_history": {"enabled": False},
-            "availability": {"enabled": False},
-            "ahrefs_batch_analysis": {"enabled": False},
-            "linked_domains": {"enabled": False},
-            "serp_overview": {
-                "enabled": True,
-                "country": country,
-                "top_positions": top_positions,
-                "unit_budget": unit_budget,
-            },
-        },
-        "ai": {"provider": None, "model": None},
-        "use_cache": False,
-        "cross_job_cache": False,
-        "lang": "en",
-    }
-    norm_spec = AnalyzeSpec.model_validate(spec_dict)
-    spec_json = norm_spec.model_dump_json()
-
-    name = (payload.name or "").strip() or _autoname(keywords)
+    base_name = (payload.name or "").strip() or _autoname(keywords)
     notes = (payload.notes or "").strip()
+    multi = len(countries) > 1
 
-    job = Job(
-        name=name,
-        notes=notes,
-        spec_json=spec_json,
-        kind="serp_overview",
-    )
-    db.add(job)
-    db.flush()
+    created: list[SerpOverviewCreatedRun] = []
+    skipped_countries: list[SerpOverviewSkippedCountry] = []
+    for c in countries:
+        dups = dups_by_country.get(c) or set()
+        kw = [k for k in keywords if k not in dups]
+        if not kw:
+            skipped_countries.append(SerpOverviewSkippedCountry(
+                country=c, count=len(keywords),
+            ))
+            continue
+        spec_dict = {
+            "domains": kw,
+            "criteria": {
+                "backlinks": {"enabled": False},
+                "refdomains": {"enabled": False},
+                "anchors": {"enabled": False},
+                "keywords": {"enabled": False},
+                "wayback": {"enabled": False},
+                "wayback_classify": {"enabled": False},
+                "whois_history": {"enabled": False},
+                "availability": {"enabled": False},
+                "ahrefs_batch_analysis": {"enabled": False},
+                "linked_domains": {"enabled": False},
+                "serp_overview": {
+                    "enabled": True,
+                    "country": c,
+                    "top_positions": top_positions,
+                    "unit_budget": unit_budget,
+                },
+            },
+            "ai": {"provider": None, "model": None},
+            "use_cache": False,
+            "cross_job_cache": False,
+            "lang": "en",
+        }
+        norm_spec = AnalyzeSpec.model_validate(spec_dict)
+        spec_json = norm_spec.model_dump_json()
 
-    run = Run(job_id=job.id, status="pending", spec_json=spec_json)
-    db.add(run)
-    db.flush()
+        job = Job(
+            name=f"{base_name} · {c}" if multi else base_name,
+            notes=notes,
+            spec_json=spec_json,
+            kind="serp_overview",
+        )
+        db.add(job)
+        db.flush()
 
-    db.bulk_insert_mappings(
-        RunDomain,
-        [
-            {"run_id": run.id, "domain": k, "status": "pending"}
-            for k in keywords
-        ],
-    )
-    db.commit()
+        run = Run(job_id=job.id, status="pending", spec_json=spec_json)
+        db.add(run)
+        db.flush()
 
-    dispatch_run(run.id)
+        db.bulk_insert_mappings(
+            RunDomain,
+            [
+                {"run_id": run.id, "domain": k, "status": "pending"}
+                for k in kw
+            ],
+        )
+        db.commit()
+
+        dispatch_run(run.id)
+        created.append(SerpOverviewCreatedRun(
+            country=c,
+            job_id=job.id,
+            run_id=run.id,
+            skipped_duplicates=[k for k in keywords if k in dups],
+        ))
+
+    if not created:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "all_duplicates",
+                "count": sum(s.count for s in skipped_countries),
+                "window_days": window_days,
+                "countries": [s.country for s in skipped_countries],
+            },
+        )
     return SubmitSerpOverviewOut(
-        job_id=job.id, run_id=run.id,
-        skipped_duplicates=skipped_duplicates,
+        runs=created, skipped_countries=skipped_countries,
     )
 
 

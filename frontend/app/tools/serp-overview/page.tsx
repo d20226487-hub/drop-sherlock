@@ -16,29 +16,17 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-// Curated country list (ISO 3166-1 alpha-2). Ahrefs accepts any valid
-// code; this covers the common ones for this operator's niche, with the
-// regional markets first. The backend lower-cases + validates.
-const SERP_COUNTRY_OPTIONS: { code: string; label: string }[] = [
-  { code: "kz", label: "Kazakhstan (kz)" },
-  { code: "ru", label: "Russia (ru)" },
-  { code: "ua", label: "Ukraine (ua)" },
-  { code: "by", label: "Belarus (by)" },
-  { code: "uz", label: "Uzbekistan (uz)" },
-  { code: "us", label: "United States (us)" },
-  { code: "gb", label: "United Kingdom (gb)" },
-  { code: "de", label: "Germany (de)" },
-  { code: "fr", label: "France (fr)" },
-  { code: "es", label: "Spain (es)" },
-  { code: "it", label: "Italy (it)" },
-  { code: "pl", label: "Poland (pl)" },
-  { code: "tr", label: "Turkey (tr)" },
-  { code: "nl", label: "Netherlands (nl)" },
-  { code: "ca", label: "Canada (ca)" },
-  { code: "au", label: "Australia (au)" },
-  { code: "in", label: "India (in)" },
-  { code: "br", label: "Brazil (br)" },
-];
+import { COUNTRIES } from "@/lib/countries";
+
+// One created run per selected country — the submit response shape.
+type CreatedRun = {
+  country: string;
+  job_id: number;
+  run_id: number;
+  skipped_duplicates: string[];
+};
+
+type SkippedCountry = { country: string; count: number };
 
 type SerpRunStatus = {
   id: number;
@@ -118,7 +106,10 @@ async function copyText(text: string): Promise<boolean> {
 
 export default function SerpOverviewToolPage() {
   const [keywordsRaw, setKeywordsRaw] = useState("");
-  const [country, setCountry] = useState("kz");
+  const [selectedCountries, setSelectedCountries] = useState<string[]>([
+    "kz",
+  ]);
+  const [countrySearch, setCountrySearch] = useState("");
   const [topPositions, setTopPositions] = useState("10");
   const [unitBudget, setUnitBudget] = useState("");
   const [busy, setBusy] = useState(false);
@@ -129,7 +120,8 @@ export default function SerpOverviewToolPage() {
   const [copied, setCopied] = useState<string | null>(null);
   const [copiedAll, setCopiedAll] = useState<string | null>(null);
   const [recheck, setRecheck] = useState(false);
-  const [skippedDuplicates, setSkippedDuplicates] = useState<string[]>([]);
+  const [dupNotices, setDupNotices] = useState<string[]>([]);
+  const [multiNotice, setMultiNotice] = useState<string | null>(null);
   const [jobName, setJobName] = useState("");
   const [history, setHistory] = useState<SerpRunHistoryItem[]>([]);
   const [search, setSearch] = useState("");
@@ -146,6 +138,19 @@ export default function SerpOverviewToolPage() {
       .filter(Boolean);
   }
   const keywords = parseKeywords();
+
+  function toggleCountry(code: string) {
+    setSelectedCountries((prev) =>
+      prev.includes(code)
+        ? prev.filter((c) => c !== code)
+        : [...prev, code],
+    );
+  }
+
+  const countryFilter = countrySearch.trim().toLowerCase();
+  const filteredCountries = countryFilter
+    ? COUNTRIES.filter((c) => c.label.toLowerCase().includes(countryFilter))
+    : COUNTRIES;
 
   // Fetch the recent-runs history. Called on mount, after a successful
   // submit, and whenever the active run reaches a terminal state.
@@ -228,10 +233,21 @@ export default function SerpOverviewToolPage() {
       setError("Unit budget must be a positive number");
       return;
     }
+    if (selectedCountries.length === 0) {
+      setError("Select at least one country");
+      return;
+    }
+    if (selectedCountries.length > 30) {
+      setError(
+        `Max 30 countries per submit (you have ${selectedCountries.length})`,
+      );
+      return;
+    }
     setBusy(true);
     setStatus(null);
     setCost(null);
-    setSkippedDuplicates([]);
+    setDupNotices([]);
+    setMultiNotice(null);
     setRunId(null);
     try {
       const res = await fetch("/api/analyze/serp-overview", {
@@ -239,7 +255,7 @@ export default function SerpOverviewToolPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           keywords,
-          country,
+          countries: selectedCountries,
           top_positions: topNum,
           unit_budget: budgetNum,
           recheck_keywords: recheck,
@@ -261,16 +277,49 @@ export default function SerpOverviewToolPage() {
         }
         if (code === "all_duplicates") {
           throw new Error(
-            `All ${count} keyword(s) were already checked with the same ` +
-              `country & result count within the last ${windowDays} days — ` +
+            `All keywords in all selected countries were already checked ` +
+              `within the last ${windowDays} days (${count} skipped) — ` +
               `tick "Recheck keywords" to force a re-check.`,
           );
         }
         throw new Error(`HTTP ${res.status}: ${t.slice(0, 300)}`);
       }
       const data = await res.json();
-      setSkippedDuplicates(data.skipped_duplicates || []);
-      setRunId(data.run_id);
+      const runs: CreatedRun[] = Array.isArray(data.runs) ? data.runs : [];
+      const skippedCountries: SkippedCountry[] = Array.isArray(
+        data.skipped_countries,
+      )
+        ? data.skipped_countries
+        : [];
+      const notices: string[] = [];
+      for (const r of runs) {
+        if (r.skipped_duplicates?.length) {
+          notices.push(
+            `${r.country}: skipped ${r.skipped_duplicates.length} ` +
+              `previously-checked keyword` +
+              `${r.skipped_duplicates.length === 1 ? "" : "s"} (` +
+              r.skipped_duplicates.slice(0, 5).join(", ") +
+              (r.skipped_duplicates.length > 5 ? "…" : "") +
+              `)`,
+          );
+        }
+      }
+      for (const s of skippedCountries) {
+        notices.push(
+          `${s.country}: all ${s.count} keywords already checked — ` +
+            `no run created`,
+        );
+      }
+      setDupNotices(notices);
+      if (runs.length > 1) {
+        setMultiNotice(
+          `Created ${runs.length} runs (` +
+            runs.map((r) => r.country).join(", ") +
+            `) — viewing ${runs[0].country}; open the others from ` +
+            `Recent runs.`,
+        );
+      }
+      if (runs.length > 0) setRunId(runs[0].run_id);
       loadHistory();
     } catch (e) {
       setError((e as Error).message);
@@ -405,8 +454,9 @@ export default function SerpOverviewToolPage() {
         <p className="text-sm text-neutral-600 dark:text-neutral-400">
           Bulk <code>/serp-overview</code> across a batch of{" "}
           <strong>keywords</strong>: the ranking-page <strong>URLs</strong>{" "}
-          per keyword for the chosen country, limited to the top organic
-          positions. Runs as a <strong>persistent, resumable job</strong> —
+          per keyword for <strong>each selected country</strong> (one run
+          per country), limited to the top organic positions. Runs as a{" "}
+          <strong>persistent, resumable job</strong> —
           survives restarts, and past runs stay downloadable below. Only the{" "}
           <code>url</code> column is fetched to keep spend at the{" "}
           <strong>~50 units/keyword</strong> floor. Keywords already checked
@@ -438,22 +488,59 @@ export default function SerpOverviewToolPage() {
           </span>
         </label>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <label className="block">
-            <span className="text-sm font-medium block mb-1">Country</span>
-            <select
-              value={country}
-              onChange={(e) => setCountry(e.target.value)}
-              className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
-              disabled={busy}
-            >
-              {SERP_COUNTRY_OPTIONS.map((c) => (
-                <option key={c.code} value={c.code}>
-                  {c.label}
-                </option>
-              ))}
-            </select>
-          </label>
+        <div className="space-y-1">
+          <span className="text-sm font-medium block">
+            Countries ({selectedCountries.length} selected)
+          </span>
+          <span className="text-xs text-neutral-500 dark:text-neutral-400 block">
+            Each keyword is checked in each selected country — one run per
+            country.
+          </span>
+          <input
+            type="text"
+            value={countrySearch}
+            onChange={(e) => setCountrySearch(e.target.value)}
+            placeholder="Search countries…"
+            className="w-full sm:max-w-xs rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
+            disabled={busy}
+          />
+          <div className="max-h-44 overflow-y-auto rounded border dark:border-neutral-700 divide-y divide-neutral-100 dark:divide-neutral-800/60">
+            {filteredCountries.map((c) => (
+              <label
+                key={c.code}
+                className="flex items-center gap-2 px-2 py-1 text-sm cursor-pointer hover:bg-neutral-50 dark:hover:bg-neutral-900"
+              >
+                <input
+                  type="checkbox"
+                  checked={selectedCountries.includes(c.code)}
+                  onChange={() => toggleCountry(c.code)}
+                  disabled={busy}
+                />
+                <span>{c.label}</span>
+              </label>
+            ))}
+            {filteredCountries.length === 0 && (
+              <p className="px-2 py-2 text-xs text-neutral-500 dark:text-neutral-400">
+                No matches.
+              </p>
+            )}
+          </div>
+          {selectedCountries.length > 0 && (
+            <div className="text-xs text-neutral-500 dark:text-neutral-400">
+              Selected: {selectedCountries.join(", ")}{" "}
+              <button
+                type="button"
+                onClick={() => setSelectedCountries([])}
+                disabled={busy}
+                className="text-blue-700 dark:text-blue-400 hover:underline"
+              >
+                Clear
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label className="block">
             <span className="text-sm font-medium block mb-1">
               Top positions (1-100)
@@ -529,14 +616,20 @@ export default function SerpOverviewToolPage() {
         )}
       </form>
 
-      {skippedDuplicates.length > 0 && (
-        <p className="text-xs text-sky-700 dark:text-sky-300">
-          Skipped {skippedDuplicates.length} previously-checked keyword
-          {skippedDuplicates.length === 1 ? "" : "s"} (same country &amp;
-          result count, within the ignore window):{" "}
-          {skippedDuplicates.slice(0, 5).join(", ")}
-          {skippedDuplicates.length > 5 ? "…" : ""}
+      {multiNotice && (
+        <p className="text-xs text-neutral-600 dark:text-neutral-300">
+          {multiNotice}
         </p>
+      )}
+
+      {dupNotices.length > 0 && (
+        <div className="space-y-0.5">
+          {dupNotices.map((n, i) => (
+            <p key={i} className="text-xs text-sky-700 dark:text-sky-300">
+              {n}
+            </p>
+          ))}
+        </div>
       )}
 
       {status && (
