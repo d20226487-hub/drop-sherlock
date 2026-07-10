@@ -820,11 +820,14 @@ def delete_job(job_id: int, db: Session = Depends(get_db)) -> dict:
     db.query(JobCriterionPin).filter(
         JobCriterionPin.job_id == job.id
     ).delete(synchronize_session=False)
-    # linked_domain_rows likewise has no FK cascade — bulk-delete by the
-    # denormalized job_id so a linked_domains job's output rows don't leak.
-    from ..models import LinkedDomainRow
+    # linked_domain_rows / serp_overview_rows likewise have no FK cascade —
+    # bulk-delete by the denormalized job_id so output rows don't leak.
+    from ..models import LinkedDomainRow, SerpOverviewRow
     db.query(LinkedDomainRow).filter(
         LinkedDomainRow.job_id == job.id
+    ).delete(synchronize_session=False)
+    db.query(SerpOverviewRow).filter(
+        SerpOverviewRow.job_id == job.id
     ).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
@@ -873,10 +876,14 @@ def bulk_delete_jobs(
         db.query(JobCriterionPin).filter(
             JobCriterionPin.job_id.in_(found_ids)
         ).delete(synchronize_session=False)
-        # Same for linked_domain_rows (no FK cascade) — bulk-delete by job_id.
-        from ..models import LinkedDomainRow
+        # Same for linked_domain_rows / serp_overview_rows (no FK cascade)
+        # — bulk-delete by job_id.
+        from ..models import LinkedDomainRow, SerpOverviewRow
         db.query(LinkedDomainRow).filter(
             LinkedDomainRow.job_id.in_(found_ids)
+        ).delete(synchronize_session=False)
+        db.query(SerpOverviewRow).filter(
+            SerpOverviewRow.job_id.in_(found_ids)
         ).delete(synchronize_session=False)
     for j in found:
         db.delete(j)
@@ -2347,11 +2354,12 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
     # relying on NULL-units, because that's clearer + future-proof
     # against accidentally counting some non-Ahrefs criterion.
     AHREFS_CRITERIA = frozenset(
-        # linked_domains added 2026-07-02 — its per-target CRs carry
-        # units_cost_* exactly like B/D/A/K (cached_from_run_id always NULL,
-        # so every one counts as a fresh Ahrefs call), so the Linked Domains
-        # Checker's spend surfaces in the run cost.
-        ("backlinks", "refdomains", "anchors", "keywords", "linked_domains")
+        # linked_domains added 2026-07-02, serp_overview 2026-07-10 — their
+        # per-target CRs carry units_cost_* exactly like B/D/A/K
+        # (cached_from_run_id always NULL, so every one counts as a fresh
+        # Ahrefs call), so those tools' spend surfaces in the run cost.
+        ("backlinks", "refdomains", "anchors", "keywords",
+         "linked_domains", "serp_overview")
     )
     ahrefs_units_billed = 0
     ahrefs_units_list = 0
@@ -2565,11 +2573,15 @@ def delete_run_route(run_id: int, db: Session = Depends(get_db)) -> dict:
                 f"run is a data source for run(s) {preview}{more} — "
                 f"delete those first",
             )
-    # linked_domain_rows has no FK cascade — bulk-delete this run's output
-    # rows by the denormalized run_id before dropping the run.
-    from ..models import LinkedDomainRow
+    # linked_domain_rows / serp_overview_rows have no FK cascade —
+    # bulk-delete this run's output rows by the denormalized run_id
+    # before dropping the run.
+    from ..models import LinkedDomainRow, SerpOverviewRow
     db.query(LinkedDomainRow).filter(
         LinkedDomainRow.run_id == run_id
+    ).delete(synchronize_session=False)
+    db.query(SerpOverviewRow).filter(
+        SerpOverviewRow.run_id == run_id
     ).delete(synchronize_session=False)
     db.delete(run)
     db.commit()
@@ -3520,18 +3532,32 @@ def export_ahrefs_batch_analysis_csv(run_id: int, db: Session = Depends(get_db))
 
 
 @runs_router.get("/{run_id}/linked-domains.csv")
-def export_linked_domains_csv(run_id: int, db: Session = Depends(get_db)):
-    """Stream the UNIQUE linked domains found across all targets of a
-    linked_domains run as a single-column CSV. Deduped + sorted via the
-    (run_id, linked_domain) composite index and streamed with yield_per so
-    a ~1M-row run exports without loading every row into memory."""
+def export_linked_domains_csv(
+    run_id: int, scope: str = "new", db: Session = Depends(get_db)
+):
+    """Stream a linked_domains run's unique linked domains as CSV.
+
+    scope='new' (the DEFAULT, 2026-07-10 per user): only domains that NO
+    EARLIER run (smaller run_id) had ever collected — "what did this run
+    newly discover". The batch workflow feeds each run's fresh finds
+    downstream, so re-exporting the ~90% overlap with prior runs was
+    noise. scope='all' returns every unique domain in the run regardless
+    of history (the original behavior).
+
+    Both scopes stream via yield_per (flat memory). The new-only filter
+    is an anti-join probing the (linked_domain, run_id) composite index
+    per candidate domain, so it stays index-served at scale."""
     import csv
     import io
 
     from fastapi.responses import StreamingResponse
+    from sqlalchemy import and_, exists
+    from sqlalchemy.orm import aliased
 
     from ..models import LinkedDomainRow
 
+    if scope not in ("new", "all"):
+        raise HTTPException(400, "scope must be 'new' or 'all'")
     run = db.get(Run, run_id)
     if run is None:
         raise HTTPException(404, "run not found")
@@ -3549,13 +3575,19 @@ def export_linked_domains_csv(run_id: int, db: Session = Depends(get_db)):
         writer.writerow(["linked_domain"])
         yield _flush()
 
-        # DISTINCT + ORDER BY served straight off the (run_id, linked_domain)
-        # composite index; yield_per streams a server-side cursor so memory
-        # stays flat regardless of the run's size.
+        q = db.query(LinkedDomainRow.linked_domain).filter(
+            LinkedDomainRow.run_id == run_id
+        )
+        if scope == "new":
+            prior = aliased(LinkedDomainRow)
+            q = q.filter(
+                ~exists().where(and_(
+                    prior.linked_domain == LinkedDomainRow.linked_domain,
+                    prior.run_id < run_id,
+                ))
+            )
         q = (
-            db.query(LinkedDomainRow.linked_domain)
-            .filter(LinkedDomainRow.run_id == run_id)
-            .distinct()
+            q.distinct()
             .order_by(LinkedDomainRow.linked_domain)
             .yield_per(1000)
         )
@@ -3567,7 +3599,129 @@ def export_linked_domains_csv(run_id: int, db: Session = Depends(get_db)):
                 yield _flush()
         yield _flush()
 
-    filename = f"linked-domains-run-{run_id}.csv"
+    suffix = "-new" if scope == "new" else ""
+    filename = f"linked-domains-run-{run_id}{suffix}.csv"
+    return StreamingResponse(
+        _rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@runs_router.get("/{run_id}/serp-overview.csv")
+def export_serp_overview_csv(run_id: int, db: Session = Depends(get_db)):
+    """Stream a serp_overview run's (keyword, position, url) rows as CSV,
+    ordered by keyword then SERP position. Served off the
+    (run_id, keyword) composite index with yield_per, so even a
+    500-keyword × 100-URL run exports with flat memory."""
+    import csv
+    import io
+
+    from fastapi.responses import StreamingResponse
+
+    from ..models import SerpOverviewRow
+
+    run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+
+    def _rows():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+
+        def _flush() -> str:
+            out = buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            return out
+
+        writer.writerow(["keyword", "position", "url"])
+        yield _flush()
+
+        q = (
+            db.query(
+                SerpOverviewRow.keyword,
+                SerpOverviewRow.position,
+                SerpOverviewRow.url,
+            )
+            .filter(SerpOverviewRow.run_id == run_id)
+            .order_by(SerpOverviewRow.keyword, SerpOverviewRow.position)
+            .yield_per(1000)
+        )
+        n = 0
+        for kw, pos, u in q:
+            writer.writerow([kw, pos if pos is not None else "", u])
+            n += 1
+            if n % 1000 == 0:
+                yield _flush()
+        yield _flush()
+
+    filename = f"serp-overview-run-{run_id}.csv"
+    return StreamingResponse(
+        _rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@runs_router.get("/{run_id}/serp-overview-domains.csv")
+def export_serp_overview_domains_csv(
+    run_id: int, db: Session = Depends(get_db)
+):
+    """Unique ranking DOMAINS across every keyword of a serp_overview run —
+    the 'just give me the domains' companion to the full keyword/position/url
+    export. Domain = URL hostname, lowercased, leading `www.` stripped
+    (no public-suffix collapsing — blog.example.com stays distinct from
+    example.com). Deduped across the whole run, sorted A→Z."""
+    import csv
+    import io
+    from urllib.parse import urlsplit
+
+    from fastapi.responses import StreamingResponse
+
+    from ..models import SerpOverviewRow
+
+    run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+
+    def _rows():
+        hosts: set[str] = set()
+        q = (
+            db.query(SerpOverviewRow.url)
+            .filter(SerpOverviewRow.run_id == run_id)
+            .yield_per(1000)
+        )
+        for (u,) in q:
+            try:
+                host = (urlsplit(u or "").hostname or "").lower()
+            except ValueError:
+                host = ""
+            if host.startswith("www."):
+                host = host[4:]
+            if host:
+                hosts.add(host)
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+
+        def _flush() -> str:
+            out = buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            return out
+
+        writer.writerow(["domain"])
+        yield _flush()
+        n = 0
+        for host in sorted(hosts):
+            writer.writerow([host])
+            n += 1
+            if n % 1000 == 0:
+                yield _flush()
+        yield _flush()
+
+    filename = f"serp-overview-domains-run-{run_id}.csv"
     return StreamingResponse(
         _rows(),
         media_type="text/csv",

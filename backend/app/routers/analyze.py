@@ -929,3 +929,267 @@ def list_linked_domains_runs(
             units_billed=units_by_run.get(run.id, 0),
         ))
     return out
+
+
+@router.get("/linked-domains/domains.csv")
+def export_all_linked_domains_csv(db: Session = Depends(get_db)):
+    """GLOBAL unique-linked-domains export: every distinct linked domain
+    ever collected across ALL linked_domains runs, sorted A→Z, one column.
+
+    Safe at scale by construction: the DISTINCT + ORDER BY is served by
+    the single-column ix_linked_domain_rows_domain index (ordered index
+    walk, no temp sort), rows stream via yield_per with a reused buffer
+    (flat memory), and SQLite WAL means this read never blocks an
+    in-flight runner's writes."""
+    import csv
+    import io
+
+    from fastapi.responses import StreamingResponse
+
+    from ..models import LinkedDomainRow
+
+    def _rows():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+
+        def _flush() -> str:
+            out = buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            return out
+
+        writer.writerow(["linked_domain"])
+        yield _flush()
+        q = (
+            db.query(LinkedDomainRow.linked_domain)
+            .distinct()
+            .order_by(LinkedDomainRow.linked_domain)
+            .yield_per(1000)
+        )
+        n = 0
+        for (dom,) in q:
+            writer.writerow([dom])
+            n += 1
+            if n % 1000 == 0:
+                yield _flush()
+        yield _flush()
+
+    return StreamingResponse(
+        _rows(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition":
+                'attachment; filename="linked-domains-all-runs.csv"',
+        },
+    )
+
+
+# --- SERP Overview submit (added 2026-07-10) --------------------------------
+#
+# Persistent-job successor to the stateless /tools/ahrefs-serp-overview
+# probe — same pattern as /analyze/linked-domains but the targets are
+# KEYWORDS (stored in RunDomain.domain), so there is no ban-list filter.
+
+_SERP_MAX_KEYWORDS = 500
+
+
+class SubmitSerpOverviewIn(BaseModel):
+    keywords: list[str]
+    # Two-letter ISO-3166-1 alpha-2 country code (required by the API).
+    country: str
+    # Cap on top organic positions per keyword (1-100); None = all.
+    top_positions: int | None = 10
+    # Optional per-run Ahrefs unit budget; None = uncapped.
+    unit_budget: int | None = None
+    name: str | None = None
+    notes: str | None = None
+
+
+class SubmitSerpOverviewOut(BaseModel):
+    job_id: int
+    run_id: int
+
+
+@router.post("/serp-overview", response_model=SubmitSerpOverviewOut)
+async def submit_serp_overview_job(
+    payload: SubmitSerpOverviewIn, db: Session = Depends(get_db)
+) -> SubmitSerpOverviewOut:
+    """Mint a Job(kind='serp_overview') + first Run + one RunDomain per
+    keyword, then dispatch the per-keyword runner. Mirrors
+    submit_linked_domains_job minus the ban filter (keywords, not domains)."""
+    country = (payload.country or "").strip().lower()
+    if len(country) != 2 or not country.isalpha():
+        raise HTTPException(400, "country must be a two-letter code")
+    top_positions = payload.top_positions
+    if top_positions is not None and not (1 <= top_positions <= 100):
+        raise HTTPException(400, "top_positions must be between 1 and 100")
+    unit_budget = payload.unit_budget
+    if unit_budget is not None and unit_budget < 1:
+        raise HTTPException(400, "unit_budget must be >= 1")
+
+    # Normalize + dedupe keywords (lower-cased + stripped, preserving
+    # order) — Ahrefs SERPs are case-insensitive, same rule as the probe.
+    seen: set[str] = set()
+    keywords: list[str] = []
+    for raw in payload.keywords:
+        k = (raw or "").strip().lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        keywords.append(k)
+    if not keywords:
+        raise HTTPException(400, "at least one keyword is required")
+    if len(keywords) > _SERP_MAX_KEYWORDS:
+        raise HTTPException(
+            400,
+            f"max {_SERP_MAX_KEYWORDS:,} keywords per run "
+            f"(you have {len(keywords):,})",
+        )
+
+    spec_dict = {
+        "domains": keywords,
+        "criteria": {
+            "backlinks": {"enabled": False},
+            "refdomains": {"enabled": False},
+            "anchors": {"enabled": False},
+            "keywords": {"enabled": False},
+            "wayback": {"enabled": False},
+            "wayback_classify": {"enabled": False},
+            "whois_history": {"enabled": False},
+            "availability": {"enabled": False},
+            "ahrefs_batch_analysis": {"enabled": False},
+            "linked_domains": {"enabled": False},
+            "serp_overview": {
+                "enabled": True,
+                "country": country,
+                "top_positions": top_positions,
+                "unit_budget": unit_budget,
+            },
+        },
+        "ai": {"provider": None, "model": None},
+        "use_cache": False,
+        "cross_job_cache": False,
+        "lang": "en",
+    }
+    norm_spec = AnalyzeSpec.model_validate(spec_dict)
+    spec_json = norm_spec.model_dump_json()
+
+    name = (payload.name or "").strip() or _autoname(keywords)
+    notes = (payload.notes or "").strip()
+
+    job = Job(
+        name=name,
+        notes=notes,
+        spec_json=spec_json,
+        kind="serp_overview",
+    )
+    db.add(job)
+    db.flush()
+
+    run = Run(job_id=job.id, status="pending", spec_json=spec_json)
+    db.add(run)
+    db.flush()
+
+    db.bulk_insert_mappings(
+        RunDomain,
+        [
+            {"run_id": run.id, "domain": k, "status": "pending"}
+            for k in keywords
+        ],
+    )
+    db.commit()
+
+    dispatch_run(run.id)
+    return SubmitSerpOverviewOut(job_id=job.id, run_id=run.id)
+
+
+class SerpOverviewRunSummary(BaseModel):
+    job_id: int
+    run_id: int
+    name: str
+    status: str
+    created_at: datetime
+    keywords_total: int
+    keywords_done: int
+    keywords_failed: int
+    urls_total: int
+    units_billed: int
+
+
+@router.get(
+    "/serp-overview/runs", response_model=list[SerpOverviewRunSummary]
+)
+def list_serp_overview_runs(
+    limit: int = 50, db: Session = Depends(get_db)
+) -> list[SerpOverviewRunSummary]:
+    """Recent serp_overview runs for the Tools-page history (most-recent
+    first) — same contract as the linked-domains history: everything is
+    already stored, so a run stays revisitable after leaving the page."""
+    from sqlalchemy import func as sfunc
+
+    from ..models import CriterionResult, Job, RunDomain, SerpOverviewRow
+
+    rows = (
+        db.query(Run, Job)
+        .join(Job, Run.job_id == Job.id)
+        .filter(Job.kind == "serp_overview")
+        .order_by(Run.id.desc())
+        .limit(max(1, min(limit, 200)))
+        .all()
+    )
+    if not rows:
+        return []
+    run_ids = [r.id for r, _ in rows]
+
+    status_counts: dict[int, dict[str, int]] = {}
+    for rid, status, cnt in (
+        db.query(RunDomain.run_id, RunDomain.status, sfunc.count(RunDomain.id))
+        .filter(RunDomain.run_id.in_(run_ids))
+        .group_by(RunDomain.run_id, RunDomain.status)
+        .all()
+    ):
+        status_counts.setdefault(rid, {})[status] = cnt
+
+    urls_by_run = {
+        rid: int(cnt)
+        for rid, cnt in (
+            db.query(SerpOverviewRow.run_id, sfunc.count(SerpOverviewRow.id))
+            .filter(SerpOverviewRow.run_id.in_(run_ids))
+            .group_by(SerpOverviewRow.run_id)
+            .all()
+        )
+    }
+
+    units_by_run = {
+        rid: int(total or 0)
+        for rid, total in (
+            db.query(
+                RunDomain.run_id,
+                sfunc.sum(CriterionResult.units_cost_actual),
+            )
+            .join(CriterionResult, CriterionResult.run_domain_id == RunDomain.id)
+            .filter(
+                RunDomain.run_id.in_(run_ids),
+                CriterionResult.criterion == "serp_overview",
+            )
+            .group_by(RunDomain.run_id)
+            .all()
+        )
+    }
+
+    out: list[SerpOverviewRunSummary] = []
+    for run, job in rows:
+        sc = status_counts.get(run.id, {})
+        out.append(SerpOverviewRunSummary(
+            job_id=job.id,
+            run_id=run.id,
+            name=job.name or "",
+            status=run.status,
+            created_at=run.started_at or job.created_at,
+            keywords_total=sum(sc.values()),
+            keywords_done=sc.get("done", 0),
+            keywords_failed=sc.get("failed", 0),
+            urls_total=urls_by_run.get(run.id, 0),
+            units_billed=units_by_run.get(run.id, 0),
+        ))
+    return out

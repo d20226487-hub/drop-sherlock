@@ -361,6 +361,30 @@ class LinkedDomainsConfig(BaseModel):
     unit_budget: int | None = Field(default=None, ge=1)
 
 
+class SerpOverviewConfig(BaseModel):
+    """SERP Overview criterion config (added 2026-07-10).
+
+    Persistent-job successor to the stateless /tools/ahrefs-serp-overview
+    probe: one Ahrefs /serp-overview call per keyword (the RunDomain's
+    `domain` column carries the keyword). Knobs:
+
+    - `country`: two-letter ISO-3166-1 alpha-2 code (required by the API;
+      lower-cased at submit).
+    - `top_positions`: cap on top organic positions returned per keyword
+      (1-100; None = all available — more rows can cost above the ~50-unit
+      per-keyword floor).
+    - `unit_budget`: same auto-pause ceiling contract as LinkedDomainsConfig.
+
+    Output is url-only (`select=url`, cheapest column set); the runner
+    writes ranking URLs to serp_overview_rows and per-keyword status/units
+    to a CriterionResult(criterion='serp_overview')."""
+
+    enabled: bool = False
+    country: str = "us"
+    top_positions: int | None = Field(default=10, ge=1, le=100)
+    unit_budget: int | None = Field(default=None, ge=1)
+
+
 class CriteriaSpec(BaseModel):
     backlinks: BacklinksConfig = Field(default_factory=BacklinksConfig)
     refdomains: RefdomainsConfig = Field(default_factory=RefdomainsConfig)
@@ -382,6 +406,9 @@ class CriteriaSpec(BaseModel):
     linked_domains: LinkedDomainsConfig = Field(
         default_factory=LinkedDomainsConfig
     )
+    serp_overview: SerpOverviewConfig = Field(
+        default_factory=SerpOverviewConfig
+    )
 
 
 # Pillar-only criteria — Quality runs' per-domain loop never dispatches
@@ -392,7 +419,7 @@ class CriteriaSpec(BaseModel):
 # (2026-05-24 — caused runs 124/126's whois "stuck running" cohort).
 PILLAR_ONLY_CRITERIA: tuple[str, ...] = (
     "whois_history", "availability", "ahrefs_batch_analysis",
-    "linked_domains",
+    "linked_domains", "serp_overview",
 )
 
 

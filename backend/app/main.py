@@ -235,6 +235,15 @@ def _migrate_sqlite_columns() -> None:
         # ix_run_domains_run_id redundant for these queries, but it's left
         # in place (harmless; still used by other run_id-only lookups).
         ("ix_run_domains_run_id_status", "run_domains", "run_id, status"),
+        # Added 2026-07-10 — serves the GLOBAL unique-linked-domains export
+        # (`SELECT DISTINCT linked_domain ... ORDER BY linked_domain` across
+        # ALL runs; the (run_id, linked_domain) composite created with the
+        # table can't — run_id-leftmost) AND the new-only per-run export's
+        # anti-join probe (covering on (linked_domain, run_id), no row
+        # fetch). Backfills existing DBs; fresh installs get it from the
+        # model's __table_args__.
+        ("ix_linked_domain_rows_domain_run", "linked_domain_rows",
+         "linked_domain, run_id"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in additions:

@@ -568,6 +568,9 @@ def dispatch_run(run_id: int) -> asyncio.Task:
     if kind == "linked_domains":
         from .linked_domains_runner import process_linked_domains_run
         return asyncio.create_task(process_linked_domains_run(run_id))
+    if kind == "serp_overview":
+        from .serp_overview_runner import process_serp_overview_run
+        return asyncio.create_task(process_serp_overview_run(run_id))
     return asyncio.create_task(process_run(run_id))
 
 

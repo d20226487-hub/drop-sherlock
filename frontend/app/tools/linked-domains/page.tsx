@@ -66,6 +66,32 @@ function fmtDate(iso: string): string {
   });
 }
 
+// Copy text to the clipboard with a fallback for non-secure contexts
+// (the LAN deploy is plain http, where navigator.clipboard is undefined).
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to the textarea fallback
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export default function LinkedDomainsToolPage() {
   const [domainsRaw, setDomainsRaw] = useState("");
   const [rootOnly, setRootOnly] = useState(false);
@@ -82,6 +108,8 @@ export default function LinkedDomainsToolPage() {
   const [skippedAlreadyChecked, setSkippedAlreadyChecked] = useState<string[]>(
     [],
   );
+  const [copied, setCopied] = useState<string | null>(null);
+  const [copiedAll, setCopiedAll] = useState<string | null>(null);
   const [history, setHistory] = useState<LinkedRunHistoryItem[]>([]);
 
   function parseDomains(): string[] {
@@ -247,7 +275,36 @@ export default function LinkedDomainsToolPage() {
     setStatus(null);
     setCost(null);
     setSkippedBanned([]);
+    setCopied(null);
     setRunId(id);
+  }
+
+  // Copy the run's NEW unique linked domains (newline-joined) — domains
+  // no earlier run had seen, matching the default export scope.
+  async function copyDomains() {
+    if (runId == null) return;
+    try {
+      const res = await fetch(
+        `/api/runs/${runId}/linked-domains.csv?scope=new`,
+      );
+      if (!res.ok) {
+        setCopied("Copy failed");
+      } else {
+        const text = await res.text();
+        const domains = text
+          .split(/\r?\n/)
+          .slice(1)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const ok = await copyText(domains.join("\n"));
+        setCopied(
+          ok ? `Copied ${domains.length} domains ✓` : "Copy failed",
+        );
+      }
+    } catch {
+      setCopied("Copy failed");
+    }
+    setTimeout(() => setCopied(null), 2500);
   }
 
   // Resume a paused run straight from the history table, then refresh
@@ -260,6 +317,31 @@ export default function LinkedDomainsToolPage() {
     }
     viewRun(id);
     loadHistory();
+  }
+
+  // Copy the GLOBAL unique linked-domain set (every run ever, deduped).
+  // ~160k domains ≈ 2.5 MB of text — fine for the clipboard.
+  async function copyAllDomains() {
+    try {
+      const res = await fetch("/api/analyze/linked-domains/domains.csv");
+      if (!res.ok) {
+        setCopiedAll("Copy failed");
+      } else {
+        const text = await res.text();
+        const domains = text
+          .split(/\r?\n/)
+          .slice(1)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const ok = await copyText(domains.join("\n"));
+        setCopiedAll(
+          ok ? `Copied ${domains.length.toLocaleString()} ✓` : "Copy failed",
+        );
+      }
+    } catch {
+      setCopiedAll("Copy failed");
+    }
+    setTimeout(() => setCopiedAll(null), 2500);
   }
 
   const isActive = status != null && !LINKED_TERMINAL.includes(status.status);
@@ -487,12 +569,27 @@ export default function LinkedDomainsToolPage() {
           )}
 
           {isTerminal && (
-            <a
-              href={`/api/runs/${status.id}/linked-domains.csv`}
-              className="inline-block rounded bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-4 py-2 text-sm font-medium"
-            >
-              Download unique domains CSV
-            </a>
+            <div className="flex flex-wrap items-center gap-2">
+              <a
+                href={`/api/runs/${status.id}/linked-domains.csv?scope=new`}
+                className="inline-block rounded bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-4 py-2 text-sm font-medium"
+              >
+                Download NEW domains CSV
+              </a>
+              <a
+                href={`/api/runs/${status.id}/linked-domains.csv?scope=all`}
+                className="inline-block rounded border dark:border-neutral-700 px-4 py-2 text-sm font-medium"
+              >
+                All run domains CSV
+              </a>
+              <button
+                type="button"
+                onClick={copyDomains}
+                className="rounded border dark:border-neutral-700 px-4 py-2 text-sm font-medium"
+              >
+                {copied ?? "Copy new domains"}
+              </button>
+            </div>
           )}
         </div>
       )}
@@ -500,7 +597,25 @@ export default function LinkedDomainsToolPage() {
       {/* Recent runs — persistent history so past runs can be re-opened
           and downloaded even after a page reload. */}
       <section className="space-y-2">
-        <h2 className="text-lg font-semibold">Recent runs</h2>
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <h2 className="text-lg font-semibold">Recent runs</h2>
+          {/* Global export — every run ever, deduped across runs. */}
+          <div className="flex items-center gap-2">
+            <a
+              href="/api/analyze/linked-domains/domains.csv"
+              className="rounded border dark:border-neutral-700 px-3 py-1.5 text-xs font-medium"
+            >
+              Download all unique domains (all runs)
+            </a>
+            <button
+              type="button"
+              onClick={copyAllDomains}
+              className="rounded border dark:border-neutral-700 px-3 py-1.5 text-xs font-medium"
+            >
+              {copiedAll ?? "Copy all"}
+            </button>
+          </div>
+        </div>
         <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 overflow-x-auto">
           {history.length === 0 ? (
             <p className="text-sm text-neutral-500 dark:text-neutral-400 px-4 py-6">
@@ -566,10 +681,16 @@ export default function LinkedDomainsToolPage() {
                           View
                         </button>
                         <a
-                          href={`/api/runs/${h.run_id}/linked-domains.csv`}
+                          href={`/api/runs/${h.run_id}/linked-domains.csv?scope=new`}
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
-                          Download CSV
+                          New CSV
+                        </a>
+                        <a
+                          href={`/api/runs/${h.run_id}/linked-domains.csv?scope=all`}
+                          className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
+                        >
+                          All CSV
                         </a>
                         {h.status === "paused" && (
                           <button

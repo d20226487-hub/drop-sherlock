@@ -514,6 +514,14 @@ class LinkedDomainRow(Base):
     __tablename__ = "linked_domain_rows"
     __table_args__ = (
         Index("ix_linked_domain_rows_run_domain", "run_id", "linked_domain"),
+        # (linked_domain, run_id) composite (added 2026-07-10) — serves BOTH
+        # the GLOBAL unique-domains export (ordered DISTINCT on the leftmost
+        # column; the run_id-leftmost composite above can't) AND the
+        # new-only per-run export's anti-join probe ("has any run with a
+        # smaller run_id seen this domain?" — covering, no row fetch).
+        # Existing DBs get it via the idempotent CREATE INDEX in
+        # main._migrate_sqlite_columns (create_all doesn't alter tables).
+        Index("ix_linked_domain_rows_domain_run", "linked_domain", "run_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -532,6 +540,43 @@ class LinkedDomainRow(Base):
     # DR of the linked domain — only populated if the run selected it
     # (non-default; the cost-optimal mode is domain-only). NULL otherwise.
     domain_rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+# --- SERP Overview job output (added 2026-07-10) ----------------------------
+#
+# Output store for the `serp_overview` Job kind — the persistent successor
+# to the stateless /tools/ahrefs-serp-overview probe. Each row is one
+# ranking-page URL for a keyword target (a RunDomain whose `domain` column
+# holds the keyword). Per-keyword status + Ahrefs unit accounting live on a
+# CriterionResult(criterion='serp_overview'), exactly like linked_domains.
+
+class SerpOverviewRow(Base):
+    """One ranking-page URL for a serp_overview-job keyword.
+
+    `keyword` + `run_id` + `job_id` are denormalized alongside the
+    `run_domain_id` FK so the CSV export is a single-table scan ordered by
+    (run_id, keyword) straight off the composite index. `position` is the
+    1-based order among the returned ranking URLs (SERP order, after
+    Ahrefs's null-url SERP-feature rows are dropped).
+
+    Cleanup: SQLite FK enforcement is OFF, so rows are removed explicitly —
+    the runner deletes a keyword's rows before re-inserting on resume, and
+    the job/run delete paths bulk-delete by job_id/run_id (same contract as
+    LinkedDomainRow)."""
+    __tablename__ = "serp_overview_rows"
+    __table_args__ = (
+        Index("ix_serp_overview_rows_run_kw", "run_id", "keyword"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_domain_id: Mapped[int] = mapped_column(
+        ForeignKey("run_domains.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[int] = mapped_column(Integer)
+    job_id: Mapped[int] = mapped_column(Integer, index=True)
+    keyword: Mapped[str] = mapped_column(String(512))
+    position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    url: Mapped[str] = mapped_column(Text, default="")
 
 
 # --- Error log + dismissals -------------------------------------------------

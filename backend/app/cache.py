@@ -114,6 +114,20 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
                 "per_target_limit": getattr(cfg, "per_target_limit", None),
             }).encode("utf-8")
         ).hexdigest()
+    # serp_overview (2026-07-10): same pillar contract as linked_domains —
+    # no quality-style `limit`/`filters`/`sort`; the request shape is
+    # country + top_positions. Branch REQUIRED so the boot-time
+    # `_backfill_params_hash` sweep doesn't choke on `.limit` (that
+    # AttributeError crash-loops the API — bit us when linked_domains
+    # shipped without it).
+    if criterion == "serp_overview":
+        return hashlib.sha256(
+            _stable_json({
+                "c": criterion,
+                "country": getattr(cfg, "country", None) or None,
+                "top_positions": getattr(cfg, "top_positions", None),
+            }).encode("utf-8")
+        ).hexdigest()
     payload: dict[str, Any] = {
         "c": criterion,
         "limit": cfg.limit,

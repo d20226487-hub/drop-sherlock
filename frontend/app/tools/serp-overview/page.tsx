@@ -1,22 +1,20 @@
 "use client";
 
-// Tool: bulk Ahrefs SERP Overview probe.
+// Tool: SERP Overview (persistent).
 //
-// Mirrors Ahrefs's SERP Overview API (/serp-overview). Input is a batch
-// of KEYWORDS; for each one we fetch the ranking-page URLs in the chosen
-// country, limited to the top N organic positions. To minimise Ahrefs
-// unit spend the backend SELECTs only `url` (the cheapest column set), so
-// the result table is deliberately just Keyword + URL.
-//
-// Stateless probe — no Job/Run/CR pipeline, no persistence; close the tab
-// and results are gone. POSTs to /api/tools/ahrefs-serp-overview.
-//
-// Split out 2026-07-02 from /tools/ahrefs-batch-analysis into its own tool
-// page.
+// Rebuilt 2026-07-10 from the stateless probe into a persistent,
+// resumable Job(kind='serp_overview') — same resilience contract as the
+// Linked Domains Checker: survives restarts (auto-pause + resume), unit
+// budget, live cost, and a runs history so past runs can be re-opened /
+// downloaded. Backend:
+//   POST   /api/analyze/serp-overview            → { job_id, run_id }
+//   GET    /api/runs/{id}/status                 → progress poll
+//   GET    /api/runs/{id}/cost                   → cost poll
+//   POST   /api/runs/{id}/{pause,resume,cancel}  → run controls
+//   GET    /api/runs/{id}/serp-overview.csv      → keyword,position,url export
+//   GET    /api/analyze/serp-overview/runs       → recent-runs history
 
-import { useMemo, useState } from "react";
-
-import { ResultsTable, type ResultsColumn } from "@/components/results-table";
+import { useCallback, useEffect, useState } from "react";
 
 // Curated country list (ISO 3166-1 alpha-2). Ahrefs accepts any valid
 // code; this covers the common ones for this operator's niche, with the
@@ -42,79 +40,154 @@ const SERP_COUNTRY_OPTIONS: { code: string; label: string }[] = [
   { code: "br", label: "Brazil (br)" },
 ];
 
-type SerpUrlRow = { url: string };
-
-type SerpKeywordResult = {
-  keyword: string;
-  http_status: number;
-  cost_row: number | null;
-  cost_total: number | null;
-  cost_actual: number | null;
-  // Raw position count before null-URL rows are dropped — lets us tell
-  // "Ahrefs has no SERP data" (0) from "only SERP features" (>0).
-  positions_count: number;
-  urls: SerpUrlRow[];
-  error: string;
+type SerpRunStatus = {
+  id: number;
+  status: string;
+  total: number;
+  pending: number;
+  running: number;
+  done: number;
+  failed: number;
 };
 
-type SerpToolOut = {
-  country: string;
-  top_positions: number | null;
-  results: SerpKeywordResult[];
-  totals: {
-    keywords_total: number;
-    keywords_ok: number;
-    urls: number;
-    cost_list_price: number;
-    cost_billed_actual: number;
-  };
+type SerpCost = {
+  ahrefs_units_billed: number;
+  ahrefs_units_list: number;
+  ahrefs_fresh_calls: number;
+  ahrefs_cached_calls: number;
 };
 
-// One flat row per (keyword, ranking-page URL) — what the results table
-// renders. Keeping it flat lets the shared ResultsTable handle search /
-// sort / pagination / CSV export for free.
-type SerpFlatRow = { keyword: string; url: string };
+// One row of the recent-runs history table. Mirrors the backend
+// /api/analyze/serp-overview/runs payload exactly.
+type SerpRunHistoryItem = {
+  job_id: number;
+  run_id: number;
+  name: string;
+  status: string;
+  created_at: string;
+  keywords_total: number;
+  keywords_done: number;
+  keywords_failed: number;
+  urls_total: number;
+  units_billed: number;
+};
 
-export default function SerpOverviewToolPage() {
-  return (
-    <main className="max-w-5xl mx-auto px-4 py-8 space-y-6">
-      <header className="space-y-1">
-        <h1 className="text-2xl font-semibold">Tool · SERP Overview</h1>
-        <p className="text-sm text-neutral-600 dark:text-neutral-400">
-          Bulk <code>/serp-overview</code> across a batch of{" "}
-          <strong>keywords</strong>. Returns the ranking-page{" "}
-          <strong>URLs</strong> per keyword for the chosen country, limited
-          to the top organic positions. Only the <code>url</code> column is
-          fetched to keep Ahrefs spend at the floor (~50 units/keyword).
-          Results are <strong>not persisted</strong>. Tip: keyword{" "}
-          <code>ahrefs</code> or <code>wordcount</code> probes for free.
-        </p>
-      </header>
+const SERP_TERMINAL = ["done", "failed", "canceled", "paused"];
 
-      <SerpOverviewSection />
-    </main>
-  );
+// Render an ISO timestamp as a compact local date+time. Falls back to
+// the raw string if it doesn't parse.
+function fmtDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
-function SerpOverviewSection() {
+// Copy text to the clipboard with a fallback for non-secure contexts
+// (the LAN deploy is plain http, where navigator.clipboard is undefined).
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to the textarea fallback
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+export default function SerpOverviewToolPage() {
   const [keywordsRaw, setKeywordsRaw] = useState("");
   const [country, setCountry] = useState("kz");
-  const [topPositions, setTopPositions] = useState(10);
-  const [concurrency, setConcurrency] = useState(4);
+  const [topPositions, setTopPositions] = useState("10");
+  const [unitBudget, setUnitBudget] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<SerpToolOut | null>(null);
+  const [runId, setRunId] = useState<number | null>(null);
+  const [status, setStatus] = useState<SerpRunStatus | null>(null);
+  const [cost, setCost] = useState<SerpCost | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
+  const [history, setHistory] = useState<SerpRunHistoryItem[]>([]);
 
-  // One keyword per line. Keep raw case for display but the backend
-  // folds case when deduping/sending.
   function parseKeywords(): string[] {
     return keywordsRaw
       .split(/\r?\n/)
       .map((s) => s.trim())
       .filter(Boolean);
   }
-
   const keywords = parseKeywords();
+
+  // Fetch the recent-runs history. Called on mount, after a successful
+  // submit, and whenever the active run reaches a terminal state.
+  const loadHistory = useCallback(async () => {
+    try {
+      const res = await fetch("/api/analyze/serp-overview/runs?limit=50");
+      if (!res.ok) return;
+      const data: SerpRunHistoryItem[] = await res.json();
+      setHistory(Array.isArray(data) ? data : []);
+    } catch {
+      return; // transient — history refreshes on the next trigger
+    }
+  }, []);
+
+  useEffect(() => {
+    loadHistory();
+  }, [loadHistory]);
+
+  // Poll run status while a run is active; stop at a terminal state and
+  // refresh history so the finished run's counts land in the table.
+  useEffect(() => {
+    if (runId == null) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let refreshedTerminal = false;
+    async function poll() {
+      try {
+        const [sRes, cRes] = await Promise.all([
+          fetch(`/api/runs/${runId}/status`),
+          fetch(`/api/runs/${runId}/cost`),
+        ]);
+        if (cancelled) return;
+        if (cRes.ok) setCost(await cRes.json());
+        if (!sRes.ok) return;
+        const data: SerpRunStatus = await sRes.json();
+        setStatus(data);
+        if (SERP_TERMINAL.includes(data.status)) {
+          if (timer) clearInterval(timer);
+          if (!refreshedTerminal) {
+            refreshedTerminal = true;
+            loadHistory();
+          }
+        }
+      } catch {
+        return; // transient — the next tick retries
+      }
+    }
+    poll();
+    timer = setInterval(poll, 2500);
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
+  }, [runId, loadHistory]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -124,28 +197,41 @@ function SerpOverviewSection() {
       return;
     }
     if (keywords.length > 500) {
-      setError(`Max 500 keywords per probe (you have ${keywords.length})`);
+      setError(`Max 500 keywords per run (you have ${keywords.length})`);
+      return;
+    }
+    const topNum = topPositions.trim() === "" ? null : Number(topPositions);
+    if (topNum != null && (Number.isNaN(topNum) || topNum < 1 || topNum > 100)) {
+      setError("Top positions must be between 1 and 100");
+      return;
+    }
+    const budgetNum = unitBudget.trim() === "" ? null : Number(unitBudget);
+    if (budgetNum != null && (Number.isNaN(budgetNum) || budgetNum < 1)) {
+      setError("Unit budget must be a positive number");
       return;
     }
     setBusy(true);
-    setResult(null);
+    setStatus(null);
+    setCost(null);
+    setRunId(null);
     try {
-      const res = await fetch("/api/tools/ahrefs-serp-overview", {
+      const res = await fetch("/api/analyze/serp-overview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           keywords,
           country,
-          top_positions: topPositions,
-          concurrency,
+          top_positions: topNum,
+          unit_budget: budgetNum,
         }),
       });
       if (!res.ok) {
         const t = await res.text();
         throw new Error(`HTTP ${res.status}: ${t.slice(0, 300)}`);
       }
-      const data: SerpToolOut = await res.json();
-      setResult(data);
+      const data = await res.json();
+      setRunId(data.run_id);
+      loadHistory();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -153,8 +239,89 @@ function SerpOverviewSection() {
     }
   }
 
+  async function control(action: "pause" | "resume" | "cancel") {
+    if (runId == null) return;
+    try {
+      await fetch(`/api/runs/${runId}/${action}`, { method: "POST" });
+      const res = await fetch(`/api/runs/${runId}/status`);
+      if (res.ok) setStatus(await res.json());
+    } catch {
+      return; // the poll loop reconciles
+    }
+  }
+
+  // View a past run: point the active runId at it so the polling effect
+  // (keyed on runId) loads and polls it.
+  function viewRun(id: number) {
+    setError(null);
+    setStatus(null);
+    setCost(null);
+    setCopied(null);
+    setRunId(id);
+  }
+
+  // Copy the run's unique ranking domains (newline-joined) — fetches the
+  // domains CSV and strips the header, so clipboard = paste-ready list.
+  async function copyDomains() {
+    if (runId == null) return;
+    try {
+      const res = await fetch(`/api/runs/${runId}/serp-overview-domains.csv`);
+      if (!res.ok) {
+        setCopied("Copy failed");
+      } else {
+        const text = await res.text();
+        const domains = text
+          .split(/\r?\n/)
+          .slice(1)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const ok = await copyText(domains.join("\n"));
+        setCopied(
+          ok ? `Copied ${domains.length} domains ✓` : "Copy failed",
+        );
+      }
+    } catch {
+      setCopied("Copy failed");
+    }
+    setTimeout(() => setCopied(null), 2500);
+  }
+
+  // Resume a paused run straight from the history table, then refresh
+  // history and open it in the status panel.
+  async function resumeRun(id: number) {
+    try {
+      await fetch(`/api/runs/${id}/resume`, { method: "POST" });
+    } catch {
+      // fall through — viewRun's poll loop reconciles the real state
+    }
+    viewRun(id);
+    loadHistory();
+  }
+
+  const isActive = status != null && !SERP_TERMINAL.includes(status.status);
+  const isTerminal = status != null && SERP_TERMINAL.includes(status.status);
+  const processed = status ? status.done + status.failed : 0;
+  const pct =
+    status && status.total > 0
+      ? Math.round((processed / status.total) * 100)
+      : 0;
+
   return (
-    <section className="space-y-4">
+    <main className="max-w-5xl mx-auto px-4 py-8 space-y-6">
+      <header className="space-y-1">
+        <h1 className="text-2xl font-semibold">Tool · SERP Overview</h1>
+        <p className="text-sm text-neutral-600 dark:text-neutral-400">
+          Bulk <code>/serp-overview</code> across a batch of{" "}
+          <strong>keywords</strong>: the ranking-page <strong>URLs</strong>{" "}
+          per keyword for the chosen country, limited to the top organic
+          positions. Runs as a <strong>persistent, resumable job</strong> —
+          survives restarts, and past runs stay downloadable below. Only the{" "}
+          <code>url</code> column is fetched to keep spend at the{" "}
+          <strong>~50 units/keyword</strong> floor. Tip: keyword{" "}
+          <code>ahrefs</code> or <code>wordcount</code> probes for free.
+        </p>
+      </header>
+
       <form
         onSubmit={submit}
         className="space-y-4 rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 p-4"
@@ -176,8 +343,6 @@ function SerpOverviewSection() {
           </span>
         </label>
 
-        {/* Filters: country + top_positions (the two Ahrefs SERP-overview
-            knobs the operator asked for). */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <label className="block">
             <span className="text-sm font-medium block mb-1">Country</span>
@@ -194,236 +359,237 @@ function SerpOverviewSection() {
               ))}
             </select>
           </label>
-
           <label className="block">
             <span className="text-sm font-medium block mb-1">
-              Top positions (1–100)
+              Top positions (1-100)
             </span>
             <input
               type="number"
               min={1}
               max={100}
               value={topPositions}
-              onChange={(e) =>
-                setTopPositions(
-                  Math.max(
-                    1,
-                    Math.min(100, parseInt(e.target.value || "1", 10)),
-                  ),
-                )
-              }
+              onChange={(e) => setTopPositions(e.target.value)}
+              placeholder="10"
               className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
               disabled={busy}
             />
           </label>
-
           <label className="block">
             <span className="text-sm font-medium block mb-1">
-              Concurrency (1–10)
+              Unit budget (optional)
             </span>
             <input
               type="number"
               min={1}
-              max={10}
-              value={concurrency}
-              onChange={(e) =>
-                setConcurrency(
-                  Math.max(
-                    1,
-                    Math.min(10, parseInt(e.target.value || "1", 10)),
-                  ),
-                )
-              }
+              value={unitBudget}
+              onChange={(e) => setUnitBudget(e.target.value)}
+              placeholder="auto-pause above N units"
               className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
               disabled={busy}
             />
           </label>
         </div>
 
-        <div className="flex items-center gap-3">
-          <button
-            type="submit"
-            disabled={busy || keywords.length === 0}
-            className="px-4 py-1.5 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 text-sm"
-          >
-            {busy ? "Probing…" : "Probe SERPs"}
-          </button>
-          <span className="text-xs text-neutral-500 dark:text-neutral-400">
-            {keywords.length > 0 ? (
-              <>
-                Estimated cost lower bound:{" "}
-                <strong>
-                  {(50 * keywords.length).toLocaleString()} units
-                </strong>{" "}
-                (~50/keyword floor × {keywords.length})
-              </>
-            ) : (
-              "Add keywords to estimate cost."
-            )}
-          </span>
-        </div>
+        <button
+          type="submit"
+          disabled={busy || keywords.length === 0}
+          className="rounded bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-4 py-2 text-sm font-medium disabled:opacity-50"
+        >
+          {busy ? "Submitting…" : "Run SERP overview"}
+        </button>
+
+        {error && (
+          <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+        )}
       </form>
 
-      {error && (
-        <div className="rounded-md border border-rose-300 dark:border-rose-900/60 bg-rose-50 dark:bg-rose-950/40 px-3 py-2 text-sm text-rose-800 dark:text-rose-300">
-          {error}
+      {status && (
+        <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 p-4 space-y-3">
+          <div className="flex items-center justify-between gap-4">
+            <div className="text-sm font-medium">
+              Run #{status.id} ·{" "}
+              <span className="uppercase tracking-wide">{status.status}</span>
+            </div>
+            <div className="flex gap-2">
+              {isActive && status.status === "running" && (
+                <button
+                  type="button"
+                  onClick={() => control("pause")}
+                  className="rounded border dark:border-neutral-700 px-3 py-1 text-xs"
+                >
+                  Pause
+                </button>
+              )}
+              {status.status === "paused" && (
+                <button
+                  type="button"
+                  onClick={() => control("resume")}
+                  className="rounded border dark:border-neutral-700 px-3 py-1 text-xs"
+                >
+                  Resume
+                </button>
+              )}
+              {isActive && (
+                <button
+                  type="button"
+                  onClick={() => control("cancel")}
+                  className="rounded border border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 px-3 py-1 text-xs"
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="h-2 w-full rounded bg-neutral-200 dark:bg-neutral-800 overflow-hidden">
+            <div
+              className="h-full bg-neutral-900 dark:bg-neutral-100 transition-all"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <div className="text-xs text-neutral-500 dark:text-neutral-400">
+            {processed}/{status.total} keywords · {status.done} done ·{" "}
+            {status.failed} failed · {status.running} running ·{" "}
+            {status.pending} pending
+          </div>
+
+          {cost && (
+            <div className="text-xs text-neutral-500 dark:text-neutral-400">
+              Ahrefs units:{" "}
+              <strong className="text-neutral-700 dark:text-neutral-200">
+                {cost.ahrefs_units_billed.toLocaleString()}
+              </strong>{" "}
+              billed
+              {cost.ahrefs_units_list !== cost.ahrefs_units_billed && (
+                <> · {cost.ahrefs_units_list.toLocaleString()} list price</>
+              )}{" "}
+              · {cost.ahrefs_fresh_calls} API call
+              {cost.ahrefs_fresh_calls === 1 ? "" : "s"}
+            </div>
+          )}
+
+          {isTerminal && (
+            <div className="flex flex-wrap items-center gap-2">
+              <a
+                href={`/api/runs/${status.id}/serp-overview.csv`}
+                className="inline-block rounded bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-4 py-2 text-sm font-medium"
+              >
+                Download CSV (keyword · position · URL)
+              </a>
+              <a
+                href={`/api/runs/${status.id}/serp-overview-domains.csv`}
+                className="inline-block rounded border dark:border-neutral-700 px-4 py-2 text-sm font-medium"
+              >
+                Download unique domains CSV
+              </a>
+              <button
+                type="button"
+                onClick={copyDomains}
+                className="rounded border dark:border-neutral-700 px-4 py-2 text-sm font-medium"
+              >
+                {copied ?? "Copy unique domains"}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
-      {result && <SerpOverviewResult result={result} />}
-    </section>
-  );
-}
-
-function SerpOverviewResult({ result }: { result: SerpToolOut }) {
-  // Flatten to (keyword, url) rows for the shared table. Keywords that
-  // returned no URLs (all-null SERP, or an error) contribute no rows but
-  // are still visible in the per-keyword status panel below.
-  const flatRows: SerpFlatRow[] = useMemo(() => {
-    const out: SerpFlatRow[] = [];
-    for (const r of result.results) {
-      for (const u of r.urls) {
-        out.push({ keyword: r.keyword, url: u.url });
-      }
-    }
-    return out;
-  }, [result.results]);
-
-  const columns: ResultsColumn<SerpFlatRow>[] = useMemo(
-    () => [
-      {
-        key: "keyword",
-        label: "Keyword",
-        render: (r) => r.keyword,
-        toExport: (r) => r.keyword,
-      },
-      {
-        key: "url",
-        label: "URL",
-        className: "font-mono break-all",
-        render: (r) => (
-          <a
-            href={r.url}
-            target="_blank"
-            rel="noreferrer"
-            className="text-blue-700 dark:text-blue-400 hover:underline"
-          >
-            {r.url}
-          </a>
-        ),
-        toExport: (r) => r.url,
-      },
-    ],
-    [],
-  );
-
-  // Keywords that came back empty or errored — surfaced so a 0-row
-  // result doesn't look like a silent failure.
-  const problems = result.results.filter(
-    (r) => r.error || (r.http_status === 200 && r.urls.length === 0),
-  );
-
-  return (
-    <div className="space-y-4">
-      {/* Cost summary card — mirrors the Ahrefs probe summary above. */}
-      <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 p-4">
-        <h3 className="text-lg font-semibold mb-2">Summary</h3>
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
-          <Stat label="Keywords" value={result.totals.keywords_total} />
-          <Stat
-            label="OK"
-            value={result.totals.keywords_ok}
-            tone={
-              result.totals.keywords_ok === result.totals.keywords_total
-                ? "good"
-                : "warn"
-            }
-          />
-          <Stat label="URLs" value={result.totals.urls} />
-          <Stat
-            label="List price"
-            value={`${result.totals.cost_list_price.toLocaleString()} u`}
-          />
-          <Stat
-            label="Billed actual"
-            value={`${result.totals.cost_billed_actual.toLocaleString()} u`}
-            tone={
-              result.totals.cost_billed_actual <
-              result.totals.cost_list_price
-                ? "good"
-                : "neutral"
-            }
-          />
+      {/* Recent runs — persistent history so past runs can be re-opened
+          and downloaded even after a page reload. */}
+      <section className="space-y-2">
+        <h2 className="text-lg font-semibold">Recent runs</h2>
+        <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 overflow-x-auto">
+          {history.length === 0 ? (
+            <p className="text-sm text-neutral-500 dark:text-neutral-400 px-4 py-6">
+              No runs yet.
+            </p>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="text-neutral-500 dark:text-neutral-400 border-b dark:border-neutral-800">
+                <tr>
+                  <th className="text-left font-medium px-3 py-2">Date</th>
+                  <th className="text-left font-medium px-3 py-2">Name</th>
+                  <th className="text-left font-medium px-3 py-2">Status</th>
+                  <th className="text-left font-medium px-3 py-2">Keywords</th>
+                  <th className="text-right font-medium px-3 py-2">URLs</th>
+                  <th className="text-right font-medium px-3 py-2">
+                    Ahrefs units
+                  </th>
+                  <th className="text-right font-medium px-3 py-2">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((h) => (
+                  <tr
+                    key={h.run_id}
+                    className={
+                      "border-t border-neutral-100 dark:border-neutral-800/60 " +
+                      (h.run_id === runId
+                        ? "bg-blue-50/60 dark:bg-blue-950/20"
+                        : "")
+                    }
+                  >
+                    <td className="px-3 py-2 whitespace-nowrap text-neutral-600 dark:text-neutral-300">
+                      {fmtDate(h.created_at)}
+                    </td>
+                    <td className="px-3 py-2">{h.name || `Run #${h.run_id}`}</td>
+                    <td className="px-3 py-2 uppercase tracking-wide text-xs">
+                      {h.status}
+                    </td>
+                    <td className="px-3 py-2 whitespace-nowrap tabular-nums">
+                      {h.keywords_done}/{h.keywords_total}
+                      {h.keywords_failed > 0 && (
+                        <span className="text-rose-600 dark:text-rose-400">
+                          {" "}
+                          · {h.keywords_failed} failed
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-right tabular-nums">
+                      {h.urls_total.toLocaleString()}
+                    </td>
+                    <td className="px-3 py-2 text-right tabular-nums">
+                      {h.units_billed.toLocaleString()}
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => viewRun(h.run_id)}
+                          className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
+                        >
+                          View
+                        </button>
+                        <a
+                          href={`/api/runs/${h.run_id}/serp-overview.csv`}
+                          className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
+                        >
+                          Download CSV
+                        </a>
+                        <a
+                          href={`/api/runs/${h.run_id}/serp-overview-domains.csv`}
+                          className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
+                        >
+                          Domains CSV
+                        </a>
+                        {h.status === "paused" && (
+                          <button
+                            type="button"
+                            onClick={() => resumeRun(h.run_id)}
+                            className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
+                          >
+                            Resume
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
-        <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-3">
-          Country: <code>{result.country}</code> · top positions:{" "}
-          <code>{result.top_positions ?? "all"}</code>. Billed-actual{" "}
-          {"<"} list price means Ahrefs's server-side cache hit on one or
-          more keywords.
-        </p>
-      </div>
-
-      <ResultsTable<SerpFlatRow>
-        rows={flatRows}
-        columns={columns}
-        csvFilename="ahrefs-serp-overview.csv"
-        emptyMessage="No ranking-page URLs returned."
-      />
-
-      {problems.length > 0 && (
-        <div className="rounded-md border border-amber-300 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-3 py-2 text-sm">
-          <p className="font-medium text-amber-800 dark:text-amber-300 mb-1">
-            {problems.length} keyword{problems.length === 1 ? "" : "s"} with
-            no URLs:
-          </p>
-          <ul className="space-y-0.5 text-xs text-amber-800/90 dark:text-amber-200/90">
-            {problems.map((r) => (
-              <li key={r.keyword}>
-                <span className="font-medium">{r.keyword}</span>
-                {" — "}
-                {r.error
-                  ? r.error
-                  : r.positions_count === 0
-                    ? `Ahrefs has no SERP snapshot for this keyword in “${result.country}” (still billed the ~50-unit floor)`
-                    : "only SERP features — no ranking-page URLs in the top positions"}
-              </li>
-            ))}
-          </ul>
-          <p className="text-[11px] text-amber-700/80 dark:text-amber-300/70 mt-1.5">
-            A keyword with no snapshot often has data in a different country
-            — e.g. the same term may return results under <code>us</code>.
-          </p>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Copied from /tools/ahrefs-batch-analysis (the batch page keeps its own
-// copy for its Summary card). Small stat cell used in the summary grid.
-function Stat({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: number | string;
-  tone?: "good" | "warn" | "neutral";
-}) {
-  const valueCls =
-    tone === "good"
-      ? "text-emerald-700 dark:text-emerald-400"
-      : tone === "warn"
-        ? "text-amber-700 dark:text-amber-400"
-        : "text-neutral-900 dark:text-neutral-100";
-  return (
-    <div>
-      <div className="text-xs uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
-        {label}
-      </div>
-      <div className={`text-lg font-semibold tabular-nums ${valueCls}`}>
-        {value}
-      </div>
-    </div>
+      </section>
+    </main>
   );
 }
