@@ -18,6 +18,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { useT } from "@/lib/i18n";
+
 type LinkedRunStatus = {
   id: number;
   status: string;
@@ -95,6 +97,9 @@ async function copyText(text: string): Promise<boolean> {
 }
 
 export default function LinkedDomainsToolPage() {
+  const { t } = useT();
+  const ts = t.pages.linkedDomains;
+  const tsh = t.pages.toolsShared;
   const [domainsRaw, setDomainsRaw] = useState("");
   const [perTargetLimit, setPerTargetLimit] = useState("");
   const [unitBudget, setUnitBudget] = useState("");
@@ -193,11 +198,11 @@ export default function LinkedDomainsToolPage() {
     e.preventDefault();
     setError(null);
     if (domains.length === 0) {
-      setError("Add at least one domain");
+      setError(ts.errAddDomain);
       return;
     }
     if (domains.length > 1000) {
-      setError(`Max 1000 domains per run (you have ${domains.length})`);
+      setError(ts.errMaxDomains(domains.length));
       return;
     }
     const limitNum =
@@ -206,12 +211,12 @@ export default function LinkedDomainsToolPage() {
       limitNum != null &&
       (Number.isNaN(limitNum) || limitNum < 1 || limitNum > 5000)
     ) {
-      setError("Per-target limit must be between 1 and 5000");
+      setError(ts.errPerTargetLimit);
       return;
     }
     const budgetNum = unitBudget.trim() === "" ? null : Number(unitBudget);
     if (budgetNum != null && (Number.isNaN(budgetNum) || budgetNum < 1)) {
-      setError("Unit budget must be a positive number");
+      setError(ts.errUnitBudget);
       return;
     }
     setBusy(true);
@@ -245,9 +250,7 @@ export default function LinkedDomainsToolPage() {
           code = "";
         }
         if (code === "all_already_checked") {
-          throw new Error(
-            `All ${count} domain(s) were already checked in a previous run — nothing new to run.`,
-          );
+          throw new Error(ts.errAllAlreadyChecked(count));
         }
         throw new Error(`HTTP ${res.status}: ${t.slice(0, 300)}`);
       }
@@ -294,7 +297,7 @@ export default function LinkedDomainsToolPage() {
         `/api/runs/${runId}/linked-domains.csv?scope=new`,
       );
       if (!res.ok) {
-        setCopied("Copy failed");
+        setCopied(tsh.copyFailed);
       } else {
         const text = await res.text();
         const domains = text
@@ -303,12 +306,10 @@ export default function LinkedDomainsToolPage() {
           .map((s) => s.trim())
           .filter(Boolean);
         const ok = await copyText(domains.join("\n"));
-        setCopied(
-          ok ? `Copied ${domains.length} domains ✓` : "Copy failed",
-        );
+        setCopied(ok ? ts.copyNewDone(domains.length) : tsh.copyFailed);
       }
     } catch {
-      setCopied("Copy failed");
+      setCopied(tsh.copyFailed);
     }
     setTimeout(() => setCopied(null), 2500);
   }
@@ -331,7 +332,7 @@ export default function LinkedDomainsToolPage() {
     try {
       const res = await fetch("/api/analyze/linked-domains/domains.csv");
       if (!res.ok) {
-        setCopiedAll("Copy failed");
+        setCopiedAll(tsh.copyFailed);
       } else {
         const text = await res.text();
         const domains = text
@@ -341,11 +342,11 @@ export default function LinkedDomainsToolPage() {
           .filter(Boolean);
         const ok = await copyText(domains.join("\n"));
         setCopiedAll(
-          ok ? `Copied ${domains.length.toLocaleString()} ✓` : "Copy failed",
+          ok ? tsh.copyAllDone(domains.length.toLocaleString()) : tsh.copyFailed,
         );
       }
     } catch {
-      setCopiedAll("Copy failed");
+      setCopiedAll(tsh.copyFailed);
     }
     setTimeout(() => setCopiedAll(null), 2500);
   }
@@ -389,17 +390,9 @@ export default function LinkedDomainsToolPage() {
   return (
     <main className="max-w-5xl mx-auto px-4 py-8 space-y-6">
       <header className="space-y-1">
-        <h1 className="text-2xl font-semibold">Tool · Linked Domains Checker</h1>
+        <h1 className="text-2xl font-semibold">{ts.title}</h1>
         <p className="text-sm text-neutral-600 dark:text-neutral-400">
-          For each domain, pull the external{" "}
-          <strong>domains it links out to</strong> via Ahrefs{" "}
-          <code>/linkeddomains</code> (one call per domain). Runs as a{" "}
-          <strong>persistent, resumable job</strong> — safe to leave running,
-          and it survives restarts. Export the <strong>unique</strong> linked
-          domains across all inputs as CSV. Only the <code>domain</code>{" "}
-          column is fetched — 1 unit per returned domain, with a{" "}
-          <strong>~50 units/domain</strong> floor. Tip: domain{" "}
-          <code>ahrefs.com</code> probes for free.
+          {ts.description}
         </p>
       </header>
 
@@ -409,24 +402,24 @@ export default function LinkedDomainsToolPage() {
       >
         <label className="block">
           <span className="text-sm font-medium block mb-1">
-            Domains (one per line · max 1000)
+            {ts.domainsLabel}
           </span>
           <textarea
             value={domainsRaw}
             onChange={(e) => setDomainsRaw(e.target.value)}
             rows={6}
-            placeholder={"example.com\nsomesite.org\nahrefs.com"}
+            placeholder={ts.domainsPlaceholder}
             className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-3 py-2 text-sm outline-none"
             disabled={busy}
           />
           <span className="text-xs text-neutral-500 dark:text-neutral-400 block mt-1">
-            Parsed: {domains.length} domain{domains.length === 1 ? "" : "s"}
+            {ts.parsedCount(domains.length)}
           </span>
         </label>
 
         <label className="block sm:max-w-xs">
           <span className="text-sm font-medium block mb-1">
-            Per-target limit (optional)
+            {ts.perTargetLimitLabel}
           </span>
           <input
             type="number"
@@ -434,7 +427,7 @@ export default function LinkedDomainsToolPage() {
             max={5000}
             value={perTargetLimit}
             onChange={(e) => setPerTargetLimit(e.target.value)}
-            placeholder="5000 (default)"
+            placeholder={ts.perTargetLimitPlaceholder}
             className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
             disabled={busy}
           />
@@ -449,9 +442,9 @@ export default function LinkedDomainsToolPage() {
             className="mt-0.5"
           />
           <span className="text-sm font-medium">
-            Skip already-checked domains
+            {ts.skipCheckedLabel}
             <span className="block text-xs font-normal text-neutral-500 dark:text-neutral-400">
-              drop domains that already completed in a previous run
+              {ts.skipCheckedHint}
             </span>
           </span>
         </label>
@@ -465,41 +458,40 @@ export default function LinkedDomainsToolPage() {
             className="mt-0.5"
           />
           <span className="text-sm font-medium">
-            Allowed TLDs only
+            {ts.allowedTldsLabel}
             <span className="block text-xs font-normal text-neutral-500 dark:text-neutral-400">
-              fetch only linked domains whose TLD is in the Settings
-              allowlist — filtered rows aren&apos;t billed
+              {ts.allowedTldsHint}
             </span>
           </span>
         </label>
 
         <label className="block sm:max-w-xs">
           <span className="text-sm font-medium block mb-1">
-            Unit budget (optional)
+            {ts.unitBudgetLabel}
           </span>
           <input
             type="number"
             min={1}
             value={unitBudget}
             onChange={(e) => setUnitBudget(e.target.value)}
-            placeholder="auto-pause above N units"
+            placeholder={ts.unitBudgetPlaceholder}
             className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
             disabled={busy}
           />
           <span className="text-xs text-neutral-500 dark:text-neutral-400 block mt-1">
-            Pauses the run (resumable) once Ahrefs spend crosses this ceiling.
+            {ts.unitBudgetHint}
           </span>
         </label>
 
         <label className="block sm:max-w-xs">
           <span className="text-sm font-medium block mb-1">
-            Job name (optional)
+            {ts.jobNameLabel}
           </span>
           <input
             type="text"
             value={jobName}
             onChange={(e) => setJobName(e.target.value)}
-            placeholder="auto-named from first domain"
+            placeholder={ts.jobNamePlaceholder}
             className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
             disabled={busy}
           />
@@ -510,7 +502,7 @@ export default function LinkedDomainsToolPage() {
           disabled={busy || domains.length === 0}
           className="rounded bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-4 py-2 text-sm font-medium disabled:opacity-50"
         >
-          {busy ? "Submitting…" : "Run checker"}
+          {busy ? ts.submitting : ts.submit}
         </button>
 
         {error && (
@@ -520,18 +512,21 @@ export default function LinkedDomainsToolPage() {
 
       {skippedBanned.length > 0 && (
         <p className="text-xs text-amber-700 dark:text-amber-300">
-          Skipped {skippedBanned.length} banned domain(s):{" "}
-          {skippedBanned.slice(0, 5).join(", ")}
-          {skippedBanned.length > 5 ? "…" : ""}
+          {ts.skippedBanned(
+            skippedBanned.length,
+            skippedBanned.slice(0, 5).join(", "),
+            skippedBanned.length > 5 ? "…" : "",
+          )}
         </p>
       )}
 
       {skippedAlreadyChecked.length > 0 && (
         <p className="text-xs text-sky-700 dark:text-sky-300">
-          Skipped {skippedAlreadyChecked.length} already-checked domain
-          {skippedAlreadyChecked.length === 1 ? "" : "s"} (from previous runs):{" "}
-          {skippedAlreadyChecked.slice(0, 5).join(", ")}
-          {skippedAlreadyChecked.length > 5 ? "…" : ""}
+          {ts.skippedAlreadyChecked(
+            skippedAlreadyChecked.length,
+            skippedAlreadyChecked.slice(0, 5).join(", "),
+            skippedAlreadyChecked.length > 5 ? "…" : "",
+          )}
         </p>
       )}
 
@@ -539,7 +534,7 @@ export default function LinkedDomainsToolPage() {
         <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 p-4 space-y-3">
           <div className="flex items-center justify-between gap-4">
             <div className="text-sm font-medium">
-              Run #{status.id} ·{" "}
+              {tsh.runNo(status.id)} ·{" "}
               <span className="uppercase tracking-wide">{status.status}</span>
             </div>
             <div className="flex gap-2">
@@ -549,7 +544,7 @@ export default function LinkedDomainsToolPage() {
                   onClick={() => control("pause")}
                   className="rounded border dark:border-neutral-700 px-3 py-1 text-xs"
                 >
-                  Pause
+                  {tsh.pause}
                 </button>
               )}
               {status.status === "paused" && (
@@ -558,7 +553,7 @@ export default function LinkedDomainsToolPage() {
                   onClick={() => control("resume")}
                   className="rounded border dark:border-neutral-700 px-3 py-1 text-xs"
                 >
-                  Resume
+                  {tsh.resume}
                 </button>
               )}
               {isActive && (
@@ -567,7 +562,7 @@ export default function LinkedDomainsToolPage() {
                   onClick={() => control("cancel")}
                   className="rounded border border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 px-3 py-1 text-xs"
                 >
-                  Cancel
+                  {tsh.cancel}
                 </button>
               )}
             </div>
@@ -580,23 +575,26 @@ export default function LinkedDomainsToolPage() {
             />
           </div>
           <div className="text-xs text-neutral-500 dark:text-neutral-400">
-            {processed}/{status.total} targets · {status.done} done ·{" "}
-            {status.failed} failed · {status.running} running ·{" "}
-            {status.pending} pending
+            {ts.progressCounts(
+              processed,
+              status.total,
+              status.done,
+              status.failed,
+              status.running,
+              status.pending,
+            )}
           </div>
 
           {cost && (
             <div className="text-xs text-neutral-500 dark:text-neutral-400">
-              Ahrefs units:{" "}
+              {tsh.unitsLabel}{" "}
               <strong className="text-neutral-700 dark:text-neutral-200">
                 {cost.ahrefs_units_billed.toLocaleString()}
               </strong>{" "}
-              billed
-              {cost.ahrefs_units_list !== cost.ahrefs_units_billed && (
-                <> · {cost.ahrefs_units_list.toLocaleString()} list price</>
-              )}{" "}
-              · {cost.ahrefs_fresh_calls} API call
-              {cost.ahrefs_fresh_calls === 1 ? "" : "s"}
+              {tsh.unitsBilled}
+              {cost.ahrefs_units_list !== cost.ahrefs_units_billed &&
+                tsh.unitsListPrice(cost.ahrefs_units_list.toLocaleString())}
+              {tsh.apiCalls(cost.ahrefs_fresh_calls)}
             </div>
           )}
 
@@ -606,20 +604,20 @@ export default function LinkedDomainsToolPage() {
                 href={`/api/runs/${status.id}/linked-domains.csv?scope=new`}
                 className="inline-block rounded bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-4 py-2 text-sm font-medium"
               >
-                Download NEW domains CSV
+                {ts.downloadNewCsv}
               </a>
               <a
                 href={`/api/runs/${status.id}/linked-domains.csv?scope=all`}
                 className="inline-block rounded border dark:border-neutral-700 px-4 py-2 text-sm font-medium"
               >
-                All run domains CSV
+                {ts.downloadAllRunCsv}
               </a>
               <button
                 type="button"
                 onClick={copyDomains}
                 className="rounded border dark:border-neutral-700 px-4 py-2 text-sm font-medium"
               >
-                {copied ?? "Copy new domains"}
+                {copied ?? ts.copyNew}
               </button>
             </div>
           )}
@@ -630,21 +628,21 @@ export default function LinkedDomainsToolPage() {
           and downloaded even after a page reload. */}
       <section className="space-y-2">
         <div className="flex items-center justify-between gap-3 flex-wrap">
-          <h2 className="text-lg font-semibold">Recent runs</h2>
+          <h2 className="text-lg font-semibold">{tsh.recentRuns}</h2>
           {/* Global export — every run ever, deduped across runs. */}
           <div className="flex items-center gap-2">
             <a
               href="/api/analyze/linked-domains/domains.csv"
               className="rounded border dark:border-neutral-700 px-3 py-1.5 text-xs font-medium"
             >
-              Download all unique domains (all runs)
+              {tsh.downloadAllDomains}
             </a>
             <button
               type="button"
               onClick={copyAllDomains}
               className="rounded border dark:border-neutral-700 px-3 py-1.5 text-xs font-medium"
             >
-              {copiedAll ?? "Copy all"}
+              {copiedAll ?? tsh.copyAll}
             </button>
           </div>
         </div>
@@ -658,13 +656,16 @@ export default function LinkedDomainsToolPage() {
               setSearch(e.target.value);
               setPage(1);
             }}
-            placeholder="Search by job name…"
+            placeholder={tsh.searchPlaceholder}
             className="rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-xs w-56"
           />
           <div className="ml-auto flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
             <span>
-              {total} run{total === 1 ? "" : "s"} · page {page}/
-              {Math.max(1, Math.ceil(total / HISTORY_PAGE_SIZE))}
+              {tsh.runsPage(
+                total,
+                page,
+                Math.max(1, Math.ceil(total / HISTORY_PAGE_SIZE)),
+              )}
             </span>
             <button
               type="button"
@@ -672,7 +673,7 @@ export default function LinkedDomainsToolPage() {
               onClick={() => setPage((p) => Math.max(1, p - 1))}
               className="rounded border dark:border-neutral-700 px-2 py-1 disabled:opacity-40"
             >
-              Prev
+              {tsh.prev}
             </button>
             <button
               type="button"
@@ -680,7 +681,7 @@ export default function LinkedDomainsToolPage() {
               onClick={() => setPage((p) => p + 1)}
               className="rounded border dark:border-neutral-700 px-2 py-1 disabled:opacity-40"
             >
-              Next
+              {tsh.next}
             </button>
           </div>
         </div>
@@ -688,23 +689,33 @@ export default function LinkedDomainsToolPage() {
         <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 overflow-x-auto">
           {history.length === 0 ? (
             <p className="text-sm text-neutral-500 dark:text-neutral-400 px-4 py-6">
-              {search.trim() ? "No matching runs." : "No runs yet."}
+              {search.trim() ? tsh.noMatchingRuns : tsh.noRunsYet}
             </p>
           ) : (
             <table className="w-full text-sm">
               <thead className="text-neutral-500 dark:text-neutral-400 border-b dark:border-neutral-800">
                 <tr>
-                  <th className="text-left font-medium px-3 py-2">Date</th>
-                  <th className="text-left font-medium px-3 py-2">Name</th>
-                  <th className="text-left font-medium px-3 py-2">Status</th>
-                  <th className="text-left font-medium px-3 py-2">Targets</th>
-                  <th className="text-right font-medium px-3 py-2">
-                    Unique domains
+                  <th className="text-left font-medium px-3 py-2">
+                    {tsh.colDate}
+                  </th>
+                  <th className="text-left font-medium px-3 py-2">
+                    {tsh.colName}
+                  </th>
+                  <th className="text-left font-medium px-3 py-2">
+                    {tsh.colStatus}
+                  </th>
+                  <th className="text-left font-medium px-3 py-2">
+                    {ts.colTargets}
                   </th>
                   <th className="text-right font-medium px-3 py-2">
-                    Ahrefs units
+                    {ts.colUniqueDomains}
                   </th>
-                  <th className="text-right font-medium px-3 py-2">Actions</th>
+                  <th className="text-right font-medium px-3 py-2">
+                    {tsh.colAhrefsUnits}
+                  </th>
+                  <th className="text-right font-medium px-3 py-2">
+                    {tsh.colActions}
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -745,18 +756,18 @@ export default function LinkedDomainsToolPage() {
                             disabled={renameBusy || !renameValue.trim()}
                             className="text-xs text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40"
                           >
-                            Save
+                            {tsh.save}
                           </button>
                           <button
                             type="button"
                             onClick={() => setRenamingJobId(null)}
                             className="text-xs text-neutral-500 dark:text-neutral-400 hover:underline"
                           >
-                            ✕
+                            {tsh.renameCancel}
                           </button>
                         </span>
                       ) : (
-                        h.name || `Run #${h.run_id}`
+                        h.name || tsh.runFallbackName(h.run_id)
                       )}
                     </td>
                     <td className="px-3 py-2 uppercase tracking-wide text-xs">
@@ -766,8 +777,7 @@ export default function LinkedDomainsToolPage() {
                       {h.targets_done}/{h.targets_total}
                       {h.targets_failed > 0 && (
                         <span className="text-rose-600 dark:text-rose-400">
-                          {" "}
-                          · {h.targets_failed} failed
+                          {tsh.failedSuffix(h.targets_failed)}
                         </span>
                       )}
                     </td>
@@ -784,26 +794,26 @@ export default function LinkedDomainsToolPage() {
                           onClick={() => viewRun(h.run_id)}
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
-                          View
+                          {tsh.view}
                         </button>
                         <button
                           type="button"
                           onClick={() => startRename(h)}
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
-                          Rename
+                          {tsh.rename}
                         </button>
                         <a
                           href={`/api/runs/${h.run_id}/linked-domains.csv?scope=new`}
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
-                          New CSV
+                          {ts.newCsv}
                         </a>
                         <a
                           href={`/api/runs/${h.run_id}/linked-domains.csv?scope=all`}
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
-                          All CSV
+                          {ts.allCsv}
                         </a>
                         {h.status === "paused" && (
                           <button
@@ -811,7 +821,7 @@ export default function LinkedDomainsToolPage() {
                             onClick={() => resumeRun(h.run_id)}
                             className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                           >
-                            Resume
+                            {tsh.resumeAction}
                           </button>
                         )}
                       </div>

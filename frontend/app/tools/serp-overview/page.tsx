@@ -17,6 +17,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { COUNTRIES } from "@/lib/countries";
+import { useT } from "@/lib/i18n";
 
 // One created run per selected country — the submit response shape.
 type CreatedRun = {
@@ -105,6 +106,9 @@ async function copyText(text: string): Promise<boolean> {
 }
 
 export default function SerpOverviewToolPage() {
+  const { t } = useT();
+  const ts = t.pages.serpOverview;
+  const tsh = t.pages.toolsShared;
   const [keywordsRaw, setKeywordsRaw] = useState("");
   const [selectedCountries, setSelectedCountries] = useState<string[]>([
     "kz",
@@ -219,31 +223,29 @@ export default function SerpOverviewToolPage() {
     e.preventDefault();
     setError(null);
     if (keywords.length === 0) {
-      setError("Add at least one keyword");
+      setError(ts.errAddKeyword);
       return;
     }
     if (keywords.length > 500) {
-      setError(`Max 500 keywords per run (you have ${keywords.length})`);
+      setError(ts.errMaxKeywords(keywords.length));
       return;
     }
     const topNum = topPositions.trim() === "" ? null : Number(topPositions);
     if (topNum != null && (Number.isNaN(topNum) || topNum < 1 || topNum > 100)) {
-      setError("Top positions must be between 1 and 100");
+      setError(ts.errTopPositions);
       return;
     }
     const budgetNum = unitBudget.trim() === "" ? null : Number(unitBudget);
     if (budgetNum != null && (Number.isNaN(budgetNum) || budgetNum < 1)) {
-      setError("Unit budget must be a positive number");
+      setError(ts.errUnitBudget);
       return;
     }
     if (selectedCountries.length === 0) {
-      setError("Select at least one country");
+      setError(ts.errSelectCountry);
       return;
     }
     if (selectedCountries.length > 30) {
-      setError(
-        `Max 30 countries per submit (you have ${selectedCountries.length})`,
-      );
+      setError(ts.errMaxCountries(selectedCountries.length));
       return;
     }
     setBusy(true);
@@ -279,11 +281,7 @@ export default function SerpOverviewToolPage() {
           code = "";
         }
         if (code === "all_duplicates") {
-          throw new Error(
-            `All keywords in all selected countries were already checked ` +
-              `within the last ${windowDays} days (${count} skipped) — ` +
-              `tick "Recheck keywords" to force a re-check.`,
-          );
+          throw new Error(ts.errAllDuplicates(windowDays, count));
         }
         throw new Error(`HTTP ${res.status}: ${t.slice(0, 300)}`);
       }
@@ -298,28 +296,26 @@ export default function SerpOverviewToolPage() {
       for (const r of runs) {
         if (r.skipped_duplicates?.length) {
           notices.push(
-            `${r.country}: skipped ${r.skipped_duplicates.length} ` +
-              `previously-checked keyword` +
-              `${r.skipped_duplicates.length === 1 ? "" : "s"} (` +
-              r.skipped_duplicates.slice(0, 5).join(", ") +
-              (r.skipped_duplicates.length > 5 ? "…" : "") +
-              `)`,
+            ts.dupNoticeCountry(
+              r.country,
+              r.skipped_duplicates.length,
+              r.skipped_duplicates.slice(0, 5).join(", "),
+              r.skipped_duplicates.length > 5 ? "…" : "",
+            ),
           );
         }
       }
       for (const s of skippedCountries) {
-        notices.push(
-          `${s.country}: all ${s.count} keywords already checked — ` +
-            `no run created`,
-        );
+        notices.push(ts.dupNoticeSkippedCountry(s.country, s.count));
       }
       setDupNotices(notices);
       if (runs.length > 1) {
         setMultiNotice(
-          `Created ${runs.length} runs (` +
-            runs.map((r) => r.country).join(", ") +
-            `) — viewing ${runs[0].country}; open the others from ` +
-            `Recent runs.`,
+          ts.multiNotice(
+            runs.length,
+            runs.map((r) => r.country).join(", "),
+            runs[0].country,
+          ),
         );
       }
       if (runs.length > 0) setRunId(runs[0].run_id);
@@ -361,7 +357,7 @@ export default function SerpOverviewToolPage() {
         }`,
       );
       if (!res.ok) {
-        setCopiedAll("Copy failed");
+        setCopiedAll(tsh.copyFailed);
       } else {
         const text = await res.text();
         const domains = text
@@ -371,11 +367,11 @@ export default function SerpOverviewToolPage() {
           .filter(Boolean);
         const ok = await copyText(domains.join("\n"));
         setCopiedAll(
-          ok ? `Copied ${domains.length.toLocaleString()} ✓` : "Copy failed",
+          ok ? tsh.copyAllDone(domains.length.toLocaleString()) : tsh.copyFailed,
         );
       }
     } catch {
-      setCopiedAll("Copy failed");
+      setCopiedAll(tsh.copyFailed);
     }
     setTimeout(() => setCopiedAll(null), 2500);
   }
@@ -391,7 +387,7 @@ export default function SerpOverviewToolPage() {
         }`,
       );
       if (!res.ok) {
-        setCopied("Copy failed");
+        setCopied(tsh.copyFailed);
       } else {
         const text = await res.text();
         const domains = text
@@ -400,12 +396,10 @@ export default function SerpOverviewToolPage() {
           .map((s) => s.trim())
           .filter(Boolean);
         const ok = await copyText(domains.join("\n"));
-        setCopied(
-          ok ? `Copied ${domains.length} domains ✓` : "Copy failed",
-        );
+        setCopied(ok ? ts.copyUniqueDomainsDone(domains.length) : tsh.copyFailed);
       }
     } catch {
-      setCopied("Copy failed");
+      setCopied(tsh.copyFailed);
     }
     setTimeout(() => setCopied(null), 2500);
   }
@@ -461,20 +455,9 @@ export default function SerpOverviewToolPage() {
   return (
     <main className="max-w-5xl mx-auto px-4 py-8 space-y-6">
       <header className="space-y-1">
-        <h1 className="text-2xl font-semibold">Tool · SERP Overview</h1>
+        <h1 className="text-2xl font-semibold">{ts.title}</h1>
         <p className="text-sm text-neutral-600 dark:text-neutral-400">
-          Bulk <code>/serp-overview</code> across a batch of{" "}
-          <strong>keywords</strong>: the ranking-page <strong>URLs</strong>{" "}
-          per keyword for <strong>each selected country</strong> (one run
-          per country), limited to the top organic positions. Runs as a{" "}
-          <strong>persistent, resumable job</strong> —
-          survives restarts, and past runs stay downloadable below. Only the{" "}
-          <code>url</code> column is fetched to keep spend at the{" "}
-          <strong>~50 units/keyword</strong> floor. Keywords already checked
-          with the <strong>same country &amp; result count</strong> are
-          skipped by default for the window set in Settings → SERP Overview
-          (30 days out of the box). Tip: keyword <code>ahrefs</code> or{" "}
-          <code>wordcount</code> probes for free.
+          {ts.description}
         </p>
       </header>
 
@@ -484,34 +467,33 @@ export default function SerpOverviewToolPage() {
       >
         <label className="block">
           <span className="text-sm font-medium block mb-1">
-            Keywords (one per line · max 500)
+            {ts.keywordsLabel}
           </span>
           <textarea
             value={keywordsRaw}
             onChange={(e) => setKeywordsRaw(e.target.value)}
             rows={6}
-            placeholder={"купить телефон\nдоставка цветов алматы\nahrefs"}
+            placeholder={ts.keywordsPlaceholder}
             className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-3 py-2 text-sm outline-none"
             disabled={busy}
           />
           <span className="text-xs text-neutral-500 dark:text-neutral-400 block mt-1">
-            Parsed: {keywords.length} keyword{keywords.length === 1 ? "" : "s"}
+            {ts.parsedCount(keywords.length)}
           </span>
         </label>
 
         <div className="space-y-1">
           <span className="text-sm font-medium block">
-            Countries ({selectedCountries.length} selected)
+            {ts.countriesLabel(selectedCountries.length)}
           </span>
           <span className="text-xs text-neutral-500 dark:text-neutral-400 block">
-            Each keyword is checked in each selected country — one run per
-            country.
+            {ts.countriesHint}
           </span>
           <input
             type="text"
             value={countrySearch}
             onChange={(e) => setCountrySearch(e.target.value)}
-            placeholder="Search countries…"
+            placeholder={ts.countrySearchPlaceholder}
             className="w-full sm:max-w-xs rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
             disabled={busy}
           />
@@ -532,20 +514,20 @@ export default function SerpOverviewToolPage() {
             ))}
             {filteredCountries.length === 0 && (
               <p className="px-2 py-2 text-xs text-neutral-500 dark:text-neutral-400">
-                No matches.
+                {ts.noCountryMatches}
               </p>
             )}
           </div>
           {selectedCountries.length > 0 && (
             <div className="text-xs text-neutral-500 dark:text-neutral-400">
-              Selected: {selectedCountries.join(", ")}{" "}
+              {ts.selectedPrefix} {selectedCountries.join(", ")}{" "}
               <button
                 type="button"
                 onClick={() => setSelectedCountries([])}
                 disabled={busy}
                 className="text-blue-700 dark:text-blue-400 hover:underline"
               >
-                Clear
+                {ts.clearCountries}
               </button>
             </div>
           )}
@@ -554,7 +536,7 @@ export default function SerpOverviewToolPage() {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label className="block">
             <span className="text-sm font-medium block mb-1">
-              Top positions (1-100)
+              {ts.topPositionsLabel}
             </span>
             <input
               type="number"
@@ -562,21 +544,21 @@ export default function SerpOverviewToolPage() {
               max={100}
               value={topPositions}
               onChange={(e) => setTopPositions(e.target.value)}
-              placeholder="10"
+              placeholder={ts.topPositionsPlaceholder}
               className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
               disabled={busy}
             />
           </label>
           <label className="block">
             <span className="text-sm font-medium block mb-1">
-              Unit budget (optional)
+              {ts.unitBudgetLabel}
             </span>
             <input
               type="number"
               min={1}
               value={unitBudget}
               onChange={(e) => setUnitBudget(e.target.value)}
-              placeholder="auto-pause above N units"
+              placeholder={ts.unitBudgetPlaceholder}
               className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
               disabled={busy}
             />
@@ -585,13 +567,13 @@ export default function SerpOverviewToolPage() {
 
         <label className="block sm:max-w-xs">
           <span className="text-sm font-medium block mb-1">
-            Job name (optional)
+            {ts.jobNameLabel}
           </span>
           <input
             type="text"
             value={jobName}
             onChange={(e) => setJobName(e.target.value)}
-            placeholder="auto-named from first keyword"
+            placeholder={ts.jobNamePlaceholder}
             className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-sm"
             disabled={busy}
           />
@@ -606,10 +588,9 @@ export default function SerpOverviewToolPage() {
             className="mt-0.5"
           />
           <span className="text-sm font-medium">
-            Recheck keywords
+            {ts.recheckLabel}
             <span className="block text-xs font-normal text-neutral-500 dark:text-neutral-400">
-              check again even if a keyword was already checked with the same
-              country &amp; result count within the ignore window
+              {ts.recheckHint}
             </span>
           </span>
         </label>
@@ -619,7 +600,7 @@ export default function SerpOverviewToolPage() {
           disabled={busy || keywords.length === 0}
           className="rounded bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-4 py-2 text-sm font-medium disabled:opacity-50"
         >
-          {busy ? "Submitting…" : "Run SERP overview"}
+          {busy ? ts.submitting : ts.submit}
         </button>
 
         {error && (
@@ -647,7 +628,7 @@ export default function SerpOverviewToolPage() {
         <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 p-4 space-y-3">
           <div className="flex items-center justify-between gap-4">
             <div className="text-sm font-medium">
-              Run #{status.id} ·{" "}
+              {tsh.runNo(status.id)} ·{" "}
               <span className="uppercase tracking-wide">{status.status}</span>
             </div>
             <div className="flex gap-2">
@@ -657,7 +638,7 @@ export default function SerpOverviewToolPage() {
                   onClick={() => control("pause")}
                   className="rounded border dark:border-neutral-700 px-3 py-1 text-xs"
                 >
-                  Pause
+                  {tsh.pause}
                 </button>
               )}
               {status.status === "paused" && (
@@ -666,7 +647,7 @@ export default function SerpOverviewToolPage() {
                   onClick={() => control("resume")}
                   className="rounded border dark:border-neutral-700 px-3 py-1 text-xs"
                 >
-                  Resume
+                  {tsh.resume}
                 </button>
               )}
               {isActive && (
@@ -675,7 +656,7 @@ export default function SerpOverviewToolPage() {
                   onClick={() => control("cancel")}
                   className="rounded border border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 px-3 py-1 text-xs"
                 >
-                  Cancel
+                  {tsh.cancel}
                 </button>
               )}
             </div>
@@ -688,23 +669,26 @@ export default function SerpOverviewToolPage() {
             />
           </div>
           <div className="text-xs text-neutral-500 dark:text-neutral-400">
-            {processed}/{status.total} keywords · {status.done} done ·{" "}
-            {status.failed} failed · {status.running} running ·{" "}
-            {status.pending} pending
+            {ts.progressCounts(
+              processed,
+              status.total,
+              status.done,
+              status.failed,
+              status.running,
+              status.pending,
+            )}
           </div>
 
           {cost && (
             <div className="text-xs text-neutral-500 dark:text-neutral-400">
-              Ahrefs units:{" "}
+              {tsh.unitsLabel}{" "}
               <strong className="text-neutral-700 dark:text-neutral-200">
                 {cost.ahrefs_units_billed.toLocaleString()}
               </strong>{" "}
-              billed
-              {cost.ahrefs_units_list !== cost.ahrefs_units_billed && (
-                <> · {cost.ahrefs_units_list.toLocaleString()} list price</>
-              )}{" "}
-              · {cost.ahrefs_fresh_calls} API call
-              {cost.ahrefs_fresh_calls === 1 ? "" : "s"}
+              {tsh.unitsBilled}
+              {cost.ahrefs_units_list !== cost.ahrefs_units_billed &&
+                tsh.unitsListPrice(cost.ahrefs_units_list.toLocaleString())}
+              {tsh.apiCalls(cost.ahrefs_fresh_calls)}
             </div>
           )}
 
@@ -714,7 +698,7 @@ export default function SerpOverviewToolPage() {
                 href={`/api/runs/${status.id}/serp-overview.csv`}
                 className="inline-block rounded bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-4 py-2 text-sm font-medium"
               >
-                Download CSV (keyword · position · URL)
+                {ts.downloadCsv}
               </a>
               <a
                 href={`/api/runs/${status.id}/serp-overview-domains.csv${
@@ -722,14 +706,14 @@ export default function SerpOverviewToolPage() {
                 }`}
                 className="inline-block rounded border dark:border-neutral-700 px-4 py-2 text-sm font-medium"
               >
-                Download unique domains CSV
+                {ts.downloadDomainsCsv}
               </a>
               <button
                 type="button"
                 onClick={copyDomains}
                 className="rounded border dark:border-neutral-700 px-4 py-2 text-sm font-medium"
               >
-                {copied ?? "Copy unique domains"}
+                {copied ?? ts.copyUniqueDomains}
               </button>
             </div>
           )}
@@ -740,7 +724,7 @@ export default function SerpOverviewToolPage() {
           and downloaded even after a page reload. */}
       <section className="space-y-2">
         <div className="flex items-center justify-between gap-3 flex-wrap">
-          <h2 className="text-lg font-semibold">Recent runs</h2>
+          <h2 className="text-lg font-semibold">{tsh.recentRuns}</h2>
           {/* Global export — every run ever, deduped across runs. */}
           <div className="flex items-center gap-2">
             <label className="flex items-center gap-1.5 text-xs text-neutral-600 dark:text-neutral-300">
@@ -749,7 +733,7 @@ export default function SerpOverviewToolPage() {
                 checked={tldFiltered}
                 onChange={(e) => setTldFiltered(e.target.checked)}
               />
-              Allowed TLDs only
+              {ts.allowedTldsOnly}
             </label>
             <a
               href={`/api/analyze/serp-overview/domains.csv${
@@ -757,14 +741,14 @@ export default function SerpOverviewToolPage() {
               }`}
               className="rounded border dark:border-neutral-700 px-3 py-1.5 text-xs font-medium"
             >
-              Download all unique domains (all runs)
+              {tsh.downloadAllDomains}
             </a>
             <button
               type="button"
               onClick={copyAllDomains}
               className="rounded border dark:border-neutral-700 px-3 py-1.5 text-xs font-medium"
             >
-              {copiedAll ?? "Copy all"}
+              {copiedAll ?? tsh.copyAll}
             </button>
           </div>
         </div>
@@ -778,13 +762,16 @@ export default function SerpOverviewToolPage() {
               setSearch(e.target.value);
               setPage(1);
             }}
-            placeholder="Search by job name…"
+            placeholder={tsh.searchPlaceholder}
             className="rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1.5 text-xs w-56"
           />
           <div className="ml-auto flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
             <span>
-              {total} run{total === 1 ? "" : "s"} · page {page}/
-              {Math.max(1, Math.ceil(total / HISTORY_PAGE_SIZE))}
+              {tsh.runsPage(
+                total,
+                page,
+                Math.max(1, Math.ceil(total / HISTORY_PAGE_SIZE)),
+              )}
             </span>
             <button
               type="button"
@@ -792,7 +779,7 @@ export default function SerpOverviewToolPage() {
               onClick={() => setPage((p) => Math.max(1, p - 1))}
               className="rounded border dark:border-neutral-700 px-2 py-1 disabled:opacity-40"
             >
-              Prev
+              {tsh.prev}
             </button>
             <button
               type="button"
@@ -800,7 +787,7 @@ export default function SerpOverviewToolPage() {
               onClick={() => setPage((p) => p + 1)}
               className="rounded border dark:border-neutral-700 px-2 py-1 disabled:opacity-40"
             >
-              Next
+              {tsh.next}
             </button>
           </div>
         </div>
@@ -808,21 +795,33 @@ export default function SerpOverviewToolPage() {
         <div className="rounded-md border dark:border-neutral-800 bg-white dark:bg-neutral-950 overflow-x-auto">
           {history.length === 0 ? (
             <p className="text-sm text-neutral-500 dark:text-neutral-400 px-4 py-6">
-              {search.trim() ? "No matching runs." : "No runs yet."}
+              {search.trim() ? tsh.noMatchingRuns : tsh.noRunsYet}
             </p>
           ) : (
             <table className="w-full text-sm">
               <thead className="text-neutral-500 dark:text-neutral-400 border-b dark:border-neutral-800">
                 <tr>
-                  <th className="text-left font-medium px-3 py-2">Date</th>
-                  <th className="text-left font-medium px-3 py-2">Name</th>
-                  <th className="text-left font-medium px-3 py-2">Status</th>
-                  <th className="text-left font-medium px-3 py-2">Keywords</th>
-                  <th className="text-right font-medium px-3 py-2">URLs</th>
-                  <th className="text-right font-medium px-3 py-2">
-                    Ahrefs units
+                  <th className="text-left font-medium px-3 py-2">
+                    {tsh.colDate}
                   </th>
-                  <th className="text-right font-medium px-3 py-2">Actions</th>
+                  <th className="text-left font-medium px-3 py-2">
+                    {tsh.colName}
+                  </th>
+                  <th className="text-left font-medium px-3 py-2">
+                    {tsh.colStatus}
+                  </th>
+                  <th className="text-left font-medium px-3 py-2">
+                    {ts.colKeywords}
+                  </th>
+                  <th className="text-right font-medium px-3 py-2">
+                    {ts.colUrls}
+                  </th>
+                  <th className="text-right font-medium px-3 py-2">
+                    {tsh.colAhrefsUnits}
+                  </th>
+                  <th className="text-right font-medium px-3 py-2">
+                    {tsh.colActions}
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -863,18 +862,18 @@ export default function SerpOverviewToolPage() {
                             disabled={renameBusy || !renameValue.trim()}
                             className="text-xs text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40"
                           >
-                            Save
+                            {tsh.save}
                           </button>
                           <button
                             type="button"
                             onClick={() => setRenamingJobId(null)}
                             className="text-xs text-neutral-500 dark:text-neutral-400 hover:underline"
                           >
-                            ✕
+                            {tsh.renameCancel}
                           </button>
                         </span>
                       ) : (
-                        h.name || `Run #${h.run_id}`
+                        h.name || tsh.runFallbackName(h.run_id)
                       )}
                     </td>
                     <td className="px-3 py-2 uppercase tracking-wide text-xs">
@@ -884,8 +883,7 @@ export default function SerpOverviewToolPage() {
                       {h.keywords_done}/{h.keywords_total}
                       {h.keywords_failed > 0 && (
                         <span className="text-rose-600 dark:text-rose-400">
-                          {" "}
-                          · {h.keywords_failed} failed
+                          {tsh.failedSuffix(h.keywords_failed)}
                         </span>
                       )}
                     </td>
@@ -902,20 +900,20 @@ export default function SerpOverviewToolPage() {
                           onClick={() => viewRun(h.run_id)}
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
-                          View
+                          {tsh.view}
                         </button>
                         <button
                           type="button"
                           onClick={() => startRename(h)}
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
-                          Rename
+                          {tsh.rename}
                         </button>
                         <a
                           href={`/api/runs/${h.run_id}/serp-overview.csv`}
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
-                          Download CSV
+                          {ts.downloadCsvShort}
                         </a>
                         <a
                           href={`/api/runs/${h.run_id}/serp-overview-domains.csv${
@@ -923,7 +921,7 @@ export default function SerpOverviewToolPage() {
                           }`}
                           className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                         >
-                          Domains CSV
+                          {ts.domainsCsvShort}
                         </a>
                         {h.status === "paused" && (
                           <button
@@ -931,7 +929,7 @@ export default function SerpOverviewToolPage() {
                             onClick={() => resumeRun(h.run_id)}
                             className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
                           >
-                            Resume
+                            {tsh.resumeAction}
                           </button>
                         )}
                       </div>
