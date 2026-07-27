@@ -1020,6 +1020,54 @@ def _cascade_wayback_classify(
             crits.append("wayback_classify")
 
 
+def _retry_ahrefs_batch_failed(
+    run_id: int, db: Session, rd_ids: set[int] | None = None
+) -> dict:
+    """Retry-failed for an `ahrefs_batch_analysis` run. That kind has no AI
+    and no per-criterion retry machinery (its criterion isn't in
+    `_ALL_CRITERIA`), but its runner is idempotent + resumable — it
+    re-fetches only non-terminal RDs and skips 'done'. So "retry failed" =
+    reset the failed/orphaned RDs (or a caller-supplied subset) back to
+    pending, flip the run to pending, and re-dispatch the runner. Mirrors
+    `resume_run_now`, scoped to failures. `db` is the caller's OPEN session
+    — we commit into it, then dispatch (the caller closes it afterward)."""
+    conds = [
+        RunDomain.run_id == run_id,
+        RunDomain.status.in_(("failed", "running", "pending")),
+    ]
+    if rd_ids:
+        conds.append(RunDomain.id.in_(sorted(int(i) for i in rd_ids)))
+    n = db.query(RunDomain).filter(*conds).count()
+    if n == 0:
+        return {
+            "id": run_id, "found": True,
+            "error": "no failed domains to retry",
+        }
+    # Reset the targets to pending (bulk SQL — a batch run can be 100k RDs,
+    # so don't hydrate the ORM identity map). The runner upserts the CR per
+    # RD, so we needn't delete the stale failed CR rows first.
+    db.execute(
+        update(RunDomain)
+        .where(*conds)
+        .values(status="pending", started_at=None, finished_at=None, error="")
+        .execution_options(synchronize_session=False)
+    )
+    run = db.get(Run, run_id)
+    if run is not None:
+        run.status = "pending"
+        run.started_at = None
+        run.finished_at = None
+        run.error = ""
+    db.commit()
+    # Re-dispatch the idempotent runner: it re-fetches only the now-pending
+    # (previously failed) RDs and leaves the ones still 'done' alone.
+    dispatch_run(run_id)
+    return {
+        "id": run_id, "found": True, "status": "started",
+        "domains": n, "criteria": n,
+    }
+
+
 def retry_run_batch_now(
     run_id: int,
     run_domain_ids: list[int],
@@ -1089,6 +1137,11 @@ def retry_run_batch_now(
         # for the rationale and the original bug report.
         job = db.get(Job, run.job_id)
         job_kind = job.kind if job is not None else "quality"
+        # Ahrefs batch-analysis: no AI + no per-criterion retry — reset the
+        # selected failed/orphaned RDs and re-dispatch the idempotent runner
+        # instead of the Quality per-criterion pool. Must precede the AI gate.
+        if job_kind == "ahrefs_batch_analysis":
+            return _retry_ahrefs_batch_failed(run_id, db, rd_ids=rd_id_set)
         if job_kind != "availability" and (
             not spec.ai or not spec.ai.provider
         ):
@@ -1194,6 +1247,11 @@ def retry_failed_run_now(
         # run" even though no AI would ever be called.
         job = db.get(Job, run.job_id)
         job_kind = job.kind if job is not None else "quality"
+        # Ahrefs batch-analysis: same non-AI problem, but it also has no
+        # per-criterion retry machinery — reset failed/orphaned RDs to
+        # pending and re-dispatch its idempotent runner. Precede the gate.
+        if job_kind == "ahrefs_batch_analysis":
+            return _retry_ahrefs_batch_failed(run_id, db)
         if job_kind != "availability" and (
             not spec.ai or not spec.ai.provider
         ):

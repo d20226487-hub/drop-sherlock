@@ -5,6 +5,7 @@ import { RefreshCw, Zap } from "lucide-react";
 import { useT } from "@/lib/i18n";
 import { api, DashboardStatus } from "@/lib/api";
 import { IntegrationCard } from "@/components/integration-card";
+import { AhrefsUnitsCard } from "@/components/ahrefs-units-card";
 
 function formatChecked(iso: string): string {
   try {
@@ -118,6 +119,8 @@ export default function DashboardPage() {
           </button>
         </div>
       </div>
+
+      <AhrefsUnitsCard />
 
       {error && (
         <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-800 dark:bg-red-900/30 dark:text-red-300">

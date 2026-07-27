@@ -1,7 +1,7 @@
 """Settings router — credential CRUD, test-connection, rate-limit CRUD."""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from ..app_settings import (
@@ -255,6 +255,69 @@ async def test_provider(provider: str):
         raise HTTPException(401, str(e))
     except ProviderError as e:
         raise HTTPException(502, str(e))
+
+
+# --- Webshare rotating-proxy list -------------------------------------------
+
+class WebshareConfigIn(BaseModel):
+    # Full Webshare "Download Proxy List" URL (download token embedded).
+    # None = leave unchanged; "" = clear. Write-only — never read back.
+    proxy_list_url: str | None = Field(default=None)
+    refresh_day_of_month: int | None = Field(default=None, ge=1, le=28)
+
+
+def _webshare_status_payload() -> dict:
+    from ..app_settings import get_webshare_refresh_day
+    from ..availability import webshare
+    st = webshare.status()
+    st["refresh_day_of_month"] = get_webshare_refresh_day()
+    return st
+
+
+@router.get("/webshare")
+def get_webshare_status():
+    """Live status of the Webshare proxy source. Write-only by design:
+    reports whether a URL is configured + the pool state (proxy count, last
+    refresh, last error) but NEVER the URL itself (it embeds a secret token)."""
+    return _webshare_status_payload()
+
+
+@router.put("/webshare")
+def update_webshare_config(payload: WebshareConfigIn, background_tasks: BackgroundTasks):
+    """Save the Webshare URL and/or refresh day, and kick off a re-download.
+
+    Deliberately a SYNC endpoint: `set_webshare_config` does blocking SQLite
+    I/O, and on the single-worker api that must run in the threadpool — NOT
+    on the event loop (an earlier async version wedged the whole api when the
+    write stalled on the bind-mount DB). The list re-download is a background
+    task so saving never blocks on the network fetch either; poll
+    GET /settings/webshare or hit POST .../refresh to see the proxy count."""
+    from ..app_settings import set_webshare_config, get_webshare_refresh_day
+    from ..availability import webshare
+    set_webshare_config(payload.proxy_list_url, payload.refresh_day_of_month)
+    if payload.refresh_day_of_month is not None:
+        # Re-point the monthly cron (same id + replace_existing swaps the
+        # trigger on the already-running scheduler).
+        try:
+            from ..scheduler import get_scheduler
+            get_scheduler().add_job(
+                webshare.scheduled_refresh, "cron",
+                day=get_webshare_refresh_day(), hour=12, minute=0,
+                id="webshare_proxy_refresh", replace_existing=True,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    # Re-download in the background so a URL save (or clear) reflects in the
+    # pool shortly without holding the request open on the network fetch.
+    background_tasks.add_task(webshare.scheduled_refresh)
+    return _webshare_status_payload()
+
+
+@router.post("/webshare/refresh")
+async def refresh_webshare_now():
+    """Manual 'Refresh now' — force an immediate re-download of the list."""
+    from ..availability import webshare
+    return await webshare.refresh()
 
 
 # --- Rate limits -------------------------------------------------------------

@@ -190,6 +190,7 @@ _SECRET_KEY_SUFFIXES: tuple[str, ...] = (
     "__password",        # future provider that uses basic-auth-style creds
     "__access_key_id",   # remote_backup__access_key_id (S3)
     "__secret_access_key",  # remote_backup__secret_access_key (S3)
+    "__proxy_list_url",     # webshare__proxy_list_url (embeds a Webshare download token)
 )
 
 

@@ -1791,7 +1791,16 @@ def get_rdap_proxies() -> list[str]:
       - anything else (unparseable scheme) is dropped
 
     Order is preserved and duplicates removed so the round-robin is
-    deterministic. Empty config → [] (RDAP runs direct)."""
+    deterministic. Empty config → [] (RDAP runs direct).
+
+    Webshare source (added 2026-07-27): when a Webshare download URL is
+    configured it REPLACES this manual list — the pool is sourced from the
+    monthly-refreshed Webshare cache (availability/webshare.py). The manual
+    `availability__rdap__proxies` list is the fallback used only when no
+    Webshare URL is set."""
+    if get_webshare_proxy_list_url():
+        from .availability import webshare
+        return webshare.get_cached_proxies()
     raw = _availability_str("availability__rdap__proxies", "")
     if not raw.strip():
         return []
@@ -1808,6 +1817,45 @@ def get_rdap_proxies() -> list[str]:
             seen.add(url)
             out.append(url)
     return out
+
+
+# --- Webshare rotating-proxy list (added 2026-07-27) -----------------------
+# The RDAP egress pool can be sourced from a Webshare "Download Proxy List"
+# URL instead of the manual `availability__rdap__proxies` list. The URL
+# embeds a secret download token → Fernet-encrypted at rest via the
+# `__proxy_list_url` suffix registered in crypto._SECRET_KEY_SUFFIXES, and
+# never echoed back to the UI. See availability/webshare.py for the
+# fetch/parse/cache; main.py schedules the monthly + boot refresh. These
+# keys are intentionally NOT in AVAILABILITY_DEFAULTS so no generic settings
+# dump can enumerate (and echo) the secret URL.
+
+def get_webshare_proxy_list_url() -> str:
+    """The configured Webshare download URL, or '' when unset."""
+    return _availability_str("webshare__proxy_list_url", "").strip()
+
+
+def get_webshare_refresh_day() -> int:
+    """Day-of-month for the monthly auto-refresh cron. Clamped to 1..28 so
+    it always fires (February-safe). Default 25 — Webshare rotates the
+    plan's IPs on the billing cycle."""
+    return max(1, min(28, _availability_int("webshare__refresh_day_of_month", 25)))
+
+
+def set_webshare_config(
+    proxy_list_url: str | None, refresh_day_of_month: int | None,
+) -> None:
+    """Persist the Webshare settings. Only non-None fields are written (URL
+    and day update independently). `_set` encrypts the URL (secret suffix),
+    commits, and busts the read cache."""
+    db = SessionLocal()
+    try:
+        if proxy_list_url is not None:
+            _set(db, "webshare__proxy_list_url", proxy_list_url.strip() or None)
+        if refresh_day_of_month is not None:
+            clamped = max(1, min(28, int(refresh_day_of_month)))
+            _set(db, "webshare__refresh_day_of_month", str(clamped))
+    finally:
+        db.close()
 
 
 def _normalize_proxy_token(tok: str) -> str | None:

@@ -164,6 +164,20 @@ export type DashboardStatus = {
   integrations: IntegrationStatus[];
 };
 
+// Ahrefs API unit balance for the Dashboard (2026-07-27). `state` mirrors
+// the integration states so the card can degrade quietly when Ahrefs isn't
+// configured or the probe fails.
+export type AhrefsUnits = {
+  state: "ok" | "unconfigured" | "error";
+  error?: string;
+  subscription?: string | null;
+  units_limit?: number | null;
+  units_used?: number | null;
+  units_remaining?: number | null;
+  usage_reset_date?: string | null;
+  api_key_expiration_date?: string | null;
+};
+
 // ---- Analyze flow -----------------------------------------------------------
 
 export type Criterion =
@@ -1277,6 +1291,14 @@ export type RunDomainProgressLite = {
   is_pinned?: boolean;
 };
 
+export interface WebshareStatus {
+  configured: boolean;
+  count: number;
+  last_fetch_at: string | null;
+  last_error: string | null;
+  refresh_day_of_month: number;
+}
+
 export const api = {
   getSettings: () => request<SettingsPayload>("/settings/"),
 
@@ -1546,6 +1568,20 @@ export const api = {
       body: JSON.stringify({ key, value }),
     }),
 
+  // Webshare rotating-proxy source (2026-07-27). Status is write-only —
+  // never returns the URL, only whether it's configured + pool health.
+  getWebshareStatus: () => request<WebshareStatus>("/settings/webshare"),
+  setWebshareConfig: (body: {
+    proxy_list_url?: string | null;
+    refresh_day_of_month?: number;
+  }) =>
+    request<WebshareStatus>("/settings/webshare", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  refreshWebshareProxies: () =>
+    request<WebshareStatus>("/settings/webshare/refresh", { method: "POST" }),
+
   bulkReanalyzeDomains: (
     runDomainIds: number[],
     ai?: { provider?: string; model?: string },
@@ -1566,6 +1602,11 @@ export const api = {
   getDashboardStatus: (opts?: { live?: boolean }) =>
     request<DashboardStatus>(
       `/dashboard/status${opts?.live ? "?live=true" : ""}`,
+    ),
+
+  getAhrefsUnits: (opts?: { force?: boolean }) =>
+    request<AhrefsUnits>(
+      `/dashboard/ahrefs-units${opts?.force ? "?force=true" : ""}`,
     ),
 
   previewAnalyze: (spec: AnalyzeSpec) =>

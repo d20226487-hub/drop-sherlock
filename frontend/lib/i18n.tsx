@@ -83,6 +83,12 @@ const messagesEn = {
       intro: "Live status of all configured API integrations.",
       refresh: "Refresh",
       checkedAt: (when: string) => `Checked ${when}`,
+      ahrefsUnitsTitle: "Ahrefs API units",
+      ahrefsUnitsLoading: "Loading Ahrefs units…",
+      ahrefsUnitsLow: "Low",
+      ahrefsUnitsRemainingOf: (limit: string) => `of ${limit}`,
+      ahrefsUnitsResets: (date: string) => `Refreshes ${date}`,
+      ahrefsUnitsRefresh: "Refresh Ahrefs units",
       providerNames: {
         ahrefs: "Ahrefs",
         gemini: "Google Gemini",
@@ -1883,6 +1889,27 @@ const messagesEn = {
       settingsRdapProxiesHeading: "RDAP proxies",
       settingsRdapProxiesHint:
         "One proxy URL per line (http://, https:// or socks5://; bare host:port = http). RDAP rotates through them so bulk lookups spread across IPs and dodge the registries' per-IP throttle. Empty = direct. RDAP only — WhoisFreaks always runs direct. With N proxies, raise RDAP's max-concurrent (~N×) to turn the extra IPs into throughput.",
+      webshareHeading: "Webshare rotating proxies",
+      webshareHint:
+        "Paste your Webshare 'Download Proxy List' URL. When set it REPLACES the manual list above — the RDAP pool is sourced from this list, auto-refreshed monthly on the day below (Webshare rotates the IPs on your billing cycle), plus on startup and via the Refresh button. The URL is stored encrypted and never shown again.",
+      webshareUrlPlaceholder:
+        "https://proxy.webshare.io/api/v2/proxy/list/download/…",
+      webshareSave: "Save",
+      webshareSaving: "Saving…",
+      webshareReplace: "Replace URL",
+      webshareClear: "Clear",
+      webshareCancel: "Cancel",
+      webshareDayLabel: "Auto-refresh day of month",
+      webshareDayHint: "1–28. The monthly re-download runs on this day.",
+      webshareRefreshNow: "Refresh now",
+      webshareRefreshing: "Refreshing…",
+      webshareConfigured:
+        "Configured — Webshare list is active (overrides the manual list above).",
+      webshareNotConfigured: "Not configured — the manual list above is used.",
+      webshareCountLabel: "Active proxies",
+      webshareLastFetchLabel: "Last refresh",
+      webshareLastErrorLabel: "Last error",
+      webshareNever: "never",
       settingsSkipHeading: "Skip-registered policy",
       settingsSkipHint:
         "When ON, registered domains whose expiration is beyond the horizon below are skipped during analysis — saves Ahrefs units. Domains about to drop still flow through.",
@@ -2747,6 +2774,12 @@ const messagesRu: Messages = {
       intro: "Текущий статус всех настроенных API-интеграций.",
       refresh: "Обновить",
       checkedAt: (when) => `Проверено ${when}`,
+      ahrefsUnitsTitle: "Юниты Ahrefs API",
+      ahrefsUnitsLoading: "Загрузка юнитов Ahrefs…",
+      ahrefsUnitsLow: "Мало",
+      ahrefsUnitsRemainingOf: (limit) => `из ${limit}`,
+      ahrefsUnitsResets: (date) => `Обновление ${date}`,
+      ahrefsUnitsRefresh: "Обновить юниты Ahrefs",
       providerNames: {
         ahrefs: "Ahrefs",
         gemini: "Google Gemini",
@@ -4587,6 +4620,27 @@ const messagesRu: Messages = {
       settingsRdapProxiesHeading: "Прокси для RDAP",
       settingsRdapProxiesHint:
         "По одному URL прокси на строку (http://, https:// или socks5://; просто host:port = http). RDAP ротирует их, чтобы массовые запросы распределялись по IP и обходили лимит реестров по IP. Пусто = напрямую. Только RDAP — WhoisFreaks всегда напрямую. При N прокси поднимите max-concurrent у RDAP (~×N), чтобы превратить дополнительные IP в скорость.",
+      webshareHeading: "Ротация прокси Webshare",
+      webshareHint:
+        "Вставьте URL из Webshare «Download Proxy List». Когда задан, он ЗАМЕНЯЕТ список выше — пул RDAP берётся из этого списка, авто-обновление ежемесячно в указанный ниже день (Webshare ротирует IP по вашему биллинг-циклу), плюс при старте и по кнопке «Обновить». URL хранится в зашифрованном виде и больше не показывается.",
+      webshareUrlPlaceholder:
+        "https://proxy.webshare.io/api/v2/proxy/list/download/…",
+      webshareSave: "Сохранить",
+      webshareSaving: "Сохранение…",
+      webshareReplace: "Заменить URL",
+      webshareClear: "Очистить",
+      webshareCancel: "Отмена",
+      webshareDayLabel: "День месяца авто-обновления",
+      webshareDayHint: "1–28. Ежемесячная загрузка выполняется в этот день.",
+      webshareRefreshNow: "Обновить сейчас",
+      webshareRefreshing: "Обновление…",
+      webshareConfigured:
+        "Настроено — список Webshare активен (переопределяет список выше).",
+      webshareNotConfigured: "Не настроено — используется список выше.",
+      webshareCountLabel: "Активных прокси",
+      webshareLastFetchLabel: "Последнее обновление",
+      webshareLastErrorLabel: "Последняя ошибка",
+      webshareNever: "никогда",
       settingsSkipHeading: "Политика «пропускать зарегистрированные»",
       settingsSkipHint:
         "Когда ВКЛ, зарегистрированные домены с истечением дальше горизонта ниже пропускаются при анализе — экономит юниты Ahrefs. Домены, скоро освобождающиеся, проходят анализ.",

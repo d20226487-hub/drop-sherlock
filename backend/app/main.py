@@ -918,6 +918,33 @@ async def lifespan(_: FastAPI):
     sched = get_scheduler()
     sched.start()
 
+    # Webshare rotating-proxy list (added 2026-07-27). Webshare rotates the
+    # plan's proxy IPs monthly on the billing day (the operator's is the
+    # 25th), so a monthly cron re-downloads the list then. A fire-and-forget
+    # fetch at boot populates the pool on startup — NON-blocking, because a
+    # slow/failing Webshare download must never stall startup (cf. the
+    # synchronous boot-backup ~7min stall scar). The Settings "Refresh now"
+    # button forces an immediate re-download in between. No-op when no
+    # Webshare URL is configured. See availability/webshare.py.
+    import asyncio as _asyncio
+    from .availability import webshare as _webshare
+    from .app_settings import get_webshare_refresh_day as _get_ws_day
+    try:
+        _asyncio.create_task(_webshare.scheduled_refresh())
+    except RuntimeError:
+        # No running loop (shouldn't happen inside lifespan) — the monthly
+        # cron below still covers it.
+        pass
+    sched.add_job(
+        _webshare.scheduled_refresh,
+        "cron",
+        day=_get_ws_day(),
+        hour=12,
+        minute=0,
+        id="webshare_proxy_refresh",
+        replace_existing=True,
+    )
+
     # Pre-warm the Database-page snapshot in the background (2026-06-21).
     # `_build_all_rows` is the heaviest read in the app (~tens of seconds at
     # scale — ~83s on the 68k-domain prod DB). Building it at boot, off the

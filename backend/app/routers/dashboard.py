@@ -16,6 +16,7 @@ operator decides when to pay).
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter
@@ -196,3 +197,70 @@ async def status_overview(live: bool = False):
         "mode": "live" if live else "config",
         "integrations": results,
     }
+
+
+# --- Ahrefs unit balance (2026-07-27) -------------------------------------
+# Surfaced on the Dashboard so the operator sees remaining API units + the
+# monthly reset date at a glance (and a red highlight when the balance runs
+# low). Uses the FREE subscription-info/limits-and-usage endpoint (no row
+# credit — same call as the Ahrefs status probe), cached for a short TTL so
+# frequent dashboard loads / multiple LAN users don't spam Ahrefs.
+
+_units_cache: dict = {"data": None, "at": 0.0}
+# 60 min — the balance moves slowly, so a passive dashboard load doesn't need
+# a fresh probe often. The Dashboard's manual Refresh button (force=true)
+# covers "check it right now".
+_UNITS_TTL_SEC = 3600.0
+
+
+async def _fetch_ahrefs_units() -> dict:
+    try:
+        async with get_provider("ahrefs") as p:
+            details = await p.test_credentials()
+    except ProviderConfigError as e:
+        return {"state": "unconfigured", "error": str(e)}
+    except ProviderError as e:
+        return {"state": "error", "error": str(e)}
+    except Exception as e:  # noqa: BLE001 — never 500 the dashboard
+        return {"state": "error", "error": f"unexpected: {e!r}"}
+    raw = (details or {}).get("raw") or {}
+    limit = raw.get("units_limit_workspace")
+    used = raw.get("units_usage_workspace")
+    limit_n = limit if isinstance(limit, (int, float)) else None
+    used_n = used if isinstance(used, (int, float)) else None
+    remaining = (
+        int(limit_n) - int(used_n)
+        if limit_n is not None and used_n is not None
+        else None
+    )
+    return {
+        "state": "ok",
+        "subscription": raw.get("subscription"),
+        "units_limit": limit_n,
+        "units_used": used_n,
+        "units_remaining": remaining,
+        "usage_reset_date": raw.get("usage_reset_date"),
+        "api_key_expiration_date": raw.get("api_key_expiration_date"),
+    }
+
+
+@router.get("/ahrefs-units")
+async def ahrefs_units(force: bool = False):
+    """Ahrefs API unit balance for the Dashboard (FREE upstream call, cached
+    ~60 min). Pass `?force=true` (the Dashboard's manual Refresh button) to
+    bypass the cache and re-probe now. Returns {state, units_limit,
+    units_used, units_remaining, usage_reset_date, subscription,
+    api_key_expiration_date}; `state` is 'ok' | 'unconfigured' | 'error' so
+    the frontend can degrade gracefully. The <1,000,000 red-highlight rule
+    is a frontend display concern."""
+    now = time.monotonic()
+    cached = _units_cache["data"]
+    if not force and cached is not None and now - _units_cache["at"] < _UNITS_TTL_SEC:
+        return cached
+    result = await _fetch_ahrefs_units()
+    # Only cache good reads — a transient error / just-fixed key should
+    # re-probe on the next load rather than stick around for the full TTL.
+    if result.get("state") == "ok":
+        _units_cache["data"] = result
+        _units_cache["at"] = now
+    return result
