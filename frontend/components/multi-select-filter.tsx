@@ -80,6 +80,15 @@ export function MultiSelectFilter({
     // stays stable as users tick boxes in arbitrary order.
     onChange(options.filter((o) => next.has(o.value)).map((o) => o.value));
   }
+  // Select-all (2026-08-05). Adds every CURRENTLY-VISIBLE option (i.e. the
+  // ones matching the active search) to the selection, keeping any prior
+  // selections that fall outside the search. With no query this selects
+  // everything. Only surfaced on `searchable` (long-list) filters — Language
+  // / Category / source — where hand-ticking dozens of boxes is the pain.
+  function selectAllVisible(visibleValues: string[]) {
+    const next = new Set([...value, ...visibleValues]);
+    onChange(options.filter((o) => next.has(o.value)).map((o) => o.value));
+  }
 
   let summary: string;
   if (value.length === 0) {
@@ -152,15 +161,30 @@ export function MultiSelectFilter({
           )}
           <div className="flex items-center justify-between px-2 py-1 text-xs text-neutral-500 dark:text-neutral-400">
             <span>{value.length} selected</span>
-            {value.length > 0 && (
-              <button
-                type="button"
-                onClick={() => onChange([])}
-                className="text-blue-600 dark:text-blue-400 hover:underline"
-              >
-                Clear
-              </button>
-            )}
+            <div className="flex items-center gap-2">
+              {searchable && main.length + tail.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    selectAllVisible(
+                      [...main, ...tail].map((o) => o.value),
+                    )
+                  }
+                  className="text-blue-600 dark:text-blue-400 hover:underline"
+                >
+                  {q ? "Select all matching" : "Select all"}
+                </button>
+              )}
+              {value.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => onChange([])}
+                  className="text-blue-600 dark:text-blue-400 hover:underline"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
           </div>
           {main.length === 0 && tail.length === 0 && (
             <div className="px-2 py-2 text-xs text-neutral-500">

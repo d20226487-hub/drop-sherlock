@@ -2436,6 +2436,55 @@ export const api = {
       }),
     }),
 
+  // Move-to-source (2026-08-05): bulk re-tag the "Source" (registrar) of
+  // selected backlog rows (by id) so small check-batches merge under one
+  // source. Mirrors bulkBacklogStatus.
+  bulkBacklogSetRegistrar: (ids: number[], source: string) =>
+    request<{ updated: number; source: string }>(
+      `/backlog/bulk-set-registrar`,
+      { method: "POST", body: JSON.stringify({ ids, source }) },
+    ),
+
+  // Set "Source" (registrar) on every row matching the filters — the "move
+  // all filtered to one source" sweep (e.g. all un-checked leftovers → one
+  // list). Mirrors bulkBacklogSetRegistrar / bulkBacklogStatusFiltered.
+  bulkBacklogSetRegistrarFiltered: (
+    source: string,
+    filters: {
+      search?: string;
+      status?: BacklogStatus[];
+      registrar?: string[];
+      expiry_from?: string;
+      expiry_to?: string;
+      availability?: string[];
+      max_price_min?: number;
+      max_price_max?: number;
+      notes?: string;
+    },
+  ) =>
+    request<{ updated: number; source: string }>(
+      `/backlog/bulk-set-registrar-filtered`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          source,
+          search: filters.search || "",
+          status_filter: filters.status?.length
+            ? filters.status.join(",")
+            : null,
+          registrar: filters.registrar?.length ? filters.registrar : null,
+          expiry_from: filters.expiry_from || null,
+          expiry_to: filters.expiry_to || null,
+          availability: filters.availability?.length
+            ? filters.availability.join(",")
+            : null,
+          max_price_min: filters.max_price_min || 0,
+          max_price_max: filters.max_price_max || 0,
+          notes: filters.notes || "any",
+        }),
+      },
+    ),
+
   // Backlog rows whose domain has been analyzed elsewhere but the
   // backlog status hasn't been moved to 'analyzed'/'discarded' yet.
   // Returns count + the row ids so the UI can hand them straight to
@@ -2595,6 +2644,60 @@ export const api = {
     }>("/database/domains/bulk-backlog-status", {
       method: "POST",
       body: JSON.stringify({ domains, status }),
+    }),
+
+  // Bulk re-tag the "Source" (BacklogDomain.registrar) of selected Database
+  // domains — the "move to source" action used to merge small check-batches
+  // under one source name. Upserts a backlog row for any domain not in the
+  // backlog yet.
+  bulkSetDomainSource: (domains: string[], source: string) =>
+    request<{
+      updated: number;
+      created: number;
+      skipped: number;
+      skipped_banned: number;
+      source: string;
+    }>("/database/domains/bulk-set-source", {
+      method: "POST",
+      body: JSON.stringify({ domains, source }),
+    }),
+
+  // Move-to-source across the WHOLE filtered set (every page, not just the
+  // selection) — mirrors listDatabaseDomains's filter shape so the backend
+  // resolves exactly the rows the page shows, server-side (no giant
+  // fetch-all-rows round-trip). `opts.source` is the Source FILTER; the first
+  // arg is the source to SET.
+  bulkSetDomainSourceFiltered: (source: string, opts: DatabaseListOpts = {}) =>
+    request<{
+      updated: number;
+      created: number;
+      skipped: number;
+      skipped_banned: number;
+      source: string;
+    }>("/database/domains/bulk-set-source-filtered", {
+      method: "POST",
+      body: JSON.stringify({
+        source,
+        verdict: opts.verdict ?? null,
+        wayback_verdict: opts.wayback_verdict ?? null,
+        whois_band: opts.whois_band ?? null,
+        availability: opts.availability ?? null,
+        language: opts.language ?? null,
+        category: opts.category ?? null,
+        criterion: opts.criterion ?? null,
+        source_filter: opts.source ?? null,
+        status: opts.status ?? null,
+        notes: opts.notes ?? "any",
+        wayback_conf_min: opts.wayback_conf_min ?? 0,
+        ahrefs_conf_min: opts.ahrefs_conf_min ?? 0,
+        dr_min: opts.dr_min ?? 0,
+        ref_domains_min: opts.ref_domains_min ?? 0,
+        whois_cycles_max: opts.whois_cycles_max ?? 0,
+        max_price_min: opts.max_price_min ?? 0,
+        max_price_max: opts.max_price_max ?? 0,
+        search: opts.search ?? "",
+        show_taken: opts.show_taken ?? false,
+      }),
     }),
 
   // --- DB backups (added 2026-05-10) ---

@@ -269,3 +269,254 @@ def test_rebuild_does_not_clobber_concurrent_patch(fresh_db):
     by = {r.domain: r for r in dbmod._peek_rows_cache()[0]}
     assert by["a.com"].backlog_status == "discarded"  # patch survived
     assert by["b.com"].backlog_status is None         # untouched
+
+
+# --- External-mutation cache invalidation (the "pinned/checked it but the
+# Database doesn't show it for minutes" bug) --------------------------------
+# The rows snapshot has a 5-min TTL. Before this fix, only the in-router
+# /database/* mutations invalidated it; pins made on the Jobs/Runs router and
+# the batch-analysis autopin did NOT, so their effect stayed invisible until
+# the TTL lapsed. These guard that each of those paths now invalidates.
+
+def test_pin_run_domain_route_patches_cache(fresh_db, monkeypatch):
+    """Pinning an rd via the Jobs router patches that domain into the
+    snapshot immediately (instant per-row freshness)."""
+    from app.models import RunDomain
+    from app.routers import database as dbmod
+    from app.routers import jobs as jobsmod
+    _seed(fresh_db, ["a.com", "b.com"])
+    rd = (
+        fresh_db.query(RunDomain).filter(RunDomain.domain == "a.com").first()
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        dbmod, "_patch_domains_in_cache",
+        lambda db, domains: calls.append(list(domains)),
+    )
+    jobsmod.pin_run_domain_route(rd.id, db=fresh_db)
+    assert calls == [["a.com"]]
+
+
+def test_unpin_run_domain_route_patches_cache(fresh_db, monkeypatch):
+    from app.models import RunDomain
+    from app.routers import database as dbmod
+    from app.routers import jobs as jobsmod
+    _seed(fresh_db, ["a.com", "b.com"])
+    rd = (
+        fresh_db.query(RunDomain).filter(RunDomain.domain == "a.com").first()
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        dbmod, "_patch_domains_in_cache",
+        lambda db, domains: calls.append(list(domains)),
+    )
+    jobsmod.unpin_run_domain_route(rd.id, db=fresh_db)
+    assert calls == [["a.com"]]
+
+
+def test_pin_run_route_invalidates_cache(fresh_db, monkeypatch):
+    """Pinning a run re-points the job's pins across a potentially large set,
+    on a USER REQUEST — so it kicks the NON-BLOCKING background rebuild, never
+    a synchronous inline patch (which would block the request ~20s at the
+    ~20-30K checked-domain scale). Guards against re-introducing that."""
+    from app.models import Run
+    from app.routers import database as dbmod
+    from app.routers import jobs as jobsmod
+    _seed(fresh_db, ["a.com", "b.com"])
+    run = fresh_db.query(Run).first()  # _seed makes 'done' runs
+    invalidated: list[bool] = []
+    patched: list[object] = []
+    monkeypatch.setattr(
+        dbmod, "_invalidate_rows_cache", lambda: invalidated.append(True),
+    )
+    monkeypatch.setattr(
+        dbmod, "_patch_domains_in_cache",
+        lambda db, domains: patched.append(domains),
+    )
+    jobsmod.pin_run_route(run.id, db=fresh_db)
+    assert invalidated == [True]  # background rebuild kicked
+    assert patched == []          # NOT a synchronous inline patch
+
+
+def test_unpin_run_route_invalidates_cache(fresh_db, monkeypatch):
+    from app.models import Run
+    from app.routers import database as dbmod
+    from app.routers import jobs as jobsmod
+    _seed(fresh_db, ["a.com", "b.com"])
+    run = fresh_db.query(Run).first()
+    invalidated: list[bool] = []
+    monkeypatch.setattr(
+        dbmod, "_invalidate_rows_cache", lambda: invalidated.append(True),
+    )
+    jobsmod.unpin_run_route(run.id, db=fresh_db)
+    assert invalidated == [True]
+
+
+# --- Move-to-source bulk action (2026-08-05) -------------------------------
+# bulk_set_source re-tags the "Source" (BacklogDomain.registrar) of selected
+# Database domains so several small check-batches merge under one source.
+
+def test_bulk_set_source_updates_and_creates(fresh_db, monkeypatch):
+    """Existing backlog rows get their registrar re-tagged; a domain with no
+    backlog row gets one created (status defaults to 'backlog'). Source is
+    trimmed; counts reflect the split."""
+    from app.models import BacklogDomain
+    from app.routers import database as dbmod
+    # The endpoint kicks a real background rebuild — stub it out in the test.
+    monkeypatch.setattr(dbmod, "_invalidate_rows_cache", lambda: None)
+    fresh_db.add(BacklogDomain(
+        domain="a.com", registrar="old-src", status="backlog",
+    ))
+    fresh_db.commit()
+
+    out = dbmod.bulk_set_source(
+        dbmod.BulkSetSourceIn(domains=["a.com", "b.com"], source="  RU  "),
+        db=fresh_db,
+    )
+    assert out.source == "RU"          # trimmed
+    assert out.updated == 1            # a.com (existing row re-tagged)
+    assert out.created == 1            # b.com (new backlog row)
+    by = {b.domain: b for b in fresh_db.query(BacklogDomain).all()}
+    assert by["a.com"].registrar == "RU"
+    assert by["b.com"].registrar == "RU"
+    assert by["b.com"].status == "backlog"
+
+
+def test_bulk_set_source_rejects_empty_name(fresh_db):
+    """An empty/whitespace source name is a 400 — the UI disables submit, but
+    the endpoint guards it too (an empty registrar is meaningless)."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+    from app.routers import database as dbmod
+    with _pytest.raises(HTTPException):
+        dbmod.bulk_set_source(
+            dbmod.BulkSetSourceIn(domains=["a.com"], source="   "),
+            db=fresh_db,
+        )
+
+
+def test_bulk_set_source_filtered_scopes_to_filter(fresh_db, monkeypatch):
+    """The all-filtered variant resolves the matching set via `list_domains`
+    (same server-side filtering the page uses) and re-tags only those. Here
+    the Source filter picks one of two checked domains."""
+    from app.models import BacklogDomain
+    from app.routers import database as dbmod
+    monkeypatch.setattr(dbmod, "_invalidate_rows_cache", lambda: None)
+    _seed(fresh_db, ["a.com", "b.com"])
+    fresh_db.add_all([
+        BacklogDomain(domain="a.com", registrar="src-a", status="backlog"),
+        BacklogDomain(domain="b.com", registrar="src-b", status="backlog"),
+    ])
+    fresh_db.commit()
+    # Filter to Source='src-a' → only a.com should be re-tagged to 'RU'.
+    out = dbmod.bulk_set_source_filtered(
+        dbmod.BulkSetSourceFilteredIn(source="RU", source_filter=["src-a"]),
+        db=fresh_db,
+    )
+    assert out.source == "RU" and out.updated == 1
+    by = {b.domain: b for b in fresh_db.query(BacklogDomain).all()}
+    assert by["a.com"].registrar == "RU"      # matched the filter
+    assert by["b.com"].registrar == "src-b"   # didn't match, untouched
+
+
+def test_bulk_set_source_preserves_all_metrics(fresh_db, monkeypatch):
+    """Moving a domain to another Source re-tags ONLY the registrar — every
+    other datum is untouched: the import-time backlog fields (DR / age / rank /
+    refdomains / prices / expiry / status / project / comments) AND the
+    analysed metrics (verdict, score, DR/RD/backlinks) which live on
+    RunDomain / CriterionResult, not the backlog row. Verified by comparing
+    the WHOLE synthesized Database row before vs after — identical but for the
+    source."""
+    from datetime import date
+    from app.models import BacklogDomain
+    from app.routers import database as dbmod
+    monkeypatch.setattr(dbmod, "_invalidate_rows_cache", lambda: None)
+    # _seed gives a.com pinned wayback + backlinks + refdomains verdicts (a
+    # non-trivial scored row); add a backlog row carrying every import field.
+    _seed(fresh_db, ["a.com"])
+    fresh_db.add(BacklogDomain(
+        domain="a.com", registrar="old-src", status="order",
+        ahrefs_dr=42.0, domain_age_years=5.5, ahrefs_rank=1234,
+        dofollow_refdomains=99, desired_price=100.0, max_price=250.0,
+        expiration_date=date(2027, 1, 1), project="proj-x", comments="note",
+    ))
+    fresh_db.commit()
+
+    before = {r.domain: r for r in dbmod._build_all_rows(fresh_db)[0]}["a.com"]
+    before_dump = before.model_dump()
+    assert before_dump["final_score"] is not None  # proves it's non-trivial
+
+    dbmod.bulk_set_source(
+        dbmod.BulkSetSourceIn(domains=["a.com"], source="new-src"), db=fresh_db,
+    )
+
+    # BacklogDomain row: only registrar changed; everything else preserved.
+    b = fresh_db.query(BacklogDomain).filter_by(domain="a.com").one()
+    assert b.registrar == "new-src"
+    assert (
+        b.status, b.ahrefs_dr, b.domain_age_years, b.ahrefs_rank,
+        b.dofollow_refdomains, b.desired_price, b.max_price,
+        b.expiration_date, b.project, b.comments,
+    ) == (
+        "order", 42.0, 5.5, 1234, 99, 100.0, 250.0,
+        date(2027, 1, 1), "proj-x", "note",
+    )
+
+    # The whole synthesized Database row is identical EXCEPT the source.
+    after = {r.domain: r for r in dbmod._build_all_rows(fresh_db)[0]}["a.com"]
+    after_dump = after.model_dump()
+    assert after_dump["backlog_registrar"] == "new-src"
+    before_dump.pop("backlog_registrar")
+    after_dump.pop("backlog_registrar")
+    assert before_dump == after_dump  # verdict, score, DR, RD, criteria — all intact
+
+
+# --- Backlog-page move-to-source (2026-08-05) ------------------------------
+# The Backlog side re-tags registrar directly on backlog rows (by id, or
+# across the whole filtered set) — works on ANY rows regardless of status,
+# for sweeping un-checked leftovers into one source.
+
+def test_backlog_bulk_set_registrar_by_ids(fresh_db):
+    from app.models import BacklogDomain
+    from app.routers import backlog as blmod
+    a = BacklogDomain(domain="a.com", registrar="old", status="backlog")
+    b = BacklogDomain(domain="b.com", registrar="old", status="backlog")
+    fresh_db.add_all([a, b])
+    fresh_db.commit()
+    out = blmod.bulk_set_registrar(
+        blmod.BulkSetRegistrarIn(ids=[a.id], source="  RU  "), db=fresh_db,
+    )
+    assert out["updated"] == 1 and out["source"] == "RU"  # trimmed
+    fresh_db.refresh(a)
+    fresh_db.refresh(b)
+    assert a.registrar == "RU"     # re-tagged
+    assert b.registrar == "old"    # untouched (not in ids)
+
+
+def test_backlog_bulk_set_registrar_filtered_scopes_to_filter(fresh_db):
+    from app.models import BacklogDomain
+    from app.routers import backlog as blmod
+    keep = BacklogDomain(domain="k.com", registrar="old", status="backlog")
+    disc = BacklogDomain(domain="d.com", registrar="old", status="discarded")
+    fresh_db.add_all([keep, disc])
+    fresh_db.commit()
+    # Only status='backlog' rows should be re-tagged (chunked-update path).
+    out = blmod.bulk_set_registrar_filtered(
+        blmod.BulkSetRegistrarFilteredIn(source="RU", status_filter="backlog"),
+        db=fresh_db,
+    )
+    assert out["updated"] == 1
+    fresh_db.refresh(keep)
+    fresh_db.refresh(disc)
+    assert keep.registrar == "RU"
+    assert disc.registrar == "old"
+
+
+def test_backlog_bulk_set_registrar_rejects_empty(fresh_db):
+    import pytest as _pytest
+    from fastapi import HTTPException
+    from app.routers import backlog as blmod
+    with _pytest.raises(HTTPException):
+        blmod.bulk_set_registrar(
+            blmod.BulkSetRegistrarIn(ids=[1], source="  "), db=fresh_db,
+        )

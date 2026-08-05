@@ -1051,6 +1051,27 @@ const messagesEn = {
           return `${parts.join(" · ")} (status = ${status}).`;
         },
       },
+      // Move-to-source (2026-08-05). Database bulk action that re-tags the
+      // selected domains' Source (registrar) so small check-batches merge
+      // into one source.
+      moveSource: {
+        placeholder: "Source name…",
+        button: (n: number) => `Move ${n} to source`,
+        buttonFiltered: (n: number) => `Move all ${n} to source`,
+        confirmFiltered: (n: number, source: string) =>
+          `Move all ${n} filtered domains to source “${source}”?`,
+        saving: "Moving…",
+        hint:
+          "Re-tag the selected domains' Source. Pick an existing source or type a new name to merge them under one. A brand-new name appears in the Source filter after Refresh.",
+        failed: "Move failed",
+        result: (updated: number, created: number, source: string) => {
+          const parts: string[] = [];
+          if (updated > 0) parts.push(`${updated} moved`);
+          if (created > 0) parts.push(`${created} created`);
+          if (parts.length === 0) parts.push("nothing changed");
+          return `${parts.join(" · ")} → “${source}”. New sources appear in the Source filter after Refresh.`;
+        },
+      },
       // Apruv export (added 2026-05-20). Bulk action that builds a CSV
       // for an approver, including auto-generated share URLs per row.
       apruv: {
@@ -2458,6 +2479,17 @@ const messagesEn = {
         `Mark ${n} as Analyzed`,
       analyzedHintDismiss: "Not now",
       openAnalyzed: "Open the analyzed domain page",
+      // Move-to-source (2026-08-05). Backlog bulk action: re-tag the "Source"
+      // (registrar) of selected rows, or of the whole filtered set, to merge
+      // small check-batches (or sweep leftovers) into one source.
+      moveSource: {
+        placeholder: "Source…",
+        hint: "Set the Source (registrar) of these rows. Pick an existing source or type a new name to merge them under one.",
+        button: (n: number) => `Move ${n} to source`,
+        buttonFiltered: (n: number) => `Move all ${n} to source`,
+        confirmFiltered: (n: number, source: string) =>
+          `Move all ${n} filtered rows to source “${source}”?`,
+      },
       bulkDelete: (n: number) => `Delete ${n}`,
       bulkDeleting: "Deleting…",
       bulkDeleteAllFiltered: (n: number) => `Delete all ${n} filtered`,
@@ -3731,6 +3763,24 @@ const messagesRu: Messages = {
           if (created > 0) parts.push(`создано ${created}`);
           if (parts.length === 0) parts.push("без изменений");
           return `${parts.join(" · ")} (статус = ${status}).`;
+        },
+      },
+      moveSource: {
+        placeholder: "Название источника…",
+        button: (n) => `Перенести ${n} в источник`,
+        buttonFiltered: (n) => `Перенести все ${n} в источник`,
+        confirmFiltered: (n, source) =>
+          `Перенести все ${n} отфильтрованных доменов в источник «${source}»?`,
+        saving: "Перенос…",
+        hint:
+          "Изменить «Источник» выбранных доменов. Выберите существующий источник или введите новое название, чтобы объединить их в один. Новое название появится в фильтре «Источник» после обновления.",
+        failed: "Не удалось перенести",
+        result: (updated, created, source) => {
+          const parts: string[] = [];
+          if (updated > 0) parts.push(`перенесено ${updated}`);
+          if (created > 0) parts.push(`создано ${created}`);
+          if (parts.length === 0) parts.push("без изменений");
+          return `${parts.join(" · ")} → «${source}». Новые источники появятся в фильтре «Источник» после обновления.`;
         },
       },
       // Apruv export (added 2026-05-20) — см. EN.
@@ -5173,6 +5223,14 @@ const messagesRu: Messages = {
       analyzedHintMark: (n) => `Отметить ${n} как Проанализирован`,
       analyzedHintDismiss: "Не сейчас",
       openAnalyzed: "Открыть страницу проанализированного домена",
+      moveSource: {
+        placeholder: "Источник…",
+        hint: "Задать «Источник» (registrar) для этих строк. Выберите существующий источник или введите новое название, чтобы объединить их в один.",
+        button: (n) => `Перенести ${n} в источник`,
+        buttonFiltered: (n) => `Перенести все ${n} в источник`,
+        confirmFiltered: (n, source) =>
+          `Перенести все ${n} отфильтрованных строк в источник «${source}»?`,
+      },
       bulkDelete: (n) => `Удалить ${n}`,
       bulkDeleting: "Удаление…",
       bulkDeleteAllFiltered: (n) => `Удалить все ${n} отфильтрованных`,

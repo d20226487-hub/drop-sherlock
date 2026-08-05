@@ -87,6 +87,11 @@ export default function BacklogPage() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [bulkBusy, setBulkBusy] = useState<boolean>(false);
   const [bulkError, setBulkError] = useState<string | null>(null);
+  // Move-to-source (2026-08-05). Two independent inputs — one in the
+  // selection toolbar (by id), one in the all-filtered toolbar — so typing in
+  // one doesn't echo into the other when both toolbars are visible.
+  const [moveSrcIds, setMoveSrcIds] = useState<string>("");
+  const [moveSrcFiltered, setMoveSrcFiltered] = useState<string>("");
 
   // --- Import wizard ------------------------------------------------------
   const [importOpen, setImportOpen] = useState(false);
@@ -417,6 +422,59 @@ export default function BacklogPage() {
     try {
       await api.bulkBacklogStatus(Array.from(selected), newStatus);
       setSelected(new Set());
+      reload({ silent: true, refreshOptions: true });
+    } catch (e) {
+      setBulkError((e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  // Move-to-source (2026-08-05). Re-tag the "Source" (registrar) of the
+  // selection, or of the whole filtered set — merges small check-batches (or
+  // sweeps leftovers) into one source, on ANY rows regardless of status.
+  // `refreshOptions: true` re-pulls the registrar universe so a brand-new
+  // source name shows up in the Source filter + datalist right away.
+  async function handleSetSourceIds(source: string) {
+    const src = source.trim();
+    if (selected.size === 0 || bulkBusy || !src) return;
+    setBulkBusy(true);
+    setBulkError(null);
+    try {
+      await api.bulkBacklogSetRegistrar(Array.from(selected), src);
+      setSelected(new Set());
+      setMoveSrcIds("");
+      reload({ silent: true, refreshOptions: true });
+    } catch (e) {
+      setBulkError((e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+  async function handleSetSourceAllFiltered(source: string) {
+    const src = source.trim();
+    if (!data || data.filtered_total === 0 || bulkBusy || !src) return;
+    if (
+      !window.confirm(ts.moveSource.confirmFiltered(data.filtered_total, src))
+    )
+      return;
+    setBulkBusy(true);
+    setBulkError(null);
+    try {
+      await api.bulkBacklogSetRegistrarFiltered(src, {
+        search: search.trim() || undefined,
+        status: statusFilter.length ? statusFilter : undefined,
+        registrar: registrarFilter.length ? registrarFilter : undefined,
+        expiry_from: expiryFrom || undefined,
+        expiry_to: expiryTo || undefined,
+        availability: availabilityFilter.length
+          ? availabilityFilter
+          : undefined,
+        max_price_min: maxPriceMin > 0 ? maxPriceMin : undefined,
+        max_price_max: maxPriceMax > 0 ? maxPriceMax : undefined,
+        notes: notesFilter !== "any" ? notesFilter : undefined,
+      });
+      setMoveSrcFiltered("");
       reload({ silent: true, refreshOptions: true });
     } catch (e) {
       setBulkError((e as Error).message);
@@ -901,6 +959,14 @@ export default function BacklogPage() {
         )}
       </div>
 
+      {/* Shared source-name suggestions for the move-to-source comboboxes in
+          both toolbars (2026-08-05). */}
+      <datalist id="backlog-source-options">
+        {cachedRegistrars.map((s) => (
+          <option key={s} value={s} />
+        ))}
+      </datalist>
+
       {/* Bulk-action bar that scopes to the entire filtered set, not just
           the visible page. Lives outside the selection toolbar so the
           user can act on all-filtered without first selecting rows. */}
@@ -926,6 +992,27 @@ export default function BacklogPage() {
               </option>
             ))}
           </select>
+          {/* Move ALL filtered rows to a source (2026-08-05). */}
+          <span className="inline-flex items-center gap-1">
+            <input
+              type="text"
+              list="backlog-source-options"
+              value={moveSrcFiltered}
+              onChange={(e) => setMoveSrcFiltered(e.target.value)}
+              placeholder={ts.moveSource.placeholder}
+              disabled={bulkBusy}
+              className="text-xs px-2 py-1 w-32 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 disabled:opacity-50"
+            />
+            <button
+              type="button"
+              onClick={() => handleSetSourceAllFiltered(moveSrcFiltered)}
+              disabled={bulkBusy || !moveSrcFiltered.trim()}
+              title={ts.moveSource.hint}
+              className="text-xs px-3 py-1 rounded-md border border-indigo-300 dark:border-indigo-900/60 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 disabled:opacity-50"
+            >
+              {ts.moveSource.buttonFiltered(data.filtered_total)}
+            </button>
+          </span>
           <span className="text-xs text-neutral-500 dark:text-neutral-400 self-center">
             {ts.sendToPicker.allFilteredLabel(data.filtered_total)}
           </span>
@@ -1020,6 +1107,27 @@ export default function BacklogPage() {
                 </option>
               ))}
             </select>
+            {/* Move the SELECTION to a source (2026-08-05). */}
+            <span className="inline-flex items-center gap-1">
+              <input
+                type="text"
+                list="backlog-source-options"
+                value={moveSrcIds}
+                onChange={(e) => setMoveSrcIds(e.target.value)}
+                placeholder={ts.moveSource.placeholder}
+                disabled={bulkBusy}
+                className="text-xs px-2 py-1 w-32 rounded-md border border-blue-300 dark:border-blue-900/60 bg-white dark:bg-neutral-950 text-blue-800 dark:text-blue-300 disabled:opacity-50"
+              />
+              <button
+                type="button"
+                onClick={() => handleSetSourceIds(moveSrcIds)}
+                disabled={bulkBusy || !moveSrcIds.trim()}
+                title={ts.moveSource.hint}
+                className="text-xs px-3 py-1 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+              >
+                {ts.moveSource.button(selected.size)}
+              </button>
+            </span>
             <span className="text-xs text-neutral-500 dark:text-neutral-400 self-center">
               {ts.sendToPicker.label(selected.size)}
             </span>

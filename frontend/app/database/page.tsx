@@ -946,10 +946,11 @@ export default function DatabasePage() {
         // Refresh on focus to catch cross-tab changes — but DON'T force a
         // fresh rebuild (the focus event also fires on initial navigation,
         // and a cache-bypass there would re-run the ~seconds-long
-        // aggregation on every landing). The backend's 20s snapshot TTL +
-        // mutation invalidation keep this fresh enough; the manual Refresh
-        // button is the on-demand cache-bypass. Via the ref so it uses the
-        // CURRENT filter state.
+        // aggregation on every landing). The backend's snapshot TTL (5 min)
+        // plus mutation invalidation — which now also covers the job/run pin
+        // and batch-analysis autopin paths, not just in-router edits — keep
+        // this fresh enough; the manual Refresh button is the on-demand
+        // cache-bypass. Via the ref so it uses the CURRENT filter state.
         reloadRef.current({ silent: true, refreshOptions: true });
       }
     }
@@ -1180,7 +1181,9 @@ export default function DatabasePage() {
         runs: r.deleted_runs,
         jobs: r.deleted_jobs,
       });
-      reload({ fresh: true });
+      // Deleted domains are gone from the list — clear the selection too so
+      // the "N selected" count doesn't go stale (same reason as bulk-ban).
+      reload({ fresh: true, clearSelection: true });
     } catch (e) {
       setDeleteError((e as Error).message || "delete failed");
     } finally {
@@ -1220,6 +1223,12 @@ export default function DatabasePage() {
             }
           : prev,
       );
+      // Clean slate after the action (matches ban/delete). Unlike those, the
+      // rows stay visible here (local patch, no reload), so this is a UX
+      // preference rather than a stale-count fix — but it also avoids a stale
+      // selection if a status FILTER later hides the just-changed rows on
+      // refresh. Same effect as the "Clear" button (selection only).
+      setSelected(new Set());
     } catch (e) {
       setBulkBacklogResult({
         status,
@@ -1309,7 +1318,12 @@ export default function DatabasePage() {
         already: r.already_banned,
         invalid: r.invalid,
       });
-      reload({ silent: true, fresh: true });
+      // Banned domains vanish from the list, so keeping them "selected" is
+      // meaningless — it left a stale "N selected" count (and re-processing
+      // already-banned rows on the next ban). Clear the selection alongside
+      // the refresh. `clearSelection` also resets the cross-page row
+      // accumulator so off-page picks don't linger either.
+      reload({ silent: true, fresh: true, clearSelection: true });
     } catch (e) {
       setBulkBanResult({
         added: 0,
@@ -1319,6 +1333,125 @@ export default function DatabasePage() {
       });
     } finally {
       setBulkBanBusy(false);
+    }
+  }
+
+  // Move-to-source (2026-08-05). Bulk re-tag the selected domains' Source
+  // (= BacklogDomain.registrar) to an existing source or a new typed name —
+  // merges several small check-batches into one source. Mirrors the backlog-
+  // status bulk action: patch the affected rows locally (no heavy reload).
+  // The Source-FILTER option list picks up a brand-new name after Refresh
+  // (the backend kicked a background snapshot rebuild).
+  const [moveSourceValue, setMoveSourceValue] = useState("");
+  const [moveSourceBusy, setMoveSourceBusy] = useState(false);
+  const [moveSourceResult, setMoveSourceResult] = useState<{
+    updated: number;
+    created: number;
+    source: string;
+    error?: string;
+  } | null>(null);
+  async function handleBulkMoveSource(source: string) {
+    const src = source.trim();
+    if (selected.size === 0 || moveSourceBusy || !src) return;
+    const list = Array.from(selected);
+    setMoveSourceBusy(true);
+    setMoveSourceResult(null);
+    try {
+      const r = await api.bulkSetDomainSource(list, src);
+      setMoveSourceResult({
+        updated: r.updated,
+        created: r.created,
+        source: r.source,
+      });
+      // Patch the moved rows' source locally so CSV / Apruv exports reflect it
+      // without a full reload (the Source column isn't rendered in the table,
+      // but the data stays consistent). The Source filter's options refresh on
+      // the next Refresh / the backend's background rebuild.
+      const moved = new Set(list);
+      setData((prev) =>
+        prev
+          ? {
+              ...prev,
+              rows: prev.rows.map((row) =>
+                moved.has(row.domain)
+                  ? { ...row, backlog_registrar: r.source }
+                  : row,
+              ),
+            }
+          : prev,
+      );
+      setMoveSourceValue("");
+    } catch (e) {
+      setMoveSourceResult({
+        updated: 0,
+        created: 0,
+        source: src,
+        error: (e as Error).message || "move failed",
+      });
+    } finally {
+      setMoveSourceBusy(false);
+    }
+  }
+
+  // All-filtered variant of move-to-source (2026-08-05): re-tag EVERY domain
+  // matching the current filters (not just the selection). Resolved + upserted
+  // server-side (no fetch-all-rows round-trip), so it scales to the whole
+  // checked set. Confirms first — the affected set isn't all on screen.
+  const [moveSourceFilteredValue, setMoveSourceFilteredValue] = useState("");
+  const [moveSourceFilteredBusy, setMoveSourceFilteredBusy] = useState(false);
+  const [moveSourceFilteredResult, setMoveSourceFilteredResult] = useState<{
+    updated: number;
+    created: number;
+    source: string;
+    error?: string;
+  } | null>(null);
+  async function handleBulkMoveSourceFiltered(source: string) {
+    const src = source.trim();
+    if (filteredTotal === 0 || moveSourceFilteredBusy || !src) return;
+    if (!window.confirm(ts.moveSource.confirmFiltered(filteredTotal, src)))
+      return;
+    setMoveSourceFilteredBusy(true);
+    setMoveSourceFilteredResult(null);
+    try {
+      const r = await api.bulkSetDomainSourceFiltered(src, {
+        verdict: verdicts,
+        wayback_verdict: waybackVerdicts,
+        whois_band: whoisBands,
+        availability: availabilityFilter,
+        language: languages,
+        category: categories,
+        criterion: criteria,
+        notes: notesFilter,
+        source: sourceFilter,
+        status: statusFilter,
+        wayback_conf_min: waybackConfMin,
+        ahrefs_conf_min: ahrefsConfMin,
+        dr_min: drMin,
+        ref_domains_min: refDomainsMin,
+        whois_cycles_max: whoisCyclesMax,
+        max_price_min: maxPriceMin,
+        max_price_max: maxPriceMax,
+        search,
+        show_taken: showTaken,
+      });
+      setMoveSourceFilteredResult({
+        updated: r.updated,
+        created: r.created,
+        source: r.source,
+      });
+      setMoveSourceFilteredValue("");
+      // Backend kicked a background rebuild; refresh so the new/merged source
+      // surfaces in the Source filter and the counts settle.
+      reload({ silent: true, refreshOptions: true });
+    } catch (e) {
+      setMoveSourceFilteredResult({
+        updated: 0,
+        created: 0,
+        source: src,
+        error: (e as Error).message || "move failed",
+      });
+    } finally {
+      setMoveSourceFilteredBusy(false);
     }
   }
 
@@ -2171,6 +2304,15 @@ export default function DatabasePage() {
 
       <PaginationTopBar state={searchState} searchPlaceholder={ts.searchPlaceholder} />
 
+      {/* Shared source-name suggestions for BOTH move-to-source comboboxes
+          (all-filtered bar here + selection toolbar below). Rendered
+          unconditionally so it's present regardless of which bar shows. */}
+      <datalist id="db-move-source-options">
+        {(opts.sources ?? []).map((s) => (
+          <option key={s} value={s} />
+        ))}
+      </datalist>
+
       {/* All-filtered send bar (2026-06-22) — dispatch the ENTIRE filtered
           set (every page) to a pillar, mirroring the Backlog page. Shown
           only when nothing is hand-selected, so it never stacks with the
@@ -2210,8 +2352,54 @@ export default function DatabasePage() {
               >
                 {t.pages.backlog.sendToPicker.ahrefsBatch}
               </button>
+              {/* Move ALL filtered rows to a source (2026-08-05) — the
+                  all-filtered analog of the selection-toolbar move. */}
+              <span className="inline-flex items-center gap-1">
+                <input
+                  type="text"
+                  list="db-move-source-options"
+                  value={moveSourceFilteredValue}
+                  onChange={(e) => setMoveSourceFilteredValue(e.target.value)}
+                  placeholder={ts.moveSource.placeholder}
+                  disabled={
+                    deleting ||
+                    sendingPillar !== null ||
+                    moveSourceFilteredBusy
+                  }
+                  className="text-xs px-2 py-1 w-36 rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 disabled:opacity-50"
+                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleBulkMoveSourceFiltered(moveSourceFilteredValue)
+                  }
+                  disabled={
+                    deleting ||
+                    sendingPillar !== null ||
+                    moveSourceFilteredBusy ||
+                    !moveSourceFilteredValue.trim()
+                  }
+                  title={ts.moveSource.hint}
+                  className="text-xs px-3 py-1 rounded-md border border-indigo-300 dark:border-indigo-700 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 disabled:opacity-50"
+                >
+                  {moveSourceFilteredBusy
+                    ? ts.moveSource.saving
+                    : ts.moveSource.buttonFiltered(filteredTotal)}
+                </button>
+              </span>
             </div>
           </div>
+          {moveSourceFilteredResult && (
+            <div className="text-xs text-indigo-800 dark:text-indigo-300 mt-2 pt-1 border-t border-indigo-200 dark:border-indigo-900/60">
+              {moveSourceFilteredResult.error
+                ? `${ts.moveSource.failed}: ${moveSourceFilteredResult.error}`
+                : ts.moveSource.result(
+                    moveSourceFilteredResult.updated,
+                    moveSourceFilteredResult.created,
+                    moveSourceFilteredResult.source,
+                  )}
+            </div>
+          )}
         </div>
       )}
 
@@ -2293,6 +2481,45 @@ export default function DatabasePage() {
                   ? ts.backlogActions.saving
                   : ts.backlogActions.bulkDiscard(selected.size)}
               </button>
+              {/* Move-to-source (2026-08-05): re-tag Source (registrar) of the
+                  selected rows — merges small check-batches into one source.
+                  Native datalist = pick an existing source OR type a new
+                  name. */}
+              <span className="inline-flex items-center gap-1">
+                <input
+                  type="text"
+                  list="db-move-source-options"
+                  value={moveSourceValue}
+                  onChange={(e) => setMoveSourceValue(e.target.value)}
+                  placeholder={ts.moveSource.placeholder}
+                  disabled={
+                    deleting ||
+                    sendingPillar !== null ||
+                    bulkBacklogBusy ||
+                    bulkBanBusy ||
+                    moveSourceBusy
+                  }
+                  className="text-xs px-2 py-1 w-36 rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 disabled:opacity-50"
+                />
+                <button
+                  type="button"
+                  onClick={() => handleBulkMoveSource(moveSourceValue)}
+                  disabled={
+                    deleting ||
+                    sendingPillar !== null ||
+                    bulkBacklogBusy ||
+                    bulkBanBusy ||
+                    moveSourceBusy ||
+                    !moveSourceValue.trim()
+                  }
+                  title={ts.moveSource.hint}
+                  className="text-xs px-3 py-1 rounded-md border border-indigo-300 dark:border-indigo-700 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 disabled:opacity-50"
+                >
+                  {moveSourceBusy
+                    ? ts.moveSource.saving
+                    : ts.moveSource.button(selected.size)}
+                </button>
+              </span>
               <button
                 type="button"
                 onClick={handleBulkBan}
@@ -2362,6 +2589,17 @@ export default function DatabasePage() {
                     bulkBanResult.added,
                     bulkBanResult.already,
                     bulkBanResult.invalid,
+                  )}
+            </div>
+          )}
+          {moveSourceResult && (
+            <div className="text-xs text-indigo-800 dark:text-indigo-300 pt-1 border-t border-indigo-200 dark:border-indigo-900/60">
+              {moveSourceResult.error
+                ? `${ts.moveSource.failed}: ${moveSourceResult.error}`
+                : ts.moveSource.result(
+                    moveSourceResult.updated,
+                    moveSourceResult.created,
+                    moveSourceResult.source,
                   )}
             </div>
           )}

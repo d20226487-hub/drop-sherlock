@@ -1185,6 +1185,107 @@ def bulk_status_filtered(
     return {"updated": total}
 
 
+class BulkSetRegistrarIn(BaseModel):
+    """Bulk re-tag the "Source" (registrar) of selected backlog rows (by id).
+    The target value is `source` (not `registrar`) to avoid colliding with the
+    `registrar` FILTER used by the -filtered sibling."""
+    ids: list[int]
+    source: str
+
+
+class BulkSetRegistrarFilteredIn(BaseModel):
+    """Bulk re-tag registrar across every row matching the same filters as the
+    list endpoint. `source` is the value to SET; `registrar` (if present) is
+    the filter selecting which rows to match."""
+    source: str
+    search: str = ""
+    status_filter: str | None = None
+    registrar: list[str] | None = None
+    expiry_from: date | None = None
+    expiry_to: date | None = None
+    availability: str | None = None
+    max_price_min: float = 0.0
+    max_price_max: float = 0.0
+    notes: str = "any"
+
+
+def _validate_source(raw: str) -> str:
+    src = raw.strip()
+    if not src:
+        raise HTTPException(400, "source name required")
+    if len(src) > _IMPORT_MAX_REGISTRAR_LEN:
+        raise HTTPException(
+            400, f"source name too long (max {_IMPORT_MAX_REGISTRAR_LEN})"
+        )
+    return src
+
+
+@router.post("/bulk-set-registrar")
+def bulk_set_registrar(
+    payload: BulkSetRegistrarIn, db: Session = Depends(get_db),
+) -> dict:
+    """Set `registrar` (= "Source") on every row whose id is in the list — the
+    Backlog page's "move to source" for a hand-picked selection. Lets the user
+    merge several small check-batches under one source name, on ANY rows
+    regardless of status. No-op for unknown ids; idempotent.
+
+    (Note: like bulk_status, this does NOT invalidate the Database
+    aggregation snapshot — a checked domain's Source on the Database page
+    self-heals within the snapshot TTL. The primary use here is organizing
+    un-checked domains, which aren't in that snapshot at all.)"""
+    source = _validate_source(payload.source)
+    if not payload.ids:
+        return {"updated": 0, "source": source}
+    n = (
+        db.query(BacklogDomain)
+        .filter(BacklogDomain.id.in_(payload.ids))
+        .update(
+            {"registrar": source, "updated_at": datetime.utcnow()},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return {"updated": int(n), "source": source}
+
+
+@router.post("/bulk-set-registrar-filtered")
+def bulk_set_registrar_filtered(
+    payload: BulkSetRegistrarFilteredIn, db: Session = Depends(get_db),
+) -> dict:
+    """Set `registrar` on every row matching the current filters — the "move
+    ALL filtered to one source" sweep (e.g. all un-checked leftovers → one
+    list). Chunked + committed per batch (same scale contract as
+    bulk_status_filtered) so a 100k-row sweep never holds the SQLite writer
+    lock for the whole run."""
+    source = _validate_source(payload.source)
+    q = _apply_backlog_filters(
+        db.query(BacklogDomain),
+        search=payload.search,
+        statuses=_parse_status_csv(payload.status_filter),
+        registrars_filter=_normalize_registrar_list(payload.registrar),
+        expiry_from=payload.expiry_from,
+        expiry_to=payload.expiry_to,
+        availability_statuses=_parse_availability_csv(payload.availability),
+        max_price_min=payload.max_price_min,
+        max_price_max=payload.max_price_max,
+        notes=payload.notes,
+    )
+    now = datetime.utcnow()
+    total = 0
+    for ids in _iter_filtered_ids(q):
+        n = (
+            db.query(BacklogDomain)
+            .filter(BacklogDomain.id.in_(ids))
+            .update(
+                {"registrar": source, "updated_at": now},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        total += int(n)
+    return {"updated": total, "source": source}
+
+
 @router.post("/bulk-delete")
 def bulk_delete(payload: BulkDeleteIn, db: Session = Depends(get_db)) -> dict:
     """Permanently delete the listed rows. No-op for unknown ids."""

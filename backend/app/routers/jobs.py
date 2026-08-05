@@ -2852,6 +2852,14 @@ def pin_run_domain_route(
         if rd_crits:
             _upsert_criterion_pins_for_run(db, run, rd_crits)
     db.commit()
+    # Reflect the pin on the Database page immediately by patching just this
+    # domain into the aggregation snapshot. Without it the snapshot keeps
+    # serving the pre-pin row until its TTL lapses (up to _ROWS_CACHE_TTL_SEC
+    # ~ 5 min) — the "I pinned it but the Database doesn't show it for
+    # minutes" bug. Local import avoids a module-load circular (jobs <->
+    # database).
+    from .database import _patch_domains_in_cache
+    _patch_domains_in_cache(db, [rd.domain])
     return PinRunDomainOut(
         run_domain_id=rd.id, domain=rd.domain, is_pinned=True,
     )
@@ -2884,6 +2892,11 @@ def unpin_run_domain_route(
                 .delete(synchronize_session=False)
             )
     db.commit()
+    # Mirror the pin path: patch this domain into the snapshot so the unpin
+    # shows on the Database page at once instead of after the TTL. See
+    # pin_run_domain_route above.
+    from .database import _patch_domains_in_cache
+    _patch_domains_in_cache(db, [rd.domain])
     return PinRunDomainOut(
         run_domain_id=rd.id, domain=rd.domain, is_pinned=False,
     )
@@ -2938,6 +2951,16 @@ def pin_run_route(
         db, run, _criteria_with_data_for_run(db, run.id),
     )
     db.commit()
+    # Pinning a run re-points the job's per-criterion pins across the WHOLE
+    # job — a potentially large set. This runs on a user request, so kick a
+    # NON-BLOCKING background rebuild rather than synthesizing the job's rows
+    # inline: a full build is ~20s at the ~20-30K checked-domain scale and must
+    # not block the pin request. Coalesced; the stale snapshot is served
+    # meanwhile. (The snapshot only ever holds CHECKED domains — never the far
+    # larger backlog — so "full" is that bounded set.) Local import dodges a
+    # module-load circular.
+    from .database import _invalidate_rows_cache
+    _invalidate_rows_cache()
     return PinRunOut(
         run_id=run.id,
         job_id=run.job_id,
@@ -2958,6 +2981,11 @@ def unpin_run_route(
         raise HTTPException(404, "run not found")
     run.is_pinned = False
     db.commit()
+    # Same job-wide reshaping as pinning, on a user request → non-blocking
+    # background rebuild (never block the request on a ~20s full build). See
+    # pin_run_route above.
+    from .database import _invalidate_rows_cache
+    _invalidate_rows_cache()
     return PinRunOut(
         run_id=run.id,
         job_id=run.job_id,

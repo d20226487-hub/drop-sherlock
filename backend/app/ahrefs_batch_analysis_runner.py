@@ -267,5 +267,28 @@ async def process_ahrefs_batch_analysis_run(run_id: int) -> None:
             from .routers.jobs import _upsert_criterion_pins_for_run
             _upsert_criterion_pins_for_run(db, run, {CRITERION})
             db.commit()
+            # Surface the just-autopinned batch metrics (DR / RD / B) on the
+            # Database page without waiting for the snapshot's ~5 min TTL.
+            # Patch ONLY this run's domains rather than a full rebuild: the
+            # batch_metrics merge is per-domain, so only these domains change.
+            # Unlike the run-pin ENDPOINTS (which trigger a non-blocking
+            # rebuild because they're on a user request), this is the batch
+            # WORKER thread and a typical check is a handful of domains — so a
+            # bounded synchronous patch is ~instant here, versus a ~20s full
+            # `_build_all_rows` (which loads the whole checked set). No-op when
+            # no snapshot is warm yet (the next Database visit cold-builds with
+            # this committed). This is the fix for "ran a DR/RD check, but the
+            # Database doesn't show it for minutes".
+            from .models import RunDomain
+            from .routers.database import _patch_domains_in_cache
+            run_domains = [
+                d
+                for (d,) in (
+                    db.query(RunDomain.domain)
+                    .filter(RunDomain.run_id == run.id)
+                    .distinct()
+                )
+            ]
+            _patch_domains_in_cache(db, run_domains)
     finally:
         db.close()

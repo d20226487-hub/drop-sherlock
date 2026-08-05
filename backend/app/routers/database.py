@@ -3092,6 +3092,204 @@ def bulk_set_backlog_status(
     )
 
 
+class BulkSetSourceIn(BaseModel):
+    domains: list[str]
+    # Target "Source" (= BacklogDomain.registrar). Free-form; trimmed. The UI
+    # only submits a chosen-or-typed non-empty name.
+    source: str
+
+
+class BulkSetSourceOut(BaseModel):
+    updated: int
+    created: int
+    skipped: int
+    skipped_banned: int = 0
+    source: str
+
+
+# Mirrors the BacklogDomain.registrar column width — a longer "source" name is
+# almost certainly a paste error.
+_MAX_SOURCE_LEN = 128
+
+
+def _validate_source_name(raw: str) -> str:
+    src = raw.strip()
+    if not src:
+        raise HTTPException(400, "source name required")
+    if len(src) > _MAX_SOURCE_LEN:
+        raise HTTPException(400, f"source name too long (max {_MAX_SOURCE_LEN})")
+    return src
+
+
+def _normalize_domain_list(domains: list[str]) -> list[str]:
+    """Strip scheme/path, lowercase, dedupe — same rule as
+    bulk_set_backlog_status."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in domains:
+        s = d.strip().lower()
+        for prefix in ("https://", "http://"):
+            if s.startswith(prefix):
+                s = s[len(prefix):]
+        s = s.split("/", 1)[0]
+        if s and s not in seen:
+            out.append(s)
+            seen.add(s)
+    return out
+
+
+def _upsert_source_for_domains(
+    db: Session, normalized: list[str], source: str,
+) -> tuple[int, int, int]:
+    """Set registrar=source on the given (already-normalized, deduped) domains:
+    existing BacklogDomain rows PATCHed, missing ones created (status
+    'backlog'). Banned domains only block the CREATE branch. Commits. Returns
+    (updated, created, skipped_banned). Shared by the domain-list and the
+    filtered "move to source" endpoints."""
+    from ..ban_filter import filter_banned
+    from ..models import BacklogDomain
+    if not normalized:
+        return (0, 0, 0)
+    now = datetime.utcnow()
+    existing = {
+        b.domain: b
+        for b in db.query(BacklogDomain)
+        .filter(BacklogDomain.domain.in_(normalized))
+        .all()
+    }
+    create_candidates = [d for d in normalized if d not in existing]
+    _allowed, banned_for_create = filter_banned(db, create_candidates)
+    updated = created = skipped_banned = 0
+    for d in normalized:
+        row = existing.get(d)
+        if row is not None:
+            row.registrar = source
+            row.updated_at = now
+            updated += 1
+        elif d in banned_for_create:
+            skipped_banned += 1
+        else:
+            db.add(BacklogDomain(
+                domain=d, registrar=source, status="backlog",
+                created_at=now, updated_at=now,
+            ))
+            created += 1
+    db.commit()
+    return (updated, created, skipped_banned)
+
+
+@router.post("/domains/bulk-set-source", response_model=BulkSetSourceOut)
+def bulk_set_source(
+    payload: BulkSetSourceIn,
+    db: Session = Depends(get_db),
+) -> BulkSetSourceOut:
+    """Re-tag the "Source" (BacklogDomain.registrar) of the given domains — the
+    Database page's "move to source" for a hand-picked selection. Existing
+    backlog rows PATCHed; a checked domain with no backlog row yet gets one
+    created (status 'backlog').
+
+    Free-form registrar → a brand-new source name is a NEW filter-universe
+    value, so we kick a full (background, non-blocking) `_invalidate_rows_cache`
+    rebuild rather than a row-only patch — otherwise the merged/new name
+    wouldn't show in the Source filter until the 5-min TTL."""
+    source = _validate_source_name(payload.source)
+    if not payload.domains:
+        raise HTTPException(400, "no domains provided")
+    normalized = _normalize_domain_list(payload.domains)
+    if not normalized:
+        raise HTTPException(400, "no valid domains after normalization")
+    updated, created, skipped_banned = _upsert_source_for_domains(
+        db, normalized, source,
+    )
+    _invalidate_rows_cache()
+    return BulkSetSourceOut(
+        updated=updated,
+        created=created,
+        skipped=len(payload.domains) - len(normalized),
+        skipped_banned=skipped_banned,
+        source=source,
+    )
+
+
+class BulkSetSourceFilteredIn(BaseModel):
+    """Move-to-source across EVERY Database row matching the current filters
+    (not just the selection / page). `source` is the value to SET; the rest
+    mirror the GET /domains query shape so the same server-side filtering
+    picks exactly the rows the page is showing."""
+    source: str
+    verdict: list[str] | None = None
+    wayback_verdict: list[str] | None = None
+    whois_band: list[str] | None = None
+    availability: list[str] | None = None
+    language: list[str] | None = None
+    category: list[str] | None = None
+    criterion: list[str] | None = None
+    # Which existing sources to MATCH (the Source filter) — distinct from the
+    # `source` we SET above.
+    source_filter: list[str] | None = None
+    status: list[str] | None = None
+    notes: str = "any"
+    wayback_conf_min: float = 0.0
+    ahrefs_conf_min: float = 0.0
+    dr_min: float = 0.0
+    ref_domains_min: float = 0.0
+    whois_cycles_max: int = 0
+    max_price_min: float = 0.0
+    max_price_max: float = 0.0
+    search: str = ""
+    show_taken: bool = False
+
+
+@router.post(
+    "/domains/bulk-set-source-filtered", response_model=BulkSetSourceOut
+)
+def bulk_set_source_filtered(
+    payload: BulkSetSourceFilteredIn,
+    db: Session = Depends(get_db),
+) -> BulkSetSourceOut:
+    """Re-tag the Source of every domain matching the current Database filters
+    — the "move all N filtered" sweep. Resolves the matching set via
+    `list_domains(limit=None, ...)` (the exact same pin-driven, filtered
+    universe the page renders), then reuses the domain-list upsert. Bounded by
+    the CHECKED set (the Database snapshot never includes un-checked backlog
+    rows), so a single upsert transaction is fine at this scale."""
+    source = _validate_source_name(payload.source)
+    resp = list_domains(
+        db=db, offset=0, limit=None, include_options=False,
+        verdicts=payload.verdict,
+        wayback_verdicts=payload.wayback_verdict,
+        whois_bands=payload.whois_band,
+        availability=payload.availability,
+        languages=payload.language,
+        categories=payload.category,
+        criteria=payload.criterion,
+        notes=payload.notes,
+        sources=payload.source_filter,
+        statuses=payload.status,
+        wayback_conf_min=payload.wayback_conf_min,
+        ahrefs_conf_min=payload.ahrefs_conf_min,
+        dr_min=payload.dr_min,
+        ref_domains_min=payload.ref_domains_min,
+        whois_cycles_max=payload.whois_cycles_max,
+        max_price_min=payload.max_price_min,
+        max_price_max=payload.max_price_max,
+        search=payload.search,
+        show_taken=payload.show_taken,
+    )
+    domains = [r.domain for r in resp.rows]
+    updated, created, skipped_banned = _upsert_source_for_domains(
+        db, domains, source,
+    )
+    _invalidate_rows_cache()
+    return BulkSetSourceOut(
+        updated=updated,
+        created=created,
+        skipped=0,
+        skipped_banned=skipped_banned,
+        source=source,
+    )
+
+
 # --- Apruv export: batch share-link resolution ----------------------------
 #
 # The Database page's "Apruv" bulk-action ships approver-ready CSV exports.

@@ -3,11 +3,20 @@ import {
   ReactNode,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
 import { api, RunDomainDetail } from "@/lib/api";
 import { useT } from "@/lib/i18n";
+
+// The popover must be measured and (re)positioned synchronously before
+// paint so flipping it above the trigger never flickers. useLayoutEffect
+// does that; fall back to useEffect during SSR to avoid React's
+// "useLayoutEffect does nothing on the server" warning — the popover only
+// ever exists after a client-side hover anyway.
+const useIsomorphicLayoutEffect =
+  typeof window !== "undefined" ? useLayoutEffect : useEffect;
 
 // LRU cache keyed by run_domain_id. Survives across rows (and unmounts
 // of the trigger) so the second hover never re-fetches the same
@@ -76,9 +85,12 @@ export function VerdictHoverCard(props: Props) {
   const showTimer = useRef<number | null>(null);
   const hideTimer = useRef<number | null>(null);
   const wrapRef = useRef<HTMLSpanElement | null>(null);
-  const [popPos, setPopPos] = useState<{ top: number; left: number } | null>(
-    null,
-  );
+  const popRef = useRef<HTMLDivElement | null>(null);
+  const [popPos, setPopPos] = useState<{
+    top: number;
+    left: number;
+    maxHeight: number;
+  } | null>(null);
 
   const cancelTimers = useCallback(() => {
     if (showTimer.current) {
@@ -112,31 +124,63 @@ export function VerdictHoverCard(props: Props) {
     }
   }, [runDomainId]);
 
+  // Position the popover next to the trigger, flipping it above when the
+  // content would overflow the bottom of the viewport — the case for rows
+  // near the end of a long table (the reported bug). `maxHeight` + internal
+  // scroll is the safety net when the content is taller than the room on
+  // whichever side we land.
   const positionPopover = useCallback(() => {
-    if (!wrapRef.current) return;
-    const rect = wrapRef.current.getBoundingClientRect();
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
     const POP_W = 360;
+    const MARGIN = 8; // keep this far from every viewport edge
+    const GAP = 6; // gap between the trigger and the popover
     const left = Math.max(
-      8,
-      Math.min(window.innerWidth - POP_W - 8, rect.left),
+      MARGIN,
+      Math.min(window.innerWidth - POP_W - MARGIN, rect.left),
     );
-    const top = rect.bottom + 6;
-    setPopPos({ top, left });
+    // Natural, unclamped content height. scrollHeight ignores any maxHeight
+    // a previous pass applied, so the flip decision stays correct across
+    // the loading -> loaded height change.
+    const contentH = popRef.current?.scrollHeight ?? 0;
+    const spaceBelow = window.innerHeight - rect.bottom - GAP - MARGIN;
+    const spaceAbove = rect.top - GAP - MARGIN;
+    // Prefer the conventional below placement; flip up only when the content
+    // overflows below and there is genuinely more room above.
+    const flipUp = contentH > spaceBelow && spaceAbove > spaceBelow;
+    if (flipUp) {
+      const maxHeight = Math.max(0, spaceAbove);
+      const usedH = Math.min(contentH, maxHeight);
+      setPopPos({ top: rect.top - GAP - usedH, left, maxHeight });
+    } else {
+      setPopPos({
+        top: rect.bottom + GAP,
+        left,
+        maxHeight: Math.max(0, spaceBelow),
+      });
+    }
   }, []);
 
   const handleEnter = useCallback(() => {
     cancelTimers();
     showTimer.current = window.setTimeout(() => {
-      positionPopover();
       setOpen(true);
       void ensureFetched();
     }, HOVER_DELAY_MS);
-  }, [cancelTimers, ensureFetched, positionPopover]);
+  }, [cancelTimers, ensureFetched]);
 
   const handleLeave = useCallback(() => {
     cancelTimers();
     hideTimer.current = window.setTimeout(() => setOpen(false), HIDE_DELAY_MS);
   }, [cancelTimers]);
+
+  // Measure + position once the popover is in the DOM, and again whenever
+  // its content changes height (loading -> loaded, or error). Runs before
+  // paint so the flip never flickers. See useIsomorphicLayoutEffect above.
+  useIsomorphicLayoutEffect(() => {
+    if (open) positionPopover();
+  }, [open, detail, loading, error, positionPopover]);
 
   return (
     <>
@@ -149,16 +193,22 @@ export function VerdictHoverCard(props: Props) {
       >
         {children}
       </span>
-      {open && popPos && (
+      {open && (
         <div
+          ref={popRef}
           role="tooltip"
           onMouseEnter={cancelTimers}
           onMouseLeave={handleLeave}
           style={{
             position: "fixed",
-            top: popPos.top,
-            left: popPos.left,
+            top: popPos?.top ?? 0,
+            left: popPos?.left ?? 0,
             width: 360,
+            maxHeight: popPos?.maxHeight,
+            overflowY: "auto",
+            // Hidden until the layout effect has measured + placed it, so
+            // the first frame never shows it at the wrong spot.
+            visibility: popPos ? "visible" : "hidden",
             zIndex: 50,
           }}
           className="pointer-events-auto rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 shadow-xl p-3 text-xs"
