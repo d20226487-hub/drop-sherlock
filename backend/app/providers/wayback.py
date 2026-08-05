@@ -55,63 +55,53 @@ from .base import BaseProvider, ProviderError
 API_BASE = "https://web.archive.org/cdx/search/cdx"
 SNAPSHOT_BASE = "https://web.archive.org/web"
 
-# Burst-cooldown gate. CDX has its own sliding throttle window that the
-# token-bucket rate limiter doesn't fully account for: even at RPM=30 +
-# concurrent=1, sustained traffic during long batches (>20 domains) hits
-# Wayback's window and produces cascading ConnectTimeouts. Enforce a
-# minimum total elapsed time per burst — if a burst of N fetches ran
-# faster than K seconds, sleep the difference before the next burst.
+# Reactive throttle-cooldown gate (replaced the proactive burst gate on
+# 2026-08-05). archive.org throttles by IP and the throttle lingers once
+# tripped. The OLD gate unconditionally slept up to K=30s after every N=5
+# requests — a FIXED tax that dominated wall-clock even on healthy batches
+# (measured: a 20-domain V1+V2 run spent ~15 min, most of it gate sleeps,
+# while archive.org was answering fine). Worse, it slept while HOLDING its
+# lock, so a cooldown serialized ALL wayback traffic behind one sleeper and
+# made max_concurrent>1 useless during the window.
 #
-# When CDX is naturally slow (10–30s per response), the burst already
-# exceeds K and no extra sleep happens. When CDX is responsive and we'd
-# otherwise saturate it, the cooldown spaces things out.
-#
-# `_WB_BURST_SIZE = 5` and `_WB_BURST_COOLDOWN_S = 30` are chosen empirically
-# from the 31/35-fail incident on 2026-05-07: the bursts started failing
-# around request #6, and recovery took ~30s of silence in observed retries.
-# State is process-global — carries between jobs, which is desirable:
-# back-to-back jobs benefit from the same breathing room.
-# Multi-user implication (LAN deploy): if user A's job triggers the
-# cooldown, user B's job inherits the wait. This is acceptable because
-# Wayback CDX is a free shared upstream — both users hammering it
-# independently is what triggered the original incident, and the gate
-# protecting both via one counter is the whole point. If you ever need
-# per-user fairness, key the state by job_id (but expect the upstream
-# to push back when concurrent bursts collide).
-_WB_BURST_SIZE = 5
-_WB_BURST_COOLDOWN_S = 30.0
-_wb_burst_lock = asyncio.Lock()
-_wb_burst_state: dict[str, float] = {"count": 0, "burst_start_at": 0.0}
+# New model: back off ONLY after archive.org actually pushes back (HTTP 429 /
+# 5xx / connect|read timeout). The offending coroutine ARMS a global cooldown;
+# every wayback request waits out an armed cooldown before its next attempt,
+# and the wait sleeps OUTSIDE the lock so healthy traffic is never serialized
+# behind it. Same pattern the sibling wayback_sparkline gate already uses
+# (_wait_for_cooldown / _arm_cooldown). State is process-global so one counter
+# governs all wayback traffic uniformly — back-to-back jobs and concurrent
+# users share the same breathing room against this free shared upstream.
+_WB_COOLDOWN_S = 30.0
+_wb_cooldown_lock = asyncio.Lock()
+_wb_cooldown_until: float = 0.0  # event-loop monotonic time
 
 
-async def _wb_burst_gate() -> None:
-    """Enforce 'burst N then cool down K seconds' on the wayback HTTP path.
-    Called at the top of every CDX query AND every V2 snapshot fetch so
-    one counter governs all wayback traffic uniformly. Cooldown duration
-    measured from the START of the current burst, not from the previous
-    cooldown — that way a slow burst doesn't accidentally double-pause."""
+async def _wb_wait_for_cooldown() -> None:
+    """Block until any armed cooldown clears. Cheap fast-path when idle (a
+    single monotonic-time comparison). Sleeps OUTSIDE the lock so concurrent
+    waiters wake together without serializing through the gate. Called at the
+    top of every CDX query AND every V2 snapshot fetch."""
+    while True:
+        now = asyncio.get_event_loop().time()
+        if now >= _wb_cooldown_until:
+            return
+        await asyncio.sleep(_wb_cooldown_until - now)
+
+
+async def _arm_cooldown(reason: str) -> None:
+    """Arm the global cooldown to now + _WB_COOLDOWN_S, but only if it isn't
+    already armed (caps the window instead of letting every sibling 429 extend
+    it). Called when archive.org pushes back (429 / 5xx / network timeout)."""
+    global _wb_cooldown_until
     import logging
-    async with _wb_burst_lock:
-        _wb_burst_state["count"] += 1
-        if _wb_burst_state["count"] == 1:
-            _wb_burst_state["burst_start_at"] = (
-                asyncio.get_event_loop().time()
-            )
-        if _wb_burst_state["count"] > _WB_BURST_SIZE:
-            loop = asyncio.get_event_loop()
-            burst_duration = loop.time() - _wb_burst_state["burst_start_at"]
-            if burst_duration < _WB_BURST_COOLDOWN_S:
-                wait = _WB_BURST_COOLDOWN_S - burst_duration
-                logging.getLogger(__name__).info(
-                    "wayback burst-cooldown: pausing %.1fs "
-                    "(burst of %d fetches took %.1fs, target %.1fs)",
-                    wait, _WB_BURST_SIZE, burst_duration,
-                    _WB_BURST_COOLDOWN_S,
-                )
-                await asyncio.sleep(wait)
-            _wb_burst_state["count"] = 1
-            _wb_burst_state["burst_start_at"] = (
-                asyncio.get_event_loop().time()
+    async with _wb_cooldown_lock:
+        now = asyncio.get_event_loop().time()
+        if _wb_cooldown_until <= now:
+            _wb_cooldown_until = now + _WB_COOLDOWN_S
+            logging.getLogger(__name__).info(
+                "wayback cooldown armed for %.0fs (%s)",
+                _WB_COOLDOWN_S, reason,
             )
 # Cap per-snapshot extracted text so a single bloated archived page can't
 # blow up the AI prompt or the persisted JSON. Body excerpt is also capped
@@ -299,7 +289,7 @@ class WaybackClient(BaseProvider):
         We unwrap into `{"wayback": [{col1: v1, ...}, ...]}` so downstream
         code (row count, AI trim, table render) sees the same shape every
         other criterion uses."""
-        await _wb_burst_gate()
+        await _wb_wait_for_cooldown()
         retry_max = get_rate_limits("wayback").get("retry_max", 3)
         last_exc: Exception | None = None
         for attempt in range(retry_max + 1):
@@ -307,6 +297,10 @@ class WaybackClient(BaseProvider):
                 r = await self.client.get(url)
             except Exception as e:  # noqa: BLE001
                 last_exc = e
+                # Network/timeout == archive.org tarpitting our IP; arm the
+                # global cooldown so ALL wayback traffic backs off (reactive
+                # gate), not just this one retry.
+                await _arm_cooldown(f"network {type(e).__name__}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
                     continue
@@ -326,6 +320,7 @@ class WaybackClient(BaseProvider):
                 ) from e
 
             if r.status_code == 429 or 500 <= r.status_code < 600:
+                await _arm_cooldown(f"http {r.status_code}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
                     continue
@@ -387,9 +382,11 @@ class WaybackClient(BaseProvider):
         response, polluting the HTML. With `id_` we get the original
         archived bytes.
         """
-        await _wb_burst_gate()
+        await _wb_wait_for_cooldown()
         snapshot_url = f"{SNAPSHOT_BASE}/{timestamp}id_/{url}"
-        retry_max = get_rate_limits("wayback").get("retry_max", 3)
+        # V2 snapshots read their retry budget from the dedicated
+        # `wayback_snapshot` row (see app_settings), independent of V1 CDX.
+        retry_max = get_rate_limits("wayback_snapshot").get("retry_max", 3)
         last_exc: Exception | None = None
 
         def _empty(http_status: int, error: str | None = None) -> dict:
@@ -415,6 +412,7 @@ class WaybackClient(BaseProvider):
                 r = await self.client.get(snapshot_url)
             except Exception as e:  # noqa: BLE001
                 last_exc = e
+                await _arm_cooldown(f"network {type(e).__name__}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
                     continue
@@ -422,6 +420,7 @@ class WaybackClient(BaseProvider):
 
             # Throttle / server errors get the same retry treatment as CDX.
             if r.status_code == 429 or 500 <= r.status_code < 600:
+                await _arm_cooldown(f"http {r.status_code}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
                     continue

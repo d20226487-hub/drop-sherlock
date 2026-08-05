@@ -5312,13 +5312,16 @@ async def _fetch_wayback_samples(
     `asyncio.gather` cannot exceed that ceiling — at max_concurrent=1
     behavior is byte-identical to the old sequential loop; at higher
     concurrency settings the wall-clock drops proportionally."""
-    async def fetch_one(ts: str, url: str) -> dict:
+    if not samples:
+        return []
+
+    async def fetch_one(wb, ts: str, url: str) -> dict:
         try:
-            async with limit("wayback"):
-                async with get_provider("wayback") as wb:
-                    return await wb.fetch_snapshot_page(
-                        timestamp=ts, url=url
-                    )
+            # V2 snapshots use their OWN limiter row (gentler max_concurrent)
+            # so archived-page downloads don't self-throttle at the CDX-safe
+            # concurrency, and don't contend with V1 CDX queries.
+            async with limit("wayback_snapshot"):
+                return await wb.fetch_snapshot_page(timestamp=ts, url=url)
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "wayback snapshot fetch crashed ts=%s url=%s: %s",
@@ -5337,9 +5340,15 @@ async def _fetch_wayback_samples(
                 "error": f"crashed: {type(e).__name__}: {e}",
             }
 
-    if not samples:
-        return []
-    return list(await asyncio.gather(*(fetch_one(ts, url) for ts, url in samples)))
+    # Reuse ONE httpx client (connection keep-alive) across all of this
+    # domain's snapshot fetches instead of opening a fresh provider — and a
+    # fresh TLS handshake — per pick (added 2026-08-05). The limit("wayback")
+    # gate still bounds concurrency; an httpx.AsyncClient is safe for
+    # concurrent requests, so one shared client serves the whole gather.
+    async with get_provider("wayback") as wb:
+        return list(await asyncio.gather(
+            *(fetch_one(wb, ts, url) for ts, url in samples)
+        ))
 
 
 def _finish_domain(run_domain_id: int, success: bool) -> None:

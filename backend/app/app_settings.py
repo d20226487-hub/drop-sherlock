@@ -323,6 +323,16 @@ _RATE_LIMIT_DEFAULTS: dict[str, dict[str, int]] = {
     # batches now drain steadily. User can bump in Settings if their
     # workload tolerates it.
     "wayback": {"rpm": 30, "max_concurrent": 1, "retry_max": 3},
+    # Wayback V2 page-content sampling (added 2026-08-05). Split off the
+    # shared `wayback` row so CDX (V1) and archived-page fetches (V2) throttle
+    # independently. Benchmarks showed that once the burst gate was made
+    # reactive, V2 became the bottleneck: the heavy `/web/{ts}id_/` page
+    # downloads get tarpitted by archive.org at the CDX-safe concurrency of 3,
+    # while light CDX queries handle 3 fine. Giving V2 its own gentler
+    # `max_concurrent=2` keeps V1 fast without V2 self-throttling. Consumed by
+    # tasks._fetch_wayback_samples via limit("wayback_snapshot"); retry budget
+    # read by providers/wayback.py:fetch_snapshot_page.
+    "wayback_snapshot": {"rpm": 60, "max_concurrent": 2, "retry_max": 1},
     # WhoisFreaks (added Wave 2b, 2026-05-15). The first user-side
     # 429 happened during the Settings → Test button — their free tier
     # limit is ~30/min and bursts hit it. Conservative defaults:
@@ -381,7 +391,9 @@ _RATE_LIMIT_DEFAULTS: dict[str, dict[str, int]] = {
 # in dedicated pillar tabs). Used by the rate-limit getter/setter to
 # validate "this is a known provider" without forcing the card UI to
 # render it.
-_RATE_LIMIT_EXTRAS: set[str] = {"whoisfreaks", "wayback_sparkline"}
+_RATE_LIMIT_EXTRAS: set[str] = {
+    "whoisfreaks", "wayback_sparkline", "wayback_snapshot",
+}
 
 
 def _rate_key(provider: str, field: str) -> str:

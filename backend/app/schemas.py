@@ -218,7 +218,10 @@ class WaybackConfig(BaseModel):
     filters: WaybackFilters = Field(default_factory=WaybackFilters)
     sort: list[SortRule] = Field(default_factory=list)
     sample_pages: bool = False
-    sample_count: int = Field(default=6, ge=1, le=15)
+    # Default lowered 6 -> 4 on 2026-08-05: each sample is a full archived-page
+    # download (the slow half of the Wayback check — ~6s median), and 4 picks
+    # already give the AI enough year-over-year theme signal. Cap unchanged.
+    sample_count: int = Field(default=4, ge=1, le=15)
     # "even" = quantile-spaced across the CDX timeline (filtered to 200/html).
     # "anchor" = pick around CDX anomaly events (status flips, mimetype
     # changes, big length jumps, long crawl gaps) — denser signal at
@@ -228,7 +231,11 @@ class WaybackConfig(BaseModel):
     # "root" = always fetch the snapshot of `/`. Mixed surfaces subpage
     # content; root keeps comparisons apples-to-apples but misses
     # subpage-only sites.
-    sample_path_mode: Literal["mixed", "root"] = "mixed"
+    # Default flipped mixed -> root on 2026-08-05 for speed: the root `/`
+    # snapshot is far more likely to be archive-cached/warm (sub-second, more
+    # 200s) than deep subpages, and it keeps year-over-year comparisons
+    # apples-to-apples. Flip back to "mixed" per-job when subpage drift matters.
+    sample_path_mode: Literal["mixed", "root"] = "root"
     # AI judge prompt variant (added 2026-06-07). "white" = default
     # white-niche prompt; "grey" = grey-niche prompt (adult / gambling
     # drops, where some signals carry inverted polarity — adult content
