@@ -372,25 +372,40 @@ def _migrate_wayback_concurrency_default() -> None:
     2; we lowered it to 1 after observing batch cascades on free-tier
     Wayback CDX. If the stored value is exactly 2 (the old default),
     flip it to 1; if the user explicitly set a different value (1, 3, or
-    higher), respect that. Idempotent — flipping `2 → 1` once leaves
-    nothing further to do."""
+    higher), respect that.
+
+    Guarded by a persisted marker key since 2026-08-05. Originally this ran
+    on EVERY boot and keyed off `value == "2"` as a proxy for "user never
+    touched it" — which silently reverted any DELIBERATE setting of 2 on the
+    next restart (caught while tuning wayback throughput: 2 is now a
+    recommended value, so the old heuristic fought the operator and made 2
+    the one un-settable number). The marker keeps the legacy 2 → 1 flip
+    working exactly once per deployment, after which an explicit 2 sticks."""
     import logging
+    marker = "migrated__wayback_concurrency_default"
     db = SessionLocal()
     try:
         from sqlalchemy import select
         from .models import AppSetting
+        done = db.execute(
+            select(AppSetting).where(AppSetting.key == marker)
+        ).scalar_one_or_none()
+        if done is not None:
+            return
+
         stmt = select(AppSetting).where(
             AppSetting.key == "rate_limit__wayback__max_concurrent"
         )
         row = db.execute(stmt).scalar_one_or_none()
-        if row is None or row.value != "2":
-            return
         # Bump down only when the stored value matches the old default.
-        row.value = "1"
+        if row is not None and row.value == "2":
+            row.value = "1"
+            logging.getLogger(__name__).info(
+                "auto-lowered wayback.max_concurrent 2 → 1 (was old default)"
+            )
+        # Record the marker either way so this never re-fires.
+        db.add(AppSetting(key=marker, value="1"))
         db.commit()
-        logging.getLogger(__name__).info(
-            "auto-lowered wayback.max_concurrent 2 → 1 (was old default)"
-        )
     except Exception:  # noqa: BLE001
         # Best-effort — never block startup on this.
         pass
