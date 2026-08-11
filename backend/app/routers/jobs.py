@@ -937,19 +937,25 @@ async def rerun_job(
     if not cleaned:
         raise HTTPException(400, "at least one domain is required")
     # Validate that the spec activates at least one criterion across ANY
-    # pillar (Quality / Whois / Availability). Earlier this only checked
-    # the 6 Quality criteria, which rejected reruns of Whois and
-    # Availability jobs (their specs leave Quality criteria off and turn
-    # on whois_history or availability instead). The 2026-05-21 fix
-    # broadens the check so /jobs/{id}/rerun is kind-agnostic — dispatch_run
-    # already routes by job.kind, so the rerun endpoint just needs to
-    # accept any valid pillar spec.
+    # pillar (Quality / Whois / Availability / Ahrefs Batch / Linked Domains /
+    # SERP Overview). Earlier this only checked the 6 Quality criteria, which
+    # rejected reruns of Whois and Availability jobs (their specs leave Quality
+    # criteria off and turn on whois_history or availability instead). The
+    # 2026-05-21 fix broadens the check so /jobs/{id}/rerun is kind-agnostic —
+    # dispatch_run already routes by job.kind, so the rerun endpoint just needs
+    # to accept any valid pillar spec.
+    #
+    # 2026-08-11: that broadening missed the three pillars added after it, so
+    # rerunning an ahrefs_batch_analysis / linked_domains / serp_overview job
+    # 400'd with "at least one criterion must be enabled" even though its spec
+    # was valid. Keep this tuple in sync with `tasks.dispatch_run`'s kinds.
     enabled_count = sum(
         1
         for k in (
             "backlinks", "refdomains", "anchors", "keywords",
             "wayback", "wayback_classify",
             "whois_history", "availability",
+            "ahrefs_batch_analysis", "linked_domains", "serp_overview",
         )
         if getattr(payload.spec.criteria, k).enabled
     )

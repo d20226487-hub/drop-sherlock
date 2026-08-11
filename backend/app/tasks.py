@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import traceback
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -514,8 +515,11 @@ def mark_orphaned_runs_paused(db: Session) -> int:
 
 def dispatch_run(run_id: int) -> asyncio.Task:
     """Schedule a runner for `run_id` based on the parent Job's `kind`.
-    Returns the Task handle so callers can keep a reference (asyncio
-    GC's task objects that aren't referenced anywhere).
+
+    Every kind is spawned through `_spawn_run_task`, which keeps a strong
+    reference (so asyncio's GC can't drop a runner mid-flight) and reports an
+    unhandled crash onto `Run.error`. Callers may therefore ignore the returned
+    Task; it's still returned for tests and for callers that want to await it.
 
     Kind dispatch (Wave 1+2+3, 2026-05-15):
       • quality       → tasks.process_run (Wayback + Ahrefs pipeline)
@@ -554,24 +558,24 @@ def dispatch_run(run_id: int) -> asyncio.Task:
         db.close()
     if kind == "whois_history":
         from .whois_history.runner import process_whois_history_run
-        return asyncio.create_task(process_whois_history_run(run_id))
+        return _spawn_run_task(run_id, process_whois_history_run(run_id))
     if kind == "availability":
         from .availability_runner import process_availability_run
-        return asyncio.create_task(process_availability_run(run_id))
+        return _spawn_run_task(run_id, process_availability_run(run_id))
     if kind == "ahrefs_batch_analysis":
         from .ahrefs_batch_analysis_runner import (
             process_ahrefs_batch_analysis_run,
         )
-        return asyncio.create_task(
-            process_ahrefs_batch_analysis_run(run_id)
+        return _spawn_run_task(
+            run_id, process_ahrefs_batch_analysis_run(run_id)
         )
     if kind == "linked_domains":
         from .linked_domains_runner import process_linked_domains_run
-        return asyncio.create_task(process_linked_domains_run(run_id))
+        return _spawn_run_task(run_id, process_linked_domains_run(run_id))
     if kind == "serp_overview":
         from .serp_overview_runner import process_serp_overview_run
-        return asyncio.create_task(process_serp_overview_run(run_id))
-    return asyncio.create_task(process_run(run_id))
+        return _spawn_run_task(run_id, process_serp_overview_run(run_id))
+    return _spawn_run_task(run_id, process_run(run_id))
 
 
 # Module-level set keeps task references alive across `dispatch_run` returns.
@@ -583,6 +587,75 @@ _BG_TASKS: set[asyncio.Task] = set()
 def _track(task: asyncio.Task) -> None:
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
+
+
+# Cap on the traceback we persist to `Run.error` — the column is TEXT so this
+# is about keeping the UI readable, not a storage limit.
+_CRASH_ERROR_MAX_CHARS = 4000
+
+
+def _record_run_crash(run_id: int, task: asyncio.Task) -> None:
+    """Done-callback: persist an unhandled runner exception onto the Run.
+
+    Added 2026-08-11 after an `UnboundLocalError` in the ahrefs_batch_analysis
+    runner killed every batch run ~30ms in. The traceback reached the ErrorLog
+    table but never the Run, so the failure was invisible: the run sat at
+    'running' (UI: queued) forever with `error` empty and its domains stuck
+    'pending'. Any runner that dies before its own try/except takes over would
+    hide exactly the same way, so this is the catch-all.
+
+    Only claims runs the worker still owned — a run the user paused/canceled,
+    or that a runner already finalized with a better message, is left alone.
+    Never raises: it runs on the event loop, where an exception would be
+    swallowed anyway (the very problem this exists to fix)."""
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except Exception:  # noqa: BLE001
+        # `.exception()` raises if the task was cancelled between the check
+        # above and here. Nothing to record.
+        return
+    if exc is None:
+        return
+
+    log.error("run %s worker crashed: %r", run_id, exc, exc_info=exc)
+    db = SessionLocal()
+    try:
+        run = db.get(Run, run_id)
+        if run is not None and run.status in ("pending", "running"):
+            detail = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+            run.status = "failed"
+            run.finished_at = datetime.utcnow()
+            run.error = (
+                f"Worker crashed: {type(exc).__name__}: {exc}\n\n{detail}"
+            )[:_CRASH_ERROR_MAX_CHARS]
+            db.commit()
+    except Exception:  # noqa: BLE001
+        log.exception("could not record crash for run %s", run_id)
+    finally:
+        db.close()
+
+
+def _spawn_run_task(run_id: int, coro) -> asyncio.Task:
+    """`create_task` + a strong reference + crash reporting.
+
+    Two guarantees a bare `asyncio.create_task()` did not give:
+
+    1. **Reference kept** (`_BG_TASKS`) so asyncio's GC can't drop a runner
+       mid-flight. Only `process_run` self-tracked via
+       `_track(asyncio.current_task())`; the other five kinds (availability,
+       whois_history, ahrefs_batch_analysis, linked_domains, serp_overview)
+       were dispatched untracked and every `dispatch_run` caller discards the
+       returned Task.
+    2. **Crashes surface** on `Run.error` via `_record_run_crash`, instead of
+       the run hanging at 'running' with an empty error."""
+    task = asyncio.create_task(coro)
+    _track(task)
+    task.add_done_callback(lambda t: _record_run_crash(run_id, t))
+    return task
 
 
 # --- Cancellation -----------------------------------------------------------
