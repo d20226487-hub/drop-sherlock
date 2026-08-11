@@ -279,7 +279,12 @@ async def process_ahrefs_batch_analysis_run(run_id: int) -> None:
             # no snapshot is warm yet (the next Database visit cold-builds with
             # this committed). This is the fix for "ran a DR/RD check, but the
             # Database doesn't show it for minutes".
-            from .models import RunDomain
+            # NOTE: do NOT re-import RunDomain here. It's already imported at
+            # module level, and a function-local `from .models import RunDomain`
+            # makes the name local to this ENTIRE function at compile time —
+            # which made the much earlier `db.query(RunDomain)` in phase 1
+            # (line ~94) raise UnboundLocalError, killing every batch run ~30ms
+            # in (run stuck 'running', domains stuck 'pending', no rows).
             from .routers.database import _patch_domains_in_cache
             run_domains = [
                 d
