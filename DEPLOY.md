@@ -263,19 +263,37 @@ failed silently per crypto.py:decrypt) — re-enter via UI.
 
 ### 5.1. Code update
 
-```bash
-ssh vps
-cd /opt/drop-sherlock
+> **NEVER add `--delete-excluded` to this command.** It caused repeated
+> production data loss via automated update scripts (diagnosed 2026-08-11).
+> `--exclude data` only stops `data/` from being *transferred*; `--delete`
+> already protects excluded paths from deletion. `--delete-excluded` revokes
+> that protection and **deletes `data/` and `.env` on the server** — i.e. the
+> SQLite database *and* every local snapshot (`BACKUP_DIR` is `/data/backups`,
+> inside `data/`), plus the secrets. After that the app boots but provider keys
+> decrypt to blank (no `FERNET_KEYS`; see crypto.py) and basicauth is gone.
 
-# preserve data/ and .env — never overwrite them
+Run the rsync **from your local machine** — it pushes to the VPS, so it must
+not be run after `ssh vps` (that would sync the VPS to itself).
+
+```bash
+# from LOCAL: preserve data/ and .env — plain --delete keeps excludes safe
 rsync -avz --exclude data --exclude .env --exclude node_modules --exclude .next \
-  --delete --delete-excluded \
+  --delete \
   local-path/drop-sherlock/ vps:/opt/drop-sherlock/
 
-# rebuild only what changed
-docker compose up -d --build api web
+# then on the VPS: rebuild only what changed
+ssh vps 'cd /opt/drop-sherlock && docker compose up -d --build api web'
 # 10–30 s downtime per service while the new image swaps in.
 # DB migrations run automatically at api startup (see main.py:lifespan).
+```
+
+Sanity-check after any scripted update — cheap, and catches this class of bug
+before the next one overwrites your last good snapshot:
+
+```bash
+ssh vps 'ls -l /opt/drop-sherlock/data/drop_sherlock.db && \
+         ls /opt/drop-sherlock/data/backups | tail -3 && \
+         test -s /opt/drop-sherlock/.env && echo ".env OK"'
 ```
 
 ### 5.2. Dependency-only update
