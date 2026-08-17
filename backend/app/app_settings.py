@@ -1870,6 +1870,83 @@ def set_webshare_config(
         db.close()
 
 
+# --- Wayback residential-proxy pool (added 2026-08-11) ---------------------
+# Independent of the Webshare/RDAP pool above. Two different problems:
+#   * RDAP registries throttle by IP and accept DATACENTER proxies fine.
+#   * archive.org throttles by IP too, but TARPITS datacenter ranges — the
+#     Webshare datacenter pool measured ~60% timeouts vs direct. Only
+#     RESIDENTIAL/ISP IPs survive there.
+# So Wayback gets its own list URL and its own pool; never share the RDAP one.
+#
+# Benchmarks (2026-08-08, 50 domains, production path, rested direct IP):
+# per-request speed is IDENTICAL (4.24s direct vs 4.26s residential) — the win
+# is COMPLETENESS: direct finished 28/50 domains, residential 43/50, because a
+# single IP starts getting refused ~4 requests into a batch. Hence this is
+# opt-in and per-phase: the operator turns it on when completeness matters and
+# turns it off if their pool underperforms.
+#
+# The list URL embeds a provider token → encrypted at rest by the shared
+# `__proxy_list_url` suffix (crypto._SECRET_KEY_SUFFIXES) and never echoed to
+# the UI. Deliberately NOT in AVAILABILITY_DEFAULTS so no generic settings dump
+# can enumerate it.
+
+def get_wayback_proxy_list_url() -> str:
+    """Residential proxy-list download URL for Wayback, or '' when unset."""
+    return _availability_str("wayback_proxies__proxy_list_url", "").strip()
+
+
+def get_wayback_proxies_config() -> dict:
+    """Master switch + per-phase routing.
+
+    The three phase flags default to TRUE: enabling the pool at all means
+    "use it for Wayback", and the operator narrows from there. They only take
+    effect while `enabled` is on — a disabled pool sends everything direct
+    regardless, so flipping the master switch off is a complete, one-click
+    rollback to the pre-proxy behaviour."""
+    return {
+        "enabled": _availability_bool("wayback_proxies__enabled", False),
+        "use_v1": _availability_bool("wayback_proxies__use_v1", True),
+        "use_v2": _availability_bool("wayback_proxies__use_v2", True),
+        "use_retry": _availability_bool("wayback_proxies__use_retry", True),
+        "refresh_day_of_month": max(1, min(28, _availability_int(
+            "wayback_proxies__refresh_day_of_month", 25))),
+    }
+
+
+def set_wayback_proxies_config(
+    *,
+    enabled: bool | None = None,
+    proxy_list_url: str | None = None,
+    use_v1: bool | None = None,
+    use_v2: bool | None = None,
+    use_retry: bool | None = None,
+    refresh_day_of_month: int | None = None,
+) -> None:
+    """Persist Wayback proxy settings. Only non-None fields are written, so the
+    UI can PATCH one toggle without clobbering the others (and without having
+    to round-trip the write-only URL). `_set` encrypts the URL."""
+    db = SessionLocal()
+    try:
+        for key, val in (
+            ("wayback_proxies__enabled", enabled),
+            ("wayback_proxies__use_v1", use_v1),
+            ("wayback_proxies__use_v2", use_v2),
+            ("wayback_proxies__use_retry", use_retry),
+        ):
+            if val is not None:
+                _set(db, key, "true" if val else "false")
+        if proxy_list_url is not None:
+            _set(
+                db, "wayback_proxies__proxy_list_url",
+                proxy_list_url.strip() or None,
+            )
+        if refresh_day_of_month is not None:
+            clamped = max(1, min(28, int(refresh_day_of_month)))
+            _set(db, "wayback_proxies__refresh_day_of_month", str(clamped))
+    finally:
+        db.close()
+
+
 def _normalize_proxy_token(tok: str) -> str | None:
     """Normalize one proxy entry to a URL httpx accepts, or None to drop
     it. Handles the formats proxy providers actually export:

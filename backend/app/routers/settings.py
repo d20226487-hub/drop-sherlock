@@ -320,6 +320,76 @@ async def refresh_webshare_now():
     return await webshare.refresh()
 
 
+# --- Wayback residential-proxy pool -----------------------------------------
+# Mirrors the Webshare endpoints above but is a SEPARATE source: archive.org
+# tarpits datacenter ranges, so this list must point at a residential/ISP plan.
+# See wayback_proxies.py for why they can't share a pool.
+
+class WaybackProxiesConfigIn(BaseModel):
+    # None = leave unchanged. Lets the UI PATCH a single toggle without having
+    # to round-trip the write-only URL.
+    enabled: bool | None = Field(default=None)
+    # Residential proxy-list download URL (token embedded).
+    # None = unchanged; "" = clear. Write-only — never read back.
+    proxy_list_url: str | None = Field(default=None)
+    use_v1: bool | None = Field(default=None)
+    use_v2: bool | None = Field(default=None)
+    use_retry: bool | None = Field(default=None)
+    refresh_day_of_month: int | None = Field(default=None, ge=1, le=28)
+
+
+@router.get("/wayback-proxies")
+def get_wayback_proxies_status():
+    """Live status of the Wayback residential pool. Write-only by design:
+    reports the toggles + pool health (total / available / cooling-down, last
+    refresh, last error) but NEVER the URL itself."""
+    from .. import wayback_proxies
+    return wayback_proxies.status()
+
+
+@router.put("/wayback-proxies")
+def update_wayback_proxies_config(
+    payload: WaybackProxiesConfigIn, background_tasks: BackgroundTasks,
+):
+    """Save the toggles and/or URL, then re-download in the background.
+
+    SYNC for the same reason as the Webshare endpoint: `set_*_config` does
+    blocking SQLite I/O, which must stay off the event loop on the
+    single-worker api."""
+    from ..app_settings import (
+        set_wayback_proxies_config, get_wayback_proxies_config,
+    )
+    from .. import wayback_proxies
+    set_wayback_proxies_config(
+        enabled=payload.enabled,
+        proxy_list_url=payload.proxy_list_url,
+        use_v1=payload.use_v1,
+        use_v2=payload.use_v2,
+        use_retry=payload.use_retry,
+        refresh_day_of_month=payload.refresh_day_of_month,
+    )
+    if payload.refresh_day_of_month is not None:
+        try:
+            from ..scheduler import get_scheduler
+            get_scheduler().add_job(
+                wayback_proxies.scheduled_refresh, "cron",
+                day=get_wayback_proxies_config()["refresh_day_of_month"],
+                hour=12, minute=0,
+                id="wayback_proxy_refresh", replace_existing=True,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    background_tasks.add_task(wayback_proxies.scheduled_refresh)
+    return wayback_proxies.status()
+
+
+@router.post("/wayback-proxies/refresh")
+async def refresh_wayback_proxies_now():
+    """Manual 'Refresh now' — force an immediate re-download of the list."""
+    from .. import wayback_proxies
+    return await wayback_proxies.refresh()
+
+
 # --- Rate limits -------------------------------------------------------------
 
 class RateLimitsIn(BaseModel):

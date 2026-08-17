@@ -960,6 +960,30 @@ async def lifespan(_: FastAPI):
         replace_existing=True,
     )
 
+    # Same boot-fetch + monthly-cron treatment for the Wayback RESIDENTIAL
+    # pool. Separate source from the Webshare/RDAP list above — archive.org
+    # tarpits datacenter ranges, so Wayback needs its own residential plan
+    # (see wayback_proxies.py). No-op when no URL is configured.
+    from . import wayback_proxies as _wb_proxies
+    from .app_settings import get_wayback_proxies_config as _get_wbp_cfg
+    try:
+        _asyncio.create_task(_wb_proxies.scheduled_refresh())
+    except RuntimeError:
+        pass
+    try:
+        _wbp_day = _get_wbp_cfg()["refresh_day_of_month"]
+    except Exception:  # noqa: BLE001
+        _wbp_day = 25
+    sched.add_job(
+        _wb_proxies.scheduled_refresh,
+        "cron",
+        day=_wbp_day,
+        hour=12,
+        minute=0,
+        id="wayback_proxy_refresh",
+        replace_existing=True,
+    )
+
     # Pre-warm the Database-page snapshot in the background (2026-06-21).
     # `_build_all_rows` is the heaviest read in the app (~tens of seconds at
     # scale — ~83s on the 68k-domain prod DB). Building it at boot, off the

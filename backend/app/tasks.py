@@ -15,6 +15,7 @@ this was `mark_orphaned_runs_failed` and the run was unrecoverable.)"""
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import traceback
@@ -43,6 +44,23 @@ from .schemas import AnalyzeSpec
 from .scoring import compute_final
 
 log = logging.getLogger(__name__)
+
+# Which Wayback egress phase the current coroutine is running under (added
+# 2026-08-11 with the residential-proxy pool). Empty = "not retry traffic", so
+# the call site's natural phase applies ('v1' for CDX, 'v2' for snapshots).
+# `_wayback_auto_retry_loop` sets it to 'retry' for its whole duration; a
+# ContextVar (not a global) because runs execute concurrently and each spawned
+# task must inherit the value that was current when IT was created.
+_wayback_phase_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "wayback_phase", default="",
+)
+
+
+def _wb_phase(default: str) -> str:
+    """Resolve the egress phase for a Wayback fetch. Retry traffic wins over
+    the call site so the operator's 'use proxies for retries' toggle covers
+    both the CDX refetch and the snapshot resample it triggers."""
+    return _wayback_phase_ctx.get("") or default
 
 
 # Memory: how many RunDomain rows to hold in the Session identity map at
@@ -1857,6 +1875,12 @@ async def _wayback_auto_retry_loop(
       - the auto-retry Settings toggle is on
       - max_attempts > 0
       - this run is not already being auto-retried"""
+    # Tag every Wayback fetch made from here on as the "retry" egress phase, so
+    # the residential-proxy pool can be routed independently for recovery
+    # traffic (Settings → Wayback → residential proxies). Set BEFORE any task
+    # is spawned: asyncio.create_task copies the current context, so the
+    # per-domain retry tasks below inherit it.
+    _phase_token = _wayback_phase_ctx.set("retry")
     try:
         delay = float(cfg.get("initial_delay_sec", 60))
         multiplier = float(cfg.get("backoff_multiplier", 2.0))
@@ -1913,6 +1937,7 @@ async def _wayback_auto_retry_loop(
     except Exception:  # noqa: BLE001
         log.exception("wayback auto-retry loop crashed for run %s", run_id)
     finally:
+        _wayback_phase_ctx.reset(_phase_token)
         _AUTO_RETRY_RUNS.discard(run_id)
 
 
@@ -5394,7 +5419,9 @@ async def _fetch_wayback_samples(
             # so archived-page downloads don't self-throttle at the CDX-safe
             # concurrency, and don't contend with V1 CDX queries.
             async with limit("wayback_snapshot"):
-                return await wb.fetch_snapshot_page(timestamp=ts, url=url)
+                return await wb.fetch_snapshot_page(
+                    timestamp=ts, url=url, phase=_wb_phase("v2"),
+                )
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "wayback snapshot fetch crashed ts=%s url=%s: %s",
@@ -5479,7 +5506,14 @@ async def _fetch_criterion(
     try:
         async with limit(provider):
             async with get_provider(provider) as p:
-                http_status, body, units = await p.fetch_url(url)
+                if provider == "wayback":
+                    # Wayback picks its egress (direct vs residential proxy)
+                    # per phase; Ahrefs' fetch_url takes no phase argument.
+                    http_status, body, units = await p.fetch_url(
+                        url, phase=_wb_phase("v1"),
+                    )
+                else:
+                    http_status, body, units = await p.fetch_url(url)
         return True, http_status, body, "", units
     except Exception as e:  # noqa: BLE001
         return False, None, None, f"{type(e).__name__}: {e}", {}

@@ -1299,6 +1299,23 @@ export interface WebshareStatus {
   refresh_day_of_month: number;
 }
 
+// Wayback residential-proxy pool (2026-08-11). Separate source from Webshare:
+// archive.org tarpits datacenter IPs, so this one must point at a residential
+// plan. `available` / `cooling_down` split `count` by per-IP cooldown state.
+export interface WaybackProxiesStatus {
+  configured: boolean;
+  enabled: boolean;
+  use_v1: boolean;
+  use_v2: boolean;
+  use_retry: boolean;
+  count: number;
+  available: number;
+  cooling_down: number;
+  last_fetch_at: string | null;
+  last_error: string | null;
+  refresh_day_of_month: number;
+}
+
 export const api = {
   getSettings: () => request<SettingsPayload>("/settings/"),
 
@@ -1581,6 +1598,28 @@ export const api = {
     }),
   refreshWebshareProxies: () =>
     request<WebshareStatus>("/settings/webshare/refresh", { method: "POST" }),
+
+  // Wayback residential-proxy pool (2026-08-11). Same write-only URL contract
+  // as Webshare; every field is optional so a single toggle can be PATCHed
+  // without round-tripping the secret URL.
+  getWaybackProxiesStatus: () =>
+    request<WaybackProxiesStatus>("/settings/wayback-proxies"),
+  setWaybackProxiesConfig: (body: {
+    enabled?: boolean;
+    proxy_list_url?: string | null;
+    use_v1?: boolean;
+    use_v2?: boolean;
+    use_retry?: boolean;
+    refresh_day_of_month?: number;
+  }) =>
+    request<WaybackProxiesStatus>("/settings/wayback-proxies", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  refreshWaybackProxies: () =>
+    request<WaybackProxiesStatus>("/settings/wayback-proxies/refresh", {
+      method: "POST",
+    }),
 
   bulkReanalyzeDomains: (
     runDomainIds: number[],

@@ -1356,6 +1356,43 @@ const messagesEn = {
         waybackClassify: "Wayback classification (language + theme + category)",
         prompts: "AI prompts",
         classifyContext: "Wayback classify → Ahrefs judges (site context)",
+        waybackProxies: "Residential proxies for Wayback",
+      },
+      waybackProxies: {
+        hint:
+          "archive.org limits by IP, so a big batch starts failing partway " +
+          "through. Routing Wayback through residential IPs spreads the load " +
+          "and finishes more domains per pass — it is not faster per request. " +
+          "Datacenter proxies do NOT work here (archive.org blocks them): use " +
+          "a residential/ISP plan. Turn this off to send everything direct.",
+        enableLabel: "Use residential proxies for Wayback",
+        urlPlaceholder: "https://…/proxy/list/download/…  (residential list URL)",
+        urlHint: "Write-only — stored encrypted and never shown again.",
+        save: "Save",
+        saving: "Saving…",
+        cancel: "Cancel",
+        replace: "Replace",
+        clear: "Clear",
+        dayLabel: "Auto-refresh day of month",
+        dayHint: "1–28; the provider rotates IPs on the billing cycle.",
+        phasesHeading: "Route through proxies",
+        useV1: "V1 — capture-history lookup (CDX)",
+        useV2: "V2 — archived page sampling",
+        useRetry: "Retries — the Wayback auto-retry pass",
+        phasesHint:
+          "All three are on by default. Retries benefit most: a domain " +
+          "usually failed because the direct IP was throttled, so retrying " +
+          "from a fresh IP is what recovers it.",
+        configured: "Proxy list configured.",
+        notConfigured: "No proxy list configured — Wayback runs direct.",
+        countLabel: "Proxies",
+        availableLabel: "Available now",
+        coolingLabel: "Cooling down",
+        lastFetchLabel: "Last refreshed",
+        lastErrorLabel: "Last error",
+        never: "never",
+        refreshNow: "Refresh now",
+        refreshing: "Refreshing…",
       },
       tabs: {
         api: "API",
@@ -4098,6 +4135,43 @@ const messagesRu: Messages = {
         waybackClassify: "Классификация Wayback (язык + тематика + категория)",
         prompts: "Промпты ИИ",
         classifyContext: "Wayback classify → судьи Ahrefs (контекст сайта)",
+        waybackProxies: "Резидентные прокси для Wayback",
+      },
+      waybackProxies: {
+        hint:
+          "archive.org ограничивает по IP, поэтому большой батч начинает " +
+          "падать на середине. Резидентные IP распределяют нагрузку и " +
+          "завершают больше доменов за проход — но не ускоряют отдельный " +
+          "запрос. Датацентровые прокси здесь НЕ работают (archive.org их " +
+          "блокирует): нужен резидентный/ISP-тариф. Выключите — всё пойдёт напрямую.",
+        enableLabel: "Использовать резидентные прокси для Wayback",
+        urlPlaceholder: "https://…/proxy/list/download/…  (ссылка на список)",
+        urlHint: "Только запись — хранится в шифрованном виде и больше не показывается.",
+        save: "Сохранить",
+        saving: "Сохранение…",
+        cancel: "Отмена",
+        replace: "Заменить",
+        clear: "Очистить",
+        dayLabel: "День месяца для автообновления",
+        dayHint: "1–28; провайдер меняет IP в биллинговом цикле.",
+        phasesHeading: "Направлять через прокси",
+        useV1: "V1 — запрос истории снимков (CDX)",
+        useV2: "V2 — выборка архивных страниц",
+        useRetry: "Повторы — авто-ретрай Wayback",
+        phasesHint:
+          "По умолчанию включены все три. Больше всего выигрывают повторы: " +
+          "домен обычно упал из-за троттлинга прямого IP, поэтому повтор с " +
+          "нового IP его и восстанавливает.",
+        configured: "Список прокси настроен.",
+        notConfigured: "Список прокси не настроен — Wayback работает напрямую.",
+        countLabel: "Прокси",
+        availableLabel: "Доступно сейчас",
+        coolingLabel: "На остывании",
+        lastFetchLabel: "Последнее обновление",
+        lastErrorLabel: "Последняя ошибка",
+        never: "никогда",
+        refreshNow: "Обновить сейчас",
+        refreshing: "Обновление…",
       },
       tabs: {
         api: "API",

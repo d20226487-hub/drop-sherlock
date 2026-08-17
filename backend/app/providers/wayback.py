@@ -103,6 +103,30 @@ async def _arm_cooldown(reason: str) -> None:
                 "wayback cooldown armed for %.0fs (%s)",
                 _WB_COOLDOWN_S, reason,
             )
+
+
+# --- Egress selection (residential proxy pool, added 2026-08-11) ------------
+# Imports are function-local: `wayback_proxies` pulls in app_settings +
+# availability.webshare, and this module is imported from providers/__init__
+# during runner startup — a module-level import risks a cycle.
+
+def _acquire_egress(phase: str):
+    """`(client_or_None, egress_key)` for this phase. `None` = go direct."""
+    from .. import wayback_proxies
+    return wayback_proxies.acquire(phase)
+
+
+async def _note_throttle(egress: str, reason: str) -> None:
+    """Route a push-back signal to the right cooldown.
+
+    Direct egress arms the GLOBAL gate — correct when every request shares one
+    server IP. A proxy egress cools down ONLY that IP: pausing all N proxies
+    because one was throttled would defeat the entire point of rotating."""
+    from .. import wayback_proxies
+    if egress == wayback_proxies.DIRECT:
+        await _arm_cooldown(reason)
+    else:
+        wayback_proxies.report_throttle(egress)
 # Cap per-snapshot extracted text so a single bloated archived page can't
 # blow up the AI prompt or the persisted JSON. Body excerpt is also capped
 # downstream (150 chars) but headings can repeat — limit each list length.
@@ -279,7 +303,9 @@ class WaybackClient(BaseProvider):
             )
         return {"ok": True, "provider": "wayback"}
 
-    async def fetch_url(self, url: str) -> tuple[int, dict, dict]:
+    async def fetch_url(
+        self, url: str, *, phase: str = "v1"
+    ) -> tuple[int, dict, dict]:
         """Issue a GET against an already-built CDX URL. Returns
         (http_status, json_body, units). `units` is always empty for
         Wayback (no metered quota), but the tuple shape matches AhrefsClient
@@ -289,18 +315,25 @@ class WaybackClient(BaseProvider):
         We unwrap into `{"wayback": [{col1: v1, ...}, ...]}` so downstream
         code (row count, AI trim, table render) sees the same shape every
         other criterion uses."""
-        await _wb_wait_for_cooldown()
         retry_max = get_rate_limits("wayback").get("retry_max", 3)
         last_exc: Exception | None = None
         for attempt in range(retry_max + 1):
+            # Re-acquired per ATTEMPT so a retry lands on a different
+            # residential IP — that rotation is the recovery mechanism, since
+            # the usual reason an attempt failed is that its egress IP was
+            # throttled.
+            client, egress = _acquire_egress(phase)
+            if client is None:
+                client = self.client
+                # Only the shared server IP waits on the global gate; proxies
+                # carry their own per-IP cooldowns.
+                await _wb_wait_for_cooldown()
             try:
-                r = await self.client.get(url)
+                r = await client.get(url)
             except Exception as e:  # noqa: BLE001
                 last_exc = e
-                # Network/timeout == archive.org tarpitting our IP; arm the
-                # global cooldown so ALL wayback traffic backs off (reactive
-                # gate), not just this one retry.
-                await _arm_cooldown(f"network {type(e).__name__}")
+                # Network/timeout == this egress IP is being tarpitted.
+                await _note_throttle(egress, f"network {type(e).__name__}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
                     continue
@@ -320,7 +353,7 @@ class WaybackClient(BaseProvider):
                 ) from e
 
             if r.status_code == 429 or 500 <= r.status_code < 600:
-                await _arm_cooldown(f"http {r.status_code}")
+                await _note_throttle(egress, f"http {r.status_code}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
                     continue
@@ -356,7 +389,7 @@ class WaybackClient(BaseProvider):
         raise ProviderError(f"unreachable: retry exhausted ({last_exc!r})")
 
     async def fetch_snapshot_page(
-        self, *, timestamp: str, url: str
+        self, *, timestamp: str, url: str, phase: str = "v2"
     ) -> dict:
         """Fetch an archived HTML page and extract title + headings + body.
 
@@ -382,7 +415,6 @@ class WaybackClient(BaseProvider):
         response, polluting the HTML. With `id_` we get the original
         archived bytes.
         """
-        await _wb_wait_for_cooldown()
         snapshot_url = f"{SNAPSHOT_BASE}/{timestamp}id_/{url}"
         # V2 snapshots read their retry budget from the dedicated
         # `wayback_snapshot` row (see app_settings), independent of V1 CDX.
@@ -408,11 +440,16 @@ class WaybackClient(BaseProvider):
             return out
 
         for attempt in range(retry_max + 1):
+            # Same per-attempt rotation as CDX — a retry gets a fresh IP.
+            client, egress = _acquire_egress(phase)
+            if client is None:
+                client = self.client
+                await _wb_wait_for_cooldown()
             try:
-                r = await self.client.get(snapshot_url)
+                r = await client.get(snapshot_url)
             except Exception as e:  # noqa: BLE001
                 last_exc = e
-                await _arm_cooldown(f"network {type(e).__name__}")
+                await _note_throttle(egress, f"network {type(e).__name__}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
                     continue
@@ -420,7 +457,7 @@ class WaybackClient(BaseProvider):
 
             # Throttle / server errors get the same retry treatment as CDX.
             if r.status_code == 429 or 500 <= r.status_code < 600:
-                await _arm_cooldown(f"http {r.status_code}")
+                await _note_throttle(egress, f"http {r.status_code}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
                     continue

@@ -5,6 +5,7 @@ import { api, ProviderStatus, RateLimits, SettingsPayload } from "@/lib/api";
 import { ProviderCard } from "@/components/provider-card";
 import { WaybackClassifyEditor } from "@/components/wayback-classify-editor";
 import { WaybackAutoRetryEditor } from "@/components/wayback-auto-retry-editor";
+import { WaybackProxiesEditor } from "@/components/wayback-proxies-editor";
 import { AvailabilityAutoRetryEditor } from "@/components/availability-auto-retry-editor";
 import { RateLimitsTable } from "@/components/rate-limits-table";
 import { ClassifyContextEditor } from "@/components/classify-context-editor";
@@ -215,6 +216,16 @@ export default function SettingsPage() {
               <section className="space-y-4">
                 <h2 className="text-lg font-semibold">Auto-retry</h2>
                 <WaybackAutoRetryEditor />
+              </section>
+              {/* Residential proxies sit next to auto-retry because they solve
+                  the same complaint ("the run doesn't finish") — auto-retry
+                  re-attempts the failures, this stops the direct IP from
+                  generating them in the first place. */}
+              <section className="space-y-4">
+                <h2 className="text-lg font-semibold">
+                  {ts.sections.waybackProxies}
+                </h2>
+                <WaybackProxiesEditor />
               </section>
               <section className="space-y-4">
                 <h2 className="text-lg font-semibold">
