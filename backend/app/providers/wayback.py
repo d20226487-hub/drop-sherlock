@@ -110,6 +110,38 @@ async def _arm_cooldown(reason: str) -> None:
 # availability.webshare, and this module is imported from providers/__init__
 # during runner startup — a module-level import risks a cycle.
 
+# --- Internet Archive site-wide outage page (added 2026-08-11) -------------
+# When the Archive is down for maintenance/incident, EVERY web.archive.org URL
+# (CDX, /web/ replay, even the host root) returns a 503 whose body is their
+# "Temporarily Offline" page — identical bytes regardless of target domain,
+# snapshot age, URL modifier, User-Agent, or egress IP. Verified 2026-08-11.
+#
+# Treating that as a normal 5xx is actively wrong: it burns the whole retry
+# budget on something no retry can fix, and arms cooldowns — which, with the
+# residential pool, would mark perfectly good proxy IPs as throttled. Detect it
+# and fail fast with a message that says what's actually happening.
+_IA_OFFLINE_MSG = (
+    "Internet Archive is temporarily offline — archive.org is serving its "
+    "site-wide maintenance page for every request. Retrying will not help; "
+    "wait for their services to return (check the Internet Archive's status "
+    "accounts). Not a rate limit, a proxy problem, or a config error."
+)
+
+
+def _is_ia_offline(resp: httpx.Response) -> bool:
+    """True when this 503 is the Archive's global maintenance page rather than
+    a real per-request server error. Deliberately narrow: 503 + HTML +the
+    page's own wording, so a genuine 503 from a busy backend still retries."""
+    if resp.status_code != 503:
+        return False
+    if "html" not in (resp.headers.get("content-type") or "").lower():
+        return False
+    try:
+        return "temporarily offline" in resp.text[:4000].lower()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _acquire_egress(phase: str):
     """`(client_or_None, egress_key)` for this phase. `None` = go direct."""
     from .. import wayback_proxies
@@ -353,6 +385,10 @@ class WaybackClient(BaseProvider):
                 ) from e
 
             if r.status_code == 429 or 500 <= r.status_code < 600:
+                # Archive-wide outage: bail immediately. No retry can fix it,
+                # and arming a cooldown would blame our IP/proxies for it.
+                if _is_ia_offline(r):
+                    raise ProviderError(_IA_OFFLINE_MSG)
                 await _note_throttle(egress, f"http {r.status_code}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
@@ -457,6 +493,10 @@ class WaybackClient(BaseProvider):
 
             # Throttle / server errors get the same retry treatment as CDX.
             if r.status_code == 429 or 500 <= r.status_code < 600:
+                # Archive-wide outage — same fast-fail as CDX. Samples are
+                # best-effort, so this returns rather than raising.
+                if _is_ia_offline(r):
+                    return _empty(r.status_code, error=_IA_OFFLINE_MSG)
                 await _note_throttle(egress, f"http {r.status_code}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
