@@ -3809,15 +3809,29 @@ async def _run_wayback_classify_for_domain(
         return
     samples = _load_wayback_samples(wb_cr_id)
     if not samples:
-        await _offload(
-            _store_ai_verdict,
-            cr_id, None,
-            error=(
+        # Distinguish "sampling was never configured / hasn't run" from
+        # "sampling ran but the archive could not serve a single page"
+        # (added 2026-08-11). Both leave zero samples, but only the latter
+        # is an upstream outage — reporting the generic message for it sent
+        # the operator hunting through Settings for a config problem that
+        # did not exist. The wayback CR carries the real reason.
+        wb_err = await _offload(_criterion_error, wb_cr_id)
+        if wb_err:
+            classify_error = (
+                f"wayback_classify skipped — the Wayback fetch did not "
+                f"produce usable page samples. {wb_err}"
+            )
+        else:
+            classify_error = (
                 "wayback_classify needs Wayback V2 page samples — none on "
                 "the wayback CR row. Enable Wayback page sampling and "
                 "rerun (Settings → Wayback config), or wait for an "
                 "in-flight wayback fetch to finish."
-            ),
+            )
+        await _offload(
+            _store_ai_verdict,
+            cr_id, None,
+            error=classify_error,
             provider=provider, model=resolved_model,
         )
         await _offload(_set_criterion_status, cr_id, "failed")
@@ -4198,6 +4212,18 @@ def _set_criterion_status(cr_id: int, status: str) -> None:
         if status == "done" and cr.fetched_at is None:
             cr.fetched_at = datetime.utcnow()
         db.commit()
+    finally:
+        db.close()
+
+
+def _criterion_error(cr_id: int) -> str:
+    """Read CriterionResult.error by id. Lets wayback_classify surface the
+    wayback row's real failure reason instead of its own generic
+    'no samples' message."""
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        return (cr.error or "") if cr else ""
     finally:
         db.close()
 
@@ -5120,6 +5146,80 @@ def _trim_samples_for_ai(samples: list[dict]) -> list[dict]:
     return out
 
 
+# --- V2 sampling: infrastructure failure vs. "no snapshot here" -------------
+# A failed snapshot fetch still returns a full sample dict (http_status set,
+# title/headings/body empty), so a wholesale V2 failure looks to downstream
+# code exactly like "we sampled and the pages were blank". That is dangerous:
+# the Wayback Quality judge and wayback_classify would both run on empty
+# content and confidently conclude "dead / no content", then PERSIST and CACHE
+# that verdict. Caught 2026-08-11 during an Internet Archive outage where every
+# snapshot returned their 503 maintenance page.
+#
+# These statuses mean "the archive could not serve us", NOT "this domain has
+# nothing here":
+#   0    - network error / timeout
+#   429  - throttled
+#   5xx  - archive.org server error, incl. the site-wide offline page
+# 404 is deliberately EXCLUDED: it genuinely means no usable capture at that
+# (timestamp, url), which is real signal the AI should see.
+_WB_INFRA_STATUSES = frozenset({0, 429})
+
+
+def _sample_is_infra_failure(sample: dict) -> bool:
+    st = sample.get("http_status")
+    if not isinstance(st, int):
+        # No status recorded (legacy row, or a caller building sample dicts by
+        # hand). We cannot PROVE an infrastructure failure, and over-blocking
+        # is the worse error: it would fail a CR and skip a judge the operator
+        # actually wanted. Fail open — real samples from fetch_snapshot_page
+        # always carry http_status on both the success and error paths.
+        return False
+    return st in _WB_INFRA_STATUSES or 500 <= st < 600
+
+
+def _samples_all_infra_failed(samples: list[dict]) -> str:
+    """Reason string when EVERY sample failed for an infrastructure reason,
+    else "". Partial success returns "" — if even one page came back the AI has
+    real content to judge, which is the pre-existing behaviour."""
+    if not samples:
+        return ""
+    if not all(_sample_is_infra_failure(s) for s in samples):
+        return ""
+    # Surface the upstream's own words when it gave any (e.g. the Internet
+    # Archive "temporarily offline" message) — that is what makes the run page
+    # actionable instead of a vague "no content".
+    detail = ""
+    for s in samples:
+        err = (s.get("error") or "").strip()
+        if err:
+            detail = err
+            break
+    statuses = sorted({str(s.get("http_status")) for s in samples})
+    return (
+        f"Wayback V2 page sampling failed for all {len(samples)} snapshot(s) "
+        f"(http {', '.join(statuses)}) - the archive could not serve them, so "
+        f"there is no page content to judge. AI judging was skipped to avoid a "
+        f"false 'no content' verdict; retry once archive.org recovers."
+        + (f" Upstream said: {detail}" if detail else "")
+    )
+
+
+def _fail_criterion_with_error(cr_id: int, error: str) -> None:
+    """Mark a CriterionResult failed with `error`. Used when V2 sampling was
+    wholly unusable, so the AI-judge guard (`_criterion_status == 'failed'`)
+    short-circuits before any model call is paid for."""
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        if cr is None:
+            return
+        cr.status = "failed"
+        cr.error = error[:2000]
+        db.commit()
+    finally:
+        db.close()
+
+
 def _attach_wayback_samples(cr_id: int, samples: list[dict]) -> None:
     """Append `samples` to a wayback CriterionResult's `data_json` shape.
 
@@ -5137,6 +5237,17 @@ def _attach_wayback_samples(cr_id: int, samples: list[dict]) -> None:
     the same RunDomain. See `_invalidate_classify_verdict_for_wayback_cr`
     docstring for the rationale (the run-128 stale-verdict cohort)."""
     if not samples:
+        return
+    # Wholesale infrastructure failure: do NOT attach blank samples. Attaching
+    # them would let the Quality judge and wayback_classify run on empty
+    # content and cache a false "dead site" verdict. Failing the CR instead
+    # blocks both AI calls (the `_criterion_status == "failed"` guard in
+    # _judge_one_criterion, and classify's own wayback-CR check) and leaves the
+    # row in a state the auto-retry pass picks up.
+    infra_reason = _samples_all_infra_failed(samples)
+    if infra_reason:
+        log.warning("wayback cr=%s: %s", cr_id, infra_reason)
+        _fail_criterion_with_error(cr_id, infra_reason)
         return
     rd_id_for_invalidate: int | None = None
     db = SessionLocal()
