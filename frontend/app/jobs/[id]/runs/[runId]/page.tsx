@@ -1260,12 +1260,20 @@ export default function RunDetailPage({
       "backlinks", "refdomains", "anchors", "keywords",
       "wayback", "wayback_classify", "whois_history", "availability",
     ];
+    // Orphaned rows ("running"/"pending" on a FINISHED run) are retried by the
+    // backend too, so they must be counted here or the button under-promises.
+    // Only on a terminal run: on a live one those statuses just mean "in
+    // flight", and counting them would show the whole run as errored.
+    // Mirrors backend `_run_failed_aggregates` + `_collect_failed_criteria`.
+    const terminal = ["done", "failed", "canceled"].includes(run.status);
+    const isStuck = (st?: string) =>
+      st === "failed" || (terminal && (st === "running" || st === "pending"));
     let criteria = 0;
     let domains = 0;
     for (const d of run.domains) {
       let perDomain = 0;
       for (const c of ALL) {
-        if (d.criteria?.[c] === "failed") perDomain += 1;
+        if (isStuck(d.criteria?.[c])) perDomain += 1;
         if (d.ai_status?.[c] === "failed") perDomain += 1;
       }
       if (perDomain > 0) {

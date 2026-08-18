@@ -1009,12 +1009,23 @@ def _collect_failed_criteria(
         branch the user is stuck — the per-RD page shows "running" but
         no work is happening and the retry button silently skips it.
       • CR.ai_verdict_error != "" (fetch OK, AI judge failed → re-judge).
-    Disabled criteria in the spec are never retried."""
+    Disabled criteria in the spec are never retried.
+
+    wayback_classify is additionally skipped when its sibling wayback CR
+    completed with ZERO CDX rows (added 2026-08-11). The domain simply has no
+    archive history, so classify can never succeed — retrying re-fetches CDX,
+    gets 0 rows again, and re-emits the identical "no samples" failure forever.
+    The auto-retry watcher has always had this rule (see
+    `_collect_wayback_retry_candidates` Branch 4); the manual "Retry failed"
+    button did not, so it burned archive.org calls on domains that can never
+    be fixed."""
     by_name = {cr.criterion: cr for cr in rd.results}
     failed: list[str] = []
     for c in _ALL_CRITERIA:
         cfg = _cfg_for_criterion(spec, c)
         if cfg is None or not getattr(cfg, "enabled", False):
+            continue
+        if c == "wayback_classify" and _classify_retry_is_futile(by_name):
             continue
         cr = by_name.get(c)
         if cr is None:
@@ -1696,6 +1707,20 @@ def _wayback_cr_has_rows(cr: "CriterionResult") -> bool:
         return False
     rows = body.get("wayback")
     return isinstance(rows, list) and len(rows) > 0
+
+
+def _classify_retry_is_futile(by_name: dict) -> bool:
+    """True when retrying wayback_classify for this RunDomain cannot ever
+    succeed: the wayback fetch finished cleanly but found ZERO CDX rows, so
+    there is no archive history to sample or classify.
+
+    Only fires on a CLEANLY-finished wayback CR. A failed/missing wayback CR
+    is a different case entirely — there the fetch itself is retryable, and
+    the caller wants both criteria retried."""
+    wb_cr = by_name.get("wayback")
+    if wb_cr is None or wb_cr.status != "done":
+        return False
+    return not _wayback_cr_has_rows(wb_cr)
 
 
 def _wayback_cr_v2_sample_count(cr: "CriterionResult") -> int:
