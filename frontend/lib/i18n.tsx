@@ -625,6 +625,13 @@ const messagesEn = {
         pinCriterionHere: "★ pinned here",
         pinCriterionElsewhere: (runId: number) => `pinned to Run #${runId}`,
         pinCriterionNone: "not pinned",
+        archiveErrorsLabel: "archive.org errors",
+        archiveErrorsHint: "Wayback failures caused by archive.org itself, not by this run's config.",
+        archiveOffline: "site-wide outage",
+        archiveHttp503: "HTTP 503",
+        archiveHttp429: "throttled (429)",
+        archiveNetwork: "network/timeout",
+        archiveDomainsAffected: "domains affected",
         retryFailed: (n: number) =>
           n > 0 ? `Retry ${n} failed` : "Retry failed",
         retryFailedHint:
@@ -3381,6 +3388,13 @@ const messagesRu: Messages = {
         pinCriterionHere: "★ зафиксирован здесь",
         pinCriterionElsewhere: (runId: number) => `зафиксирован на Run #${runId}`,
         pinCriterionNone: "не зафиксирован",
+        archiveErrorsLabel: "Ошибки archive.org",
+        archiveErrorsHint: "Сбои Wayback по вине самого archive.org, а не настроек этого запуска.",
+        archiveOffline: "полная недоступность",
+        archiveHttp503: "HTTP 503",
+        archiveHttp429: "троттлинг (429)",
+        archiveNetwork: "сеть/таймаут",
+        archiveDomainsAffected: "доменов затронуто",
         retryFailed: (n) => (n > 0 ? `Повторить ${n} с ошибкой` : "Повторить с ошибкой"),
         retryFailedHint:
           "Перезапустить каждую неудачную загрузку Ahrefs/Wayback и каждый неудачный AI-вердикт в этом запуске. Перезагружает данные где их нет; пере-судит где данные есть. Отключённые критерии не трогает.",

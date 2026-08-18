@@ -1953,6 +1953,37 @@ export default function RunDetailPage({
         )}
       </header>
 
+      {(() => {
+        // archive.org upstream-error banner (2026-08-11). Only rendered when
+        // the run actually hit archive-side failures, so a healthy run is
+        // visually unchanged. Distinguishes "the Archive was down" from
+        // "these domains are bad", which previously looked identical.
+        const up = run.wayback_upstream ?? {};
+        const total = up.total ?? 0;
+        if (!total) return null;
+        const parts: string[] = [];
+        if (up.archive_offline)
+          parts.push(`${up.archive_offline} × ${ts.archiveOffline}`);
+        if (up.http_503) parts.push(`${up.http_503} × ${ts.archiveHttp503}`);
+        if (up.http_429) parts.push(`${up.http_429} × ${ts.archiveHttp429}`);
+        if (up.network) parts.push(`${up.network} × ${ts.archiveNetwork}`);
+        return (
+          <div className="mb-4 rounded-md border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 px-3 py-2">
+            <div className="text-sm font-medium text-amber-900 dark:text-amber-200">
+              {ts.archiveErrorsLabel}: {total}
+              {up.domains ? ` (${up.domains} ${ts.archiveDomainsAffected})` : ""}
+            </div>
+            {parts.length > 0 && (
+              <div className="text-xs text-amber-800 dark:text-amber-300 mt-0.5">
+                {parts.join(" · ")}
+              </div>
+            )}
+            <div className="text-xs text-amber-700 dark:text-amber-400 mt-0.5">
+              {ts.archiveErrorsHint}
+            </div>
+          </div>
+        );
+      })()}
       <DomainsSection
         domains={run.domains}
         jobId={jobId}

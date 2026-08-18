@@ -190,6 +190,13 @@ class RunDetail(BaseModel):
     # see the same numbers, so existing tests + integrations keep working.
     total_count: int = 0
     filtered_count: int = 0
+    # archive.org upstream-error breakdown for this run (added 2026-08-11).
+    # Lets the operator see at a glance whether a disappointing Wayback run was
+    # their config or the Internet Archive having a bad day -- during the
+    # 2026-08-11 outage every snapshot returned a 503 maintenance page, which
+    # previously looked like ordinary per-domain failure. Keys:
+    # archive_offline / http_503 / http_429 / network / total / domains.
+    wayback_upstream: dict[str, int] = {}
     # Run-wide aggregates (added 2026-06-14) for the server-paginated Run
     # page (availability / ahrefs_batch_analysis): in server mode the
     # frontend no longer holds every domain in memory, so it can't compute
@@ -1126,6 +1133,61 @@ _FAILED_CRITERIA_KEYS = (
 )
 
 
+# Substrings that identify an archive.org-side failure in CriterionResult.error.
+# Matched on the error TEXT because a failed fetch stores http_status=None (see
+# tasks._fetch_criterion) -- the status code only survives in the message.
+_WB_UPSTREAM_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("archive_offline", "temporarily offline"),
+    ("http_503", "503"),
+    ("http_429", "429"),
+    ("network", "network error"),
+)
+
+
+def _wayback_upstream_errors(db: Session, run_id: int) -> dict[str, int]:
+    """Count wayback CRs that failed because ARCHIVE.ORG could not serve us,
+    split by kind, plus the distinct domains affected.
+
+    Scoped to criterion='wayback' so classify rows -- which now quote the
+    wayback error verbatim -- don't double-count. `archive_offline` wins over
+    the plain status buckets: those messages also contain "503", and the
+    site-wide maintenance page is the more useful label.
+
+    Cheap by construction: SQL LIKE counts over the error column, no JSON
+    parsing and no per-domain scan."""
+    base = (
+        db.query(CriterionResult)
+        .join(RunDomain, CriterionResult.run_domain_id == RunDomain.id)
+        .filter(RunDomain.run_id == run_id)
+        .filter(CriterionResult.criterion == "wayback")
+        .filter(CriterionResult.error.isnot(None))
+        .filter(CriterionResult.error != "")
+    )
+    offline_clause = CriterionResult.error.ilike("%temporarily offline%")
+    out: dict[str, int] = {}
+    for key, needle in _WB_UPSTREAM_PATTERNS:
+        q = base.filter(CriterionResult.error.ilike(f"%{needle}%"))
+        if key != "archive_offline":
+            q = q.filter(~offline_clause)
+        n = q.count()
+        if n:
+            out[key] = n
+    if not out:
+        return {}
+    any_clause = or_(*[
+        CriterionResult.error.ilike(f"%{needle}%")
+        for _key, needle in _WB_UPSTREAM_PATTERNS
+    ])
+    out["total"] = base.filter(any_clause).count()
+    out["domains"] = (
+        base.filter(any_clause)
+        .with_entities(CriterionResult.run_domain_id)
+        .distinct()
+        .count()
+    )
+    return out
+
+
 def _run_failed_aggregates(db: Session, run_id: int) -> tuple[int, int]:
     """Run-wide failed-criteria / failed-domains counts mirroring the
     frontend `failedCount` scan AND `tasks._collect_failed_criteria`, which is
@@ -1516,6 +1578,7 @@ def get_run(
         last_analyzed_at_max=last_analyzed_at_max,
         failed_domains=failed_domains,
         failed_criteria=failed_criteria,
+        wayback_upstream=_wayback_upstream_errors(db, run_id),
         scoring_override=get_run_scoring_override(run.id),
     )
 

@@ -837,6 +837,9 @@ export type RunDetail = {
   last_analyzed_at_max?: string | null;
   failed_domains?: number;
   failed_criteria?: number;
+  // archive.org upstream-error breakdown (2026-08-11):
+  // archive_offline / http_503 / http_429 / network / total / domains.
+  wayback_upstream?: Record<string, number>;
   // Per-run scoring override (added 2026-05-13 wave J). null = run uses
   // global Settings weights; non-null = the override last applied via
   // the /recompute-final endpoints. The Run-page "Score weights" panel
