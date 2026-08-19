@@ -1709,6 +1709,27 @@ def _wayback_cr_has_rows(cr: "CriterionResult") -> bool:
     return isinstance(rows, list) and len(rows) > 0
 
 
+def _wayback_cr_row_count(cr_id: int) -> int:
+    """CDX row count on a wayback CR by id. Lets wayback_classify tell "this
+    domain has no archive history" apart from "sampling isn't switched on",
+    which produce the same empty-samples state but need opposite advice."""
+    db = SessionLocal()
+    try:
+        cr = db.get(CriterionResult, cr_id)
+        if cr is None or not cr.data_json:
+            return 0
+        try:
+            body = json.loads(cr.data_json)
+        except json.JSONDecodeError:
+            return 0
+        if not isinstance(body, dict):
+            return 0
+        rows = body.get("wayback")
+        return len(rows) if isinstance(rows, list) else 0
+    finally:
+        db.close()
+
+
 def _classify_retry_is_futile(by_name: dict) -> bool:
     """True when retrying wayback_classify for this RunDomain cannot ever
     succeed: the wayback fetch finished cleanly but found ZERO CDX rows, so
@@ -3841,10 +3862,23 @@ async def _run_wayback_classify_for_domain(
         # the operator hunting through Settings for a config problem that
         # did not exist. The wayback CR carries the real reason.
         wb_err = await _offload(_criterion_error, wb_cr_id)
+        wb_rows = await _offload(_wayback_cr_row_count, wb_cr_id)
         if wb_err:
             classify_error = (
                 f"wayback_classify skipped — the Wayback fetch did not "
                 f"produce usable page samples. {wb_err}"
+            )
+        elif wb_rows == 0:
+            # No archive history at all. The old message told the operator to
+            # go enable page sampling in Settings — advice that cannot help,
+            # because there are no snapshots to sample. Say what is actually
+            # true so a 0-row domain reads as "nothing to classify" instead of
+            # a configuration mistake. Retries deliberately skip these (see
+            # _classify_retry_is_futile).
+            classify_error = (
+                "No Wayback history for this domain (0 CDX rows), so there "
+                "are no archived pages to classify. Nothing to fix and "
+                "nothing to retry — the empty archive IS the answer."
             )
         else:
             classify_error = (

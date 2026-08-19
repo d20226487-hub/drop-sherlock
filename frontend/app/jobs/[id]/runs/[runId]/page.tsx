@@ -1247,42 +1247,22 @@ export default function RunDetailPage({
   // button label.
   const failedCount = useMemo(() => {
     if (!run) return { criteria: 0, domains: 0 };
-    // Server-paginated runs only hold the current page in memory, so the
-    // scan below would undercount. Use the run-wide aggregate the backend
-    // computes (mirrors this exact scan over the whole run).
-    if (serverPaginated) {
-      return {
-        criteria: run.failed_criteria ?? 0,
-        domains: run.failed_domains ?? 0,
-      };
-    }
-    const ALL = [
-      "backlinks", "refdomains", "anchors", "keywords",
-      "wayback", "wayback_classify", "whois_history", "availability",
-    ];
-    // Orphaned rows ("running"/"pending" on a FINISHED run) are retried by the
-    // backend too, so they must be counted here or the button under-promises.
-    // Only on a terminal run: on a live one those statuses just mean "in
-    // flight", and counting them would show the whole run as errored.
-    // Mirrors backend `_run_failed_aggregates` + `_collect_failed_criteria`.
-    const terminal = ["done", "failed", "canceled"].includes(run.status);
-    const isStuck = (st?: string) =>
-      st === "failed" || (terminal && (st === "running" || st === "pending"));
-    let criteria = 0;
-    let domains = 0;
-    for (const d of run.domains) {
-      let perDomain = 0;
-      for (const c of ALL) {
-        if (isStuck(d.criteria?.[c])) perDomain += 1;
-        if (d.ai_status?.[c] === "failed") perDomain += 1;
-      }
-      if (perDomain > 0) {
-        criteria += perDomain;
-        domains += 1;
-      }
-    }
-    return { criteria, domains };
-  }, [run, serverPaginated]);
+    // Single source of truth: the backend aggregate, which is computed on
+    // EVERY run-detail response (not just server-paginated ones).
+    //
+    // This used to be a client-side scan that duplicated the backend rule and
+    // inevitably drifted from it. Concretely (2026-08-11): the backend excludes
+    // wayback_classify rows whose wayback CR finished with 0 CDX rows -- the
+    // domain has no archive history, so classify can never succeed and the
+    // retry deliberately skips it. The client scan knew nothing about CDX row
+    // counts, so it still counted them and the button advertised "retry 2"
+    // for domains it would then refuse to touch. The frontend has no access
+    // to the row counts, so the only correct fix is to stop recomputing.
+    return {
+      criteria: run.failed_criteria ?? 0,
+      domains: run.failed_domains ?? 0,
+    };
+  }, [run]);
 
   // Per-RD retry/reanalyze progress. Drives the in-flight "Retrying X of Y"
   // label and disables the button until the batch drains. Includes the

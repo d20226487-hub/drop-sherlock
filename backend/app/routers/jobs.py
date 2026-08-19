@@ -1189,26 +1189,31 @@ def _wayback_upstream_errors(db: Session, run_id: int) -> dict[str, int]:
 
 
 def _run_failed_aggregates(db: Session, run_id: int) -> tuple[int, int]:
-    """Run-wide failed-criteria / failed-domains counts mirroring the
-    frontend `failedCount` scan AND `tasks._collect_failed_criteria`, which is
-    what the "Retry failed" button actually processes. All three must agree or
-    the button promises a number it doesn't deliver.
+    """(failed_domains, failed_criteria) for the run page's "Retry failed"
+    button. This is the SINGLE source of truth -- the frontend renders these
+    verbatim rather than rescanning, because two implementations of the rule
+    inevitably drifted apart.
 
-    A CR counts as failed when its fetch `status == 'failed'`, OR it carries an
-    `ai_verdict_error`; the two are counted SEPARATELY (a CR that is both
-    fetch- and AI-failed adds 2, matching the client loop).
+    `failed_criteria` counts DISTINCT CriterionResult rows that the retry will
+    actually re-run, matching `tasks._collect_failed_criteria` one-for-one. It
+    used to sum two buckets, so a row that failed its fetch AND carried an
+    ai_verdict_error added 2 -- the button then promised "retry 2" and did 1.
+    For a control labelled "Retry N", N must be the number of things retried.
 
-    Orphaned rows (`status in ('running','pending')`) also count, but ONLY on a
-    terminal run (added 2026-08-11). `_collect_failed_criteria` retries them —
-    on a finished run a non-terminal CR means its task died (e.g. uvicorn
-    restart), so it is genuinely stuck. On a LIVE run those same statuses just
-    mean "in flight", and counting them would report the whole run as errored.
+    A row is retryable when `status == 'failed'`, or it carries an
+    `ai_verdict_error`, or it is orphaned (`status in ('running','pending')`)
+    on a TERMINAL run -- there a non-terminal CR means its task died (e.g.
+    uvicorn restart). On a live run those same statuses just mean "in flight",
+    so they are excluded or the whole run would read as errored.
+
+    wayback_classify rows the retry skips as futile (their wayback CR finished
+    with 0 CDX rows -> no archive history, so classify can never succeed) are
+    subtracted; see `_futile_classify_count`.
 
     Known, deliberate gap: a criterion enabled in the spec whose CR row was
-    never created is retried but NOT counted here — counting it would require
-    the spec plus a per-domain scan of every run, which is exactly the cost
-    this cheap SQL aggregate exists to avoid. It only occurs when a run aborted
-    before a criterion started."""
+    never created is retried but not counted -- counting it needs the spec plus
+    a per-domain scan of the whole run, which is exactly the cost this cheap
+    SQL aggregate exists to avoid."""
     run = db.get(Run, run_id)
     run_is_terminal = bool(
         run is not None and run.status in ("done", "failed", "canceled")
@@ -1226,36 +1231,38 @@ def _run_failed_aggregates(db: Session, run_id: int) -> tuple[int, int]:
     stuck_statuses = (
         ["failed", "running", "pending"] if run_is_terminal else ["failed"]
     )
-    fetch_failed = CriterionResult.status.in_(stuck_statuses)
-    failed_fetch = base.filter(fetch_failed).count()
-    failed_ai = base.filter(ai_failed).count()
+    retryable = or_(CriterionResult.status.in_(stuck_statuses), ai_failed)
+    failed_criteria = base.filter(retryable).count()
     failed_domains = (
-        base.filter(or_(fetch_failed, ai_failed))
+        base.filter(retryable)
         .with_entities(CriterionResult.run_domain_id)
         .distinct()
         .count()
     )
 
-    # Exclude wayback_classify rows the retry will skip as unfixable (its
-    # wayback CR finished with 0 CDX rows -> no archive history). Bounded by
-    # the number of FAILED classify rows, not the run size, so this stays cheap
-    # on healthy runs. Without it the button over-promises: "retry 12" then
-    # silently does 3.
     futile = _futile_classify_count(db, run_id, stuck_statuses)
     if futile:
-        failed_fetch = max(0, failed_fetch - futile["criteria"])
+        failed_criteria = max(0, failed_criteria - futile["rows"])
         failed_domains = max(0, failed_domains - futile["domains_only"])
-    return failed_domains, failed_fetch + failed_ai
+    return failed_domains, failed_criteria
 
 
 def _futile_classify_count(
     db: Session, run_id: int, stuck_statuses: list[str]
 ) -> dict | None:
-    """How many failed wayback_classify rows the retry will skip as futile.
+    """How much of the raw failure count comes from wayback_classify rows the
+    retry will skip as futile (their wayback CR finished with 0 CDX rows).
 
-    `domains_only` counts RunDomains whose ONLY failure was that futile
-    classify row — those drop out of the domain count entirely; a domain with
-    other failures still counts once."""
+Returns `rows` (distinct futile CRs to subtract) and `domains_only`.
+    Caught by the dpu.kz reproduction from run 97: a domain whose Wayback
+    history is genuinely empty was advertised as a retryable error, and the
+    retry then refused to touch it.
+
+    `domains_only` counts RunDomains whose ONLY failure is that futile row, so
+    they drop out of the domain count entirely; a domain with other genuine
+    failures still counts once. The row's own ai_verdict_error does NOT
+    disqualify it here -- that error IS the futile row, not a separate
+    problem."""
     from ..tasks import _classify_retry_is_futile
 
     rows = (
@@ -1263,7 +1270,15 @@ def _futile_classify_count(
         .join(RunDomain, CriterionResult.run_domain_id == RunDomain.id)
         .filter(RunDomain.run_id == run_id)
         .filter(CriterionResult.criterion == "wayback_classify")
-        .filter(CriterionResult.status.in_(stuck_statuses))
+        .filter(
+            or_(
+                CriterionResult.status.in_(stuck_statuses),
+                and_(
+                    CriterionResult.ai_verdict_error.isnot(None),
+                    CriterionResult.ai_verdict_error != "",
+                ),
+            )
+        )
         .all()
     )
     if not rows:
@@ -1278,23 +1293,24 @@ def _futile_classify_count(
     for cr in siblings:
         by_rd.setdefault(cr.run_domain_id, {})[cr.criterion] = cr
 
-    criteria = 0
-    domains_only = 0
+    rows_futile = domains_only = 0
     for r in rows:
         by_name = by_rd.get(r.run_domain_id, {})
         if not _classify_retry_is_futile(by_name):
             continue
-        criteria += 1
-        # Does anything ELSE on this domain still count as failed?
+        rows_futile += 1
         others = [
             cr for cr in by_name.values()
             if cr.id != r.id
             and cr.criterion in _FAILED_CRITERIA_KEYS
-            and (cr.status in stuck_statuses or (cr.ai_verdict_error or ""))
+            and (
+                cr.status in stuck_statuses
+                or (cr.ai_verdict_error or "").strip()
+            )
         ]
-        if not others and not (r.ai_verdict_error or ""):
+        if not others:
             domains_only += 1
-    return {"criteria": criteria, "domains_only": domains_only}
+    return {"rows": rows_futile, "domains_only": domains_only}
 
 
 def get_run(
