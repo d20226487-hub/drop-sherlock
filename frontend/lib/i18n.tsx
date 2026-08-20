@@ -240,7 +240,7 @@ const messagesEn = {
         samplePagesHint:
           "Off = CDX rows only (fast). On = additionally pull a handful of archived pages so the AI sees actual titles over time.",
         sampleCount: "Sample count",
-        sampleCountHint: "How many archived pages to fetch per domain (1–15). 6 ≈ one per ~3 years on a 20-year history.",
+        sampleCountHint: "How many archived pages to fetch per domain (1–30). 6 ≈ one per ~3 years on a 20-year history; high values multiply load on archive.org.",
         sampleStrategyLabel: "Pick strategy",
         sampleStrategy: {
           even: "Even — quantile-spaced across the timeline",
@@ -3011,7 +3011,7 @@ const messagesRu: Messages = {
           "Выкл = только CDX-строки (быстро). Вкл = дополнительно подгружает несколько архивных страниц, чтобы ИИ видел реальные заголовки во времени.",
         sampleCount: "Количество сэмплов",
         sampleCountHint:
-          "Сколько архивных страниц забирать на домен (1–15). 6 ≈ по одной на ~3 года при 20-летней истории.",
+          "Сколько архивных страниц забирать на домен (1–30). 6 ≈ по одной на ~3 года при 20-летней истории; большие значения кратно увеличивают нагрузку на archive.org.",
         sampleStrategyLabel: "Стратегия выбора",
         sampleStrategy: {
           even: "Равномерно — по квантилям таймлайна",

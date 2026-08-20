@@ -220,8 +220,11 @@ class WaybackConfig(BaseModel):
     sample_pages: bool = False
     # Default lowered 6 -> 4 on 2026-08-05: each sample is a full archived-page
     # download (the slow half of the Wayback check — ~6s median), and 4 picks
-    # already give the AI enough year-over-year theme signal. Cap unchanged.
-    sample_count: int = Field(default=4, ge=1, le=15)
+    # already give the AI enough year-over-year theme signal. Cap raised
+    # 15 -> 30 on 2026-08-20 (operator request, for deeper deep-dives); note
+    # each extra sample multiplies V2 load against archive.org's single-IP
+    # throttle, so high values are best kept to small sets.
+    sample_count: int = Field(default=4, ge=1, le=30)
     # "even" = quantile-spaced across the CDX timeline (filtered to 200/html).
     # "anchor" = pick around CDX anomaly events (status flips, mimetype
     # changes, big length jumps, long crawl gaps) — denser signal at

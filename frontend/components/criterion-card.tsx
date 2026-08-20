@@ -1149,14 +1149,14 @@ export function WaybackCard({
               <input
                 type="number"
                 min={1}
-                max={15}
+                max={30}
                 value={cfg.sample_count}
                 onChange={(e) =>
                   onChange({
                     ...cfg,
                     sample_count: Math.max(
                       1,
-                      Math.min(15, parseInt(e.target.value, 10) || 6)
+                      Math.min(30, parseInt(e.target.value, 10) || 6)
                     ),
                   })
                 }
