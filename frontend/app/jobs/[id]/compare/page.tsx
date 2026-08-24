@@ -22,7 +22,10 @@ import {
 // pillar) is appended after these in alphabetical order — the page itself
 // derives the column set from what each run actually ran, not from this
 // hardcoded order.
-const CRITERIA_ORDER = ["backlinks", "refdomains", "anchors", "keywords", "wayback"] as const;
+const CRITERIA_ORDER = [
+  "backlinks", "refdomains", "anchors", "keywords", "stop_words",
+  "wayback",
+] as const;
 
 // A criterion "ran" in a run iff at least one domain has an entry for it
 // in the criteria dict. Backend populates that dict from CriterionResult

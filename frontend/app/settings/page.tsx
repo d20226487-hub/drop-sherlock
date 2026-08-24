@@ -10,6 +10,7 @@ import { AvailabilityAutoRetryEditor } from "@/components/availability-auto-retr
 import { RateLimitsTable } from "@/components/rate-limits-table";
 import { ClassifyContextEditor } from "@/components/classify-context-editor";
 import { PromptEditors } from "@/components/prompt-editors";
+import { StopWordsEditor } from "@/components/stop-words-editor";
 import { ScoringEditor } from "@/components/scoring-editor";
 import { PricingEditor } from "@/components/pricing-editor";
 import { RetentionEditor } from "@/components/retention-editor";
@@ -197,6 +198,17 @@ export default function SettingsPage() {
                   {ts.sections.classifyContext}
                 </h2>
                 <ClassifyContextEditor />
+              </section>
+
+              {/* Stop words sits directly above the prompt list: the
+                  word list and the Stop Words judge prompt are edited
+                  together, and the vocabulary is the input the prompt
+                  reasons over. */}
+              <section className="space-y-4">
+                <h2 className="text-lg font-semibold">
+                  {ts.sections.stopWords}
+                </h2>
+                <StopWordsEditor />
               </section>
 
               <section className="space-y-4">

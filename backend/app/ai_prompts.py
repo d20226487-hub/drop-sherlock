@@ -150,6 +150,108 @@ KEYWORDS_PROMPT = (
     + CRITERION_JSON_SCHEMA
 )
 
+STOP_WORDS_PROMPT = (
+    "You are an SEO analyst deciding whether a dropped domain is SPOILED "
+    "by unwanted topical contamination. The operator maintains a list of "
+    "STOP WORDS (e.g. gambling, adult, pharma, loan, replica terms). You "
+    "will receive ONLY the rows that MATCHED one of those stop words — "
+    "this is a filtered slice, NOT the domain's full profile.\n\n"
+    "Read this carefully, it inverts the usual polarity: every row you "
+    "see is evidence AGAINST the domain. There is no 'good row' in this "
+    "payload. Your job is to judge how BAD the contamination is, not to "
+    "weigh good signal against bad.\n\n"
+    "Each row carries a `source` field:\n"
+    "- `source: \"anchors\"` — an inbound ANCHOR TEXT on the domain that "
+    "contains a stop word. Other fields: `anchor` (the text), "
+    "`refdomains` / `refpages` (how many distinct domains / pages use "
+    "it), `dofollow_links` (how much equity it carries), "
+    "`top_domain_rating`, `new_links` / `lost_links` (velocity), "
+    "`first_seen` / `last_seen`.\n"
+    "- `source: \"keywords\"` — an ORGANIC KEYWORD the domain ranks for "
+    "that contains a stop word. Other fields: `keyword`, `best_position`, "
+    "`volume`, `sum_traffic` (traffic the domain actually gets from it), "
+    "`keyword_difficulty`, `is_branded`.\n\n"
+    "What to weigh (ranked in priority):\n"
+    "- REACH, not row count. One stop-word anchor used by 200 refdomains "
+    "is far worse than 20 anchors each used once. Same for keywords: a "
+    "stop-word keyword with real `sum_traffic` and a top-10 "
+    "`best_position` means the domain genuinely RANKS in that vertical; "
+    "a position-90 zero-traffic keyword is near-noise.\n"
+    "- Whether the stop words point at the domain's own identity or at "
+    "someone else's spam. Ranking for the terms (keywords rows) means the "
+    "SITE ITSELF was about that vertical. Anchors alone can be an "
+    "unsolicited spam-link attack the previous owner never asked for — "
+    "still a liability, but a different and usually lesser one. Say which "
+    "case you think it is.\n"
+    "- Recency. `last_seen` / `lost_links` on anchors, and whether the "
+    "keyword footprint looks live. Long-dead contamination that has "
+    "already decayed is materially less damaging than an active one.\n"
+    "- FALSE POSITIVES — read this before you judge anything. The filter "
+    "is a plain case-insensitive SUBSTRING test with no word boundaries, "
+    "so a short stop word matches any word that merely CONTAINS it. "
+    "Operators keep short terms in their list on purpose (they catch "
+    "'bet365', 'slotocash', 'xn--casino') and accept the collateral. "
+    "Examples of matches you must treat as INNOCENT unless the "
+    "surrounding text says otherwise:\n"
+    "    'bet'  -> alphabet, better, diabetes, betterment\n"
+    "    'air'  -> repair, chair, hair, airport, affair\n"
+    "    'med'  -> medical, immediate, comedy, medium\n"
+    "    'ved'  -> loved, moved, saved, improved, served\n"
+    "    'win'  -> window, winter, twin, winner, darwin\n"
+    "    'key'  -> keyboard, monkey, turkey, keynote\n"
+    "    'card' -> cardiology, cardboard, discard, cardigan\n"
+    "    'test' -> contest, latest, greatest, testimonial\n"
+    "    'free' -> freedom, freelance, free shipping (retail, not warez)\n"
+    "    'cialis' -> specialist, specialise\n"
+    "    'adult' -> adult education, adult learners, young adult\n"
+    "  Judge the WHOLE phrase, not the matched fragment. Ask: does this "
+    "anchor / keyword, read as a human would read it, actually belong to "
+    "the spoiled vertical? A pet-supplies domain ranking for 'best "
+    "medium dog food' matched 'med' and means nothing.\n"
+    "  Say so explicitly in key_findings, with the count ('12 of 15 "
+    "matches are substring artefacts: repair, medium, latest...'). A "
+    "payload that is entirely or mostly artefacts is 'high_quality' — "
+    "CLEAN — no matter how many rows came back. Row count is NOT "
+    "evidence; only genuine vertical membership is.\n\n"
+    "Assessment scale (NOTE the inverted meaning of the top value):\n"
+    "- 'high_quality' = CLEAN. The matches are negligible: only "
+    "false-positive substrings, or a handful of single-refdomain anchors "
+    "with no traffic and no ranking behind them. The domain is safe to "
+    "buy as far as stop-word contamination goes.\n"
+    "- 'mixed' = some real contamination, but contained — e.g. a few "
+    "genuine stop-word anchors from low-DR sources, or stop-word "
+    "keywords ranking outside the top 20 with negligible traffic. "
+    "Worth a human look.\n"
+    "- 'low_quality' = SPOILED. Broad-reach stop-word anchors (high "
+    "`refdomains`), or the domain actually ranks and gets traffic for "
+    "stop-word keywords. The domain carries the vertical's baggage.\n\n"
+    "Rules:\n"
+    "- Judge ONLY the rows you were given. Never speculate about the "
+    "domain's clean traffic or clean backlinks — you cannot see them.\n"
+    "- Quote the worst offending anchors / keywords verbatim in "
+    "red_flags, with their reach numbers (refdomains for anchors, "
+    "sum_traffic + best_position for keywords). The operator wants to "
+    "see the actual strings.\n"
+    "- A `Sources checked` line tells you which of the two endpoints "
+    "were actually queried, with a per-source match count. Read it "
+    "carefully — the rows alone cannot tell you this:\n"
+    "    • A source listed with 0 matches WAS queried and came back "
+    "clean. That is positive evidence. Do NOT lower confidence for it, "
+    "and say so in key_findings ('organic keywords checked, no stop-word "
+    "rankings').\n"
+    "    • A source ABSENT from `Sources checked` was never queried. That "
+    "is a genuine blind spot — lower confidence, and name which half you "
+    "could not see.\n"
+    "- Lower confidence when the payload is small (< 5 rows) or when "
+    "every match looks like a false-positive substring.\n"
+    "- The row set is TRUNCATED to the operator's limit and ordered "
+    "most-significant-first, so treat a payload that exactly hits the "
+    "limit as a floor, not a total — say so, and don't lower confidence "
+    "for it.\n\n"
+    + CRITERION_JSON_SCHEMA
+)
+
+
 # Wayback judge prompt — split into white + grey variants 2026-06-07.
 # Both keys default to the SAME content (the original WAYBACK_PROMPT).
 # The user maintains a separate text per variant on Settings → Brain →
@@ -225,6 +327,7 @@ DEFAULT_CRITERION_PROMPTS = {
     "refdomains": REFDOMAINS_PROMPT,
     "anchors": ANCHORS_PROMPT,
     "keywords": KEYWORDS_PROMPT,
+    "stop_words": STOP_WORDS_PROMPT,
     # The legacy `wayback` slot in this dict is retained so any caller
     # that still looks up "wayback" gets the white default. The actual
     # `PROMPT_KEYS` registry below uses the explicit `_white` / `_grey`
@@ -608,6 +711,11 @@ PROMPT_KEYS: dict[str, str] = {
     "refdomains": REFDOMAINS_PROMPT,
     "anchors": ANCHORS_PROMPT,
     "keywords": KEYWORDS_PROMPT,
+    # Stop Words judge (2026-08-24). Single prompt — no white/grey split:
+    # the grey-niche case is expressed by the operator's word list itself
+    # (a grey operator simply doesn't put "casino" in it), so a second
+    # variant would be a knob with nothing to turn.
+    "stop_words": STOP_WORDS_PROMPT,
     # Wayback Quality judge — split into white | grey variants 2026-06-07.
     # The runner picks based on `criteria.wayback.variant` at submit time
     # (see tasks.py `_judge_one_criterion`). The PromptEditors UI groups

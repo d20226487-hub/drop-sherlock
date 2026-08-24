@@ -61,6 +61,11 @@ _REMOVED_PER_CRITERION: dict[str, frozenset[str]] = {
         "best_position_url", "best_position_kind",
     }),
     "wayback": frozenset(),
+    # stop_words (2026-08-24) — shipped with its final column set, so
+    # nothing has been removed from it yet. Present so the audit covers
+    # the criterion rather than silently skipping customized prompts
+    # for it.
+    "stop_words": frozenset(),
 }
 
 

@@ -272,6 +272,7 @@ function CriterionShell({
   limit,
   onLimitChange,
   limitMax = 1000,
+  hideLimit = false,
   children,
 }: {
   title: string;
@@ -286,6 +287,10 @@ function CriterionShell({
   // Wayback overrides to 200 because CDX's free backend chokes on
   // larger queries — the schema enforces the same cap.
   limitMax?: number;
+  // Suppress the generic single "Limit" row. Stop Words sets this
+  // because it has TWO caps (anchors / keywords) that it renders itself
+  // in `children`; the shell's one-size input doesn't fit.
+  hideLimit?: boolean;
   children?: ReactNode;
 }) {
   const { t } = useT();
@@ -341,23 +346,25 @@ function CriterionShell({
 
       {open && (
         <>
-          <div className="grid grid-cols-[auto,1fr] items-center gap-x-3 gap-y-2 text-sm">
-            <label className="text-neutral-600 dark:text-neutral-400">
-              {ts.fields.limit}
-            </label>
-            <input
-              type="number"
-              min={1}
-              max={limitMax}
-              value={limit}
-              onChange={(e) => {
-                const n = parseInt(e.target.value, 10);
-                if (!Number.isNaN(n)) onLimitChange(n);
-              }}
-              disabled={!enabled}
-              className="w-28 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-blue-500/40 disabled:opacity-50"
-            />
-          </div>
+          {!hideLimit && (
+            <div className="grid grid-cols-[auto,1fr] items-center gap-x-3 gap-y-2 text-sm">
+              <label className="text-neutral-600 dark:text-neutral-400">
+                {ts.fields.limit}
+              </label>
+              <input
+                type="number"
+                min={1}
+                max={limitMax}
+                value={limit}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  if (!Number.isNaN(n)) onLimitChange(n);
+                }}
+                disabled={!enabled}
+                className="w-28 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-blue-500/40 disabled:opacity-50"
+              />
+            </div>
+          )}
 
           {enabled && children}
         </>
@@ -572,7 +579,7 @@ function SortBuilder({
 
 // --- Public per-criterion components ----------------------------------------
 
-import { CriteriaSpec } from "@/lib/api";
+import { api, CriteriaSpec } from "@/lib/api";
 
 export function BacklinksCard({
   cfg,
@@ -1004,6 +1011,191 @@ export function KeywordsCard({
         onChange={(s) => onChange({ ...cfg, sort: s })}
         fields={SORT_FIELDS_KEYWORDS}
       />
+    </CriterionShell>
+  );
+}
+
+// Stop Words criterion (added 2026-08-24). Fetches ONLY the anchors /
+// organic keywords that CONTAIN one of the operator's stop words, then
+// has the AI judge how spoiled the domain is. Default-off (opt-in).
+//
+// The word list itself is NOT edited here — it's a global vocabulary in
+// Settings → Brain → Stop words, snapshotted onto the spec at submit
+// time. This card owns only the two per-run knobs: which endpoint(s) to
+// query, and how many rows to pull from each. We fetch the list on mount
+// purely to show the count + block the "you have no words configured"
+// footgun before the user submits.
+export function StopWordsCard({
+  cfg,
+  onChange,
+}: {
+  cfg: CriteriaSpec["stop_words"];
+  onChange: (next: CriteriaSpec["stop_words"]) => void;
+}) {
+  const { t } = useT();
+  const ts = t.pages.analyze.stopWords;
+  // null = still loading (say nothing rather than flash a false "0 words").
+  const [wordCount, setWordCount] = useState<number | null>(null);
+  const [maxClauses, setMaxClauses] = useState<number>(250);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getStopWords()
+      .then((d) => {
+        if (cancelled) return;
+        setWordCount(d.count);
+        setMaxClauses(d.max_clauses_per_request);
+      })
+      .catch(() => {
+        // Non-fatal: the card still works, it just can't show the count.
+        // The submit endpoint enforces the real "no words" guard.
+        if (!cancelled) setWordCount(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const sourceOptions: CriteriaSpec["stop_words"]["source"][] = [
+    "both",
+    "anchors",
+    "keywords",
+  ];
+  const showAnchor = cfg.source === "both" || cfg.source === "anchors";
+  const showKeyword = cfg.source === "both" || cfg.source === "keywords";
+  // How many billed Ahrefs requests this config costs per domain:
+  // (endpoints picked) x (term chunks). Surfaced because "both" doubles
+  // spend and a >250-word list doubles it again.
+  const endpointCount = cfg.source === "both" ? 2 : 1;
+  const chunkCount =
+    wordCount === null ? 1 : Math.max(1, Math.ceil(wordCount / maxClauses));
+  const requestCount = endpointCount * chunkCount;
+
+  return (
+    <CriterionShell
+      title={ts.title}
+      letter="S"
+      enabled={cfg.enabled}
+      onEnabledChange={(v) => onChange({ ...cfg, enabled: v })}
+      // Stop Words has two per-source caps rendered below; suppress the
+      // shell's single generic "Limit" input.
+      limit={cfg.anchor_limit}
+      onLimitChange={() => {}}
+      hideLimit
+    >
+      <p className="text-xs text-neutral-500 dark:text-neutral-400">
+        {ts.intro}
+      </p>
+
+      <div className="space-y-1">
+        <label
+          className="text-sm text-neutral-600 dark:text-neutral-400 block"
+          title={ts.sourceHelp}
+        >
+          {ts.sourceLabel}
+        </label>
+        <select
+          value={cfg.source}
+          onChange={(e) =>
+            onChange({
+              ...cfg,
+              source: e.target
+                .value as CriteriaSpec["stop_words"]["source"],
+            })
+          }
+          className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-sm outline-none"
+        >
+          {sourceOptions.map((opt) => (
+            <option key={opt} value={opt}>
+              {ts.source[opt]}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* Per-source row caps. Only the ones the chosen source will
+          actually query are shown, so the card never offers a knob that
+          does nothing. */}
+      <div className="grid grid-cols-2 gap-3">
+        {showAnchor && (
+          <label className="flex flex-col gap-1 text-sm">
+            <span
+              className="text-neutral-600 dark:text-neutral-400"
+              title={ts.anchorLimitHelp}
+            >
+              {ts.anchorLimitLabel}
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={1000}
+              value={cfg.anchor_limit}
+              onChange={(e) => {
+                const n = parseInt(e.target.value, 10);
+                if (!Number.isNaN(n)) onChange({ ...cfg, anchor_limit: n });
+              }}
+              className="w-full rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 outline-none focus:ring-2 focus:ring-blue-500/40"
+            />
+          </label>
+        )}
+        {showKeyword && (
+          <label className="flex flex-col gap-1 text-sm">
+            <span
+              className="text-neutral-600 dark:text-neutral-400"
+              title={ts.keywordLimitHelp}
+            >
+              {ts.keywordLimitLabel}
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={1000}
+              value={cfg.keyword_limit}
+              onChange={(e) => {
+                const n = parseInt(e.target.value, 10);
+                if (!Number.isNaN(n)) onChange({ ...cfg, keyword_limit: n });
+              }}
+              className="w-full rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 outline-none focus:ring-2 focus:ring-blue-500/40"
+            />
+          </label>
+        )}
+      </div>
+      <p className="text-xs text-neutral-500 dark:text-neutral-400">
+        {ts.requestHint(requestCount)}
+      </p>
+
+      {/* Word-list status. The list lives in Settings, so the card's job
+          is to tell the user what it currently holds and get them there
+          in one click — especially in the zero-words case, which the
+          submit endpoint rejects outright. */}
+      {wordCount === 0 ? (
+        <p className="text-xs rounded-md px-3 py-2 bg-amber-50 text-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
+          {ts.noWords}{" "}
+          <a
+            href="/settings"
+            className="underline hover:no-underline font-medium"
+          >
+            {ts.manageLink}
+          </a>
+        </p>
+      ) : (
+        wordCount !== null && (
+          <p className="text-xs text-neutral-500 dark:text-neutral-400">
+            {ts.wordCount(wordCount)}{" "}
+            <a
+              href="/settings"
+              className="underline hover:no-underline text-blue-600 dark:text-blue-400"
+            >
+              {ts.manageLink}
+            </a>
+            {wordCount > maxClauses && (
+              <span className="block mt-1 text-amber-700 dark:text-amber-400">
+                {ts.chunkWarning(maxClauses, chunkCount)}
+              </span>
+            )}
+          </p>
+        )
+      )}
     </CriterionShell>
   );
 }

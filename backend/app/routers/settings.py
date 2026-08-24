@@ -471,6 +471,11 @@ class ScoringWeightsIn(BaseModel):
     refdomains: float | None = Field(default=None, ge=0, le=1)
     anchors: float | None = Field(default=None, ge=0, le=1)
     keywords: float | None = Field(default=None, ge=0, le=1)
+    # Zero-weight-by-default criteria. Accepted here so the weight editor
+    # can actually dial them up; `set_scoring_config` still filters to
+    # `_SCORING_CRITERIA` and enforces the 0..1 + sum>0 rules.
+    wayback: float | None = Field(default=None, ge=0, le=1)
+    stop_words: float | None = Field(default=None, ge=0, le=1)
 
 
 class ScoringConfigIn(BaseModel):
@@ -871,6 +876,59 @@ def set_domain_filter_route(payload: DomainFilterIn):
     return {
         "state": cleaned,
         "categories": list(DOMAIN_FILTER_CATEGORIES),
+    }
+
+
+# --- Stop words (added 2026-08-24) ----------------------------------------
+# The operator's spoiled-niche vocabulary, consumed by the Stop Words
+# quality criterion. Lives on Settings → Brain next to the prompts because
+# the word list and the judge prompt are edited together.
+
+class StopWordsIn(BaseModel):
+    # Whole-list replace, same contract as domain-filter: the server
+    # normalises (trim / lower-case / dedup / sort) and the client
+    # reconciles from the response, so optimistic-reorder bugs can't
+    # happen.
+    terms: list[str]
+
+
+@router.get("/stop-words")
+def get_stop_words_route():
+    """Current stop-word list + the per-request clause ceiling so the UI
+    can warn before the operator crosses into multi-chunk (multi-billed)
+    territory. `max_term_length` lets the client explain a rejection
+    without hardcoding the server's cap."""
+    from ..app_settings import _STOP_WORD_MAX_LEN, get_stop_words
+    from ..providers.ahrefs_requests import STOP_WORDS_MAX_CLAUSES
+    terms = get_stop_words()
+    return {
+        "terms": terms,
+        "count": len(terms),
+        "max_clauses_per_request": STOP_WORDS_MAX_CLAUSES,
+        "max_term_length": _STOP_WORD_MAX_LEN,
+        "rejected": [],
+    }
+
+
+@router.put("/stop-words")
+def set_stop_words_route(payload: StopWordsIn):
+    from ..app_settings import _STOP_WORD_MAX_LEN, set_stop_words
+    from ..providers.ahrefs_requests import STOP_WORDS_MAX_CLAUSES
+    try:
+        cleaned, rejected = set_stop_words(payload.terms)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "terms": cleaned,
+        "count": len(cleaned),
+        "max_clauses_per_request": STOP_WORDS_MAX_CLAUSES,
+        "max_term_length": _STOP_WORD_MAX_LEN,
+        # Entries the server refused (over-long / non-string). Surfaced so
+        # the UI can say WHAT it dropped — the "pasted a whole delimited
+        # list into a field that doesn't split on that delimiter" mistake
+        # used to look like a successful no-op. Capped so a pathological
+        # paste can't return a megabyte of echo.
+        "rejected": rejected[:20],
     }
 
 

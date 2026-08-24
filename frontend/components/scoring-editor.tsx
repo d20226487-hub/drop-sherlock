@@ -44,7 +44,12 @@ export function ScoringEditor() {
     if (!config) return 0;
     const w = config.weights;
     return (
-      w.backlinks + w.refdomains + w.anchors + w.keywords + (w.wayback ?? 0)
+      w.backlinks +
+      w.refdomains +
+      w.anchors +
+      w.keywords +
+      (w.wayback ?? 0) +
+      (w.stop_words ?? 0)
     );
   }, [config]);
 
@@ -56,6 +61,8 @@ export function ScoringEditor() {
       config.weights.anchors === defaults.weights.anchors &&
       config.weights.keywords === defaults.weights.keywords &&
       (config.weights.wayback ?? 0) === (defaults.weights.wayback ?? 0) &&
+      (config.weights.stop_words ?? 0) ===
+        (defaults.weights.stop_words ?? 0) &&
       config.good_threshold === defaults.good_threshold &&
       config.mixed_threshold === defaults.mixed_threshold &&
       config.low_confidence_threshold === defaults.low_confidence_threshold
@@ -131,7 +138,7 @@ export function ScoringEditor() {
         <p className="text-xs text-neutral-500 dark:text-neutral-400">
           {ts.weightsHelp}
         </p>
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           {(
             [
               ["backlinks", t.pages.analyze.criteria.backlinks],
@@ -139,6 +146,7 @@ export function ScoringEditor() {
               ["anchors", t.pages.analyze.criteria.anchors],
               ["keywords", t.pages.analyze.criteria.keywords],
               ["wayback", t.pages.analyze.criteria.wayback],
+              ["stop_words", t.pages.analyze.criteria.stop_words],
             ] as const
           ).map(([key, label]) => (
             <label key={key} className="flex flex-col gap-1">

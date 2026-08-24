@@ -106,6 +106,10 @@ const TABS = [
   "refdomains",
   "anchors",
   "keywords",
+  // stop_words (2026-08-24): a merged table of the anchors + organic
+  // keywords that matched the operator's stop-word list, each row
+  // tagged with the endpoint it came from.
+  "stop_words",
   "wayback",
   // wayback_classify (added 2026-05-09): no fetched rows — the tab body
   // renders the classify verdict directly (language + theme + category +
@@ -515,7 +519,9 @@ export default function DomainDetailPage({
         // (the synth runs over whatever per-criterion verdicts exist),
         // but showing it under an "Ahrefs" header on a run that never
         // touched Ahrefs is misleading.
-        const AHREFS = ["backlinks", "refdomains", "anchors", "keywords"];
+        const AHREFS = [
+          "backlinks", "refdomains", "anchors", "keywords", "stop_words",
+        ];
         const criteriaDict = (data.criteria ?? {}) as Record<string, unknown>;
         const hasAhrefs = AHREFS.some((c) => {
           const cell = criteriaDict[c];

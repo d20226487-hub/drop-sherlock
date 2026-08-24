@@ -81,6 +81,23 @@ const DEFAULT_COLUMNS: Record<string, string[]> = {
     "keyword_difficulty",
     "is_branded",
   ],
+  // Stop Words (2026-08-24). One merged table over TWO row shapes, so
+  // the column list is the union: `source` first (it's what tells you
+  // which half you're reading), then the anchors columns, then the
+  // keywords columns. Cells that don't apply to a row's shape render as
+  // "—" via `renderCell`, which is the honest representation — a
+  // keywords row genuinely has no `refdomains`.
+  stop_words: [
+    "source",
+    "anchor",
+    "refdomains",
+    "dofollow_links",
+    "top_domain_rating",
+    "keyword",
+    "best_position",
+    "volume",
+    "sum_traffic",
+  ],
   // Wayback CDX rows. `original` is the URL crawled at that timestamp;
   // `statuscode` is critical for spotting 301 patterns. `digest` skipped
   // (just hash noise).
@@ -245,6 +262,21 @@ export function CriterionTable({
     );
   }
 
+  // Stop Words is the one criterion whose rows come from TWO endpoints,
+  // merged into one CR. A single table forces every anchor row to carry
+  // empty keyword columns and vice-versa (half the grid is "—"). Split
+  // it into two stacked tables, each with only its own columns.
+  if (criterion === "stop_words") {
+    return (
+      <StopWordsTables
+        detail={detail}
+        viewOnly={viewOnly}
+        showUrl={showUrl}
+        onToggleUrl={() => setShowUrl((s) => !s)}
+      />
+    );
+  }
+
   const defaultColumns =
     DEFAULT_COLUMNS[criterion] || Object.keys(detail.rows[0] || {});
   // Interleave `_prev` mirrors when the row data carries them. Applies
@@ -301,6 +333,8 @@ function SortableTable({
   showUrl,
   onToggleUrl,
   viewOnly,
+  hideMeta = false,
+  heading,
 }: {
   rows: Record<string, unknown>[];
   columns: string[];
@@ -314,6 +348,12 @@ function SortableTable({
   showUrl: boolean;
   onToggleUrl: () => void;
   viewOnly: boolean;
+  // When true, suppress the cache pill / units chip / request-URL toggle
+  // (the caller renders them ONCE above a group of tables — see
+  // StopWordsTables). The rowCountLabel / heading still show per table.
+  hideMeta?: boolean;
+  // Optional sub-heading rendered before the row-count (e.g. "Anchors").
+  heading?: string;
 }) {
   const { t } = useT();
   const [sort, setSort] = useState<SortState>(null);
@@ -338,18 +378,21 @@ function SortableTable({
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-2 flex-wrap">
+          {heading && (
+            <span className="text-sm font-semibold text-neutral-700 dark:text-neutral-200">
+              {heading}
+            </span>
+          )}
           <p className="text-sm text-neutral-600 dark:text-neutral-400">
             {rowCountLabel}
           </p>
           {/* Cache provenance + Ahrefs unit accounting + the request
               URL toggle are operator-only — suppress in viewOnly so the
               public share page doesn't leak internal run IDs, spend
-              numbers, or the raw Ahrefs request signature. The
-              `cachedFromRunId != null` guard (loose !=) also catches
-              the `undefined` we get from the sanitized public payload —
-              tighter than the previous `!== null` which let undefined
-              through and rendered "Run #undefined". */}
-          {!viewOnly && cachedFromRunId != null && (
+              numbers, or the raw Ahrefs request signature. `hideMeta`
+              additionally suppresses them when a parent renders them once
+              above a group of tables (StopWordsTables). */}
+          {!viewOnly && !hideMeta && cachedFromRunId != null && (
             <span
               className="text-xs px-2 py-0.5 rounded-full bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300"
               title="Reused from a prior run with matching criteria"
@@ -357,7 +400,7 @@ function SortableTable({
               {t.pages.jobs.domain.dataCachedFromRun(cachedFromRunId)}
             </span>
           )}
-          {!viewOnly && (
+          {!viewOnly && !hideMeta && (
             <UnitsChip
               cachedFromRunId={cachedFromRunId}
               costRow={unitsCostRow}
@@ -366,7 +409,7 @@ function SortableTable({
             />
           )}
         </div>
-        {!viewOnly && (
+        {!viewOnly && !hideMeta && (
           <RequestUrlBlock
             showUrl={showUrl}
             onToggle={onToggleUrl}
@@ -430,6 +473,156 @@ function SortableTable({
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+// Stop Words is judged on ONE merged verdict, but its rows come from two
+// endpoints with disjoint columns. Render one table per source, each with
+// only its own columns, so neither is padded with "—". The `source` tag
+// is dropped from the columns — the heading already names it.
+const STOP_WORDS_SECTIONS: { source: string; columns: string[] }[] = [
+  {
+    source: "anchors",
+    columns: [
+      "anchor",
+      "refdomains",
+      "refpages",
+      "dofollow_links",
+      "links_to_target",
+      "top_domain_rating",
+    ],
+  },
+  {
+    source: "keywords",
+    columns: [
+      "keyword",
+      "best_position",
+      "volume",
+      "sum_traffic",
+      "keyword_difficulty",
+      "is_branded",
+    ],
+  },
+];
+
+function StopWordsTables({
+  detail,
+  viewOnly,
+  showUrl,
+  onToggleUrl,
+}: {
+  detail: CriterionDetail;
+  viewOnly: boolean;
+  showUrl: boolean;
+  onToggleUrl: () => void;
+}) {
+  const { t } = useT();
+  const ts = t.pages.jobs.domain;
+  const sw = ts.stopWords;
+  const rows = (detail.rows || []) as Record<string, unknown>[];
+
+  // Which endpoints were actually queried, read from the run's own meta
+  // (written by the runner). Lets a source that WAS checked but matched
+  // nothing render an explicit "· 0 · clean" line — positive evidence
+  // that would otherwise be invisible (no rows = no table). Falls back to
+  // "infer from the rows present" when meta is absent (old cache rows).
+  const meta =
+    detail.raw && typeof detail.raw === "object"
+      ? ((detail.raw as Record<string, unknown>)["stop_words_meta"] as
+          | Record<string, unknown>
+          | undefined)
+      : undefined;
+  const checkedSources = new Set<string>();
+  const metaRequests = meta?.["requests"];
+  if (Array.isArray(metaRequests)) {
+    for (const r of metaRequests) {
+      const s = (r as Record<string, unknown>)?.["source"];
+      if (typeof s === "string") checkedSources.add(s);
+    }
+  }
+  if (checkedSources.size === 0) {
+    for (const r of rows) {
+      const s = r["source"];
+      if (typeof s === "string") checkedSources.add(s);
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+      {/* Shared meta — the units/cache/URL describe the whole merged CR,
+          so render them ONCE above both tables rather than per source. */}
+      {!viewOnly && (
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap">
+            {detail.cached_from_run_id != null && (
+              <span
+                className="text-xs px-2 py-0.5 rounded-full bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300"
+                title="Reused from a prior run with matching criteria"
+              >
+                {ts.dataCachedFromRun(detail.cached_from_run_id)}
+              </span>
+            )}
+            <UnitsChip
+              cachedFromRunId={detail.cached_from_run_id}
+              costRow={detail.units_cost_row}
+              costTotal={detail.units_cost_total}
+              costActual={detail.units_cost_actual}
+            />
+          </div>
+          <RequestUrlBlock
+            showUrl={showUrl}
+            onToggle={onToggleUrl}
+            url={detail.request_url}
+          />
+        </div>
+      )}
+
+      {STOP_WORDS_SECTIONS.map((sec) => {
+        const secRows = rows.filter((r) => r["source"] === sec.source);
+        const label =
+          sec.source === "anchors" ? sw.anchorsSection : sw.keywordsSection;
+        // Checked but no matches → a clean line, not a table. This is the
+        // "keywords came back empty" positive signal.
+        if (secRows.length === 0) {
+          if (!checkedSources.has(sec.source)) return null; // not queried
+          return (
+            <div key={sec.source} className="space-y-1">
+              <span className="text-sm font-semibold text-neutral-700 dark:text-neutral-200">
+                {label}
+              </span>
+              <p className="text-xs text-emerald-700 dark:text-emerald-400">
+                {sw.sectionClean}
+              </p>
+            </div>
+          );
+        }
+        // Keep only columns actually present on these rows (defends
+        // against older payloads with a trimmed field set).
+        const present = sec.columns.filter((c) =>
+          secRows.some((r) => c in r),
+        );
+        const columns = present.length > 0 ? present : sec.columns;
+        return (
+          <SortableTable
+            key={sec.source}
+            rows={secRows}
+            columns={columns}
+            sortColumnSet={new Set()}
+            rowCountLabel={ts.rowCount(secRows.length)}
+            heading={label}
+            hideMeta
+            requestUrl={detail.request_url}
+            cachedFromRunId={detail.cached_from_run_id}
+            unitsCostRow={detail.units_cost_row}
+            unitsCostTotal={detail.units_cost_total}
+            unitsCostActual={detail.units_cost_actual}
+            showUrl={showUrl}
+            onToggleUrl={onToggleUrl}
+            viewOnly={viewOnly}
+          />
+        );
+      })}
     </div>
   );
 }

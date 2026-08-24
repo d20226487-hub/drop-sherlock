@@ -308,6 +308,9 @@ const CRITERIA_KEYS = [
   "refdomains",
   "anchors",
   "keywords",
+  // stop_words (2026-08-24) — selectable so the operator can narrow to
+  // rows where the Stop Words check actually ran.
+  "stop_words",
   "wayback",
   // Added 2026-05-15: classify (wayback_classify) and Whois are
   // selectable in the "Any criterion" multi-select so the user can
@@ -341,6 +344,10 @@ export default function DatabasePage() {
   // they filter to rows missing the respective field.
   const [verdicts, setVerdicts] = useState<string[]>([]);
   const [waybackVerdicts, setWaybackVerdicts] = useState<string[]>([]);
+  // Stop Words verdict filter (2026-08-24). Same three-value space as
+  // the wayback verdict filter, plus the "__none__" sentinel for rows
+  // that never ran the check.
+  const [stopWordsVerdicts, setStopWordsVerdicts] = useState<string[]>([]);
   const [whoisBands, setWhoisBands] = useState<string[]>([]);
   // Availability filter (added 2026-05-15) — separate from the
   // criterion multi-select because availability isn't a CR-row
@@ -449,6 +456,8 @@ export default function DatabasePage() {
         const v = JSON.parse(raw);
         if (Array.isArray(v.verdicts)) setVerdicts(v.verdicts);
         if (Array.isArray(v.waybackVerdicts)) setWaybackVerdicts(v.waybackVerdicts);
+        if (Array.isArray(v.stopWordsVerdicts))
+          setStopWordsVerdicts(v.stopWordsVerdicts);
         if (Array.isArray(v.whoisBands)) setWhoisBands(v.whoisBands);
         if (Array.isArray(v.availabilityFilter)) setAvailabilityFilter(v.availabilityFilter);
         if (Array.isArray(v.criteria)) setCriteria(v.criteria);
@@ -525,6 +534,7 @@ export default function DatabasePage() {
           JSON.stringify({
             verdicts,
             waybackVerdicts,
+            stopWordsVerdicts,
             whoisBands,
             availabilityFilter,
             criteria,
@@ -553,6 +563,7 @@ export default function DatabasePage() {
     filtersHydrated,
     verdicts,
     waybackVerdicts,
+    stopWordsVerdicts,
     whoisBands,
     availabilityFilter,
     criteria,
@@ -775,6 +786,7 @@ export default function DatabasePage() {
         fresh: opts.fresh ?? false,
         verdict: verdicts,
         wayback_verdict: waybackVerdicts,
+        stop_words_verdict: stopWordsVerdicts,
         whois_band: whoisBands,
         availability: availabilityFilter,
         language: languages,
@@ -849,6 +861,7 @@ export default function DatabasePage() {
   }, [
     verdicts,
     waybackVerdicts,
+    stopWordsVerdicts,
     whoisBands,
     availabilityFilter,
     languages,
@@ -881,6 +894,7 @@ export default function DatabasePage() {
       perPage,
       verdicts,
       waybackVerdicts,
+      stopWordsVerdicts,
       whoisBands,
       availabilityFilter,
       languages,
@@ -919,6 +933,7 @@ export default function DatabasePage() {
     perPage,
     verdicts,
     waybackVerdicts,
+    stopWordsVerdicts,
     whoisBands,
     availabilityFilter,
     languages,
@@ -1118,6 +1133,7 @@ export default function DatabasePage() {
         include_options: false,
         verdict: verdicts,
         wayback_verdict: waybackVerdicts,
+        stop_words_verdict: stopWordsVerdicts,
         whois_band: whoisBands,
         availability: availabilityFilter,
         language: languages,
@@ -1279,6 +1295,8 @@ export default function DatabasePage() {
     final_confidence: false,
     wayback_verdict: false,
     wayback_confidence: false,
+    stop_words_verdict: false,
+    stop_words_matches: false,
     whois_band: false,
     primary_language: false,
     category: false,
@@ -1416,6 +1434,7 @@ export default function DatabasePage() {
       const r = await api.bulkSetDomainSourceFiltered(src, {
         verdict: verdicts,
         wayback_verdict: waybackVerdicts,
+        stop_words_verdict: stopWordsVerdicts,
         whois_band: whoisBands,
         availability: availabilityFilter,
         language: languages,
@@ -1540,6 +1559,8 @@ export default function DatabasePage() {
         { key: "final_confidence", header: "confidence", get: (r) => r?.final_confidence ?? "" },
         { key: "wayback_verdict", header: "wayback_verdict", get: (r) => r?.wayback_assessment || "" },
         { key: "wayback_confidence", header: "wayback_confidence", get: (r) => r?.wayback_confidence ?? "" },
+        { key: "stop_words_verdict", header: "stop_words_verdict", get: (r) => r?.stop_words_assessment || "" },
+        { key: "stop_words_matches", header: "stop_words_matches", get: (r) => r?.stop_words_assessment ? (r?.stop_words_matches ?? 0) : "" },
         { key: "whois_band", header: "whois_band", get: (r) => r?.whois_band || "" },
         { key: "primary_language", header: "language", get: (r) => r?.primary_language || "" },
         { key: "category", header: "category", get: (r) => r?.category || "" },
@@ -1587,6 +1608,7 @@ export default function DatabasePage() {
   function clearFilters() {
     setVerdicts([]);
     setWaybackVerdicts([]);
+    setStopWordsVerdicts([]);
     setWhoisBands([]);
     setAvailabilityFilter([]);
     setLanguages([]);
@@ -1640,6 +1662,20 @@ export default function DatabasePage() {
       {
         header: "wayback_confidence",
         get: (r) => r.wayback_confidence ?? "",
+      },
+      {
+        header: "stop_words_verdict",
+        get: (r) => r.stop_words_assessment || "",
+      },
+      {
+        header: "stop_words_confidence",
+        get: (r) => r.stop_words_confidence ?? "",
+      },
+      {
+        // Blank (not 0) when the check never ran — 0 means "ran and
+        // found nothing", which is the opposite conclusion.
+        header: "stop_words_matches",
+        get: (r) => (r.stop_words_assessment ? r.stop_words_matches : ""),
       },
       {
         header: "primary_language",
@@ -1698,6 +1734,11 @@ export default function DatabasePage() {
         get: (r) => (r.criteria.keywords?.enabled ? r.criteria.keywords.rows : ""),
       },
       {
+        header: "stop_words_rows",
+        get: (r) =>
+          r.criteria.stop_words?.enabled ? r.criteria.stop_words.rows : "",
+      },
+      {
         header: "wayback_rows",
         get: (r) => (r.criteria.wayback?.enabled ? r.criteria.wayback.rows : ""),
       },
@@ -1734,6 +1775,7 @@ export default function DatabasePage() {
               include_options: false,
               verdict: verdicts,
               wayback_verdict: waybackVerdicts,
+              stop_words_verdict: stopWordsVerdicts,
               whois_band: whoisBands,
               availability: availabilityFilter,
               language: languages,
@@ -1768,6 +1810,7 @@ export default function DatabasePage() {
   const filtersActive =
     verdicts.length > 0 ||
     waybackVerdicts.length > 0 ||
+    stopWordsVerdicts.length > 0 ||
     whoisBands.length > 0 ||
     availabilityFilter.length > 0 ||
     languages.length > 0 ||
@@ -1988,6 +2031,30 @@ export default function DatabasePage() {
               {
                 value: "__none__",
                 label: ts.filters.verdictWaybackNone,
+                group: "tail" as const,
+              },
+            ]}
+          />
+
+          <MultiSelectFilter
+            label={ts.filters.verdictStopWordsLabel}
+            anyLabel={ts.filters.verdictStopWordsAny}
+            value={stopWordsVerdicts}
+            onChange={setStopWordsVerdicts}
+            title={ts.filters.verdictStopWordsHint}
+            disabled={(opts.stop_words_verdicts || []).length === 0}
+            options={[
+              ...(opts.stop_words_verdicts || []).map((v) => ({
+                value: v,
+                // "high_quality" reads as "clean" for this criterion —
+                // there is no good news in a stop-words payload, only
+                // less-bad news. Keep the stored value verbatim so the
+                // query still matches; relabel for the human.
+                label: v === "high_quality" ? ts.cols.stopWordsClean : v,
+              })),
+              {
+                value: "__none__",
+                label: ts.filters.verdictStopWordsNone,
                 group: "tail" as const,
               },
             ]}
@@ -2707,6 +2774,15 @@ export default function DatabasePage() {
                   </button>
                 </th>
                 <th className="px-3 py-2 font-medium">{ts.cols.wayback}</th>
+                {/* Stop (2026-08-24) — sits next to Wayback because both
+                    are "is this domain poisoned?" signals read at a
+                    glance, distinct from the Ahrefs quality score. */}
+                <th
+                  className="px-3 py-2 font-medium"
+                  title={ts.cols.stopWordsHint}
+                >
+                  {ts.cols.stopWords}
+                </th>
                 <th className="px-3 py-2 font-medium">{ts.cols.language}</th>
                 <th className="px-3 py-2 font-medium">{ts.cols.theme}</th>
                 {/* Column-group B — operational state (Criteria pills,
@@ -2917,6 +2993,8 @@ export default function DatabasePage() {
                     { key: "final_confidence", locked: false },
                     { key: "wayback_verdict", locked: false },
                     { key: "wayback_confidence", locked: false },
+                    { key: "stop_words_verdict", locked: false },
+                    { key: "stop_words_matches", locked: false },
                     { key: "whois_band", locked: false },
                     { key: "primary_language", locked: false },
                     { key: "category", locked: false },
@@ -3073,6 +3151,7 @@ function DomainListRow({
     "backlinks", "refdomains", "anchors", "keywords",
   ]);
   const waybackHref = hrefFor(["wayback"]);
+  const stopWordsHref = hrefFor(["stop_words"]);
   const classifyHref = hrefFor(["wayback_classify"]);
 
   // Domain-cell link target (U1, returned 2026-05-18). Prefers the
@@ -3090,7 +3169,7 @@ function DomainListRow({
       return `/jobs/${row.pinned_job_id}/runs/${row.pinned_run_id}/domains/${row.pinned_run_domain_id}`;
     }
     return hrefFor([
-      "backlinks", "refdomains", "anchors", "keywords",
+      "backlinks", "refdomains", "anchors", "keywords", "stop_words",
       "wayback", "wayback_classify", "whois_history", "availability",
     ]);
   })();
@@ -3119,6 +3198,7 @@ function DomainListRow({
     "backlinks", "refdomains", "anchors", "keywords",
   ]);
   const waybackCached = cachedFor(["wayback"]);
+  const stopWordsCached = cachedFor(["stop_words"]);
   const classifyCached = cachedFor(["wayback_classify"]);
 
   const bucket: FinalBucket | null = isBucket(row.final_bucket)
@@ -3152,6 +3232,7 @@ function DomainListRow({
     ["refdomains", "D"],
     ["anchors", "A"],
     ["keywords", "K"],
+    ["stop_words", "S"],
     ["wayback", "W"],
     ["wayback_classify", "C"],
     ["whois_history", "H"],
@@ -3187,7 +3268,9 @@ function DomainListRow({
   // having to parse a single dense 5-7 chip strip, and reinforces the
   // mental grouping (quality-scoring vs auxiliary signals).
   const AHREFS_KEYS = new Set([
-    "backlinks", "refdomains", "anchors", "keywords",
+    // stop_words rides on line 1 with the other Ahrefs-endpoint
+    // criteria; W/C/H on line 2 are the non-Ahrefs pillars.
+    "backlinks", "refdomains", "anchors", "keywords", "stop_words",
   ]);
   const ahrefsPills = enabledCriteriaPills.filter((p) =>
     AHREFS_KEYS.has(p.key),
@@ -3448,6 +3531,7 @@ function DomainListRow({
               refdomains: "D",
               anchors: "A",
               keywords: "K",
+              stop_words: "S",
               wayback: "W",
               wayback_classify: "C",
               whois_history: "H",
@@ -3511,6 +3595,7 @@ function DomainListRow({
                     refdomains: "D",
                     anchors: "A",
                     keywords: "K",
+                    stop_words: "S",
                     wayback: "W",
                     wayback_classify: "C",
                     whois_history: "H",
@@ -3724,6 +3809,90 @@ function DomainListRow({
           <span
             className="ml-2 text-[10px] uppercase tracking-wide text-violet-700 dark:text-violet-400"
             title="Wayback data or AI verdict reused from a prior run"
+          >
+            {ts.cachedTag}
+          </span>
+        )}
+      </td>
+      {/* Stop column (2026-08-24). Shows the Stop Words criterion's
+          assessment, with "high_quality" relabelled "clean" — there is
+          no good news in a stop-words payload, only an absence of bad
+          news, so "high" would read as praise the data can't support.
+          A zero-match verdict (`stop_words_no_matches`) renders the same
+          "clean" pill; only the tooltip distinguishes "the AI weighed N
+          matches and cleared them" from "nothing matched at all". */}
+      <td className="px-3 py-2 align-top">
+        {!row.is_pinned ? (
+          <span className="text-xs text-neutral-400 dark:text-neutral-500">
+            —
+          </span>
+        ) : row.stop_words_assessment ? (
+          (() => {
+            const a = row.stop_words_assessment;
+            const c = row.stop_words_confidence;
+            const label =
+              a === "high_quality"
+                ? ts.cols.stopWordsClean
+                : a.replace("_quality", "");
+            const title = (() => {
+              const conf =
+                c != null
+                  ? ` · ${Math.round(c * 100)}%${
+                      isLowConfidence(c) ? " (low — greyed)" : ""
+                    }`
+                  : "";
+              const detail = row.stop_words_no_matches
+                ? ts.cols.stopWordsNoMatchHint
+                : ts.cols.stopWordsMatchHint(row.stop_words_matches);
+              return `Stop: ${a}${conf} · ${detail}`;
+            })();
+            const srcRdId =
+              row.criteria.stop_words?.source_run_domain_id ??
+              row.pinned_run_domain_id;
+            const pill = (
+              <span
+                className={`text-xs px-2 py-0.5 rounded-full ${
+                  srcRdId != null ? "cursor-help " : ""
+                }${criterionPillTone(a, c)}`}
+                title={title}
+              >
+                {label}
+                {/* Match count is the number the operator actually
+                    reasons about ("40 poisoned anchors"), so surface it
+                    inline rather than burying it in the tooltip. Hidden
+                    on the zero-match path — "clean 0" is noise. */}
+                {!row.stop_words_no_matches && row.stop_words_matches > 0 && (
+                  <span className="ml-1 opacity-70">
+                    {row.stop_words_matches}
+                  </span>
+                )}
+              </span>
+            );
+            return (
+              <MaybeLink href={stopWordsHref}>
+                {srcRdId != null ? (
+                  <VerdictHoverCard
+                    runDomainId={srcRdId}
+                    mode="criterion"
+                    criterion="stop_words"
+                  >
+                    {pill}
+                  </VerdictHoverCard>
+                ) : (
+                  pill
+                )}
+              </MaybeLink>
+            );
+          })()
+        ) : (
+          <span className="text-xs text-neutral-400 dark:text-neutral-500">
+            {ts.noVerdict}
+          </span>
+        )}
+        {row.is_pinned && row.stop_words_assessment && stopWordsCached && (
+          <span
+            className="ml-2 text-[10px] uppercase tracking-wide text-violet-700 dark:text-violet-400"
+            title="Stop Words data or AI verdict reused from a prior run"
           >
             {ts.cachedTag}
           </span>

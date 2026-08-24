@@ -143,6 +143,7 @@ const messagesEn = {
         refdomains: "Referring domains",
         anchors: "Anchors",
         keywords: "Organic keywords",
+        stop_words: "Stop words",
         wayback: "Wayback history",
         wayback_classify: "Language + theme + category",
         whois_history: "Whois history",
@@ -217,6 +218,34 @@ const messagesEn = {
           "2y": "2 years ago",
           "5y": "5 years ago",
         },
+      },
+      stopWords: {
+        title: "Stop words",
+        intro:
+          "Asks Ahrefs for ONLY the anchors and organic keywords that CONTAIN one of your stop words, then has the AI judge how spoiled the domain is. Every row it returns is bad news — zero rows is the good outcome, and the AI is skipped entirely in that case.",
+        sourceLabel: "Check",
+        sourceHelp:
+          "Anchors = inbound anchor text pointing at the domain (spam other people aimed at it). Organic keywords = terms the domain itself ranks for (what the site actually WAS). Each is a separately billed Ahrefs request.",
+        source: {
+          both: "Anchors + organic keywords",
+          anchors: "Anchors only",
+          keywords: "Organic keywords only",
+        },
+        anchorLimitLabel: "Anchor rows",
+        anchorLimitHelp:
+          "Max anchor rows to fetch, worst-first (by referring domains). Hard spend ceiling for the anchors request. Anchors cost ~14 units/row.",
+        keywordLimitLabel: "Keyword rows",
+        keywordLimitHelp:
+          "Max organic-keyword rows to fetch, worst-first (by traffic). Hard spend ceiling for the keywords request. Keywords cost ~33 units/row — ~2.4x anchors.",
+        requestHint: (requests: number) =>
+          `${requests} Ahrefs request${requests === 1 ? "" : "s"} per domain.`,
+        wordCount: (n: number) =>
+          `${n} stop word${n === 1 ? "" : "s"} configured.`,
+        noWords:
+          "No stop words configured yet — this criterion has nothing to look for and the run will be rejected at submit.",
+        manageLink: "Manage the list in Settings → Brain",
+        chunkWarning: (max: number, chunks: number) =>
+          `Over ${max} words: Ahrefs caps a filter at ${max} terms, so each source splits into ${chunks} separately billed requests.`,
       },
       wayback: {
         intro:
@@ -870,12 +899,19 @@ const messagesEn = {
           refdomains: "Referring domains",
           anchors: "Anchors",
           keywords: "Organic keywords",
+          stop_words: "Stop words",
           wayback: "Wayback history",
           wayback_classify: "Language + theme",
         },
         criterionMissing: "This criterion was not enabled for this run.",
         criterionFailed: "Failed to fetch this criterion.",
         criterionEmpty: "No rows returned.",
+        // Stop Words raw-data view: one merged CR shown as two tables.
+        stopWords: {
+          anchorsSection: "Anchors",
+          keywordsSection: "Organic keywords",
+          sectionClean: "Checked — no stop-word matches.",
+        },
         rowCount: (n: number) => `${n} row${n === 1 ? "" : "s"}`,
         showRaw: "Show raw row",
         hideRaw: "Hide raw row",
@@ -1008,6 +1044,13 @@ const messagesEn = {
         whoisSortHint:
           "Click to sort by Whois drop-confidence. Cycles asc (stable first) → desc → default. Rows without a Whois verdict always sink to the bottom.",
         wayback: "Wayback",
+        stopWords: "Stop",
+        stopWordsHint:
+          "Stop Words verdict: how contaminated the domain's anchors / organic keywords are with your stop-word list. \"clean\" means nothing meaningful matched.",
+        stopWordsClean: "clean",
+        stopWordsNoMatchHint: "nothing matched the stop-word list",
+        stopWordsMatchHint: (n: number) =>
+          `${n} matching row${n === 1 ? "" : "s"} judged`,
         language: "Lang",
         theme: "Theme",
         category: "Category",
@@ -1169,6 +1212,11 @@ const messagesEn = {
         verdictWaybackNone: "(no Wayback verdict)",
         verdictWaybackHint:
           "Filter by the Wayback judge's per-criterion assessment (separate from the aggregated final score).",
+        verdictStopWordsAny: "Any Stop verdict",
+        verdictStopWordsLabel: "Stop verdict",
+        verdictStopWordsNone: "(no Stop verdict)",
+        verdictStopWordsHint:
+          "Filter by the Stop Words judge's assessment. \"clean\" = nothing meaningful matched your stop-word list; low_quality = the domain carries the vertical's baggage.",
         verdictWhoisAny: "Any Whois verdict",
         verdictWhoisLabel: "Whois verdict",
         verdictWhoisNone: "(no Whois verdict)",
@@ -1361,9 +1409,33 @@ const messagesEn = {
         scoring: "Final score weights & thresholds",
         pricing: "AI model pricing",
         waybackClassify: "Wayback classification (language + theme + category)",
+        stopWords: "Stop words",
         prompts: "AI prompts",
         classifyContext: "Wayback classify → Ahrefs judges (site context)",
         waybackProxies: "Residential proxies for Wayback",
+      },
+      stopWords: {
+        intro:
+          "Your \"spoiled niche\" vocabulary — gambling, adult, pharma, loan, replica terms and anything else you refuse to buy. The Stop Words criterion asks Ahrefs for only the anchors and organic keywords CONTAINING one of these, then has the AI judge how badly the domain is contaminated. Matching is case-insensitive substring matching, so \"casino\" also catches \"casinos\" and \"onlinecasino\" — and innocent hosts like \"specialist\" for \"cialis\", which the judge is told to discount.",
+        listTitle: "Stop words",
+        empty: "No stop words yet. Add a few to start using the criterion.",
+        placeholder: "casino",
+        hint: "Multi-word phrases are fine (\"free spins\"). Stored lower-case.",
+        add: "Add",
+        adding: "Adding…",
+        bulkOpen: "Paste a list",
+        bulkClose: "Close",
+        bulkHint:
+          "Separate with new lines, commas, semicolons or pipes. Spaces are NOT separators — multi-word phrases like \"free spins\" stay intact.",
+        bulkAdd: "Add all",
+        bulkAdding: "Adding…",
+        clearAll: "Clear all",
+        confirmClear: "Remove every stop word? Runs already finished keep the list they were checked against.",
+        removeAria: (v: string) => `Remove ${v}`,
+        ceilingWarning: (max: number, chunks: number) =>
+          `Over ${max} words: Ahrefs rejects a filter with more than ${max} terms, so each source is split into ${chunks} requests — and every request is billed separately. Trim the list to ${max} or fewer to keep it at one request per source.`,
+        rejectedWarning: (n: number, maxLen: number) =>
+          `${n} ${n === 1 ? "entry was" : "entries were"} skipped — longer than ${maxLen} characters. If you pasted a whole list, separate the words with new lines, commas, semicolons or pipes:`,
       },
       waybackProxies: {
         hint:
@@ -1735,6 +1807,7 @@ const messagesEn = {
           refdomains: "Referring domains judge",
           anchors: "Anchors judge",
           keywords: "Organic keywords judge",
+          stop_words: "Stop words judge",
           // Legacy single-key label kept for back-compat with any old
           // call-site; the new grouped editor uses `prompts.wayback.*`
           // instead. Render path no longer hits this for the wayback
@@ -2915,6 +2988,7 @@ const messagesRu: Messages = {
         refdomains: "Ссылающиеся домены",
         anchors: "Анкоры",
         keywords: "Органические ключи",
+        stop_words: "Стоп-слова",
         wayback: "История Wayback",
         wayback_classify: "Язык + тематика + категория",
         whois_history: "История Whois",
@@ -2987,6 +3061,33 @@ const messagesRu: Messages = {
           "2y": "2 года назад",
           "5y": "5 лет назад",
         },
+      },
+      stopWords: {
+        title: "Стоп-слова",
+        intro:
+          "Запрашивает у Ahrefs ТОЛЬКО те анкоры и органические ключи, которые СОДЕРЖАТ одно из ваших стоп-слов, после чего ИИ оценивает, насколько домен испорчен. Каждая строка в ответе — это плохая новость; ноль строк — хороший исход, и ИИ в этом случае вообще не вызывается.",
+        sourceLabel: "Проверять",
+        sourceHelp:
+          "Анкоры — входящий анкорный текст на домен (спам, который направили на него другие). Органические ключи — запросы, по которым ранжируется сам домен (чем сайт БЫЛ на самом деле). Каждый источник — отдельный оплачиваемый запрос к Ahrefs.",
+        source: {
+          both: "Анкоры + органические ключи",
+          anchors: "Только анкоры",
+          keywords: "Только органические ключи",
+        },
+        anchorLimitLabel: "Строк анкоров",
+        anchorLimitHelp:
+          "Сколько строк анкоров забрать, худшие первыми (по числу ссылающихся доменов). Жёсткий потолок расхода на запрос анкоров. Анкоры ~14 юнитов/строка.",
+        keywordLimitLabel: "Строк ключей",
+        keywordLimitHelp:
+          "Сколько строк органических ключей забрать, худшие первыми (по трафику). Жёсткий потолок расхода на запрос ключей. Ключи ~33 юнита/строка — в ~2.4 раза дороже анкоров.",
+        requestHint: (requests: number) =>
+          `${requests} запрос(ов) к Ahrefs на домен.`,
+        wordCount: (n: number) => `Настроено стоп-слов: ${n}.`,
+        noWords:
+          "Стоп-слова ещё не заданы — критерию нечего искать, и запуск будет отклонён при отправке.",
+        manageLink: "Управлять списком: Настройки → Мозг",
+        chunkWarning: (max: number, chunks: number) =>
+          `Больше ${max} слов: Ahrefs ограничивает фильтр ${max} условиями, поэтому каждый источник разбивается на ${chunks} отдельно оплачиваемых запросов.`,
       },
       wayback: {
         intro:
@@ -3610,12 +3711,18 @@ const messagesRu: Messages = {
           refdomains: "Ссылающиеся домены",
           anchors: "Анкоры",
           keywords: "Органические ключи",
+          stop_words: "Стоп-слова",
           wayback: "История Wayback",
           wayback_classify: "Язык + тематика",
         },
         criterionMissing: "Этот критерий не был включён в этом запуске.",
         criterionFailed: "Не удалось получить этот критерий.",
         criterionEmpty: "Строки не возвращены.",
+        stopWords: {
+          anchorsSection: "Анкоры",
+          keywordsSection: "Органические ключи",
+          sectionClean: "Проверено — совпадений со стоп-словами нет.",
+        },
         rowCount: (n) => {
           const last2 = n % 100;
           const last1 = n % 10;
@@ -3771,6 +3878,12 @@ const messagesRu: Messages = {
         whoisSortHint:
           "Кликните для сортировки по уверенности дропа Whois. Цикл: возр (стабильные сверху) → убыв → по умолчанию. Строки без Whois-вердикта всегда уходят вниз.",
         wayback: "Wayback",
+        stopWords: "Стоп",
+        stopWordsHint:
+          "Вердикт по стоп-словам: насколько анкоры и органические ключи домена загрязнены вашим списком стоп-слов. «чисто» — значимых совпадений нет.",
+        stopWordsClean: "чисто",
+        stopWordsNoMatchHint: "совпадений со списком стоп-слов нет",
+        stopWordsMatchHint: (n: number) => `оценено совпадений: ${n}`,
         language: "Язык",
         theme: "Тема",
         category: "Категория",
@@ -3930,6 +4043,11 @@ const messagesRu: Messages = {
         verdictWaybackNone: "(без вердикта Wayback)",
         verdictWaybackHint:
           "Фильтр по покритериальной оценке судьи Wayback (отдельно от агрегированного итогового балла).",
+        verdictStopWordsAny: "Любой вердикт «Стоп»",
+        verdictStopWordsLabel: "Вердикт «Стоп»",
+        verdictStopWordsNone: "(без вердикта «Стоп»)",
+        verdictStopWordsHint:
+          "Фильтр по оценке судьи стоп-слов. «чисто» — значимых совпадений со списком нет; low_quality — домен тянет за собой шлейф ниши.",
         verdictWhoisAny: "Любой вердикт Whois",
         verdictWhoisLabel: "Вердикт Whois",
         verdictWhoisNone: "(без вердикта Whois)",
@@ -4147,9 +4265,33 @@ const messagesRu: Messages = {
         scoring: "Веса итогового балла и пороги",
         pricing: "Цены AI-моделей",
         waybackClassify: "Классификация Wayback (язык + тематика + категория)",
+        stopWords: "Стоп-слова",
         prompts: "Промпты ИИ",
         classifyContext: "Wayback classify → судьи Ahrefs (контекст сайта)",
         waybackProxies: "Резидентные прокси для Wayback",
+      },
+      stopWords: {
+        intro:
+          "Ваш словарь «испорченных ниш» — гемблинг, adult, фарма, займы, реплики и всё остальное, что вы не покупаете. Критерий «Стоп-слова» запрашивает у Ahrefs только те анкоры и органические ключи, которые СОДЕРЖАТ одно из этих слов, после чего ИИ оценивает степень загрязнения домена. Совпадение — подстрока без учёта регистра: «casino» поймает и «casinos», и «onlinecasino», но также безобидное «specialist» для «cialis» — судью отдельно просят такие случаи не засчитывать.",
+        listTitle: "Стоп-слова",
+        empty: "Стоп-слов пока нет. Добавьте несколько, чтобы критерий заработал.",
+        placeholder: "casino",
+        hint: "Можно фразы из нескольких слов («free spins»). Хранится в нижнем регистре.",
+        add: "Добавить",
+        adding: "Добавляем…",
+        bulkOpen: "Вставить список",
+        bulkClose: "Закрыть",
+        bulkHint:
+          "Разделяйте переводом строки, запятой, точкой с запятой или вертикальной чертой. Пробел разделителем НЕ считается — фразы вроде «free spins» сохраняются целиком.",
+        bulkAdd: "Добавить все",
+        bulkAdding: "Добавляем…",
+        clearAll: "Очистить всё",
+        confirmClear: "Удалить все стоп-слова? Уже завершённые запуски сохранят тот список, по которому их проверяли.",
+        removeAria: (v: string) => `Удалить ${v}`,
+        ceilingWarning: (max: number, chunks: number) =>
+          `Больше ${max} слов: Ahrefs отклоняет фильтр более чем с ${max} условиями, поэтому каждый источник разбивается на ${chunks} запрос(ов) — и каждый оплачивается отдельно. Сократите список до ${max}, чтобы остался один запрос на источник.`,
+        rejectedWarning: (n: number, maxLen: number) =>
+          `Пропущено записей: ${n} — длиннее ${maxLen} символов. Если вы вставили список целиком, разделите слова переводом строки, запятой, точкой с запятой или вертикальной чертой:`,
       },
       waybackProxies: {
         hint:
@@ -4529,6 +4671,7 @@ const messagesRu: Messages = {
           refdomains: "Судья ссылающихся доменов",
           anchors: "Судья анкоров",
           keywords: "Судья органических ключей",
+          stop_words: "Судья стоп-слов",
           wayback: "Судья истории Wayback",
           wayback_classify_combined:
             "Wayback classify — общий язык + тематика (режим ИИ)",

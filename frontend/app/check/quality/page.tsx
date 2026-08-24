@@ -16,6 +16,7 @@ import {
   BacklinksCard,
   KeywordsCard,
   RefdomainsCard,
+  StopWordsCard,
   WaybackCard,
   WaybackClassifyCard,
 } from "@/components/criterion-card";
@@ -77,6 +78,18 @@ const DEFAULT_CRITERIA: CriteriaSpec = {
     sort: [],
     date_compared: "off",
   },
+  // stop_words (2026-08-24): opt-in. Queries the anchors + organic-
+  // keywords endpoints filtered to rows CONTAINING one of the operator's
+  // stop words (Settings → Brain → Stop words; snapshotted onto the spec
+  // server-side, never sent from here). Limit 20 per source matches the
+  // other Ahrefs criteria and caps the spend — the rows come back
+  // most-significant-first, so 20 already surfaces the worst offenders.
+  stop_words: {
+    enabled: false,
+    source: "both",
+    anchor_limit: 20,
+    keyword_limit: 20,
+  },
   // Wayback: opt-in. Hits the free CDX API — see WaybackCard for filter
   // semantics. Defaults updated 2026-05-07 after a 35-domain batch
   // cascade-failed: `match_type: "host"` (was "domain") is much faster
@@ -132,7 +145,18 @@ const DEFAULT_CRITERIA: CriteriaSpec = {
 // repairs the pre-filled paths.) Backlinks carries its OWN extra
 // default-on baseline beyond dofollow/non_spammy — noindex_exclude,
 // content_only, root_only — so force those too (matches DEFAULT_CRITERIA).
+// Fill in criteria the incoming spec doesn't carry. The server normally
+// round-trips prefill specs through the Pydantic model (so new criteria
+// arrive with their defaults), but `get_job_spec` falls back to the RAW
+// stored JSON when validation fails — and a spec saved before a criterion
+// existed has no key for it. Reading `.enabled` off that undefined is a
+// render crash, so merge defaults in on every prefill path.
+function withMissingCriteria(c: CriteriaSpec): CriteriaSpec {
+  return { ...DEFAULT_CRITERIA, ...c };
+}
+
 function withQualityDefaults(c: CriteriaSpec): CriteriaSpec {
+  c = withMissingCriteria(c);
   return {
     ...c,
     backlinks: {
@@ -268,7 +292,7 @@ function AnalyzePageInner() {
       .then((r) => {
         if (cancelled) return;
         setDomainsRaw(r.spec.domains.join("\n"));
-        setCriteria(r.spec.criteria);
+        setCriteria(withMissingCriteria(r.spec.criteria));
         if (r.spec.ai) setAi(r.spec.ai);
         setName(r.name || "");
         setNotes(r.notes || "");
@@ -718,6 +742,14 @@ function AnalyzePageInner() {
             }
             waybackEnabled={criteria.wayback.enabled}
             waybackSamplingEnabled={criteria.wayback.sample_pages}
+          />
+          {/* Stop words sits LAST (2026-08-24): its card is short even when
+              enabled (two knobs), so pairing it in the grid with the tall
+              Wayback card left an awkward gap. Trailing the strip lets it
+              sit alone on the final row without stranding a big neighbour. */}
+          <StopWordsCard
+            cfg={criteria.stop_words}
+            onChange={(sw) => setCriteria((c) => ({ ...c, stop_words: sw }))}
           />
         </div>
         {/* Discoverability nudge for collapsed disabled cards (W/C

@@ -657,6 +657,13 @@ DEFAULT_SCORING_CONFIG: dict = {
         # here only so the Settings UI's weight editor stays consistent
         # across criteria.
         "wayback_classify": 0.0,
+        # stop_words (2026-08-24) also defaults to 0 — informational until
+        # the operator dials it up, same contract as wayback. Deliberate:
+        # a weighted criterion that fails to produce a verdict BLOCKS the
+        # whole final assessment (see the partial-result guard in
+        # tasks._run_ai_for_domain), and stop_words legitimately produces
+        # no AI verdict on the common zero-match path.
+        "stop_words": 0.0,
     },
     "good_threshold": 80.0,
     "mixed_threshold": 60.0,
@@ -665,7 +672,7 @@ DEFAULT_SCORING_CONFIG: dict = {
 
 _SCORING_CRITERIA = (
     "backlinks", "refdomains", "anchors", "keywords",
-    "wayback", "wayback_classify",
+    "wayback", "wayback_classify", "stop_words",
 )
 
 
@@ -1362,6 +1369,124 @@ def set_allowed_tlds(tlds: list[str] | None) -> list[str]:
     finally:
         db.close()
     return cleaned or list(DEFAULT_ALLOWED_TLDS)
+
+
+# --- Stop words (added 2026-08-24) ------------------------------------------
+# The operator's list of "spoiled niche" terms (gambling / adult / pharma /
+# loan / replica …). Used by the Stop Words quality criterion as the
+# substring terms of an Ahrefs `where` against the `anchor` column
+# (anchors endpoint) and the `keyword` column (organic-keywords endpoint).
+#
+# Lives in Settings → Brain rather than on the job card because it's a
+# slow-moving global vocabulary the operator curates once, not a per-run
+# knob. Jobs SNAPSHOT it at submit time into
+# `StopWordsConfig.terms` — see `snapshot_stop_words_terms` in
+# routers/analyze.py — so a later edit here can't retroactively change
+# what a finished run was actually checked against.
+STOP_WORDS_KEY = "stop_words__terms"
+
+# Per-term cap: Ahrefs matches by substring, so a term longer than this is
+# almost certainly a pasted sentence rather than a keyword.
+_STOP_WORD_MAX_LEN = 120
+# List cap. The practical ceiling is Ahrefs's 255-clause `where` limit —
+# past 250 terms the request builder splits into extra chunks and each
+# chunk is separately billed (see STOP_WORDS_MAX_CLAUSES). We allow well
+# past that so a determined operator can, but the UI warns.
+_STOP_WORDS_MAX_COUNT = 2_000
+
+
+def normalize_stop_word(raw: object) -> str | None:
+    """Canonical stored form for one term: trimmed + lower-cased.
+
+    Lower-casing is safe because Ahrefs's `substring` operator is
+    case-insensitive — and it makes "Casino" and "casino" collapse to one
+    clause instead of burning two of the 255 available.
+
+    Multi-word phrases ARE allowed (substring matching handles "free
+    spins" fine, and term length is irrelevant to Ahrefs's clause
+    ceiling). Returns None for anything unusable so callers can drop it
+    silently."""
+    if not isinstance(raw, str):
+        return None
+    v = " ".join(raw.strip().lower().split())
+    if not v or len(v) > _STOP_WORD_MAX_LEN:
+        return None
+    return v
+
+
+def partition_stop_words(raw_list: object) -> tuple[list[str], list[str]]:
+    """Split a submitted list into (accepted, rejected).
+
+    `rejected` carries the entries that failed `normalize_stop_word` —
+    today that means over-`_STOP_WORD_MAX_LEN` or non-string. Duplicates
+    are NOT counted as rejects (dropping a dupe is the expected outcome,
+    not a failure the operator needs told about).
+
+    Why this exists: the write path used to just drop bad entries on the
+    floor. That turned the single most likely mistake — pasting a whole
+    delimited list into a field that doesn't split on that delimiter —
+    into a silent no-op: the blob arrives as one over-long "term", gets
+    dropped, and the UI reports success with nothing added. Returning the
+    rejects lets the caller say what happened."""
+    if not isinstance(raw_list, (list, tuple)):
+        return [], []
+    seen: set[str] = set()
+    out: list[str] = []
+    rejected: list[str] = []
+    for item in raw_list:
+        v = normalize_stop_word(item)
+        if v is None:
+            rejected.append(
+                item if isinstance(item, str) else repr(item)
+            )
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+        if len(out) >= _STOP_WORDS_MAX_COUNT:
+            break
+    out.sort()
+    return out, rejected
+
+
+def _normalize_stop_words(raw_list: object) -> list[str]:
+    """Validate + dedup (first-seen order preserved) + cap length."""
+    return partition_stop_words(raw_list)[0]
+
+
+def get_stop_words() -> list[str]:
+    """Current stop-word list. Empty list when unset — the Stop Words
+    criterion treats that as "nothing to check" and skips rather than
+    sending a `where`-less request."""
+    db = SessionLocal()
+    try:
+        raw = _get(db, STOP_WORDS_KEY) or ""
+    finally:
+        db.close()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return _normalize_stop_words(parsed)
+
+
+def set_stop_words(terms: list[str] | None) -> tuple[list[str], list[str]]:
+    """Replace the whole list. Normalised + sorted server-side; the
+    caller reconciles its local state from the return value.
+
+    Returns (accepted, rejected) — see `partition_stop_words`. The
+    rejects are NOT persisted; they're handed back so the route can tell
+    the operator what it refused instead of silently swallowing it."""
+    cleaned, rejected = partition_stop_words(terms or [])
+    db = SessionLocal()
+    try:
+        _set(db, STOP_WORDS_KEY, json.dumps(cleaned) if cleaned else "")
+    finally:
+        db.close()
+    return cleaned, rejected
 
 
 # --- Backlog CSV import row cap (added 2026-05-09) ------------------------
@@ -2155,7 +2280,12 @@ def all_ai_prompts() -> list[dict]:
 CLASSIFY_CONTEXT_CONFIG_KEY = "classify_context_config"
 
 _CLASSIFY_CONTEXT_ALLOWED_CRITERIA: tuple[str, ...] = (
-    "backlinks", "refdomains", "anchors", "keywords",
+    # stop_words (2026-08-24) is opt-in-able but NOT in the defaults
+    # below: the classify theme is genuinely useful there ("this site
+    # WAS a casino" explains why its anchors match), but turning it on
+    # by default would silently bust every existing stop_words verdict
+    # cache the moment classify runs.
+    "backlinks", "refdomains", "anchors", "keywords", "stop_words",
 )
 _CLASSIFY_CONTEXT_ALLOWED_FIELDS: tuple[str, ...] = (
     "primary_theme",

@@ -28,6 +28,10 @@ const KEYS = [
   "refdomains",
   "anchors",
   "keywords",
+  // Stop Words judge (2026-08-24). Single prompt — no white/grey split:
+  // the grey-niche case is expressed by the operator's word list itself,
+  // so it sits in the flat section rather than the tabbed one.
+  "stop_words",
   "wayback_white",
   "wayback_classify_combined_white",
   "wayback_classify_theme_only_white",

@@ -197,6 +197,65 @@ class KeywordsConfig(CriterionBase):
     date_compared: DateComparedChoice = "off"
 
 
+# Which Ahrefs endpoints the Stop Words check queries. "both" issues one
+# request per endpoint (each pays its own `max(50, rows × row_cost)` floor
+# — see the ahrefs-where-filters project memory for the measured cost
+# model), so picking a single source halves the spend per domain.
+StopWordsSource = Literal["anchors", "keywords", "both"]
+
+
+class StopWordsConfig(CriterionBase):
+    """Stop Words criterion (added 2026-08-24).
+
+    Asks Ahrefs for ONLY the rows that CONTAIN one of the operator's stop
+    words — an OR of `{"field": F, "is": ["substring", term]}` clauses
+    against `anchor` (anchors endpoint) and/or `keyword` (organic-keywords
+    endpoint). The point is the inverse of the other criteria: every row
+    that comes back is evidence AGAINST the domain, and zero rows is the
+    good outcome.
+
+    `terms` is SNAPSHOTTED from Settings → Brain → Stop words at submit
+    time (same contract as `LinkedDomainsConfig.tlds`), not read live at
+    fetch time. Two reasons:
+      • `compute_params_hash` must cover the word list, or the data cache
+        would serve rows fetched against a different word set.
+      • A run stays reproducible after the operator edits the global list.
+
+    Cost/limit semantics: each source has its OWN row cap
+    (`anchor_limit` / `keyword_limit`), applied per request and acting as
+    the hard ceiling on that endpoint's spend — a broad word list can only
+    change WHICH rows come back, never how many. Split from a single shared
+    limit (2026-08-24) because the two endpoints price very differently:
+    anchors cost 14 units/row, organic keywords 33 (~2.4×), so one cap
+    forced you to either overpay on keywords or starve anchors. Rows come
+    back most-significant-first (anchors by refdomains, keywords by
+    traffic) so a small cap still surfaces the worst offenders.
+
+    Ahrefs enforces a hard **255-clause ceiling** per `where` (measured
+    2026-08-18: 255 → HTTP 200, 256 → HTTP 500 with a bare "internal
+    server error" and no hint about the cause). The request builder
+    chunks at 250 terms and each chunk is a separate billed request, so
+    keeping the list under 250 words keeps it to one call per source.
+
+    NOTE the inherited `limit` from CriterionBase is UNUSED here — the
+    request builder + params hash read `anchor_limit` / `keyword_limit`
+    instead. It stays inherited only so generic `.limit` readers elsewhere
+    don't trip on this config."""
+
+    # Opt-in like Wayback — the operator has to curate a word list before
+    # this criterion means anything.
+    enabled: bool = False
+    source: StopWordsSource = "both"
+    # Per-source row caps. Default 20 matches the other Ahrefs criteria.
+    anchor_limit: int = Field(default=20, ge=1, le=1000)
+    keyword_limit: int = Field(default=20, ge=1, le=1000)
+    # Snapshot of the Settings word list, filled in at submit time by
+    # `snapshot_stop_words_terms`. Empty = nothing to match, and the
+    # runner skips the criterion rather than sending a `where`-less
+    # request that would return the domain's entire anchor/keyword profile.
+    terms: list[str] = Field(default_factory=list)
+
+
 class WaybackConfig(BaseModel):
     """Wayback CDX criterion. Defaults to OFF — opt-in per user (added
     2026-05-07). Limit defaults to 100 (was 200) and is hard-capped at
@@ -407,6 +466,7 @@ class CriteriaSpec(BaseModel):
     refdomains: RefdomainsConfig = Field(default_factory=RefdomainsConfig)
     anchors: AnchorsConfig = Field(default_factory=AnchorsConfig)
     keywords: KeywordsConfig = Field(default_factory=KeywordsConfig)
+    stop_words: StopWordsConfig = Field(default_factory=StopWordsConfig)
     wayback: WaybackConfig = Field(default_factory=WaybackConfig)
     wayback_classify: WaybackClassifyConfig = Field(
         default_factory=WaybackClassifyConfig
@@ -533,10 +593,19 @@ def strip_pillar_criteria_from_quality_spec(spec: "AnalyzeSpec") -> "AnalyzeSpec
 # --- Preview response --------------------------------------------------------
 
 class PreviewedRequest(BaseModel):
-    criterion: Literal["backlinks", "refdomains", "anchors", "keywords", "wayback"]
+    criterion: Literal[
+        "backlinks", "refdomains", "anchors", "keywords", "wayback",
+        "stop_words",
+    ]
     enabled: bool
     method: Literal["GET"] = "GET"
     url: str
+    # Which Ahrefs endpoint this particular request hits. Only meaningful
+    # for `stop_words`, which is the one criterion that fans out over more
+    # than one endpoint (and, when the word list exceeds the 250-term
+    # chunk size, over more than one request per endpoint). None for every
+    # other criterion, where `criterion` already identifies the endpoint.
+    source: Literal["anchors", "keywords"] | None = None
     # Echoed back so the UI can show "this is the where JSON" in a separate
     # block without re-parsing the URL.
     where: dict | None = None

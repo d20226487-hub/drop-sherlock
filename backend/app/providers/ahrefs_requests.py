@@ -27,6 +27,7 @@ from ..schemas import (
     PreviewedRequest,
     RefdomainsConfig,
     SortRule,
+    StopWordsConfig,
     WaybackConfig,
 )
 
@@ -135,6 +136,147 @@ CRITERION_PATH = {
     "anchors": "anchors",
     "keywords": "organic-keywords",
 }
+
+# --- Stop Words (added 2026-08-24) ------------------------------------------
+#
+# The Stop Words criterion reuses the anchors + organic-keywords endpoints
+# but adds a `where` that keeps ONLY rows containing one of the operator's
+# stop words. Per-source wiring lives in this table so adding a third
+# source later is one entry, not a new branch in four places.
+#
+#   field     — the Ahrefs column the substring clauses match against.
+#   path      — reuses CRITERION_PATH via the `criterion` key.
+#   select    — reuses SELECT_FIELDS so the AI sees the same columns it
+#               already knows how to read from the plain A / K criteria.
+#   order_by  — hardcoded most-significant-first. There is no sort builder
+#               on the Stop Words card (deliberately: it's a "how bad is
+#               it" check, not an exploration tool), and `limit` truncates
+#               server-side — so without an explicit order Ahrefs's
+#               arbitrary row order would decide which contamination the
+#               operator gets to see. Anchors sort by how many distinct
+#               referring domains use the anchor; keywords by the traffic
+#               the domain actually gets from them.
+STOP_WORDS_SOURCES: dict[str, dict[str, str]] = {
+    "anchors": {
+        "criterion": "anchors",
+        "field": "anchor",
+        "order_by": "refdomains:desc",
+        # Which StopWordsConfig attribute holds this source's row cap.
+        "limit_attr": "anchor_limit",
+    },
+    "keywords": {
+        "criterion": "keywords",
+        "field": "keyword",
+        "order_by": "sum_traffic:desc",
+        "limit_attr": "keyword_limit",
+    },
+}
+
+# Max substring clauses we put in one `where`. Ahrefs's hard ceiling is
+# exactly 255 clauses (measured 2026-08-18: 255 → HTTP 200, 256 → HTTP 500
+# "internal server error"); it is CLAUSE COUNT, not URL length — 200
+# clauses at 28KB passed while 260 clauses at 23KB failed. We chunk at 250
+# for margin. Chunk as FEW times as possible: every chunk is a separate
+# billed request paying its own `max(50, rows × row_cost)` floor.
+STOP_WORDS_MAX_CLAUSES = 250
+
+
+def _chunk_terms(terms: list[str], size: int) -> list[list[str]]:
+    return [terms[i : i + size] for i in range(0, len(terms), size)]
+
+
+def normalize_stop_words(raw: object) -> list[str]:
+    """Clean a user-supplied stop-word list into the canonical form used
+    for both the `where` clauses and the params hash: trimmed, lower-cased,
+    de-duplicated, first-seen order preserved. Ahrefs's `substring`
+    operator is case-insensitive, so lower-casing loses nothing and makes
+    "Casino" and "casino" hash identically."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        v = item.strip().lower()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+def stop_words_sources(source: str) -> list[str]:
+    """Expand the card's single-select into the concrete source list."""
+    if source == "both":
+        return ["anchors", "keywords"]
+    if source in STOP_WORDS_SOURCES:
+        return [source]
+    return []
+
+
+def build_stop_words_requests(
+    domain: str, cfg: StopWordsConfig
+) -> list[PreviewedRequest]:
+    """One PreviewedRequest per (source, term-chunk).
+
+    Returns [] when the criterion has nothing to ask for — no terms, or a
+    source selection that resolves to nothing. That empty list is load-
+    bearing: a `where`-less request to these endpoints would return the
+    domain's ENTIRE anchor / keyword profile and the judge would read a
+    clean domain as maximally contaminated.
+    """
+    terms = normalize_stop_words(cfg.terms)
+    if not terms:
+        return []
+    target = _normalize_target(domain)
+    out: list[PreviewedRequest] = []
+    for source in stop_words_sources(cfg.source):
+        meta = STOP_WORDS_SOURCES[source]
+        criterion = meta["criterion"]
+        # Per-source cap. Fall back to the legacy shared `limit` for any
+        # spec written before the split (defensive — submit/rerun now
+        # always populate the per-source fields).
+        limit = getattr(cfg, meta["limit_attr"], None)
+        if not isinstance(limit, int):
+            limit = getattr(cfg, "limit", 20)
+        for chunk in _chunk_terms(terms, STOP_WORDS_MAX_CLAUSES):
+            where = {
+                "and": [
+                    {
+                        "or": [
+                            {"field": meta["field"], "is": ["substring", t]}
+                            for t in chunk
+                        ]
+                    }
+                ]
+            }
+            extra: dict[str, str] = {}
+            if criterion == "keywords":
+                # organic-keywords requires a `date` snapshot parameter,
+                # same as the plain K criterion.
+                extra["date"] = _today_iso()
+            url = _build_url(
+                criterion=criterion,
+                target=target,
+                select=SELECT_FIELDS[criterion],
+                limit=limit,
+                where=where,
+                order_by=meta["order_by"],
+                extra=extra or None,
+            )
+            out.append(
+                PreviewedRequest(
+                    criterion="stop_words",
+                    source=source,  # type: ignore[arg-type]
+                    enabled=cfg.enabled,
+                    url=url,
+                    where=where,
+                    order_by=meta["order_by"],
+                    limit=limit,
+                )
+            )
+    return out
 
 
 def _normalize_target(domain: str) -> str:
@@ -532,4 +674,12 @@ def build_preview(spec: AnalyzeSpec) -> tuple[str | None, list[PreviewedRequest]
         _preview_keywords(domain, spec.criteria.keywords),
         _preview_wayback(domain, spec.criteria.wayback),
     ]
+    # Stop Words fans out over 1-2 endpoints (× N term chunks), so it
+    # contributes a VARIABLE number of entries instead of exactly one.
+    # Callers that key by `criterion` must treat these as a group — see
+    # `tasks._fetch_stop_words_for_domain`, which merges them into a
+    # single CriterionResult.
+    requests.extend(
+        build_stop_words_requests(domain, spec.criteria.stop_words)
+    )
     return (domain if cleaned else None), requests

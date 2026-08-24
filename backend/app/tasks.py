@@ -38,7 +38,11 @@ from .db import SessionLocal
 from .limits import limit
 from .models import CriterionResult, Job, Run, RunDomain
 from .providers import get_provider
-from .providers.ahrefs_requests import build_preview
+from .providers.ahrefs_requests import (
+    build_preview,
+    build_stop_words_requests,
+    normalize_stop_words,
+)
 from .providers.base import ProviderConfigError, ProviderError
 from .schemas import AnalyzeSpec
 from .scoring import compute_final
@@ -168,6 +172,22 @@ AI_FIELD_TRIM: dict[str, list[str]] = {
     "wayback": [
         "timestamp", "original", "statuscode", "mimetype", "length",
     ],
+    # Stop Words (2026-08-24). One merged row list drawn from TWO
+    # endpoints, so this is the union of the anchors + keywords field
+    # sets plus the `source` tag the merger stamps on every row. The trim
+    # is per-key with an `if k in r` guard, so an anchors row simply
+    # doesn't grow empty keyword columns and vice-versa. `source` MUST
+    # come first — the judge prompt keys everything off it.
+    "stop_words": [
+        "source",
+        # anchors half
+        "anchor", "refdomains", "refpages", "dofollow_links",
+        "links_to_target", "top_domain_rating", "new_links",
+        "lost_links", "first_seen", "last_seen",
+        # organic-keywords half
+        "keyword", "sum_traffic", "volume", "best_position",
+        "keyword_difficulty", "is_branded",
+    ],
 }
 
 
@@ -188,7 +208,7 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
     behind a verdict (e.g. is_spam / first_seen / last_seen fields that
     aren't in the default raw-data table)."""
     if criterion not in (
-        "backlinks", "refdomains", "anchors", "keywords",
+        "backlinks", "refdomains", "anchors", "keywords", "stop_words",
         "wayback", "wayback_classify",
         # Wave 2b (2026-05-15): whois_history pillar criterion. Has its
         # own dedicated branch below (single-shot prompt, no row-trim,
@@ -250,6 +270,10 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
         # so the preview always points at a real prompt slot.
         spec_classify_variant = "white"
         spec_wayback_variant = "white"
+        # Which Ahrefs endpoints the Stop Words criterion queried on this
+        # run. Read from the run's own spec so the preview reflects what
+        # THAT run did, not the current Check → Quality defaults.
+        spec_stop_words_source = "both"
         spec_lang = "en"
         if run is not None:
             try:
@@ -265,6 +289,9 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
                 wb_cfg = crits.get("wayback") or {}
                 if wb_cfg.get("variant") == "grey":
                     spec_wayback_variant = "grey"
+                sw_cfg_raw = crits.get("stop_words") or {}
+                if sw_cfg_raw.get("source"):
+                    spec_stop_words_source = sw_cfg_raw["source"]
                 # Output-language directive carried on the run's spec; the
                 # preview should show the EXACT system prompt the runner
                 # would use (RU directive included on RU runs).
@@ -425,6 +452,19 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
 
     trimmed = _trim_rows_for_ai(criterion, rows)
     fields_sent = AI_FIELD_TRIM.get(criterion, [])
+    # Mirror the runner's Stop Words "Sources checked" block + its cache
+    # sentinel. Appended BEFORE the classify sentinel below to match the
+    # order `_judge_one_criterion` builds them in — the preview's job is
+    # to show exactly what the judge would receive.
+    stop_words_sources_for_ai: list[str] | None = None
+    if criterion == "stop_words":
+        from .providers.ahrefs_requests import stop_words_sources
+        stop_words_sources_for_ai = stop_words_sources(
+            spec_stop_words_source
+        )
+        fields_sent = list(fields_sent) + [
+            "stop_words_sources:" + ",".join(stop_words_sources_for_ai)
+        ]
     # 2026-06-07: route the Wayback Quality preview through the
     # `_white` / `_grey` variant slot. Before this fix the preview
     # called `get_ai_prompt("wayback")`, but the bare `wayback` key was
@@ -465,6 +505,7 @@ def build_ai_preview(run_domain_id: int, criterion: str) -> dict:
         rows=trimmed,
         wayback_samples=wayback_samples_for_ai,
         classify_context=classify_context_for_ai,
+        stop_words_sources=stop_words_sources_for_ai,
     )
     # Provider/model — same provenance preference as the wayback_classify
     # branch above: actual verdict producer wins, falling back to the
@@ -914,7 +955,10 @@ def reanalyze_run_domain_criterion_now(
     the existing per-domain `reanalyzing` polling state covers it without
     UI plumbing changes. The other criteria's existing verdicts are kept;
     the final assessment is recomputed because it aggregates all four."""
-    if criterion not in ("backlinks", "refdomains", "anchors", "keywords", "wayback", "wayback_classify"):
+    if criterion not in (
+        "backlinks", "refdomains", "anchors", "keywords", "stop_words",
+        "wayback", "wayback_classify",
+    ):
         return {
             "id": run_domain_id, "found": True,
             "error": f"invalid criterion: {criterion}",
@@ -967,7 +1011,7 @@ def reanalyze_run_domain_criterion_now(
 
 
 _ALL_CRITERIA = (
-    "backlinks", "refdomains", "anchors", "keywords",
+    "backlinks", "refdomains", "anchors", "keywords", "stop_words",
     "wayback", "wayback_classify",
     # Pillar criteria (Wave 2+). Included so the retry/reanalyze path
     # picks them up; quality jobs leave these `.enabled=False` so they
@@ -989,7 +1033,7 @@ _ALL_CRITERIA = (
 # `_load_classify_context`. wayback and wayback_classify never appear here
 # (wayback already sees V2 samples; classify is the source, not a consumer).
 _CLASSIFY_CONTEXT_ELIGIBLE_CRITERIA = frozenset(
-    ("backlinks", "refdomains", "anchors", "keywords")
+    ("backlinks", "refdomains", "anchors", "keywords", "stop_words")
 )
 
 
@@ -1026,6 +1070,14 @@ def _collect_failed_criteria(
         if cfg is None or not getattr(cfg, "enabled", False):
             continue
         if c == "wayback_classify" and _classify_retry_is_futile(by_name):
+            continue
+        # stop_words with an unrunnable config (no word list snapshotted
+        # on the spec) can never succeed: `build_stop_words_requests`
+        # returns nothing, so the retry just rewrites the same failure
+        # row forever and keeps the domain in the failed cohort. Submit
+        # already rejects this shape; this covers hand-edited / very old
+        # specs. Same reasoning as the wayback_classify guard above.
+        if c == "stop_words" and _stop_words_error(cfg):
             continue
         cr = by_name.get(c)
         if cr is None:
@@ -2253,6 +2305,26 @@ async def _reanalyze_run_domain_criterion(
         # spec config and run a fresh Ahrefs request. The existing failed
         # CriterionResult row is reset in place; if there isn't one we
         # create a fresh row.
+        # Stop Words refetch: one CR row fed by up to 2 endpoints × N term
+        # chunks, so the single-`target_req` path below can't express it.
+        # `_fetch_stop_words_for_domain` resets the existing row in place
+        # (reset_existing=True) exactly like `_reset_or_create_criterion_
+        # row` does for the other criteria.
+        if criterion == "stop_words" and criterion not in fetched_rows:
+            sw_cfg = _cfg_for_criterion(spec, "stop_words")
+            if sw_cfg is None or not getattr(sw_cfg, "enabled", False):
+                return
+            sw_rows = await _fetch_stop_words_for_domain(
+                run_domain_id=run_domain_id,
+                domain=domain,
+                cfg=sw_cfg,
+                params_hash=compute_params_hash("stop_words", sw_cfg),
+                run_id=run_id,
+            )
+            if sw_rows is None:
+                return  # fetch failed; the CR row carries the error
+            fetched_rows["stop_words"] = sw_rows
+
         if criterion not in fetched_rows:
             cfg = _cfg_for_criterion(spec, criterion)
             if cfg is None or not getattr(cfg, "enabled", False):
@@ -2749,7 +2821,7 @@ def _audit_missing_cr_coverage(run_id: int, db: Session) -> None:
         # Pillar-only ones (whois_history/availability) are intentionally
         # excluded — see docstring.
         quality_universe = (
-            "backlinks", "refdomains", "anchors", "keywords",
+            "backlinks", "refdomains", "anchors", "keywords", "stop_words",
             "wayback", "wayback_classify",
         )
         expected = {
@@ -2991,6 +3063,163 @@ async def _offload(fn, /, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+# --- Stop Words fetch (added 2026-08-24) ------------------------------------
+#
+# The one criterion that fans out over more than one Ahrefs request:
+# up to two endpoints (anchors + organic-keywords) × N term chunks when the
+# operator's word list exceeds Ahrefs's 255-clause `where` ceiling. All of
+# it collapses into a SINGLE CriterionResult so the rest of the pipeline
+# (cache lookup, resume, AI judge, Database column, pins) treats it exactly
+# like any other criterion.
+
+def _stop_words_error(cfg) -> str:
+    """Return a config-level error string when this criterion cannot
+    meaningfully run, else "".
+
+    An empty word list is a MISCONFIGURATION, not a clean result: the
+    request builder deliberately emits nothing rather than sending a
+    `where`-less request (which would return the domain's entire anchor /
+    keyword profile and read as maximal contamination). Failing loudly is
+    what gets it fixed — reporting "clean" would quietly certify every
+    domain in the run."""
+    if not normalize_stop_words(getattr(cfg, "terms", None) or []):
+        return (
+            "no stop words configured — add them in Settings → Brain → "
+            "Stop words, then rerun"
+        )
+    from .providers.ahrefs_requests import stop_words_sources
+    if not stop_words_sources(getattr(cfg, "source", "both")):
+        return f"invalid stop-words source: {getattr(cfg, 'source', None)!r}"
+    return ""
+
+
+async def _fetch_stop_words_for_domain(
+    *,
+    run_domain_id: int,
+    domain: str,
+    cfg,
+    params_hash: str,
+    run_id: int,
+) -> list[dict] | None:
+    """Fetch every stop-words sub-request, merge into one CriterionResult,
+    and return the merged rows (None when the criterion could not run).
+
+    Partial-failure policy: if ANY sub-request fails the row is marked
+    `failed`, even though the rows we DID get are still persisted. This
+    is the opposite of "best effort" on purpose — stop words have inverted
+    polarity, so a silently-missing half makes a spoiled domain look
+    cleaner than it is. Failing keeps it in the Retry-failed cohort and
+    out of the judge; the persisted rows are still there for the operator
+    to eyeball on the domain page.
+
+    Returns [] (not None) on a successful fetch that matched nothing —
+    the good outcome, and the caller must be able to tell it apart from
+    "didn't run".
+
+    Always RESETS an existing row rather than adding one, unlike the
+    single-request criteria which call `_create_criterion_row` directly.
+    The invariant is one CR per (rd, criterion) — and this function has a
+    wider window for leaving a half-written row behind than they do,
+    because it checks cancel/pause BETWEEN sub-requests and bails with the
+    row still `running`. Resume re-enters here, and `already_done` only
+    covers `status='done'` rows, so a plain create would silently
+    duplicate."""
+    requests = build_stop_words_requests(domain, cfg)
+
+    def _make_row(url: str) -> int:
+        return _reset_or_create_criterion_row(
+            run_domain_id=run_domain_id,
+            criterion="stop_words",
+            url=url,
+            params_hash=params_hash,
+        )
+
+    config_error = _stop_words_error(cfg)
+    if config_error or not requests:
+        cr_id = await _offload(_make_row, "")
+        await _offload(
+            _finish_criterion_row, cr_id, False, None, None,
+            config_error or "stop words produced no requests", None,
+        )
+        return None
+
+    merged: list[dict] = []
+    request_meta: list[dict] = []
+    units_total = {"cost_row": 0, "cost_total": 0, "cost_actual": 0}
+    saw_units = False
+    errors: list[str] = []
+    http_status_last: int | None = None
+
+    cr_id = await _offload(
+        _make_row, "\n".join(r.url for r in requests),
+    )
+
+    for req in requests:
+        if is_canceled(run_id) or is_paused(run_id):
+            # Leave the row `running`; resume re-enters this function and
+            # `_reset_or_create_criterion_row` starts it over cleanly.
+            return None
+        source = req.source or "anchors"
+        ok, http_status, body, err, units = await _fetch_criterion(
+            req.url, criterion="stop_words",
+        )
+        http_status_last = http_status if http_status is not None else http_status_last
+        rows_here: list[dict] = []
+        if ok and isinstance(body, dict):
+            for v in body.values():
+                if isinstance(v, list):
+                    rows_here = [r for r in v if isinstance(r, dict)]
+                    break
+        for r in rows_here:
+            # `source` is stamped on every row so one merged list can carry
+            # both shapes — the judge prompt keys its whole reading off it,
+            # and the domain-page table gets a column that says which
+            # endpoint a row came from.
+            merged.append({"source": source, **r})
+        if not ok:
+            errors.append(f"{source}: {err}")
+        for k in units_total:
+            v = units.get(k) if isinstance(units, dict) else None
+            if isinstance(v, int):
+                units_total[k] += v
+                saw_units = True
+        request_meta.append({
+            "source": source,
+            "url": req.url,
+            "ok": ok,
+            "http_status": http_status,
+            "rows": len(rows_here),
+            "error": err,
+        })
+
+    body_out = {
+        # MUST stay the first key: `_completed_criteria`, the run-domain
+        # detail endpoint, and the Database rollup all pick the FIRST list
+        # value out of data_json.
+        "stop_words": merged,
+        "stop_words_meta": {
+            "source": getattr(cfg, "source", "both"),
+            "terms_count": len(normalize_stop_words(
+                getattr(cfg, "terms", None) or []
+            )),
+            "anchor_limit": getattr(cfg, "anchor_limit", None),
+            "keyword_limit": getattr(cfg, "keyword_limit", None),
+            "requests": request_meta,
+        },
+    }
+    ok_all = not errors
+    await _offload(
+        _finish_criterion_row,
+        cr_id,
+        ok_all,
+        http_status_last,
+        body_out,
+        "; ".join(errors),
+        units_total if saw_units else None,
+    )
+    return merged if ok_all else None
+
+
 async def _process_domain(
     run_domain_id: int, spec: AnalyzeSpec, run_id: int
 ) -> None:
@@ -3055,6 +3284,11 @@ async def _process_domain(
         domains=[domain], criteria=spec.criteria, ai=spec.ai
     )
     _, requests = build_preview(single_spec)
+    # Stop Words is the one criterion whose preview expands to a VARIABLE
+    # number of requests (up to 2 endpoints × N term chunks) that all
+    # collapse into ONE CriterionResult. Pull it out of the generic loop —
+    # which assumes 1 request == 1 CR row — and handle it below.
+    requests = [r for r in requests if r.criterion != "stop_words"]
 
     any_failed = False
     # Track the rows per criterion in memory so the AI step doesn't need a
@@ -3188,6 +3422,48 @@ async def _process_domain(
                     samples = await _fetch_wayback_samples(samples=picks)
                     await _offload(_attach_wayback_samples, cr_id, samples)
 
+    # Stop Words (2026-08-24). Same cache / resume / failure contract as
+    # the loop above, just driven by its own multi-request fetcher.
+    sw_cfg = getattr(spec.criteria, "stop_words", None)
+    if (
+        sw_cfg is not None
+        and sw_cfg.enabled
+        and not is_canceled(run_id)
+        and not is_paused(run_id)
+    ):
+        if "stop_words" in already_done:
+            fetched_rows["stop_words"] = already_done["stop_words"]
+        else:
+            sw_params_hash = compute_params_hash("stop_words", sw_cfg)
+            sw_cached = None
+            if cache_enabled and sw_params_hash and (
+                cache_job_scope is not None or spec.cross_job_cache
+            ):
+                sw_cached = await _offload(
+                    _try_serve_data_from_cache,
+                    run_domain_id=run_domain_id,
+                    domain=domain,
+                    criterion="stop_words",
+                    params_hash=sw_params_hash,
+                    job_id=cache_job_scope,
+                    run_id=run_id,
+                )
+            if sw_cached is not None:
+                _, _, sw_rows = sw_cached
+                fetched_rows["stop_words"] = sw_rows
+            else:
+                sw_rows = await _fetch_stop_words_for_domain(
+                    run_domain_id=run_domain_id,
+                    domain=domain,
+                    cfg=sw_cfg,
+                    params_hash=sw_params_hash,
+                    run_id=run_id,
+                )
+                if sw_rows is None:
+                    any_failed = True
+                else:
+                    fetched_rows["stop_words"] = sw_rows
+
     # wayback_classify is enabled — make sure its CR row exists before the
     # AI step. The row is non-fetching (no URL); it just acts as a slot to
     # persist the classify verdict + propagate status to the criteria pill.
@@ -3293,6 +3569,24 @@ async def _judge_one_criterion(
             run_domain_id, criterion, sub_verdicts, classify_ctx_config,
         )
     fields_sent = AI_FIELD_TRIM.get(criterion, [])
+    # Stop Words: the "Sources checked" block changes the judge's
+    # confidence calibration, so it MUST be in the cache key. Same trap
+    # as the classify_context sentinel below — `compute_prompt_hash`
+    # hashes the SYSTEM prompt, never the user message, so a user-message
+    # block that isn't mirrored into `fields_sent` gets silently served
+    # verdicts judged without it. Editing the default prompt does NOT
+    # cover this: an operator with a customized prompt in Settings would
+    # keep hitting the old hash.
+    stop_words_sources_for_ai: list[str] | None = None
+    if criterion == "stop_words":
+        from .providers.ahrefs_requests import stop_words_sources
+        sw_cfg_for_msg = getattr(spec.criteria, "stop_words", None)
+        stop_words_sources_for_ai = stop_words_sources(
+            getattr(sw_cfg_for_msg, "source", "both")
+        )
+        fields_sent = list(fields_sent) + [
+            "stop_words_sources:" + ",".join(stop_words_sources_for_ai)
+        ]
     if classify_context_for_ai is not None:
         # Sentinel encodes the sorted set of context field NAMES so
         # changing the Settings field-set in any way invalidates the
@@ -3307,6 +3601,40 @@ async def _judge_one_criterion(
     # Already judged in a prior worker — reuse and skip the API call.
     if criterion in cached_verdicts:
         sub_verdicts[criterion] = cached_verdicts[criterion]
+        return
+
+    # Stop Words with zero matches: the AI has nothing to read, so don't
+    # call it (per the 2026-08-24 decision — no AI on an empty payload).
+    # We still write a verdict rather than leaving the row blank, because
+    # "no anchor and no keyword on this domain contains any of your N stop
+    # words" is a real, positive finding — and because a blank verdict is
+    # indistinguishable from "never checked" everywhere downstream (the
+    # Database column, the CSV export, the partial-result guard, and
+    # compute_final if the operator ever dials the weight above 0).
+    # `no_matches` marks the provenance so the UI can label the badge
+    # "clean" and say it came from a zero-row fetch, not from a model.
+    if criterion == "stop_words" and not rows:
+        sw_cfg = getattr(spec.criteria, "stop_words", None)
+        term_count = len(normalize_stop_words(
+            getattr(sw_cfg, "terms", None) or []
+        ))
+        verdict = {
+            "assessment": "high_quality",
+            "confidence": 1.0,
+            "no_matches": True,
+            "key_findings": [
+                f"No matches: nothing on this domain contains any of the "
+                f"{term_count} configured stop words.",
+            ],
+            "red_flags": [],
+        }
+        sub_verdicts[criterion] = verdict
+        await _offload(
+            _store_ai_verdict,
+            cr_id, verdict, error="",
+            # No prompt_hash / provider / model — no AI call happened, and
+            # claiming one would make the run's AI cost accounting lie.
+        )
         return
 
     # Wayback Quality (2026-06-07): white | grey prompt variants.
@@ -3367,6 +3695,7 @@ async def _judge_one_criterion(
         rows=trimmed,
         wayback_samples=wayback_samples_for_ai,
         classify_context=classify_context_for_ai,
+        stop_words_sources=stop_words_sources_for_ai,
     )
     # Resolve the model up-front so we can persist it on the row no
     # matter which branch wins below. If the provider has no usable
@@ -3544,7 +3873,9 @@ async def _run_ai_for_domain(
     # sub_verdicts (populated by Phase 2). Cache hits inside this loop
     # are safe — there's nothing left that depends on inter-phase
     # ordering.
-    for criterion in ("backlinks", "refdomains", "anchors", "keywords"):
+    for criterion in (
+        "backlinks", "refdomains", "anchors", "keywords", "stop_words",
+    ):
         if criterion not in fetched_rows:
             continue
         if is_canceled(run_id) or is_paused(run_id):
@@ -3565,7 +3896,7 @@ async def _run_ai_for_domain(
     enabled_criteria = [
         c
         for c in (
-            "backlinks", "refdomains", "anchors", "keywords",
+            "backlinks", "refdomains", "anchors", "keywords", "stop_words",
             "wayback", "wayback_classify",
         )
         if getattr(getattr(spec.criteria, c, None), "enabled", False)
@@ -3678,6 +4009,7 @@ def _build_user_message_for_criterion(
     rows: list[dict],
     wayback_samples: list[dict] | None = None,
     classify_context: dict | None = None,
+    stop_words_sources: list[str] | None = None,
 ) -> str:
     """Compact JSON payload sent to the model. The system prompt does the
     heavy explanation; the user message stays short to save tokens.
@@ -3701,6 +4033,28 @@ def _build_user_message_for_criterion(
         f"Row count: {len(rows)}",
         f"Rows (JSON):\n{json.dumps(rows, ensure_ascii=False)}",
     ]
+    # Stop Words: state which endpoints were QUERIED, separately from how
+    # many rows each returned. Without this the judge cannot distinguish
+    # "the operator only checked anchors" (evidence genuinely missing —
+    # be less sure) from "both were checked and keywords matched nothing"
+    # (evidence of CLEANLINESS — be more sure). Both look identical from
+    # the rows alone: every row tagged `source: anchors`. The prompt's
+    # confidence rule keys off this block.
+    if criterion == "stop_words" and stop_words_sources:
+        counts = {s: 0 for s in stop_words_sources}
+        for r in rows:
+            s = r.get("source")
+            if s in counts:
+                counts[s] += 1
+        checked = ", ".join(stop_words_sources)
+        breakdown = ", ".join(f"{s}={counts[s]}" for s in stop_words_sources)
+        parts.append(
+            f"Sources checked: {checked}\n"
+            f"Matches per source: {breakdown}\n"
+            f"(A source listed with 0 matches WAS queried and came back "
+            f"clean — that is evidence, not missing data. A source absent "
+            f"from 'Sources checked' was never queried.)"
+        )
     if criterion == "wayback" and wayback_samples:
         parts.append(
             f"Page samples (JSON, chronological):"
@@ -4415,7 +4769,7 @@ def _store_final_assessment(
 # logic, only the rd-level final-assessment columns are.
 
 SCORING_CRITERIA: tuple[str, ...] = (
-    "backlinks", "refdomains", "anchors", "keywords",
+    "backlinks", "refdomains", "anchors", "keywords", "stop_words",
     "wayback", "wayback_classify",
 )
 
@@ -5658,6 +6012,9 @@ _CRITERION_PROVIDER = {
     "refdomains": "ahrefs",
     "anchors": "ahrefs",
     "keywords": "ahrefs",
+    # stop_words reuses the anchors + organic-keywords endpoints, so it
+    # goes through the same Ahrefs client and rate-limit bucket.
+    "stop_words": "ahrefs",
     "wayback": "wayback",
 }
 

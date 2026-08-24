@@ -60,12 +60,50 @@ def auto_enable_wayback_for_classify(spec: AnalyzeSpec) -> AnalyzeSpec:
     return spec
 
 
+def snapshot_stop_words_terms(spec: AnalyzeSpec) -> AnalyzeSpec:
+    """Fill `criteria.stop_words.terms` from Settings → Brain → Stop words.
+
+    The word list is a global the operator curates in Settings, but the
+    RUN has to own a frozen copy of it, for two reasons:
+
+      • `compute_params_hash` hashes the terms. Without them in the spec
+        there'd be nothing to hash, and the data cache would happily serve
+        rows fetched against last week's word list for this week's — i.e.
+        report a domain clean of words it was never checked for.
+      • A finished run stays auditable. "Why did run #412 pass this
+        domain?" is answerable from spec_json alone.
+
+    Always overwrites: the client never supplies terms (the Stop Words card
+    has no word editor), so anything already in the field is either a
+    replayed older spec — which SHOULD pick up the current list on rerun,
+    matching how every other Settings-sourced value behaves — or spoofed.
+    Mirrors the `allowed_tlds` snapshot on linked_domains submits.
+
+    Idempotent + safe on disabled specs (writes an empty list rather than
+    paying a DB read when the criterion is off).
+    """
+    sw = getattr(spec.criteria, "stop_words", None)
+    if sw is None:
+        return spec
+    if not sw.enabled:
+        sw.terms = []
+        return spec
+    from ..app_settings import get_stop_words
+    sw.terms = get_stop_words()
+    return spec
+
+
 @router.post("/preview", response_model=PreviewResponse)
 def preview(spec: AnalyzeSpec) -> PreviewResponse:
     """Build the canonical Ahrefs request URLs for the given spec, using the
-    first domain in the list as the example. Returns 4 request entries — one
-    per criterion — flagged enabled/disabled per the user's toggles."""
+    first domain in the list as the example. Returns one entry per criterion
+    — plus one per (endpoint × term chunk) for Stop Words — flagged
+    enabled/disabled per the user's toggles."""
     spec = auto_enable_wayback_for_classify(spec)
+    # Stop Words' URLs are unbuildable without the word list, and the
+    # client doesn't have it — resolve it here so the preview panel shows
+    # the real `where` the runner will send.
+    spec = snapshot_stop_words_terms(spec)
     example_domain, requests = build_preview(spec)
     note = None
     cleaned = [d.strip() for d in spec.domains if d.strip()]
@@ -146,13 +184,26 @@ async def submit_job(
     enabled_count = sum(
         1
         for k in (
-            "backlinks", "refdomains", "anchors", "keywords",
+            "backlinks", "refdomains", "anchors", "keywords", "stop_words",
             "wayback", "wayback_classify",
         )
         if getattr(payload.spec.criteria, k).enabled
     )
     if enabled_count == 0:
         raise HTTPException(400, "at least one criterion must be enabled")
+
+    # Stop Words is meaningless without a word list, and the failure mode
+    # is bad: the request builder emits nothing, so every domain in the run
+    # would come back with a failed criterion. Reject at submit instead of
+    # letting the operator discover it 500 domains later.
+    if payload.spec.criteria.stop_words.enabled:
+        from ..app_settings import get_stop_words
+        if not get_stop_words():
+            raise HTTPException(
+                400,
+                "Stop Words is enabled but no stop words are configured — "
+                "add them in Settings → Brain → Stop words",
+            )
 
     # Normalize the spec so the persisted snapshot matches what the runner
     # will iterate. Use model_copy(update=) so EVERY spec field flows through
@@ -173,6 +224,9 @@ async def submit_job(
     # the empty-criteria guard above so a spec with ONLY classify on (and
     # everything else disabled) still passes — classify counts.
     auto_enable_wayback_for_classify(norm_spec)
+    # Freeze the Settings word list onto the spec — see
+    # `snapshot_stop_words_terms` for why the run must own a copy.
+    snapshot_stop_words_terms(norm_spec)
     spec_json = norm_spec.model_dump_json()
 
     name = (payload.name or "").strip() or _autoname(cleaned_domains)
@@ -312,6 +366,7 @@ async def submit_whois_history_job(
             "refdomains": {"enabled": False},
             "anchors": {"enabled": False},
             "keywords": {"enabled": False},
+            "stop_words": {"enabled": False},
             "wayback": {"enabled": False},
             "wayback_classify": {"enabled": False},
             "whois_history": {"enabled": True},
@@ -437,6 +492,7 @@ async def submit_availability_job(
             "refdomains": {"enabled": False},
             "anchors": {"enabled": False},
             "keywords": {"enabled": False},
+            "stop_words": {"enabled": False},
             "wayback": {"enabled": False},
             "wayback_classify": {"enabled": False},
             "whois_history": {"enabled": False},
@@ -576,6 +632,7 @@ async def submit_ahrefs_batch_analysis_job(
             "refdomains": {"enabled": False},
             "anchors": {"enabled": False},
             "keywords": {"enabled": False},
+            "stop_words": {"enabled": False},
             "wayback": {"enabled": False},
             "wayback_classify": {"enabled": False},
             "whois_history": {"enabled": False},
@@ -792,6 +849,7 @@ async def submit_linked_domains_job(
             "refdomains": {"enabled": False},
             "anchors": {"enabled": False},
             "keywords": {"enabled": False},
+            "stop_words": {"enabled": False},
             "wayback": {"enabled": False},
             "wayback_classify": {"enabled": False},
             "whois_history": {"enabled": False},

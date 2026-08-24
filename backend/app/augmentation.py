@@ -35,7 +35,10 @@ from .schemas import AnalyzeSpec
 
 # Criteria the runner knows about. Order matters only for hashing/printing,
 # not semantics — augmentation is set-based.
-_CRITERIA = ("backlinks", "refdomains", "anchors", "keywords", "wayback")
+_CRITERIA = (
+    "backlinks", "refdomains", "anchors", "keywords", "stop_words",
+    "wayback",
+)
 
 
 def _enabled_set_from_spec(spec: AnalyzeSpec) -> frozenset[str]:

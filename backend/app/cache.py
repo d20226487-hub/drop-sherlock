@@ -130,6 +130,34 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
                 "top_positions": getattr(cfg, "top_positions", None),
             }).encode("utf-8")
         ).hexdigest()
+    # stop_words (2026-08-24): the request shape is limit + source + the
+    # SNAPSHOTTED word list. The terms MUST be in the hash — they're the
+    # whole `where` clause, so without them a cache row fetched against an
+    # older word list would be served for a newer one and the judge would
+    # score a domain on contamination it was never actually checked for.
+    # Sorted so reordering the Settings list doesn't needlessly bust the
+    # cache; the builder already lower-cases + dedups via
+    # `normalize_stop_words`, and we repeat that here so a hand-written
+    # spec hashes the same as a UI-built one.
+    if criterion == "stop_words":
+        from .providers.ahrefs_requests import normalize_stop_words
+        return hashlib.sha256(
+            _stable_json({
+                "c": criterion,
+                # Per-source caps (split from a single `limit` 2026-08-24).
+                # Both go in the hash: changing either changes how many
+                # rows that endpoint returns, so a cache row fetched under
+                # the old cap must miss.
+                "anchor_limit": getattr(cfg, "anchor_limit", None)
+                or getattr(cfg, "limit", 20),
+                "keyword_limit": getattr(cfg, "keyword_limit", None)
+                or getattr(cfg, "limit", 20),
+                "source": getattr(cfg, "source", "both"),
+                "terms": sorted(
+                    normalize_stop_words(getattr(cfg, "terms", None) or [])
+                ),
+            }).encode("utf-8")
+        ).hexdigest()
     payload: dict[str, Any] = {
         "c": criterion,
         "limit": cfg.limit,

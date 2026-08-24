@@ -35,6 +35,7 @@ const TABS = [
   "refdomains",
   "anchors",
   "keywords",
+  "stop_words",
   "wayback",
   "wayback_classify",
 ] as const;

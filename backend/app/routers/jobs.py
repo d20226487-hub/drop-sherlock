@@ -959,7 +959,7 @@ async def rerun_job(
     enabled_count = sum(
         1
         for k in (
-            "backlinks", "refdomains", "anchors", "keywords",
+            "backlinks", "refdomains", "anchors", "keywords", "stop_words",
             "wayback", "wayback_classify",
             "whois_history", "availability",
             "ahrefs_batch_analysis", "linked_domains", "serp_overview",
@@ -982,8 +982,17 @@ async def rerun_job(
         from ..schemas import strip_pillar_criteria_from_quality_spec
         norm_spec = strip_pillar_criteria_from_quality_spec(norm_spec)
     # Auto-enable wayback + V2 sampling when classify is on.
-    from .analyze import auto_enable_wayback_for_classify
+    from .analyze import (
+        auto_enable_wayback_for_classify,
+        snapshot_stop_words_terms,
+    )
     auto_enable_wayback_for_classify(norm_spec)
+    # Re-snapshot the stop-word list from Settings. A rerun deliberately
+    # picks up the CURRENT vocabulary rather than replaying the original
+    # run's — "rerun with my updated stop words" is the whole point of
+    # rerunning this criterion, and the params hash covers the terms so
+    # a changed list correctly misses the data cache.
+    snapshot_stop_words_terms(norm_spec)
     spec_json = norm_spec.model_dump_json()
 
     # Update Job.spec_json so a future Analyze prefill picks up the latest
@@ -1128,7 +1137,7 @@ def _run_domain_filter_q(
 # (ahrefs_batch_analysis is NOT in it — the client never counted it, so a
 # batch run shows 0 failed criteria, same as before).
 _FAILED_CRITERIA_KEYS = (
-    "backlinks", "refdomains", "anchors", "keywords",
+    "backlinks", "refdomains", "anchors", "keywords", "stop_words",
     "wayback", "wayback_classify", "whois_history", "availability",
 )
 
@@ -1816,7 +1825,10 @@ def get_run_domain_detail(
     try:
         spec_raw = json.loads(rd.run.spec_json or "{}")
         crits = spec_raw.get("criteria") or {}
-        for key in ("backlinks", "refdomains", "anchors", "keywords", "wayback", "wayback_classify"):
+        for key in (
+            "backlinks", "refdomains", "anchors", "keywords", "stop_words",
+            "wayback", "wayback_classify",
+        ):
             cfg = crits.get(key) or {}
             sort_rules = cfg.get("sort") or []
             cols: list[str] = []
@@ -1874,7 +1886,10 @@ def get_run_domain_detail(
         run = db.get(Run, run_id)
         try:
             spec_raw = json.loads(run.spec_json or "{}") if run else {}
-            for key in ("backlinks", "refdomains", "anchors", "keywords", "wayback", "wayback_classify"):
+            for key in (
+                "backlinks", "refdomains", "anchors", "keywords",
+                "stop_words", "wayback", "wayback_classify",
+            ):
                 cfg = (spec_raw.get("criteria") or {}).get(key) or {}
                 sort_rules = cfg.get("sort") or []
                 cols: list[str] = []
@@ -1918,7 +1933,7 @@ def get_run_domain_detail(
     # for any rd whose only CR is one of the omitted criteria — which
     # is exactly what happened for whois_history rds pre-2026-05-15.
     for criterion_name in (
-        "backlinks", "refdomains", "anchors", "keywords",
+        "backlinks", "refdomains", "anchors", "keywords", "stop_words",
         "wayback", "wayback_classify",
         # Whois History pillar (Wave 2b, 2026-05-15) — single criterion,
         # same CR shape (data_json + ai_verdict_json), surfaced through
@@ -2524,7 +2539,11 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
         # per-target CRs carry units_cost_* exactly like B/D/A/K
         # (cached_from_run_id always NULL, so every one counts as a fresh
         # Ahrefs call), so those tools' spend surfaces in the run cost.
-        ("backlinks", "refdomains", "anchors", "keywords",
+        # stop_words (2026-08-24) issues 1-2 Ahrefs requests per domain
+        # (anchors + organic-keywords, x term chunks) and its CR carries
+        # the SUMMED units_cost_* across all of them — so it belongs in
+        # the run's Ahrefs spend exactly like B/D/A/K.
+        ("backlinks", "refdomains", "anchors", "keywords", "stop_words",
          "linked_domains", "serp_overview")
     )
     ahrefs_units_billed = 0
@@ -2902,7 +2921,7 @@ async def reanalyze_run_domain_route(
 
 
 class ReanalyzeCriterionIn(BaseModel):
-    # Required — one of backlinks/refdomains/anchors/keywords.
+    # Required — one of backlinks/refdomains/anchors/keywords/stop_words.
     criterion: str
     provider: str | None = None
     model: str | None = None
@@ -3194,7 +3213,7 @@ class RecomputeFinalOut(BaseModel):
 
 
 _RECOMPUTE_ALLOWED_CRITERIA: tuple[str, ...] = (
-    "backlinks", "refdomains", "anchors", "keywords",
+    "backlinks", "refdomains", "anchors", "keywords", "stop_words",
     "wayback", "wayback_classify",
 )
 
@@ -3303,6 +3322,11 @@ CRITERIA_NAMES = (
     "refdomains",
     "anchors",
     "keywords",
+    # stop_words (2026-08-24) — pinnable like any other Quality
+    # criterion, so the Database rollup can source the Stop column from
+    # a different run than the rest of the score (cheap stop-words sweep
+    # first, full Ahrefs later).
+    "stop_words",
     "wayback",
     "wayback_classify",
     # whois_history (added 2026-05-15 Wave 2 follow-up). Lets the

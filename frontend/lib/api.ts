@@ -73,6 +73,9 @@ export type ScoringConfig = {
     // it up. Optional in the type so older settings payloads (pre-wayback)
     // don't trip TypeScript while migrating.
     wayback?: number;
+    // Also defaults to 0 (2026-08-24). Same optional-for-migration
+    // reasoning as wayback.
+    stop_words?: number;
   };
   good_threshold: number;
   mixed_threshold: number;
@@ -185,6 +188,10 @@ export type Criterion =
   | "refdomains"
   | "anchors"
   | "keywords"
+  // stop_words (2026-08-24) — the anchors + organic keywords that matched
+  // the operator's stop-word list, merged into one CR. Rows carry a
+  // `source` tag naming which endpoint each came from.
+  | "stop_words"
   | "wayback"
   // wayback_classify is a derived AI-only criterion — no fetch URL, no
   // raw rows. Result lives in the CR's ai_verdict_json with shape
@@ -312,6 +319,33 @@ export type CriteriaSpec = {
     // buckets mirror Ahrefs's own UI; backend resolves the enum to a
     // date string at build time.
     date_compared: "off" | "3m" | "6m" | "1y" | "2y" | "5y";
+  };
+  // stop_words (added 2026-08-24): asks Ahrefs for ONLY the anchors /
+  // organic keywords that CONTAIN one of the operator's stop words, then
+  // has the AI judge how spoiled the domain is. Opt-in.
+  //
+  // `source` picks which endpoint(s) to query — each is a separately
+  // billed request, so "both" costs roughly double. `limit` applies PER
+  // SOURCE and is the hard ceiling on spend.
+  //
+  // `terms` is NOT edited here: the word list lives in Settings → Brain
+  // and the backend snapshots it onto the spec at preview/submit time.
+  // The field exists on the type only because it round-trips on saved
+  // specs (rerun prefill, "last spec" prefill); never populate it from
+  // the client.
+  stop_words: {
+    enabled: boolean;
+    source: "anchors" | "keywords" | "both";
+    // Per-source row caps (split from a single `limit` 2026-08-24, because
+    // anchors cost ~2.4x less per row than organic keywords). Each is the
+    // hard spend ceiling for its endpoint.
+    anchor_limit: number;
+    keyword_limit: number;
+    terms?: string[];
+    // Legacy shared cap. Still emitted by the backend (inherited from
+    // CriterionBase) but no longer used by the request builder; kept
+    // optional so old saved specs round-trip.
+    limit?: number;
   };
   // Opt-in by default. Hits Wayback Machine CDX — free, unauthenticated,
   // separate rate-limit row in Settings (RPM 30 / max concurrent 2 default).
@@ -1080,6 +1114,17 @@ export type DatabaseDomainRow = {
   wayback_assessment: string;
   wayback_confidence: number | null;
   wayback_samples_count: number;
+  // Stop Words per-criterion AI assessment (added 2026-08-24). Same
+  // sourcing rule as wayback — from whichever rd supplies the
+  // `stop_words` criterion. `stop_words_matches` is the raw number of
+  // contaminated anchors/keywords Ahrefs returned;
+  // `stop_words_no_matches` is true when the verdict came from a
+  // ZERO-row fetch (no AI call), which is what lets the Stop column
+  // say "clean" rather than showing a model-authored "high".
+  stop_words_assessment: string;
+  stop_words_confidence: number | null;
+  stop_words_matches: number;
+  stop_words_no_matches: boolean;
   // wayback_classify outputs (added 2026-05-09): language + theme + auto-
   // chained category. All sourced from the pinned RunDomain's
   // wayback_classify CR row only. Empty when the criterion isn't enabled
@@ -1222,6 +1267,9 @@ export type DatabaseDomainList = {
     // "mixed" / "low_quality"). Used to populate the second verdict filter
     // dropdown on the Database page.
     wayback_verdicts: string[];
+    // Stop Words assessment values seen on pinned runs (2026-08-24).
+    // Same three-value space as wayback_verdicts.
+    stop_words_verdicts?: string[];
     // wayback_classify universes (added 2026-05-09). languages = ISO 639-1
     // codes seen on pinned rds; categories = the user-defined category
     // names actually assigned by the AI.
@@ -1266,6 +1314,7 @@ export type DatabaseListOpts = {
   fresh?: boolean;
   verdict?: string[];
   wayback_verdict?: string[];
+  stop_words_verdict?: string[];
   whois_band?: string[];
   availability?: string[];
   language?: string[];
@@ -1332,6 +1381,7 @@ export const api = {
     const repeated: [string, string[] | undefined][] = [
       ["verdict", opts.verdict],
       ["wayback_verdict", opts.wayback_verdict],
+      ["stop_words_verdict", opts.stop_words_verdict],
       ["whois_band", opts.whois_band],
       ["availability", opts.availability],
       ["language", opts.language],
@@ -2069,6 +2119,19 @@ export const api = {
       body: JSON.stringify({ state }),
     }),
 
+  // --- Stop words (Settings → Brain, added 2026-08-24) ---
+  // The spoiled-niche vocabulary consumed by the Stop Words quality
+  // criterion. Whole-list replace on PUT; the server trims, lower-cases,
+  // dedups and sorts, so the caller MUST reconcile from the response
+  // rather than trusting its optimistic local order.
+  getStopWords: () => request<StopWordsPayload>("/settings/stop-words"),
+
+  putStopWords: (terms: string[]) =>
+    request<StopWordsPayload>("/settings/stop-words", {
+      method: "PUT",
+      body: JSON.stringify({ terms }),
+    }),
+
   retryFailedRun: (
     runId: number,
     ai?: { provider?: string; model?: string },
@@ -2722,6 +2785,7 @@ export const api = {
         source,
         verdict: opts.verdict ?? null,
         wayback_verdict: opts.wayback_verdict ?? null,
+        stop_words_verdict: opts.stop_words_verdict ?? null,
         whois_band: opts.whois_band ?? null,
         availability: opts.availability ?? null,
         language: opts.language ?? null,
@@ -3278,6 +3342,24 @@ export type DomainFilterState = Record<string, string[]>;
 export type DomainFilterPayload = {
   state: DomainFilterState;
   categories: string[];
+};
+
+// Stop words (Settings → Brain, added 2026-08-24). `max_clauses_per_request`
+// is Ahrefs's hard per-`where` clause ceiling minus our safety margin —
+// crossing it doesn't break anything, but the request builder starts
+// splitting into extra (separately billed) chunks, so the UI warns.
+export type StopWordsPayload = {
+  terms: string[];
+  count: number;
+  max_clauses_per_request: number;
+  // Server-side per-term character cap. Sent so the UI can explain a
+  // rejection without hardcoding the number.
+  max_term_length?: number;
+  // Entries the server REFUSED on this write (over-long / non-string),
+  // capped at 20. Always [] on GET. Surfaced because the likeliest
+  // mistake — pasting a whole delimited list into a field that doesn't
+  // split on that delimiter — otherwise looks like a successful no-op.
+  rejected?: string[];
 };
 
 // ---- Backlog types ---------------------------------------------------------

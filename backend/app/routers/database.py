@@ -150,6 +150,16 @@ class DomainRow(BaseModel):
     wayback_assessment: str = ""
     wayback_confidence: float | None = None
     wayback_samples_count: int = 0
+    # Stop Words verdict (added 2026-08-24) — surfaced separately from
+    # the aggregated final for the same reason as wayback: it's
+    # informational (default weight=0). `stop_words_no_matches` is True
+    # when the verdict came from a ZERO-row fetch rather than from the
+    # model, which is what lets the UI render an unambiguous "clean"
+    # badge instead of an AI-authored "high" one.
+    stop_words_assessment: str = ""
+    stop_words_confidence: float | None = None
+    stop_words_matches: int = 0
+    stop_words_no_matches: bool = False
     # wayback_classify outputs (added 2026-05-09) — language + theme +
     # category derived from the wayback V2 samples. All sourced from the
     # pinned RunDomain's wayback_classify CR row only. Empty when the
@@ -291,6 +301,11 @@ class DomainListResponse(BaseModel):
 
 CRITERIA = (
     "backlinks", "refdomains", "anchors", "keywords",
+    # stop_words (2026-08-24): a Quality-scoring criterion like B/D/A/K
+    # (it has an {assessment, confidence} verdict and a scoring weight,
+    # default 0), so it belongs in `sources_by_domain`, NOT in the aux
+    # pillar set below.
+    "stop_words",
     "wayback", "wayback_classify",
     # whois_history added 2026-05-15: lets the Database page surface
     # whois-only domains (Quality-pillar pins not required) and the new
@@ -848,6 +863,9 @@ def _build_all_rows(
     models: set[str] = set()
     verdicts: set[str] = set()
     wayback_assessments: set[str] = set()
+    # Stop Words verdict universe for the Stop filter dropdown
+    # (2026-08-24). Subset of {high_quality, mixed, low_quality}.
+    stop_words_assessments: set[str] = set()
     # Filter universes for wayback_classify columns (added 2026-05-09).
     languages_seen: set[str] = set()
     categories_seen: set[str] = set()
@@ -1309,6 +1327,46 @@ def _build_all_rows(
                 if isinstance(samples, list):
                     wayback_samples_count = len(samples)
 
+        # Stop Words per-criterion verdict (2026-08-24) — sourced from
+        # whichever rd supplies the `stop_words` criterion, same pin-walk
+        # as wayback above. `stop_words_matches` is the raw row count
+        # (how many contaminated anchors/keywords came back), surfaced so
+        # the operator can distinguish "AI judged 40 matches as mostly
+        # false positives" from "there was nothing to judge".
+        stop_words_assessment = ""
+        stop_words_confidence: float | None = None
+        stop_words_matches = 0
+        stop_words_no_matches = False
+        sw_src = per_crit_sources.get("stop_words")
+        sw_cr = (
+            crs_by_rd.get(sw_src[0].id, {}).get("stop_words")
+            if sw_src else None
+        )
+        if sw_cr is not None and sw_cr.ai_verdict_json:
+            try:
+                sw_parsed = json.loads(sw_cr.ai_verdict_json)
+            except json.JSONDecodeError:
+                sw_parsed = None
+            if isinstance(sw_parsed, dict):
+                a = sw_parsed.get("assessment")
+                if isinstance(a, str):
+                    stop_words_assessment = a
+                    stop_words_assessments.add(a)
+                c = sw_parsed.get("confidence")
+                if isinstance(c, (int, float)) and not isinstance(c, bool):
+                    if 0.0 <= float(c) <= 1.0:
+                        stop_words_confidence = float(c)
+                stop_words_no_matches = bool(sw_parsed.get("no_matches"))
+        if sw_cr is not None and sw_cr.data_json:
+            try:
+                sw_body = json.loads(sw_cr.data_json)
+            except json.JSONDecodeError:
+                sw_body = None
+            if isinstance(sw_body, dict):
+                sw_rows = sw_body.get("stop_words")
+                if isinstance(sw_rows, list):
+                    stop_words_matches = len(sw_rows)
+
         # wayback_classify per-criterion verdict for the pinned rd only.
         # Schema (from wayback_classify.py): {primary_language,
         # secondary_languages, language_confidence, primary_theme,
@@ -1627,6 +1685,10 @@ def _build_all_rows(
             wayback_assessment=wayback_assessment,
             wayback_confidence=wayback_confidence,
             wayback_samples_count=wayback_samples_count,
+            stop_words_assessment=stop_words_assessment,
+            stop_words_confidence=stop_words_confidence,
+            stop_words_matches=stop_words_matches,
+            stop_words_no_matches=stop_words_no_matches,
             primary_language=primary_language,
             secondary_languages=secondary_languages,
             language_confidence=language_confidence,
@@ -1684,6 +1746,7 @@ def _build_all_rows(
             "ai_models": sorted(models),
             "verdicts": sorted(verdicts),
             "wayback_verdicts": sorted(wayback_assessments),
+            "stop_words_verdicts": sorted(stop_words_assessments),
             "languages": sorted(languages_seen),
             "categories": sorted(categories_seen),
             "whois_bands": sorted(whois_bands_seen),
@@ -1793,6 +1856,7 @@ _EMPTY_FILTER_OPTIONS: dict[str, list[str]] = {
     "ai_models": [],
     "verdicts": [],
     "wayback_verdicts": [],
+    "stop_words_verdicts": [],
     "languages": [],
     "categories": [],
     "whois_bands": [],
@@ -2053,6 +2117,7 @@ def _apply_domain_filters(
     *,
     verdicts: list[str],
     wayback_verdicts: list[str],
+    stop_words_verdicts: list[str],
     whois_bands: list[str],
     availability: list[str],
     languages: list[str],
@@ -2086,6 +2151,8 @@ def _apply_domain_filters(
             if not ok:
                 return False
         if not _match_multi(r.wayback_assessment, wayback_verdicts):
+            return False
+        if not _match_multi(r.stop_words_assessment, stop_words_verdicts):
             return False
         if not _match_multi(r.whois_band, whois_bands):
             return False
@@ -2226,6 +2293,7 @@ def list_domains(
     allow_building_empty: bool = False,
     verdicts: list[str] | None = None,
     wayback_verdicts: list[str] | None = None,
+    stop_words_verdicts: list[str] | None = None,
     whois_bands: list[str] | None = None,
     availability: list[str] | None = None,
     languages: list[str] | None = None,
@@ -2275,6 +2343,7 @@ def list_domains(
         base_rows,
         verdicts=verdicts or [],
         wayback_verdicts=wayback_verdicts or [],
+        stop_words_verdicts=stop_words_verdicts or [],
         whois_bands=whois_bands or [],
         availability=availability or [],
         languages=languages or [],
@@ -2324,6 +2393,7 @@ async def _list_domains_route(
     fresh: bool = False,
     verdict: list[str] | None = Query(None),
     wayback_verdict: list[str] | None = Query(None),
+    stop_words_verdict: list[str] | None = Query(None),
     whois_band: list[str] | None = Query(None),
     availability: list[str] | None = Query(None),
     language: list[str] | None = Query(None),
@@ -2360,6 +2430,7 @@ async def _list_domains_route(
         fresh,
         verdict,
         wayback_verdict,
+        stop_words_verdict,
         whois_band,
         availability,
         language,
@@ -2389,6 +2460,7 @@ def _run_list_domains(
     fresh: bool,
     verdict: list[str] | None,
     wayback_verdict: list[str] | None,
+    stop_words_verdict: list[str] | None,
     whois_band: list[str] | None,
     availability: list[str] | None,
     language: list[str] | None,
@@ -2421,6 +2493,7 @@ def _run_list_domains(
             allow_building_empty=True,
             verdicts=verdict,
             wayback_verdicts=wayback_verdict,
+            stop_words_verdicts=stop_words_verdict,
             whois_bands=whois_band,
             availability=availability,
             languages=language,
@@ -3219,6 +3292,7 @@ class BulkSetSourceFilteredIn(BaseModel):
     source: str
     verdict: list[str] | None = None
     wayback_verdict: list[str] | None = None
+    stop_words_verdict: list[str] | None = None
     whois_band: list[str] | None = None
     availability: list[str] | None = None
     language: list[str] | None = None
@@ -3258,6 +3332,7 @@ def bulk_set_source_filtered(
         db=db, offset=0, limit=None, include_options=False,
         verdicts=payload.verdict,
         wayback_verdicts=payload.wayback_verdict,
+        stop_words_verdicts=payload.stop_words_verdict,
         whois_bands=payload.whois_band,
         availability=payload.availability,
         languages=payload.language,

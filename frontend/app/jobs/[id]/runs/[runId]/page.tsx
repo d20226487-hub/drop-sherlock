@@ -165,6 +165,7 @@ const SCORE_WEIGHTS_CRITERIA: ReadonlyArray<readonly [string, string]> = [
   ["refdomains", "D"],
   ["anchors", "A"],
   ["keywords", "K"],
+  ["stop_words", "S"],
   ["wayback", "W"],
   ["wayback_classify", "C"],
 ];
@@ -596,7 +597,7 @@ function ScoreWeightsPanel({
 }
 
 const CRITERIA_ORDER = [
-  "backlinks", "refdomains", "anchors", "keywords",
+  "backlinks", "refdomains", "anchors", "keywords", "stop_words",
   "wayback",
   // wayback_classify is included in the Criteria pill column so the user
   // can scan its fetch/AI status alongside the others.
@@ -608,6 +609,7 @@ const AHREFS_LETTERS: ReadonlyArray<readonly [string, string]> = [
   ["refdomains", "D"],
   ["anchors", "A"],
   ["keywords", "K"],
+  ["stop_words", "S"],
 ];
 
 // Single-letter abbreviations for the Criteria pills column. Match the
@@ -620,6 +622,8 @@ const CRITERION_ABBREVIATIONS: Record<string, string> = {
   refdomains: "D",
   anchors: "A",
   keywords: "K",
+  // S = Stop Words (2026-08-24).
+  stop_words: "S",
   wayback: "W",
   wayback_classify: "C",
 };
@@ -1221,6 +1225,7 @@ export default function RunDetailPage({
       "refdomains",
       "anchors",
       "keywords",
+      "stop_words",
       "wayback",
       "wayback_classify",
       "whois_history",
@@ -1829,6 +1834,7 @@ export default function RunDetailPage({
                     refdomains: "D",
                     anchors: "A",
                     keywords: "K",
+                    stop_words: "S",
                     wayback: "W",
                     wayback_classify: "C",
                     whois_history: "H",
@@ -2360,6 +2366,7 @@ function DomainsSection({
       { header: "refdomains", get: (d) => d.criteria.refdomains ?? "" },
       { header: "anchors", get: (d) => d.criteria.anchors ?? "" },
       { header: "keywords", get: (d) => d.criteria.keywords ?? "" },
+      { header: "stop_words", get: (d) => d.criteria.stop_words ?? "" },
       // wayback_classify columns mirror the Database CSV export shape.
       { header: "primary_language", get: (d) => d.primary_language || "" },
       {
