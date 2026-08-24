@@ -1318,6 +1318,10 @@ export type DatabaseListOpts = {
   whois_band?: string[];
   availability?: string[];
   language?: string[];
+  // How the language multi-select matches: "primary" (default) matches
+  // the dominant language only; "any" also matches secondary/tertiary
+  // languages from wayback_classify.
+  language_match?: "primary" | "any";
   category?: string[];
   criterion?: string[];
   notes?: "any" | "with" | "without";
@@ -1394,6 +1398,7 @@ export const api = {
       if (arr && arr.length) for (const v of arr) p.append(key, v);
     }
     if (opts.notes && opts.notes !== "any") p.set("notes", opts.notes);
+    if (opts.language_match === "any") p.set("language_match", "any");
     // Numeric thresholds — only sent when active (> 0) so an idle filter
     // never narrows the set.
     const nums: [string, number | undefined][] = [
@@ -2103,20 +2108,31 @@ export const api = {
       { method: "POST", body: JSON.stringify({ items }) },
     ),
 
-  // --- Domain Filter (added 2026-06-07) ---
-  // Get the full state + the list of recognised categories. The
-  // categories array drives section order in the Settings UI; the
-  // frontend doesn't have to keep a duplicate list.
+  // --- Domain Filter (added 2026-06-07; reshaped 2026-08-24) ---
+  // Import-time filter: stop keywords (substring) + an allowed-TLD
+  // whitelist toggle. The TLD list itself is the shared Spam Filter
+  // (allowed-tlds), so the payload only carries its count for display.
   getDomainFilter: () =>
     request<DomainFilterPayload>("/settings/domain-filter"),
 
-  // Whole-state replace. The state dict is normalised + sorted server-
-  // side (lowercased, leading dots stripped, deduped). Unknown category
-  // keys are silently dropped — only `categories` keys persist.
-  putDomainFilter: (state: DomainFilterState) =>
+  // Whole-config replace. Keywords are normalised (lower / dedup / sort)
+  // server-side; reconcile local state from the response.
+  putDomainFilter: (config: DomainFilterConfig) =>
     request<DomainFilterPayload>("/settings/domain-filter", {
       method: "PUT",
-      body: JSON.stringify({ state }),
+      body: JSON.stringify(config),
+    }),
+
+  // Allowed-TLDs "Spam Filter" — the shared whitelist used by the Domain
+  // Filter (import gate), Linked Domains fetch, and SERP exports. `reset`
+  // clears the override back to the shipped default; note the server
+  // treats an empty list as "reset", so there's no way to allow zero TLDs.
+  getAllowedTlds: () => request<AllowedTldsPayload>("/settings/allowed-tlds"),
+
+  putAllowedTlds: (body: { tlds?: string[]; reset?: boolean }) =>
+    request<AllowedTldsPayload>("/settings/allowed-tlds", {
+      method: "PUT",
+      body: JSON.stringify(body),
     }),
 
   // --- Stop words (Settings → Brain, added 2026-08-24) ---
@@ -2789,6 +2805,7 @@ export const api = {
         whois_band: opts.whois_band ?? null,
         availability: opts.availability ?? null,
         language: opts.language ?? null,
+        language_match: opts.language_match ?? "primary",
         category: opts.category ?? null,
         criterion: opts.criterion ?? null,
         source_filter: opts.source ?? null,
@@ -3337,11 +3354,27 @@ export type BacklogImportResult = {
 // banned-substrings, …) can ship by extending the backend's recognised
 // category list — the UI renders one section per `categories` entry
 // returned by the server.
-export type DomainFilterState = Record<string, string[]>;
+export type DomainFilterConfig = {
+  // Stop keywords — a domain whose name CONTAINS any of these (substring,
+  // anywhere, case-insensitive) is filtered out at import.
+  keywords: string[];
+  // When true, a domain whose TLD is NOT in the shared allowed-TLDs Spam
+  // Filter is filtered out. The TLD list is edited under SERP Overview
+  // settings; this is just the on/off gate.
+  tld_whitelist_enabled: boolean;
+};
 
 export type DomainFilterPayload = {
-  state: DomainFilterState;
-  categories: string[];
+  config: DomainFilterConfig;
+  // Size of the shared allowed-TLDs list the whitelist would enforce.
+  allowed_tlds_count: number;
+};
+
+export type AllowedTldsPayload = {
+  tlds: string[];
+  count: number;
+  // Size of the shipped default list, for the "reset to default" label.
+  default_count: number;
 };
 
 // Stop words (Settings → Brain, added 2026-08-24). `max_clauses_per_request`

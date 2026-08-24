@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 from ..app_settings import (
     AI_PROVIDERS_FOR_MODELS,
     DEFAULT_SCORING_CONFIG,
-    DOMAIN_FILTER_CATEGORIES,
     PROVIDER_FIELDS,
     RATE_LIMIT_FIELDS,
     add_categories,
@@ -843,40 +842,43 @@ def add_categories_route(payload: CategoriesIn):
     return {"categories": merged}
 
 
-# --- Domain Filter (added 2026-06-07) -------------------------------------
-# User-managed exclusion list applied at /backlog/import. Schema is a
-# dict of category -> list[str] so future categories (spam-keywords,
-# banned-substrings, …) ship by extending DOMAIN_FILTER_CATEGORIES in
-# app_settings — no router / migration changes needed.
+# --- Domain Filter (added 2026-06-07; reshaped 2026-08-24) ----------------
+# Import-time gate: stop keywords (substring) + an allowed-TLD whitelist
+# toggle. The TLD list is the shared `allowed_tlds` Spam Filter (edited in
+# SERP Overview settings), so it's not part of this payload. Matching logic
+# lives in app.domain_filter; config get/set in app_settings.
 
 class DomainFilterIn(BaseModel):
-    # `state` is the whole dict the user wants persisted. Keys not in
-    # DOMAIN_FILTER_CATEGORIES are silently dropped server-side, so a
-    # stale category from an older frontend can't pollute the store.
-    state: dict[str, list[str]]
+    # Stop keywords (substring-anywhere) + the allowed-TLD whitelist
+    # toggle. The TLD list itself is NOT here — it reuses the shared
+    # `allowed_tlds` Spam Filter (edited in SERP Overview settings).
+    keywords: list[str]
+    tld_whitelist_enabled: bool = True
+
+
+def _domain_filter_response(cfg: dict) -> dict:
+    # `allowed_tlds_count` lets the UI show "filter by TLD (N allowed)"
+    # without duplicating the list; the list lives in the shared Spam
+    # Filter setting.
+    from ..app_settings import get_allowed_tlds
+    return {"config": cfg, "allowed_tlds_count": len(get_allowed_tlds())}
 
 
 @router.get("/domain-filter")
 def get_domain_filter_route():
-    """Return current filter state + the list of recognised categories.
-    The categories array drives the Settings UI section ordering; the
-    frontend doesn't have to keep a duplicate list in sync."""
-    return {
-        "state": get_domain_filter(),
-        "categories": list(DOMAIN_FILTER_CATEGORIES),
-    }
+    """Return the current domain-filter config
+    ({keywords, tld_whitelist_enabled}) plus the count of allowed TLDs
+    the whitelist would enforce."""
+    return _domain_filter_response(get_domain_filter())
 
 
 @router.put("/domain-filter")
 def set_domain_filter_route(payload: DomainFilterIn):
     try:
-        cleaned = set_domain_filter(payload.state)
+        cleaned = set_domain_filter(payload.model_dump())
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {
-        "state": cleaned,
-        "categories": list(DOMAIN_FILTER_CATEGORIES),
-    }
+    return _domain_filter_response(cleaned)
 
 
 # --- Stop words (added 2026-08-24) ----------------------------------------

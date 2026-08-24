@@ -2112,6 +2112,40 @@ def _match_multi(value: str, selected: list[str]) -> bool:
     return False
 
 
+def _match_language(
+    primary: str,
+    secondary: list[str],
+    selected: list[str],
+    mode: str,
+) -> bool:
+    """Language multi-select with a match MODE (added 2026-08-24).
+
+    - "primary" (default, legacy behaviour): match the row's PRIMARY
+      language only — identical to `_match_multi(primary, selected)`.
+    - "any": match if a selected language appears as the primary OR any
+      secondary/tertiary language (wayback_classify's `secondary_languages`
+      array). Lets the operator find domains where the language they care
+      about is present at all, not just dominant.
+
+    `__none__` means "no language detected at all" (primary empty AND no
+    secondaries) in both modes.
+    """
+    if not selected:
+        return True
+    if mode != "any":
+        return _match_multi(primary, selected)
+    langset = {s for s in (secondary or []) if s}
+    if primary:
+        langset.add(primary)
+    for v in selected:
+        if v == "__none__":
+            if not langset:
+                return True
+        elif v in langset:
+            return True
+    return False
+
+
 def _apply_domain_filters(
     rows: list[DomainRow],
     *,
@@ -2121,6 +2155,7 @@ def _apply_domain_filters(
     whois_bands: list[str],
     availability: list[str],
     languages: list[str],
+    language_match: str,
     categories: list[str],
     criteria: list[str],
     notes: str,
@@ -2158,7 +2193,9 @@ def _apply_domain_filters(
             return False
         if not _match_multi(r.availability_status, availability):
             return False
-        if not _match_multi(r.primary_language, languages):
+        if not _match_language(
+            r.primary_language, r.secondary_languages, languages, language_match,
+        ):
             return False
         if not _match_multi(r.category, categories):
             return False
@@ -2297,6 +2334,7 @@ def list_domains(
     whois_bands: list[str] | None = None,
     availability: list[str] | None = None,
     languages: list[str] | None = None,
+    language_match: str = "primary",
     categories: list[str] | None = None,
     criteria: list[str] | None = None,
     notes: str = "any",
@@ -2347,6 +2385,7 @@ def list_domains(
         whois_bands=whois_bands or [],
         availability=availability or [],
         languages=languages or [],
+        language_match=language_match,
         categories=categories or [],
         criteria=criteria or [],
         notes=notes or "any",
@@ -2397,6 +2436,7 @@ async def _list_domains_route(
     whois_band: list[str] | None = Query(None),
     availability: list[str] | None = Query(None),
     language: list[str] | None = Query(None),
+    language_match: str = "primary",
     category: list[str] | None = Query(None),
     criterion: list[str] | None = Query(None),
     notes: str = "any",
@@ -2450,6 +2490,7 @@ async def _list_domains_route(
         sort,
         direction,
         show_taken,
+        language_match,
     )
 
 
@@ -2480,6 +2521,7 @@ def _run_list_domains(
     sort: str | None,
     direction: str | None,
     show_taken: bool,
+    language_match: str = "primary",
 ) -> DomainListResponse:
     db = SessionLocal()
     try:
@@ -2497,6 +2539,7 @@ def _run_list_domains(
             whois_bands=whois_band,
             availability=availability,
             languages=language,
+            language_match=language_match,
             categories=category,
             criteria=criterion,
             notes=notes,
@@ -3296,6 +3339,7 @@ class BulkSetSourceFilteredIn(BaseModel):
     whois_band: list[str] | None = None
     availability: list[str] | None = None
     language: list[str] | None = None
+    language_match: str = "primary"
     category: list[str] | None = None
     criterion: list[str] | None = None
     # Which existing sources to MATCH (the Source filter) — distinct from the
@@ -3336,6 +3380,7 @@ def bulk_set_source_filtered(
         whois_bands=payload.whois_band,
         availability=payload.availability,
         languages=payload.language,
+        language_match=payload.language_match,
         categories=payload.category,
         criteria=payload.criterion,
         notes=payload.notes,

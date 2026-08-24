@@ -1319,11 +1319,13 @@ def set_serp_dedup_window_days(value: int) -> int:
 
 
 # --- Allowed TLDs (added 2026-07-10) ----------------------------------------
-# Editable allowlist of TLD suffixes shared by the Linked Domains fetch
-# filter and the SERP Overview domains exports. Default = the Domain Spam
-# Filter's openly-registrable list (allowed_tlds.DEFAULT_ALLOWED_TLDS, 563
-# entries). Stored as a JSON array under one key; empty/absent row =
-# default (so "Reset to default" just clears the override).
+# Editable allowlist of TLD suffixes shared by the Domain Filter import
+# gate, the Linked Domains fetch filter, and the SERP Overview domains
+# exports. Default = the operator-curated `allowed_tlds.DEFAULT_ALLOWED_TLDS`
+# set (568 entries as of 2026-08-24 — open gTLDs + registrable SLDs +
+# selected ccTLDs incl. kz/ar; excludes ru/su). Stored as a JSON array
+# under one key; empty/absent row = default (so "Reset to default" just
+# clears the override).
 ALLOWED_TLDS_KEY = "allowed_tlds"
 
 
@@ -1539,123 +1541,79 @@ def set_import_max_rows(value: int) -> int:
     return value
 
 
-# --- Domain Filter (added 2026-06-07) -------------------------------------
-# User-managed exclusion list applied to /backlog/import. The state is a
-# dict of category -> list[str] so we can add new exclusion categories
-# (spam-keywords, banned-substrings, …) without touching the schema or
-# the API surface — frontends just render whichever categories are
-# present in the response.
+# --- Domain Filter (added 2026-06-07; reshaped 2026-08-24) -----------------
+# Import-time exclusion gate applied at /backlog/import. Reshaped from the
+# original ccTLD-blacklist-only design into a combined filter modeled on
+# the "Spam Filter" (`allowed_tlds`):
 #
-# Today the only category is `cctld` — a list of TLD labels (e.g.
-# ["uk", "de", "fr"]). The match rule is intentionally narrow: a domain
-# is excluded ONLY when it has exactly TWO labels (`example.uk`) and the
-# last label is in the ccTLD list. Three-label names like `example.co.uk`
-# / `bbc.org.uk` are NOT excluded, because second-level SLDs under
-# ccTLDs (.co.uk, .org.uk, .com.au, .co.jp, …) are freely registrable
-# and the user explicitly wants them through. This avoids needing a
-# Public Suffix List dependency at the cost of allowing a handful of
-# exotic 2-label edge cases through; if that ever bites we'd revisit.
+#   • keywords — a domain whose NAME contains any keyword (substring,
+#     anywhere, case-insensitive) is filtered out.
+#   • allowed-TLD whitelist — a domain whose TLD is NOT in the operator's
+#     `allowed_tlds` list is filtered out. The whitelist REUSES that
+#     existing Spam Filter list (one source of truth, shared with Linked
+#     Domains + SERP exports) — this config stores only an on/off toggle,
+#     never its own TLD list.
+#
+# The old `cctld` blacklist is retired: an allowed-TLD whitelist supersedes
+# it (a ccTLD not in the allowlist is filtered anyway). Old stored values
+# of shape {"cctld": [...]} migrate silently to the new shape on read.
+#
+# Matching + the Aho-Corasick automaton live in app.domain_filter (pure,
+# testable, no DB). This module owns only the persisted CONFIG:
+#   {"keywords": [...], "tld_whitelist_enabled": bool}
 DOMAIN_FILTER_KEY = "domain_filter"
 
-# Recognised category keys. The frontend renders a section per recognised
-# key; unknown keys in the stored dict are silently dropped on read so
-# stale entries from a removed category don't surface in the UI.
-DOMAIN_FILTER_CATEGORIES: tuple[str, ...] = ("cctld",)
-
-# Per-entry hard cap so a typo / paste of a giant blob doesn't blow up
-# the JSON column. List-length cap too, for the same reason. Both are
-# enforced at write time; reads silently truncate to be defensive.
-_DOMAIN_FILTER_ENTRY_MAX_LEN = 64
-_DOMAIN_FILTER_LIST_MAX_LEN = 5_000
-
-
-def _normalize_filter_entry(raw: object) -> str | None:
-    """Coerce a single user-entered filter value into the canonical
-    stored form: lowercase, no surrounding whitespace, no leading dot.
-    Returns None for empty / non-string / over-long inputs so the caller
-    can drop the row silently."""
-    if not isinstance(raw, str):
-        return None
-    v = raw.strip().lower()
-    if not v:
-        return None
-    # Strip a leading dot if the user typed ".uk" — store the bare label.
-    while v.startswith("."):
-        v = v[1:]
-    if not v:
-        return None
-    if len(v) > _DOMAIN_FILTER_ENTRY_MAX_LEN:
-        return None
-    # ccTLDs are letters/digits/hyphens only (RFC 1035 LDH). Reject
-    # anything that doesn't look like a label so we don't accept random
-    # strings that'd never match — including internal dots: the cctld
-    # match rule only inspects the final label, so storing `co.uk`
-    # would silently never match and confuse the user. Force them to
-    # store the bare TLD label.
-    for ch in v:
-        if not (ch.isalnum() or ch == "-"):
-            return None
-    return v
+# TLD whitelist defaults OFF (2026-08-24). The operator asked to use their
+# curated Spam Filter list as the source — but that list is the
+# "openly-registrable" default, which OMITS most CIS/EE ccTLDs the operator
+# actually works with (kz, ru, ua, uz, az, by, tj, ge, md, ee, tr — checked
+# live). Defaulting the whitelist ON would therefore silently drop their
+# core .kz/.ru/.ua imports. So the gate is opt-IN: they add the ccTLDs they
+# want to the Spam Filter, then flip this on. Keyword filtering is unaffected
+# (it's active whenever the keyword list is non-empty).
+_DOMAIN_FILTER_TLD_DEFAULT = False
 
 
-def _normalize_filter_list(raw_list: object) -> list[str]:
-    """Validate + dedup (preserving first-seen order) + cap length."""
-    if not isinstance(raw_list, list):
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in raw_list:
-        v = _normalize_filter_entry(item)
-        if v is None or v in seen:
-            continue
-        seen.add(v)
-        out.append(v)
-        if len(out) >= _DOMAIN_FILTER_LIST_MAX_LEN:
-            break
-    out.sort()
-    return out
-
-
-def _normalize_filter_state(raw_state: object) -> dict[str, list[str]]:
-    """Coerce stored / submitted state into the canonical dict shape.
-    Always returns a key per recognised category (empty list when the
-    user hasn't populated it) so the frontend can render every section
-    without null-checks."""
-    out: dict[str, list[str]] = {cat: [] for cat in DOMAIN_FILTER_CATEGORIES}
-    if not isinstance(raw_state, dict):
+def _normalize_domain_filter(raw: object) -> dict:
+    """Coerce stored / submitted config into the canonical shape
+    {"keywords": [str], "tld_whitelist_enabled": bool}. Tolerates the
+    legacy {"cctld": [...]} shape (drops it) and partial dicts."""
+    from .domain_filter import normalize_keywords
+    out = {
+        "keywords": [],
+        "tld_whitelist_enabled": _DOMAIN_FILTER_TLD_DEFAULT,
+    }
+    if not isinstance(raw, dict):
         return out
-    for cat in DOMAIN_FILTER_CATEGORIES:
-        if cat in raw_state:
-            out[cat] = _normalize_filter_list(raw_state[cat])
+    out["keywords"] = normalize_keywords(raw.get("keywords"))
+    tw = raw.get("tld_whitelist_enabled")
+    if isinstance(tw, bool):
+        out["tld_whitelist_enabled"] = tw
     return out
 
 
-def get_domain_filter() -> dict[str, list[str]]:
-    """Current domain-filter state. Always returns a full dict keyed by
-    every recognised category — keys with no user entries map to []."""
+def get_domain_filter() -> dict:
+    """Current domain-filter config, always the full shape."""
     db = SessionLocal()
     try:
         raw = _get(db, DOMAIN_FILTER_KEY) or ""
     finally:
         db.close()
     if not raw:
-        return _normalize_filter_state(None)
+        return _normalize_domain_filter(None)
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return _normalize_filter_state(None)
-    return _normalize_filter_state(parsed)
+        return _normalize_domain_filter(None)
+    return _normalize_domain_filter(parsed)
 
 
-def set_domain_filter(state: dict) -> dict[str, list[str]]:
-    """Replace the entire filter state. Inputs are normalised + sorted.
-    Unknown category keys are silently dropped — only categories in
-    DOMAIN_FILTER_CATEGORIES are persisted."""
+def set_domain_filter(state: dict) -> dict:
+    """Replace the config. Keywords are normalised (lower / dedup / sort);
+    the TLD toggle is coerced to bool. Returns the new effective config."""
     if not isinstance(state, dict):
-        raise ValueError(
-            "domain_filter state must be an object keyed by category name",
-        )
-    cleaned = _normalize_filter_state(state)
+        raise ValueError("domain_filter must be an object")
+    cleaned = _normalize_domain_filter(state)
     db = SessionLocal()
     try:
         _set(db, DOMAIN_FILTER_KEY, json.dumps(cleaned))
@@ -1664,38 +1622,34 @@ def set_domain_filter(state: dict) -> dict[str, list[str]]:
     return cleaned
 
 
+def build_domain_filter_matcher(config: dict | None = None):
+    """Compile a `match(domain) -> reason|None` closure from the current
+    (or given) config + the shared allowed_tlds list. Build ONCE, call in
+    the hot import loop. See app.domain_filter.build_matcher."""
+    from .domain_filter import build_matcher
+    cfg = config if config is not None else get_domain_filter()
+    tld_on = bool(cfg.get("tld_whitelist_enabled"))
+    return build_matcher(
+        keywords=cfg.get("keywords") or [],
+        allowed_tlds=get_allowed_tlds() if tld_on else None,
+        tld_whitelist_enabled=tld_on,
+    )
+
+
 def check_domain_filter(
     domain: str,
-    state: dict[str, list[str]] | None = None,
+    matcher=None,
 ) -> tuple[bool, str | None]:
-    """Return (excluded, category_key) for a single domain. Pure — takes
-    a pre-fetched state for hot loops, falls back to a DB read for
-    one-offs. Reuses the canonical 2-label rule for the `cctld`
-    category; future categories add their own branch here.
+    """(excluded, reason) for ONE domain. `reason` ∈ {"keyword","tld"}.
 
-    Match rule for `cctld`:
-      - `example.uk`     → 2 labels, last in list → excluded.
-      - `example.co.uk`  → 3 labels → NOT excluded (open SLD).
-      - `bbc.co.uk`      → 3 labels → NOT excluded.
-      - `example.com`    → 2 labels but `com` not in list → NOT excluded.
-    """
+    For hot loops pass a prebuilt `matcher` from
+    `build_domain_filter_matcher()`; without one this compiles a fresh
+    matcher per call (fine for one-offs, wasteful in a loop)."""
     if not domain:
         return False, None
-    s = state if state is not None else get_domain_filter()
-    cctlds = s.get("cctld") or []
-    if cctlds:
-        # Domain is already normalised by the time it reaches the
-        # import pipeline (lowercased, scheme/path/www stripped). Be
-        # defensive in case a future caller forgets.
-        dom = domain.strip().lower()
-        if dom.startswith("www."):
-            dom = dom[4:]
-        parts = dom.split(".")
-        if len(parts) == 2:
-            tld = parts[-1]
-            if tld in set(cctlds):
-                return True, "cctld"
-    return False, None
+    m = matcher if matcher is not None else build_domain_filter_matcher()
+    reason = m(domain)
+    return (reason is not None), reason
 
 
 # --- Availability cascade settings (added 2026-05-12) ---------------------

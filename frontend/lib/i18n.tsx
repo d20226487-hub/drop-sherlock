@@ -1242,6 +1242,11 @@ const messagesEn = {
         languageHint:
           "Filter by the wayback_classify-detected primary language (ISO 639-1 code).",
         languageSearchPlaceholder: "Search languages…",
+        languageMatchLabel: "Match",
+        languageMatchHint:
+          "Primary: match only the dominant language. Any: also match domains where the selected language is secondary/tertiary.",
+        languageMatchPrimary: "Primary only",
+        languageMatchAny: "Any (incl. secondary)",
         categoryAny: "Any category",
         categoryLabel: "Category",
         categoryNone: "(no category)",
@@ -1486,30 +1491,41 @@ const messagesEn = {
       domainFilter: {
         heading: "Domain Filter",
         intro:
-          "Block domains from entering the backlog at import time. Today this filters country-level domains; more categories will land here over time.",
+          "Block domains from entering the backlog at import time. Two rules: a stop-keyword list (name contains → filtered) and an allowed-TLD whitelist (TLD not allowed → filtered).",
         bulkOpen: "Bulk paste",
         bulkClose: "Hide bulk paste",
-        bulkHint:
-          "One entry per line, or comma-separated. Whitespace and leading dots are ignored.",
-        bulkAdd: "Add to filter",
+        bulkAdd: "Add all",
         bulkAdding: "Adding…",
         add: "Add",
-        adding: "Adding…",
-        empty: "No entries yet — domains are not filtered until you add some.",
         clearAll: "Clear all",
         confirmClear:
-          "Remove every entry from this category? This cannot be undone.",
-        noCategories: "No filter categories configured.",
+          "Remove every stop keyword? This cannot be undone.",
         removeAria: (v: string) => `Remove ${v}`,
-        fallbackBody:
-          "Domains matching any of these entries are skipped at backlog import.",
-        categories: {
-          cctld: {
-            title: "Country-level TLDs (ccTLD)",
-            body: "Excludes only domains whose TLD label matches AND that have exactly two labels — so `example.uk` is filtered, but `example.co.uk` and `bbc.co.uk` get through (open SLDs under ccTLDs stay registrable).",
-            placeholder: "uk, de, fr",
-            hint: "Just the TLD label (no leading dot). Lowercase. Press Enter to add.",
-          },
+        keywords: {
+          title: "Stop keywords",
+          body: "A domain whose NAME contains any of these (substring, anywhere, case-insensitive) is skipped at import. `casino` catches `mycasino.io`, `casino-bonus.net`. Short tokens over-match (`bet` hits `alphabet.com`) — curate accordingly.",
+          placeholder: "casino",
+          hint: "Substring match, lower-cased. Multi-token phrases OK. Press Enter to add.",
+          empty: "No keywords yet — nothing is keyword-filtered until you add some.",
+          bulkHint:
+            "Separate with new lines, commas, semicolons or pipes. Spaces are NOT separators.",
+        },
+        tld: {
+          title: "Filter out non-allowed TLDs",
+          count: (n: number) => `${n} allowed`,
+          body: "When on, a domain whose TLD isn't in your Allowed TLDs list is skipped at import. This same list is shared with Linked Domains + SERP exports.",
+          cctldWarning: (list: string) =>
+            `Your allowed list is missing common CIS/EE ccTLDs: ${list}. Turning the filter on without them drops those imports.`,
+          addMissing: (n: number) =>
+            `Add the ${n} missing ccTLD${n === 1 ? "" : "s"}`,
+          editorLabel: "Allowed TLDs (one per line, or space/comma-separated)",
+          editorHint: "TLD labels only, no leading dot. Lower-cased + deduped on save. Emptying the box resets to the shipped default.",
+          save: "Save TLDs",
+          saving: "Saving…",
+          saved: "Saved",
+          unsaved: "Unsaved changes",
+          reset: (n: number) => `Reset to default (${n})`,
+          resetConfirm: "Reset the allowed-TLDs list to the shipped default? Your custom additions will be lost.",
         },
       },
       whoisHistory: {
@@ -4073,6 +4089,11 @@ const messagesRu: Messages = {
         languageHint:
           "Фильтр по основному языку, определённому wayback_classify (код ISO 639-1).",
         languageSearchPlaceholder: "Поиск языков…",
+        languageMatchLabel: "Совпадение",
+        languageMatchHint:
+          "Основной: только доминирующий язык. Любой: также домены, где выбранный язык вторичный/третичный.",
+        languageMatchPrimary: "Только основной",
+        languageMatchAny: "Любой (вкл. вторичные)",
         categoryAny: "Любая категория",
         categoryLabel: "Категория",
         categoryNone: "(без категории)",
@@ -4342,30 +4363,40 @@ const messagesRu: Messages = {
       domainFilter: {
         heading: "Фильтр доменов",
         intro:
-          "Блокирует домены при импорте в очередь. Сейчас фильтруются страновые домены; со временем сюда добавятся другие категории.",
+          "Блокирует домены при импорте в очередь. Два правила: список стоп-слов (имя содержит → отфильтрован) и белый список TLD (TLD не разрешён → отфильтрован).",
         bulkOpen: "Массовая вставка",
         bulkClose: "Скрыть вставку",
-        bulkHint:
-          "Одна запись на строку или через запятую. Пробелы и ведущие точки игнорируются.",
-        bulkAdd: "Добавить в фильтр",
+        bulkAdd: "Добавить все",
         bulkAdding: "Добавление…",
         add: "Добавить",
-        adding: "Добавление…",
-        empty: "Пока пусто — домены не фильтруются, пока вы не добавите хотя бы одну запись.",
         clearAll: "Очистить",
         confirmClear:
-          "Удалить все записи в этой категории? Это действие необратимо.",
-        noCategories: "Категории фильтра не настроены.",
+          "Удалить все стоп-слова? Это действие необратимо.",
         removeAria: (v: string) => `Удалить ${v}`,
-        fallbackBody:
-          "Домены, совпадающие с любой из записей, пропускаются при импорте в очередь.",
-        categories: {
-          cctld: {
-            title: "Страновые TLD (ccTLD)",
-            body: "Исключает только домены, у которых TLD из списка И ровно два уровня — `example.uk` будет отфильтрован, а `example.co.uk` и `bbc.co.uk` пройдут (открытые SLD под ccTLD остаются регистрируемыми).",
-            placeholder: "uk, de, fr",
-            hint: "Только метка TLD (без ведущей точки), в нижнем регистре. Enter — добавить.",
-          },
+        keywords: {
+          title: "Стоп-слова",
+          body: "Домен, в ИМЕНИ которого встречается любое из этих слов (подстрока, где угодно, без учёта регистра), пропускается при импорте. `casino` поймает `mycasino.io`, `casino-bonus.net`. Короткие токены дают ложные срабатывания (`bet` в `alphabet.com`) — подбирайте с осторожностью.",
+          placeholder: "casino",
+          hint: "Совпадение по подстроке, в нижнем регистре. Фразы из нескольких слов допустимы. Enter — добавить.",
+          empty: "Стоп-слов пока нет — фильтрация по словам не работает, пока не добавите хотя бы одно.",
+          bulkHint:
+            "Разделяйте переводом строки, запятой, точкой с запятой или вертикальной чертой. Пробел разделителем НЕ считается.",
+        },
+        tld: {
+          title: "Отсекать неразрешённые TLD",
+          count: (n: number) => `разрешено ${n}`,
+          body: "Когда включено, домен, чей TLD отсутствует в вашем списке разрешённых TLD, пропускается при импорте. Этот же список используется в Linked Domains и экспортах SERP.",
+          cctldWarning: (list: string) =>
+            `В вашем списке нет распространённых ccTLD СНГ/Восточной Европы: ${list}. Если включить фильтр без них, такие импорты будут отброшены.`,
+          addMissing: (n: number) => `Добавить недостающие ccTLD (${n})`,
+          editorLabel: "Разрешённые TLD (по одному на строку или через пробел/запятую)",
+          editorHint: "Только метки TLD, без ведущей точки. При сохранении приводятся к нижнему регистру и дедуплицируются. Пустое поле = сброс к списку по умолчанию.",
+          save: "Сохранить TLD",
+          saving: "Сохранение…",
+          saved: "Сохранено",
+          unsaved: "Есть несохранённые изменения",
+          reset: (n: number) => `Сбросить к умолчанию (${n})`,
+          resetConfirm: "Сбросить список разрешённых TLD к значению по умолчанию? Ваши добавления будут потеряны.",
         },
       },
       whoisHistory: {

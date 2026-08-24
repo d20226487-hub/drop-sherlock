@@ -1,6 +1,6 @@
 """Default allowed-TLD list (added 2026-07-10).
 
-Seeded from the Domain Spam Filter's openly-registrable allowlist (563
+Operator-curated canonical allowed-TLD set (568
 entries: open gTLDs + ccTLDs + registrable SLDs like co.uk, minus carved-
 out spam magnets) ??? the user's canonical "TLDs worth keeping" set. Used
 as the DEFAULT for the editable Settings list (app_settings key
@@ -28,6 +28,7 @@ DEFAULT_ALLOWED_TLDS: list[str] = [
     "analytics",
     "apartments",
     "app",
+    "ar",
     "archi",
     "army",
     "art",
@@ -114,7 +115,9 @@ DEFAULT_ALLOWED_TLDS: list[str] = [
     "college",
     "com",
     "com.ag",
+    "com.ar",
     "com.co",
+    "com.kz",
     "com.mx",
     "com.ua",
     "community",
@@ -298,6 +301,7 @@ DEFAULT_ALLOWED_TLDS: list[str] = [
     "kitchen",
     "kiwi",
     "kiwi.nz",
+    "kz",
     "la",
     "land",
     "lat",
@@ -366,7 +370,9 @@ DEFAULT_ALLOWED_TLDS: list[str] = [
     "navy",
     "net",
     "net.ag",
+    "net.ar",
     "net.co",
+    "net.kz",
     "net.mx",
     "net.nz",
     "network",
@@ -387,6 +393,8 @@ DEFAULT_ALLOWED_TLDS: list[str] = [
     "ooo",
     "org",
     "org.ag",
+    "org.ar",
+    "org.kz",
     "org.mx",
     "org.nz",
     "org.uk",
@@ -453,7 +461,6 @@ DEFAULT_ALLOWED_TLDS: list[str] = [
     "rodeo",
     "room",
     "rsvp",
-    "ru",
     "run",
     "safe",
     "safety",
@@ -500,8 +507,6 @@ DEFAULT_ALLOWED_TLDS: list[str] = [
     "studio",
     "study",
     "style",
-    "su",
-    "sucks",
     "supplies",
     "supply",
     "support",

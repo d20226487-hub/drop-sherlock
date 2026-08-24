@@ -57,6 +57,15 @@ export default function SettingsPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [tab, setTab] = useState<SettingsTab>("api");
 
+  // Honor `?tab=<name>` so deep links (e.g. the Domain Filter's "edit the
+  // allowed-TLDs list" pointer to SERP Overview) land on the right tab.
+  // Read from window.location in an effect to avoid a useSearchParams
+  // Suspense boundary on this otherwise-static page.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get("tab");
+    if (q && (TABS as string[]).includes(q)) setTab(q as SettingsTab);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     api

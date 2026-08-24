@@ -384,6 +384,11 @@ export default function DatabasePage() {
   const [statusFilter, setStatusFilter] = useState<BacklogStatus[]>([]);
   // wayback_classify filters (added 2026-05-09).
   const [languages, setLanguages] = useState<string[]>([]);
+  // Language match mode: "primary" (dominant only) or "any" (also
+  // matches secondary/tertiary languages from wayback_classify).
+  const [languageMatch, setLanguageMatch] = useState<"primary" | "any">(
+    "primary",
+  );
   const [categories, setCategories] = useState<string[]>([]);
   // Whois ownership-cycles filter (added 2026-05-21). 0 = off; >=1
   // shows only rows where the deterministic cycle counter from the
@@ -477,6 +482,8 @@ export default function DatabasePage() {
           );
         }
         if (Array.isArray(v.languages)) setLanguages(v.languages);
+        if (v.languageMatch === "any" || v.languageMatch === "primary")
+          setLanguageMatch(v.languageMatch);
         if (Array.isArray(v.categories)) setCategories(v.categories);
         if (typeof v.waybackConfMin === "number") setWaybackConfMin(v.waybackConfMin);
         if (typeof v.ahrefsConfMin === "number") setAhrefsConfMin(v.ahrefsConfMin);
@@ -542,6 +549,7 @@ export default function DatabasePage() {
             sourceFilter,
             statusFilter,
             languages,
+            languageMatch,
             categories,
             waybackConfMin,
             ahrefsConfMin,
@@ -571,6 +579,7 @@ export default function DatabasePage() {
     sourceFilter,
     statusFilter,
     languages,
+    languageMatch,
     categories,
     waybackConfMin,
     ahrefsConfMin,
@@ -790,6 +799,7 @@ export default function DatabasePage() {
         whois_band: whoisBands,
         availability: availabilityFilter,
         language: languages,
+        language_match: languageMatch,
         category: categories,
         criterion: criteria,
         notes: notesFilter,
@@ -865,6 +875,7 @@ export default function DatabasePage() {
     whoisBands,
     availabilityFilter,
     languages,
+    languageMatch,
     categories,
     criteria,
     notesFilter,
@@ -898,6 +909,7 @@ export default function DatabasePage() {
       whoisBands,
       availabilityFilter,
       languages,
+      languageMatch,
       categories,
       criteria,
       notesFilter,
@@ -937,6 +949,7 @@ export default function DatabasePage() {
     whoisBands,
     availabilityFilter,
     languages,
+    languageMatch,
     categories,
     criteria,
     notesFilter,
@@ -1137,6 +1150,7 @@ export default function DatabasePage() {
         whois_band: whoisBands,
         availability: availabilityFilter,
         language: languages,
+        language_match: languageMatch,
         category: categories,
         criterion: criteria,
         notes: notesFilter,
@@ -1438,6 +1452,7 @@ export default function DatabasePage() {
         whois_band: whoisBands,
         availability: availabilityFilter,
         language: languages,
+        language_match: languageMatch,
         category: categories,
         criterion: criteria,
         notes: notesFilter,
@@ -1612,6 +1627,7 @@ export default function DatabasePage() {
     setWhoisBands([]);
     setAvailabilityFilter([]);
     setLanguages([]);
+    setLanguageMatch("primary");
     setCategories([]);
     setCriteria([]);
     // setCache + setPinFilter removed (controls deleted 2026-05-23).
@@ -1779,6 +1795,7 @@ export default function DatabasePage() {
               whois_band: whoisBands,
               availability: availabilityFilter,
               language: languages,
+              language_match: languageMatch,
               category: categories,
               criterion: criteria,
               notes: notesFilter,
@@ -2147,6 +2164,31 @@ export default function DatabasePage() {
             searchable
             searchPlaceholder={ts.filters.languageSearchPlaceholder}
           />
+
+          {/* Language match mode — only meaningful once a language is
+              selected. "any" also matches secondary/tertiary languages. */}
+          {languages.length > 0 && (
+            <label className="flex flex-col gap-1 text-xs">
+              <span
+                className="text-neutral-600 dark:text-neutral-400"
+                title={ts.filters.languageMatchHint}
+              >
+                {ts.filters.languageMatchLabel}
+              </span>
+              <select
+                value={languageMatch}
+                onChange={(e) =>
+                  setLanguageMatch(e.target.value as "primary" | "any")
+                }
+                className="rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-sm outline-none"
+              >
+                <option value="primary">
+                  {ts.filters.languageMatchPrimary}
+                </option>
+                <option value="any">{ts.filters.languageMatchAny}</option>
+              </select>
+            </label>
+          )}
 
           <MultiSelectFilter
             label={ts.filters.categoryLabel}

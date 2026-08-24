@@ -164,12 +164,11 @@ class ImportResult(BaseModel):
     # Distinct from duplicates so the user can tell "this was already in
     # the backlog" apart from "this is permanently banned".
     skipped_banned: int = 0
-    # Per-category counters for the Settings → Domain Filter exclusions
-    # (added 2026-06-07). Shape is `{category_key: count}` — today only
-    # `cctld` is populated. Designed so new categories (spam-keywords,
-    # banned-substrings, …) flow through with zero schema or UI churn:
-    # the frontend just iterates the dict and shows one line per non-
-    # zero entry. Empty dict when nothing was filtered.
+    # Per-reason counters for the Settings → Domain Filter exclusions
+    # (added 2026-06-07; reshaped 2026-08-24). Shape is `{reason: count}`
+    # with reason ∈ {"keyword", "tld"}. The frontend iterates the dict and
+    # shows one line per non-zero entry. Empty dict when nothing was
+    # filtered.
     skipped_filtered: dict[str, int] = {}
     # Subset of rejected-row diagnostics the UI surfaces ("row 12: bad
     # date"). Capped on the backend to keep the response small for huge
@@ -1465,24 +1464,26 @@ def import_rows(payload: ImportIn, db: Session = Depends(get_db)) -> ImportResul
         valid = [r for r in valid if r.domain not in banned_set]
     skipped_banned = len(banned_set)
 
-    # Domain Filter pre-filter (added 2026-06-07). Settings → Domain
-    # Filter holds a per-category exclusion list (today only `cctld`).
-    # Fetch the state ONCE here so the hot per-row loop below is just
-    # a string-split — even at the 10M-row cap the cost is negligible.
-    # Per-category counters bubble up in `skipped_filtered` so the
-    # UI can render "Skipped X by Country TLD" cleanly.
-    from ..app_settings import (
-        check_domain_filter,
-        get_domain_filter,
-    )
-    filter_state = get_domain_filter()
+    # Domain Filter pre-filter (added 2026-06-07; reshaped 2026-08-24 to
+    # stop-keywords + allowed-TLD whitelist). COMPILE the matcher ONCE
+    # here — it builds an Aho-Corasick automaton for the keywords + a TLD
+    # set matcher — so the hot per-row loop is O(len(domain)) with no DB
+    # and no recompilation (benchmarked 657ms for 500K domains × 250
+    # keywords). Reasons bubble up in `skipped_filtered` keyed by
+    # "keyword" / "tld" so the UI can report each separately.
+    from ..app_settings import build_domain_filter_matcher, get_domain_filter
+    filter_cfg = get_domain_filter()
+    domain_matcher = build_domain_filter_matcher(filter_cfg)
     skipped_filtered: dict[str, int] = {}
-    if any(filter_state.get(k) for k in filter_state):
+    filter_active = bool(filter_cfg.get("keywords")) or bool(
+        filter_cfg.get("tld_whitelist_enabled")
+    )
+    if filter_active:
         kept: list[ImportRowIn] = []
         for r in valid:
-            excluded, cat = check_domain_filter(r.domain, filter_state)
-            if excluded and cat:
-                skipped_filtered[cat] = skipped_filtered.get(cat, 0) + 1
+            reason = domain_matcher(r.domain)
+            if reason:
+                skipped_filtered[reason] = skipped_filtered.get(reason, 0) + 1
             else:
                 kept.append(r)
         valid = kept
