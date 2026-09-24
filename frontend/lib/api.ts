@@ -2297,6 +2297,30 @@ export const api = {
     );
   },
 
+  // Domain NAMES matching the given filters (2026-09-24) — sibling of
+  // getRunDomainIds, same server-side filter. Backs the availability Run
+  // page's one-click "copy unresolved domains" button, which needs a
+  // paste-ready host list for the whole run (the page only holds a page).
+  getRunDomainNames: (
+    runId: number,
+    opts?: {
+      status?: string;
+      availabilityStatuses?: string[];
+      domainFilter?: string;
+    },
+  ) => {
+    const qs = new URLSearchParams();
+    if (opts?.status) qs.set("status_filter", opts.status);
+    for (const s of opts?.availabilityStatuses ?? []) {
+      qs.append("availability_status_filter", s);
+    }
+    if (opts?.domainFilter) qs.set("domain_filter", opts.domainFilter);
+    const suffix = qs.toString();
+    return request<{ domains: string[]; count: number }>(
+      `/runs/${runId}/domain-names${suffix ? `?${suffix}` : ""}`,
+    );
+  },
+
   getRunDomain: (runDomainId: number) =>
     request<RunDomainDetail>(`/run-domains/${runDomainId}`),
 

@@ -29,6 +29,33 @@ import { ReanalyzeBar } from "@/components/reanalyze-bar";
 import { CsvColumn, csvFilename, downloadBlob, toCsv } from "@/lib/csv";
 import { isLowConfidence } from "@/lib/score";
 
+// Copy text to the clipboard with a fallback for non-secure contexts
+// (the LAN deploy is plain http, where navigator.clipboard is undefined).
+// Same shape as the Tools pages' helper.
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to the textarea fallback
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 // Format $ amount: 4 decimal places under $1, 2 above. Picked so micro-
 // runs (a few thousand tokens at $0.075/M ≈ $0.0008) don't render as
 // "$0.00", but big runs aren't cluttered with trailing zeros.
@@ -2113,6 +2140,62 @@ function AvailabilityVerdictFilter({
   );
 }
 
+// The three verdict buckets that mean "the cascade didn't give me a
+// usable answer": not_supported (private multi-label suffix the cascade
+// refuses to guess on), unknown (ran, couldn't determine) and error (all
+// providers errored). `no_verdict` is deliberately NOT here — those rows
+// have a missing/failed CR rather than a verdict, and are handled by the
+// Retry-failed path instead.
+const UNRESOLVED_AVAILABILITY_BUCKETS = ["not_supported", "unknown", "error"];
+
+// One-click "copy every unresolved domain in this run" (2026-09-24).
+// Deliberately run-wide and independent of the filter row above it: the
+// point is to grab the whole re-check list in one gesture, from whatever
+// view you happen to be on. Fetches names server-side because the
+// availability page paginates and only holds one page in memory.
+function CopyUnresolvedButton({ runId }: { runId: number }) {
+  const { t } = useT();
+  const ts = t.pages.jobs.run;
+  const [flash, setFlash] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function copyUnresolved() {
+    setBusy(true);
+    try {
+      const r = await api.getRunDomainNames(runId, {
+        availabilityStatuses: UNRESOLVED_AVAILABILITY_BUCKETS,
+      });
+      if (r.domains.length === 0) {
+        setFlash(ts.copyUnresolvedNone);
+      } else {
+        const ok = await copyText(r.domains.join("\n"));
+        setFlash(
+          ok
+            ? ts.copyUnresolvedDone(r.domains.length.toLocaleString())
+            : ts.copyUnresolvedFailed,
+        );
+      }
+    } catch {
+      setFlash(ts.copyUnresolvedFailed);
+    } finally {
+      setBusy(false);
+      setTimeout(() => setFlash(null), 2500);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={copyUnresolved}
+      disabled={busy}
+      className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+      title={ts.copyUnresolvedHelp}
+    >
+      {flash ?? (busy ? ts.copyUnresolvedBusy : ts.copyUnresolved)}
+    </button>
+  );
+}
+
 function DomainsSection({
   domains,
   jobId,
@@ -2407,7 +2490,15 @@ function DomainsSection({
     <section className="space-y-3">
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <h2 className="text-lg font-semibold">{ts.domainsHeading}</h2>
-        {domains.length > 0 && (
+        {/* Server-paginated kinds gate on the RUN-wide count, not the
+            current page (changed 2026-09-24): their actions here are
+            server-streamed and run-wide, so a filter that narrows the
+            visible page to zero rows must not take the export / copy
+            buttons away with it. Client-paginated (quality) kinds keep
+            the `domains.length` gate — their CSV is built from the
+            in-memory set, so with nothing in it there's nothing to
+            export. */}
+        {(serverPaginated ? totalCount > 0 : domains.length > 0) && (
           <div className="flex items-center gap-2">
             {jobKind === "ahrefs_batch_analysis" ? (
               // Server-streamed full CSV (domain × selected metrics, all
@@ -2425,13 +2516,16 @@ function DomainsSection({
               // Availability also paginates server-side, so the client CSV
               // (which reads the in-memory page) would be incomplete —
               // stream the full verdict table from the backend instead.
-              <a
-                href={availabilityCsvUrl(runId)}
-                className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
-                title={ts.exportAllHelp}
-              >
-                {ts.exportAll(totalCount)}
-              </a>
+              <>
+                <CopyUnresolvedButton runId={runId} />
+                <a
+                  href={availabilityCsvUrl(runId)}
+                  className="text-xs px-2 py-1 rounded-md border dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                  title={ts.exportAllHelp}
+                >
+                  {ts.exportAll(totalCount)}
+                </a>
+              </>
             ) : (
               <>
                 <button

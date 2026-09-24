@@ -754,6 +754,15 @@ const messagesEn = {
         exportVisibleHelp:
           "Download a CSV of the rows currently matching your search.",
         exportAllHelp: "Download every domain in this run.",
+        // One-click copy of the availability run's unresolved domains
+        // (2026-09-24) — not supported + unknown + error, run-wide.
+        copyUnresolved: "Copy unresolved",
+        copyUnresolvedHelp:
+          "Copy every domain in this run whose availability verdict is \"not supported\", \"unknown\" or \"error\" — one per line, ready to paste back into a new check. Covers the whole run; the filters below are ignored.",
+        copyUnresolvedBusy: "Copying…",
+        copyUnresolvedDone: (n: string) => `Copied ${n} ✓`,
+        copyUnresolvedNone: "Nothing unresolved",
+        copyUnresolvedFailed: "Copy failed",
         // Score-weights override panel (added 2026-05-13 wave J).
         scoreWeightsHeading: "Score weights",
         scoreWeightsHint:
@@ -3590,6 +3599,14 @@ const messagesRu: Messages = {
         exportVisibleHelp:
           "Скачать CSV строк, которые сейчас подходят под поиск.",
         exportAllHelp: "Скачать каждый домен этого запуска.",
+        // Копирование «нерешённых» доменов запуска доступности (2026-09-24).
+        copyUnresolved: "Копировать нерешённые",
+        copyUnresolvedHelp:
+          "Скопировать все домены запуска с вердиктом «не поддерживается», «неизвестно» или «ошибка» — по одному в строке, готово для вставки в новую проверку. Берётся весь запуск, фильтры ниже не учитываются.",
+        copyUnresolvedBusy: "Копирование…",
+        copyUnresolvedDone: (n) => `Скопировано ${n} ✓`,
+        copyUnresolvedNone: "Нерешённых нет",
+        copyUnresolvedFailed: "Не удалось скопировать",
         scoreWeightsHeading: "Веса итогового балла",
         scoreWeightsHint:
           "Пересчитать итоговые баллы этого запуска с другими весами критериев. Текст резюме и рекомендация от ИИ остаются без изменений — заменяется только числовой итог и доверие. Частичные строки (где критерий не прошёл синтез) пропускаются.",

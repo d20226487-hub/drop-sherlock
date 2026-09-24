@@ -4067,6 +4067,41 @@ def get_run_domain_ids(
     return {"ids": ids, "count": len(ids)}
 
 
+@runs_router.get("/{run_id}/domain-names")
+def get_run_domain_names(
+    run_id: int,
+    db: Session = Depends(get_db),
+    status_filter: str | None = None,
+    availability_status_filter: list[str] | None = Query(None),
+    domain_filter: str | None = None,
+) -> dict:
+    """The domain NAMES matching the current Run-page filters, in the same
+    stable id order as the table. Sibling of `/domain-ids` (same
+    `_run_domain_filter_q` helper, so the two can never disagree) — powers
+    the one-click "copy these domains" buttons, where the frontend wants a
+    paste-ready host list rather than RunDomain ids.
+
+    Added 2026-09-24 for the availability Run page's "copy unresolved"
+    button (not_supported + unknown + error), but the filter args are the
+    generic ones so any surface can reuse it."""
+    run = db.query(Run).filter(Run.id == run_id).one_or_none()
+    if run is None:
+        raise HTTPException(404, "run not found")
+    q = _run_domain_filter_q(
+        db, run.id,
+        status_filter=status_filter,
+        availability_status_filter=availability_status_filter,
+        domain_filter=domain_filter,
+    )
+    domains = [
+        d
+        for (d,) in q.with_entities(RunDomain.domain)
+        .order_by(RunDomain.id.asc())
+        .all()
+    ]
+    return {"domains": domains, "count": len(domains)}
+
+
 @runs_router.get("/{run_id}/events")
 async def stream_run_events(run_id: int):
     """Server-Sent Events stream of run status. Wraps `get_run_status`
