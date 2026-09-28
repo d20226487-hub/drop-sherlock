@@ -2265,15 +2265,30 @@ def _apply_domain_filters(
 
 
 def _apply_domain_search(rows: list[DomainRow], search: str) -> list[DomainRow]:
+    """Case-insensitive substring match across the free-text the operator
+    can actually see in the table: the domain, the pinned job's name, the
+    note, and the Theme column.
+
+    Theme added 2026-09-28. `primary_theme` is what the Theme cell renders
+    and `secondary_themes` is what its tooltip lists, so both are matched —
+    searching "casino" should find a row whose theme is only a secondary.
+    Themes are AI-assigned free text, which is exactly the kind of column a
+    search box is for, and it was the last visible text column not covered.
+    """
     q = (search or "").strip().lower()
     if not q:
         return rows
-    return [
-        r for r in rows
-        if q in r.domain.lower()
-        or q in (r.pinned_job_name or "").lower()
-        or q in (r.note or "").lower()
-    ]
+
+    def hit(r: DomainRow) -> bool:
+        return (
+            q in r.domain.lower()
+            or q in (r.pinned_job_name or "").lower()
+            or q in (r.note or "").lower()
+            or q in (r.primary_theme or "").lower()
+            or any(q in (t or "").lower() for t in (r.secondary_themes or []))
+        )
+
+    return [r for r in rows if hit(r)]
 
 
 def _apply_domain_sort(

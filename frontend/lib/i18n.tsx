@@ -1033,7 +1033,7 @@ const messagesEn = {
         "Every domain you've analyzed. Each row's data comes from a manually-pinned run — pick a definitive run per domain (or pin an entire run from its detail page). Unpinned domains appear with empty cells until you choose a run.",
       empty: "No domains yet — kick off your first analysis on the Analyze page.",
       noMatch: "No domains match your filters.",
-      searchPlaceholder: "Search domain, pinned run, or note…",
+      searchPlaceholder: "Search domain, theme, pinned run, or note…",
       cols: {
         // 2026-05-17: row-number column for "I'm on row N" orientation.
         rowNumber: "#",
@@ -3894,7 +3894,7 @@ const messagesRu: Messages = {
         "Каждый проанализированный домен. Данные строки берутся из вручную зафиксированного запуска — выберите основной запуск на домен (или зафиксируйте весь запуск с его страницы). Незафиксированные домены показаны с пустыми ячейками, пока вы не выберете запуск.",
       empty: "Доменов пока нет — запустите первый анализ на странице Анализ.",
       noMatch: "Нет доменов, подходящих под фильтры.",
-      searchPlaceholder: "Поиск по домену, запуску или заметке…",
+      searchPlaceholder: "Поиск по домену, теме, запуску или заметке…",
       cols: {
         // 2026-05-17: row-number column for "I'm on row N" orientation.
         rowNumber: "№",
