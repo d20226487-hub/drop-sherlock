@@ -319,6 +319,10 @@ export type CriteriaSpec = {
     // buckets mirror Ahrefs's own UI; backend resolves the enum to a
     // date string at build time.
     date_compared: "off" | "3m" | "6m" | "1y" | "2y" | "5y";
+    // Historical snapshot date, YYYY-MM-DD (2026-10-26). "" = today.
+    // Distinct from date_compared, which keeps the snapshot on today and
+    // only annotates it with prior-period columns.
+    date: string;
   };
   // stop_words (added 2026-08-24): asks Ahrefs for ONLY the anchors /
   // organic keywords that CONTAIN one of the operator's stop words, then
@@ -341,6 +345,9 @@ export type CriteriaSpec = {
     // hard spend ceiling for its endpoint.
     anchor_limit: number;
     keyword_limit: number;
+    // Historical snapshot date for the KEYWORDS source only, YYYY-MM-DD
+    // (2026-10-26). "" = today. Anchors takes no date.
+    keyword_date: string;
     terms?: string[];
     // Legacy shared cap. Still emitted by the backend (inherited from
     // CriterionBase) but no longer used by the request builder; kept

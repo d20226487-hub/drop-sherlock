@@ -204,9 +204,25 @@ const messagesEn = {
         languagesHint:
           "Empty = no language filter. Multiple = OR-matched against each row's languages array.",
       },
+      // Snapshot-date presets, shared by the Keywords and Stop Words
+      // cards (2026-10-26). Relative wording on purpose: the operator
+      // thinks in "a year ago", and the resolved absolute date is shown
+      // under the control so nothing is hidden.
+      snapshotPresets: {
+        live: "Today (live)",
+        "3m": "3 months ago",
+        "6m": "6 months ago",
+        "1y": "1 year ago",
+        "2y": "2 years ago",
+        "5y": "5 years ago",
+      } as Record<string, string>,
+      snapshotExact: (d: string) => `Exact date: ${d}`,
       keywords: {
         // Ahrefs organic-keywords `date_compared` (2026-05-17). Predefined
         // buckets mirror Ahrefs's own UI choices.
+        snapshotDateLabel: "Snapshot date",
+        snapshotDateHelp:
+          "Which day's organic-keyword snapshot to fetch. Ahrefs requires a date; leaving this blank asks for today. On a dropped domain today usually returns nothing \u2014 the site is deindexed \u2014 so pick a date from while it was live to see what it actually ranked for. This is not the same as Compare to, which keeps the snapshot on today and only adds prior-period columns.",
         dateComparedLabel: "Compare to",
         dateComparedHelp:
           "Optional. When set, Ahrefs adds prior-period `_prev` fields to each row so the AI judge sees keyword-footprint trend (growing vs decaying).",
@@ -235,6 +251,9 @@ const messagesEn = {
         anchorLimitHelp:
           "Max anchor rows to fetch, worst-first (by referring domains). Hard spend ceiling for the anchors request. Anchors cost ~14 units/row.",
         keywordLimitLabel: "Keyword rows",
+        keywordDateLabel: "Keyword snapshot date",
+        keywordDateHelp:
+          "Which day's organic-keyword snapshot to scan for stop words. Blank = today. A dropped domain ranks for nothing today, so a today-scan reports every dead drop as clean no matter how spammy it used to be \u2014 pick a date from while it was live. Anchors are unaffected: backlinks persist after a site dies, so that source needs no date.",
         keywordLimitHelp:
           "Max organic-keyword rows to fetch, worst-first (by traffic). Hard spend ceiling for the keywords request. Keywords cost ~33 units/row — ~2.4x anchors.",
         requestHint: (requests: number) =>
@@ -3083,7 +3102,19 @@ const messagesRu: Messages = {
         languagesHint:
           "Пусто = без фильтра по языку. Несколько = ИЛИ-сравнение с массивом языков каждой строки.",
       },
+      snapshotPresets: {
+        live: "Сегодня (live)",
+        "3m": "3 месяца назад",
+        "6m": "6 месяцев назад",
+        "1y": "1 год назад",
+        "2y": "2 года назад",
+        "5y": "5 лет назад",
+      } as Record<string, string>,
+      snapshotExact: (d) => `Точная дата: ${d}`,
       keywords: {
+        snapshotDateLabel: "Дата среза",
+        snapshotDateHelp:
+          "За какой день брать срез органических ключей. Ahrefs требует дату; пустое поле — сегодня. У дроп-домена сегодня обычно нет ничего — сайт уже выпал из индекса — поэтому выберите дату из периода, когда он был жив, чтобы увидеть реальные ключи. Это не то же, что «Сравнить с»: тот параметр оставляет срез на сегодня и лишь добавляет колонки прошлого периода.",
         dateComparedLabel: "Сравнить с",
         dateComparedHelp:
           "Опционально. Если указать, Ahrefs добавит к каждой строке поля `_prev` за прошлый период — ИИ-судья видит тренд по ключам (рост или просадка).",
@@ -3112,6 +3143,9 @@ const messagesRu: Messages = {
         anchorLimitHelp:
           "Сколько строк анкоров забрать, худшие первыми (по числу ссылающихся доменов). Жёсткий потолок расхода на запрос анкоров. Анкоры ~14 юнитов/строка.",
         keywordLimitLabel: "Строк ключей",
+        keywordDateLabel: "Дата среза ключей",
+        keywordDateHelp:
+          "За какой день проверять органические ключи на стоп-слова. Пусто — сегодня. Дроп-домен сегодня не ранжируется ни по чему, поэтому проверка на сегодня помечает любой мёртвый домен как чистый, каким бы спамным он ни был — выберите дату из периода его жизни. На анкоры не влияет: ссылки остаются и после смерти сайта, там дата не нужна.",
         keywordLimitHelp:
           "Сколько строк органических ключей забрать, худшие первыми (по трафику). Жёсткий потолок расхода на запрос ключей. Ключи ~33 юнита/строка — в ~2.4 раза дороже анкоров.",
         requestHint: (requests: number) =>

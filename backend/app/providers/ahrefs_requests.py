@@ -254,8 +254,14 @@ def build_stop_words_requests(
             extra: dict[str, str] = {}
             if criterion == "keywords":
                 # organic-keywords requires a `date` snapshot parameter,
-                # same as the plain K criterion.
-                extra["date"] = _today_iso()
+                # same as the plain K criterion. Anchors takes none.
+                # Blank = today; a chosen date scans the stop words
+                # against that historical snapshot, which is the only way
+                # the keyword source says anything useful about a drop.
+                extra["date"] = (
+                    normalize_snapshot_date(getattr(cfg, "keyword_date", ""))
+                    or _today_iso()
+                )
             url = _build_url(
                 criterion=criterion,
                 target=target,
@@ -442,17 +448,56 @@ _DATE_COMPARED_DELTAS_DAYS: dict[str, int] = {
 }
 
 
-def _resolve_date_compared(choice: str) -> str | None:
+def normalize_snapshot_date(raw: object) -> str:
+    """Validate an operator-supplied YYYY-MM-DD snapshot date.
+
+    Returns "" for anything unusable so callers fall back to today. A
+    future date is rejected rather than passed through: Ahrefs has no
+    data for it, and a silent empty result would read exactly like a
+    legitimately dead domain — the failure mode this whole feature
+    exists to remove.
+    """
+    if not isinstance(raw, str):
+        return ""
+    s = raw.strip()
+    if not s:
+        return ""
+    try:
+        d = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return ""
+    if d > datetime.now(timezone.utc):
+        return ""
+    return d.strftime("%Y-%m-%d")
+
+
+def _resolve_date_compared(choice: str, base: str | None = None) -> str | None:
     """Translate a `KeywordsConfig.date_compared` enum value into the
     YYYY-MM-DD string Ahrefs expects. Returns None when the user picked
-    'off' (or any unknown sentinel) so the caller can skip the param."""
+    'off' (or any unknown sentinel) so the caller can skip the param.
+
+    The delta is measured back from `base` — the request's own `date`
+    snapshot — NOT from today. That distinction was dormant while `date`
+    was locked to today, but became a real bug when the snapshot date
+    turned operator-selectable (2026-10-26): `date=2023-06-15` with
+    `date_compared=1y` would otherwise send today-minus-a-year, a
+    comparison point AFTER the snapshot it is supposed to precede.
+    """
     days = _DATE_COMPARED_DELTAS_DAYS.get(choice)
     if days is None:
         return None
     from datetime import timedelta
-    return (
-        datetime.now(timezone.utc) - timedelta(days=days)
-    ).strftime("%Y-%m-%d")
+    anchor = None
+    if base:
+        try:
+            anchor = datetime.strptime(base, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            anchor = None
+    if anchor is None:
+        anchor = datetime.now(timezone.utc)
+    return (anchor - timedelta(days=days)).strftime("%Y-%m-%d")
 
 
 def _build_url(
@@ -613,11 +658,15 @@ def _preview_wayback(domain: str, cfg: WaybackConfig) -> PreviewedRequest:
 
 
 def _preview_keywords(domain: str, cfg: KeywordsConfig) -> PreviewedRequest:
-    # organic-keywords requires a `date` snapshot parameter. For our locked
-    # "live" mode we send today's UTC date — matches what the Ahrefs UI uses
-    # when no explicit date filter is set.
+    # organic-keywords requires a `date` snapshot parameter. Blank config
+    # date = today's UTC date, matching what the Ahrefs UI does with no
+    # explicit filter; an operator-chosen date queries that historical
+    # snapshot instead, which is the only way to see what a now-dead
+    # domain used to rank for.
     order_by = _build_order_by(cfg.sort)
-    extra: dict[str, str] = {"date": _today_iso()}
+    extra: dict[str, str] = {
+        "date": normalize_snapshot_date(getattr(cfg, "date", "")) or _today_iso()
+    }
     # Optional `date_compared` (2026-05-17) — Ahrefs returns one row per
     # "keyword event" (gained / lost / changed); rows for keywords that
     # exist at one date but not the other carry null base fields, and
@@ -627,7 +676,8 @@ def _preview_keywords(domain: str, cfg: KeywordsConfig) -> PreviewedRequest:
     # augment SELECT with `_prev` mirrors of the columns that have
     # historical analogs so the AI judge sees both periods.
     select = list(SELECT_FIELDS["keywords"])
-    dc = _resolve_date_compared(cfg.date_compared)
+    # Anchored on the request's own snapshot date, not today.
+    dc = _resolve_date_compared(cfg.date_compared, extra["date"])
     if dc is not None:
         extra["date_compared"] = dc
         # `is_branded` doesn't have a `_prev` mirror — Ahrefs returns

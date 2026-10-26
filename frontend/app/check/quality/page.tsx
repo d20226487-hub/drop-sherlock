@@ -77,6 +77,7 @@ const DEFAULT_CRITERIA: CriteriaSpec = {
     limit: 20,
     sort: [],
     date_compared: "off",
+    date: "",
   },
   // stop_words (2026-08-24): opt-in. Queries the anchors + organic-
   // keywords endpoints filtered to rows CONTAINING one of the operator's
@@ -89,6 +90,7 @@ const DEFAULT_CRITERIA: CriteriaSpec = {
     source: "both",
     anchor_limit: 20,
     keyword_limit: 20,
+    keyword_date: "",
   },
   // Wayback: opt-in. Hits the free CDX API — see WaybackCard for filter
   // semantics. Defaults updated 2026-05-07 after a 35-domain batch

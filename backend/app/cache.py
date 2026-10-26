@@ -153,6 +153,16 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
                 "keyword_limit": getattr(cfg, "keyword_limit", None)
                 or getattr(cfg, "limit", 20),
                 "source": getattr(cfg, "source", "both"),
+                # Historical snapshot date (2026-10-26). Omitted when
+                # blank so rows hashed before the field existed keep
+                # matching; a chosen date MUST bust the cache, since the
+                # same word list against a different date is a different
+                # question entirely.
+                **(
+                    {"keyword_date": getattr(cfg, "keyword_date", "")}
+                    if getattr(cfg, "keyword_date", "")
+                    else {}
+                ),
                 "terms": sorted(
                     normalize_stop_words(getattr(cfg, "terms", None) or [])
                 ),
@@ -222,6 +232,18 @@ def compute_params_hash(criterion: str, cfg: CriterionConfig) -> str:
     # from the default "off" so pre-feature cache rows still match for
     # jobs that don't use the comparison.
     if criterion == "keywords":
+        # Historical snapshot date (2026-10-26). Omitted when blank so
+        # rows hashed before the field existed keep matching. A chosen
+        # date MUST bust the cache: same target, same limit, different
+        # point in time is an entirely different answer.
+        #
+        # Note the asymmetry — a BLANK date resolves to "today" at
+        # request time but contributes nothing to the hash, so a row
+        # fetched yesterday is still served today. That is pre-existing
+        # behaviour (today's date was never hashed) and unchanged here.
+        kw_date = getattr(cfg, "date", "")
+        if kw_date:
+            payload["date"] = kw_date
         dc = getattr(cfg, "date_compared", "off")
         if dc and dc != "off":
             payload["date_compared"] = dc

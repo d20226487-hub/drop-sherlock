@@ -238,6 +238,96 @@ const SORT_FIELDS_ANCHORS: SortField[] = [
   "first_seen",
 ];
 
+// Snapshot-date presets (2026-10-26). The operator thinks in "a year
+// ago", not in calendar days, and the native <input type="date"> rendered
+// as mm/dd/yyyy — a US format on a Russian-locale UI.
+//
+// The dropdown resolves to an ABSOLUTE YYYY-MM-DD the moment it is
+// picked, and that is what the spec stores. Keeping the relative bucket
+// instead would make a saved job drift: re-running it next year would
+// silently query a different snapshot, and `compute_params_hash` would
+// still call it a cache hit. Same reasoning as Stop Words snapshotting
+// its word list at submit time rather than reading it live.
+//
+// Deltas mirror the backend's `_DATE_COMPARED_DELTAS_DAYS` so the two
+// date controls on the Keywords card agree on what "1y" means.
+const SNAPSHOT_PRESETS: { id: string; days: number }[] = [
+  { id: "live", days: 0 },
+  { id: "3m", days: 90 },
+  { id: "6m", days: 180 },
+  { id: "1y", days: 365 },
+  { id: "2y", days: 730 },
+  { id: "5y", days: 1825 },
+];
+
+function resolveSnapshotPreset(id: string): string {
+  const p = SNAPSHOT_PRESETS.find((x) => x.id === id);
+  if (!p || p.days === 0) return "";
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - p.days);
+  return d.toISOString().slice(0, 10);
+}
+
+// Which preset a stored date corresponds to, or null when it matches
+// none — a job saved months ago whose absolute date no longer lines up
+// with any bucket. The caller surfaces that date as its own option so
+// reopening the job shows what it will actually query.
+function presetForDate(date: string): string | null {
+  if (!date) return "live";
+  const hit = SNAPSHOT_PRESETS.find(
+    (p) => p.days !== 0 && resolveSnapshotPreset(p.id) === date,
+  );
+  return hit ? hit.id : null;
+}
+
+// One <select> shared by the Keywords card and the Stop Words card.
+function SnapshotDateSelect({
+  value,
+  onChange,
+  label,
+  help,
+  labels,
+  exactLabel,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+  label: string;
+  help: string;
+  labels: Record<string, string>;
+  exactLabel: (d: string) => string;
+}) {
+  const current = presetForDate(value);
+  return (
+    <div className="space-y-1">
+      <label
+        className="text-sm text-neutral-600 dark:text-neutral-400 block"
+        title={help}
+      >
+        {label}
+      </label>
+      <select
+        value={current ?? "__exact__"}
+        onChange={(e) => onChange(resolveSnapshotPreset(e.target.value))}
+        className="w-full rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-sm outline-none"
+      >
+        {current === null && (
+          <option value="__exact__">{exactLabel(value)}</option>
+        )}
+        {SNAPSHOT_PRESETS.map((p) => (
+          <option key={p.id} value={p.id}>
+            {labels[p.id] ?? p.id}
+          </option>
+        ))}
+      </select>
+      {value && (
+        <p className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums">
+          {value}
+        </p>
+      )}
+    </div>
+  );
+}
+
 const SORT_FIELDS_KEYWORDS: SortField[] = [
   "volume_mobile_pct",
   "sum_traffic",
@@ -961,6 +1051,7 @@ export function KeywordsCard({
 }) {
   const { t } = useT();
   const ts = t.pages.analyze.keywords;
+  const tsa = t.pages.analyze;
   const dcOptions: CriteriaSpec["keywords"]["date_compared"][] = [
     "off",
     "3m",
@@ -1006,6 +1097,20 @@ export function KeywordsCard({
           ))}
         </select>
       </div>
+      {/* Snapshot date (2026-10-26). organic-keywords always needed a
+          `date`; we always sent today, which returns nothing for a
+          dropped domain because it is already deindexed. Setting a past
+          date is the only way to see what the domain used to rank for.
+          Capped at today — a future date has no data and would look
+          exactly like a dead domain. */}
+      <SnapshotDateSelect
+        value={cfg.date}
+        onChange={(d) => onChange({ ...cfg, date: d })}
+        label={ts.snapshotDateLabel}
+        help={ts.snapshotDateHelp}
+        labels={tsa.snapshotPresets}
+        exactLabel={tsa.snapshotExact}
+      />
       <SortBuilder
         sort={cfg.sort}
         onChange={(s) => onChange({ ...cfg, sort: s })}
@@ -1034,6 +1139,7 @@ export function StopWordsCard({
 }) {
   const { t } = useT();
   const ts = t.pages.analyze.stopWords;
+  const tsa = t.pages.analyze;
   // null = still loading (say nothing rather than flash a false "0 words").
   const [wordCount, setWordCount] = useState<number | null>(null);
   const [maxClauses, setMaxClauses] = useState<number>(250);
@@ -1160,6 +1266,22 @@ export function StopWordsCard({
           </label>
         )}
       </div>
+      {/* Snapshot date for the keyword scan (2026-10-26). Only shown when
+          the keywords source is selected: anchors takes no date, so on an
+          anchors-only run this would be a control that does nothing.
+          Without it the scan runs against today, and a dropped domain
+          ranks for nothing today — so the stop-word check reported
+          "clean" on domains that ranked for the banned terms for years. */}
+      {showKeyword && (
+        <SnapshotDateSelect
+          value={cfg.keyword_date}
+          onChange={(d) => onChange({ ...cfg, keyword_date: d })}
+          label={ts.keywordDateLabel}
+          help={ts.keywordDateHelp}
+          labels={tsa.snapshotPresets}
+          exactLabel={tsa.snapshotExact}
+        />
+      )}
       <p className="text-xs text-neutral-500 dark:text-neutral-400">
         {ts.requestHint(requestCount)}
       </p>

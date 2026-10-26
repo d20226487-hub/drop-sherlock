@@ -195,6 +195,18 @@ class KeywordsConfig(CriterionBase):
     # at request build time relative to the request's `date` snapshot.
     # "off" = no comparison parameter sent (legacy behaviour).
     date_compared: DateComparedChoice = "off"
+    # Historical snapshot date (2026-10-26). organic-keywords REQUIRES a
+    # `date`; we previously always sent today, which on a dropped domain
+    # returns nothing — the site is deindexed, so the criterion reported
+    # an empty keyword profile for a domain that ranked for years.
+    #
+    # This is NOT `date_compared`. That keeps the snapshot on today and
+    # annotates it with prior-period `_prev` columns; it cannot look at
+    # the past on its own. To see what a dead domain used to rank for,
+    # `date` itself has to move.
+    #
+    # "" = today (the previous locked-live behaviour, still the default).
+    date: str = ""
 
 
 # Which Ahrefs endpoints the Stop Words check queries. "both" issues one
@@ -254,6 +266,12 @@ class StopWordsConfig(CriterionBase):
     # runner skips the criterion rather than sending a `where`-less
     # request that would return the domain's entire anchor/keyword profile.
     terms: list[str] = Field(default_factory=list)
+    # Historical snapshot date for the KEYWORDS source only (2026-10-26);
+    # the anchors endpoint takes no date. Same rationale as
+    # `KeywordsConfig.date`: against today, a dead drop returns no
+    # keywords at all, so the stop-word scan silently reports "clean" on
+    # a domain that ranked for `casino bonus` for years. "" = today.
+    keyword_date: str = ""
 
 
 class WaybackConfig(BaseModel):
