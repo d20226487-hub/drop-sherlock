@@ -140,22 +140,66 @@ class AhoCorasick:
         return False
 
 
+def normalize_suffix(raw: object) -> str | None:
+    """Normalize a blocked multi-label suffix ("`.NET.PA `" -> "net.pa").
+
+    Returns None for anything unusable so callers can drop it. A suffix
+    MUST contain a dot: a single label like "pa" is a TLD, and belongs in
+    the allowed-TLD whitelist rather than here — accepting it would
+    silently block an entire ccTLD from a field meant for one second
+    level.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().lower().lstrip(".").rstrip(".")
+    if not s or "." not in s or len(s) > 120:
+        return None
+    if any(c.isspace() for c in s):
+        return None
+    return s
+
+
+def normalize_suffixes(raw_list: object) -> list[str]:
+    """Normalize + dedupe a list of blocked suffixes, order preserved."""
+    if not isinstance(raw_list, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_list:
+        s = normalize_suffix(item)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def build_matcher(
     *,
     keywords: list[str],
     allowed_tlds: list[str] | None,
     tld_whitelist_enabled: bool,
+    blocked_suffixes: list[str] | None = None,
 ) -> Callable[[str], str | None]:
     """Compile the filter ONCE and return `match(domain) -> reason|None`.
 
-    reason is "keyword" or "tld"; None means the domain passes. The
-    returned closure does NO DB access and NO recompilation — call it in
-    the hot per-row loop.
+    reason is "keyword", "tld" or "suffix"; None means the domain passes.
+    The returned closure does NO DB access and NO recompilation — call it
+    in the hot per-row loop.
 
-    Check order is cheap-first: the TLD test is a set lookup, the keyword
-    test is an automaton pass, so testing TLD first lets a non-allowed-TLD
-    domain short-circuit before the (costlier) keyword scan. When the TLD
-    whitelist is disabled, only keywords run.
+    Check order is cheap-first: the TLD test is a set lookup, the suffix
+    test is a handful of `endswith` calls, and the keyword test is an
+    automaton pass — so the costlier scan only runs on domains that
+    survive the others. When the TLD whitelist is disabled, only suffixes
+    and keywords run.
+
+    `blocked_suffixes` (added 2026-09-28) rejects a specific multi-label
+    suffix while its parent ccTLD stays allowed. Motivating case: Panama
+    allows `.com.pa` / `.nom.pa` to anyone but restricts `.net.pa` and
+    `.org.pa` to qualifying registrants, so those drops can never be
+    completed and analysing them wastes Ahrefs units. A keyword of
+    "net.pa" could NOT express this — keywords match a substring anywhere,
+    so it would also swallow e.g. "magnet.paris". This match is anchored
+    to the end of the domain and to a label boundary.
     """
     kws = normalize_keywords(keywords)
     ac = AhoCorasick(kws) if kws else None
@@ -163,6 +207,13 @@ def build_matcher(
     tld_match = None
     if tld_whitelist_enabled and allowed_tlds:
         tld_match = make_tld_matcher(allowed_tlds)
+
+    # Pre-dotted so the hot loop does a plain endswith with no per-call
+    # string building. The bare suffix is kept too: "net.pa" must block
+    # "net.pa" itself, not just "x.net.pa".
+    sufs = normalize_suffixes(blocked_suffixes or [])
+    dotted = tuple("." + s for s in sufs)
+    exact = frozenset(sufs)
 
     def match(domain: str) -> str | None:
         if not domain:
@@ -175,6 +226,8 @@ def build_matcher(
         # Cheap reject first: TLD not in the whitelist.
         if tld_match is not None and not tld_match(d):
             return "tld"
+        if dotted and (d.endswith(dotted) or d in exact):
+            return "suffix"
         if ac is not None and ac.contains(d):
             return "keyword"
         return None

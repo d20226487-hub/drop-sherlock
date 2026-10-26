@@ -153,16 +153,26 @@ def test_config_defaults_tld_off(fresh_db):
     .kz/.ru imports."""
     from app.app_settings import get_domain_filter
     cfg = get_domain_filter()
-    assert cfg == {"keywords": [], "tld_whitelist_enabled": False}
+    # blocked_suffixes ships seeded with Panama's restricted .net.pa
+    # (2026-09-28) -- see _DOMAIN_FILTER_SUFFIX_DEFAULT.
+    assert cfg == {
+        "keywords": [],
+        "tld_whitelist_enabled": False,
+        "blocked_suffixes": ["net.pa"],
+    }
 
 
 def test_legacy_cctld_config_migrates(fresh_db):
     """Old stored shape {"cctld": [...]} must not crash — it drops the
     retired category and yields the new empty shape."""
     from app.app_settings import _normalize_domain_filter
+    # A config stored before blocked_suffixes existed has no such key, so
+    # it INHERITS the seeded default rather than an empty list -- the
+    # Panama rule applies without the operator re-saving.
     assert _normalize_domain_filter({"cctld": ["uk", "de"]}) == {
         "keywords": [],
         "tld_whitelist_enabled": False,
+        "blocked_suffixes": ["net.pa"],
     }
 
 
@@ -180,3 +190,14 @@ def test_set_get_round_trip_and_matcher(fresh_db):
     assert m("best-casino.io") == "keyword"
     assert m("1xbet.com") == "keyword"
     assert m("clean.com") is None
+
+
+def test_explicit_empty_suffix_list_clears_the_seeded_default(fresh_db):
+    """Absent key inherits the default; an explicitly supplied list --
+    even empty -- is the operator's choice and wins, so the seeded
+    Panama rule can be deliberately turned off."""
+    from app.app_settings import _normalize_domain_filter
+    cfg = _normalize_domain_filter({"blocked_suffixes": []})
+    assert cfg["blocked_suffixes"] == []
+    cfg = _normalize_domain_filter({"blocked_suffixes": ["org.pa"]})
+    assert cfg["blocked_suffixes"] == ["org.pa"]

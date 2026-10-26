@@ -1585,14 +1585,31 @@ DOMAIN_FILTER_KEY = "domain_filter"
 _DOMAIN_FILTER_TLD_DEFAULT = False
 
 
+# Multi-label suffixes blocked even though their parent ccTLD is
+# allowed. Seeded 2026-09-28 with Panama's `.net.pa`: NIC Panama leaves
+# `.com.pa` / `.nom.pa` open to anyone ("nacional o extranjera", passport
+# accepted) but restricts `.net.pa`, so a `.net.pa` drop can never be
+# completed and analysing one burns Ahrefs units for nothing. `.org.pa`
+# is restricted on the same list and is a one-entry addition here if the
+# operator wants it too.
+_DOMAIN_FILTER_SUFFIX_DEFAULT: list[str] = ["net.pa"]
+
+
 def _normalize_domain_filter(raw: object) -> dict:
     """Coerce stored / submitted config into the canonical shape
-    {"keywords": [str], "tld_whitelist_enabled": bool}. Tolerates the
-    legacy {"cctld": [...]} shape (drops it) and partial dicts."""
-    from .domain_filter import normalize_keywords
+    {"keywords": [str], "tld_whitelist_enabled": bool,
+    "blocked_suffixes": [str]}. Tolerates the legacy {"cctld": [...]}
+    shape (drops it) and partial dicts.
+
+    A config saved before blocked_suffixes existed has no such key; it
+    inherits the seeded default rather than an empty list, so the
+    Panama rule applies without the operator having to re-save.
+    """
+    from .domain_filter import normalize_keywords, normalize_suffixes
     out = {
         "keywords": [],
         "tld_whitelist_enabled": _DOMAIN_FILTER_TLD_DEFAULT,
+        "blocked_suffixes": list(_DOMAIN_FILTER_SUFFIX_DEFAULT),
     }
     if not isinstance(raw, dict):
         return out
@@ -1600,6 +1617,11 @@ def _normalize_domain_filter(raw: object) -> dict:
     tw = raw.get("tld_whitelist_enabled")
     if isinstance(tw, bool):
         out["tld_whitelist_enabled"] = tw
+    # Absent key -> keep the default. An explicitly supplied list (even
+    # empty) is the operator's choice and wins, so the rule can be
+    # cleared deliberately.
+    if "blocked_suffixes" in raw:
+        out["blocked_suffixes"] = normalize_suffixes(raw.get("blocked_suffixes"))
     return out
 
 
@@ -1644,6 +1666,7 @@ def build_domain_filter_matcher(config: dict | None = None):
         keywords=cfg.get("keywords") or [],
         allowed_tlds=get_allowed_tlds() if tld_on else None,
         tld_whitelist_enabled=tld_on,
+        blocked_suffixes=cfg.get("blocked_suffixes") or [],
     )
 
 
@@ -1651,7 +1674,8 @@ def check_domain_filter(
     domain: str,
     matcher=None,
 ) -> tuple[bool, str | None]:
-    """(excluded, reason) for ONE domain. `reason` ∈ {"keyword","tld"}.
+    """(excluded, reason) for ONE domain.
+    `reason` ∈ {"keyword", "tld", "suffix"}.
 
     For hot loops pass a prebuilt `matcher` from
     `build_domain_filter_matcher()`; without one this compiles a fresh
