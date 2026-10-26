@@ -442,7 +442,18 @@ def set_rate_limits(provider: str, values: dict[str, int]) -> None:
 
 
 def all_rate_limits() -> dict[str, dict[str, int]]:
-    return {p: get_rate_limits(p) for p in PROVIDER_FIELDS}
+    """Every provider with a tunable rate limit, main + pillar extras.
+
+    The extras (`wayback_snapshot`, `wayback_sparkline`, `whoisfreaks`)
+    were omitted here until 2026-09-28, which quietly made them
+    uneditable: the Settings table renders whatever this returns, so they
+    never got a row, and the routes rejected them by name. That left
+    `wayback_snapshot` -- the limiter that actually governs V2 archived-
+    page throughput, and the real Wayback bottleneck -- reachable only by
+    a direct DB write.
+    """
+    names = list(PROVIDER_FIELDS) + sorted(_RATE_LIMIT_EXTRAS)
+    return {p: get_rate_limits(p) for p in names}
 
 
 # --- Model pricing ----------------------------------------------------------

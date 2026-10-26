@@ -9,6 +9,7 @@ from ..app_settings import (
     DEFAULT_SCORING_CONFIG,
     PROVIDER_FIELDS,
     RATE_LIMIT_FIELDS,
+    _rate_limit_provider_allowed,
     add_categories,
     add_known_models,
     all_ai_prompts,
@@ -404,14 +405,18 @@ def list_rate_limits():
 
 @router.get("/rate-limits/{provider}")
 def get_rate_limits_route(provider: str):
-    if provider not in PROVIDER_FIELDS:
+    # Uses the shared allow-check, not PROVIDER_FIELDS: pillar-specific
+    # limiters (wayback_snapshot / wayback_sparkline / whoisfreaks) have
+    # no credential card but ARE tunable. Checking PROVIDER_FIELDS here
+    # 404'd them, so the helper built for exactly this was dead code.
+    if not _rate_limit_provider_allowed(provider):
         raise HTTPException(404, "unknown provider")
     return get_rate_limits(provider)
 
 
 @router.put("/rate-limits/{provider}")
 def update_rate_limits(provider: str, payload: RateLimitsIn):
-    if provider not in PROVIDER_FIELDS:
+    if not _rate_limit_provider_allowed(provider):
         raise HTTPException(404, "unknown provider")
     raw = payload.model_dump(exclude_unset=True)
     valid = {k: v for k, v in raw.items() if k in RATE_LIMIT_FIELDS and v is not None}

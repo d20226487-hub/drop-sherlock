@@ -1896,6 +1896,15 @@ const messagesEn = {
         github_models: "GitHub Models",
         openrouter: "OpenRouter",
         vertex_ai: "Google Vertex AI",
+        // Rate-limit-only rows (2026-09-28). These have no credential
+        // card, so they only ever appear in the rate-limits table.
+        // Naming is explicit about WHICH Wayback traffic each governs:
+        // "Wayback" alone reads as the whole pillar, and the CDX row is
+        // the one that is almost never the bottleneck.
+        wayback: "Wayback \u2014 CDX queries (V1)",
+        wayback_snapshot: "Wayback \u2014 archived pages (V2)",
+        wayback_sparkline: "Wayback \u2014 sparkline",
+        whoisfreaks: "WhoisFreaks",
       },
       providerHelp: {
         ahrefs:
@@ -4774,6 +4783,11 @@ const messagesRu: Messages = {
         github_models: "GitHub Models",
         openrouter: "OpenRouter",
         vertex_ai: "Google Vertex AI",
+        // Строки только для лимитов (2026-09-28) — без карточки ключа.
+        wayback: "Wayback \u2014 CDX-запросы (V1)",
+        wayback_snapshot: "Wayback \u2014 архивные страницы (V2)",
+        wayback_sparkline: "Wayback \u2014 sparkline",
+        whoisfreaks: "WhoisFreaks",
       },
       providerHelp: {
         ahrefs:
