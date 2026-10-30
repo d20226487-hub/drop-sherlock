@@ -22,6 +22,8 @@ import asyncio
 import gzip
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -373,3 +375,95 @@ def test_body_excerpt_is_capped_at_300_characters(wb):
 def test_short_body_excerpt_is_returned_whole(wb):
     out = wb.parse_snapshot_html("<html><body><p>Short   page\n text.</p></body></html>")
     assert out["body_excerpt"] == "Short page text."         # collapsed, no ellipsis
+
+
+# --- parsing must not freeze the event loop -------------------------------
+#
+# The API is ONE uvicorn worker: a single event loop serves page requests
+# and runs jobs. Parsing an archived page inline froze that loop, so pages
+# stalled until Cloudflare returned 524 — which looked like a reboot.
+
+
+def _ok_handler(html):
+    def handler(_req):
+        return httpx.Response(200, headers={"content-type": "text/html"},
+                              content=Body(html, total=len(html)))
+    return handler
+
+
+def test_parsing_runs_on_the_dedicated_pool_not_the_loop(wb, monkeypatch):
+    seen = {}
+    real = wb.parse_snapshot_html
+
+    def spy(html):
+        seen["thread"] = threading.current_thread().name
+        return real(html)
+
+    monkeypatch.setattr(wb, "parse_snapshot_html", spy)
+    out = _fetch(wb, _ok_handler(HEAD + b"</p></body></html>"))
+    assert out["title"] == "Probe Title"          # result still flows back
+    assert seen["thread"].startswith("wb-parse"), seen
+    assert seen["thread"] != threading.main_thread().name
+
+
+def test_event_loop_keeps_serving_while_a_page_parses(wb, monkeypatch):
+    """THE property. A heartbeat coroutine stands in for incoming page
+    requests and must keep ticking while a deliberately slow, CPU-bound
+    parse runs. Inline parsing would freeze it at zero ticks."""
+    state = {"parsing": False, "ticks": 0}
+
+    def slow_parse(_html):
+        state["parsing"] = True
+        end = time.perf_counter() + 0.4
+        while time.perf_counter() < end:      # pure-Python CPU, holds the GIL
+            pass
+        state["parsing"] = False
+        return {"title": "", "h1s": [], "h2s": [], "h3s": [],
+                "body_excerpt": "", "lang_attr": ""}
+
+    monkeypatch.setattr(wb, "parse_snapshot_html", slow_parse)
+    html = HEAD + b"</p></body></html>"
+
+    async def run():
+        p = wb.WaybackClient()
+        p._client = httpx.AsyncClient(transport=httpx.MockTransport(_ok_handler(html)))
+        stop = asyncio.Event()
+
+        async def heartbeat():
+            while not stop.is_set():
+                if state["parsing"]:
+                    state["ticks"] += 1
+                await asyncio.sleep(0.01)
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            await p.fetch_snapshot_page(timestamp="20200101000000",
+                                        url="http://example.kz/")
+        finally:
+            stop.set()
+            await hb
+            await p._client.aclose()
+
+    asyncio.run(run())
+    # ~25 ticks are expected in 0.4 s; 3 leaves wide margin for a slow box.
+    assert state["ticks"] >= 3, state
+
+
+def test_concurrent_fetches_all_complete_through_the_pool(wb):
+    """More parses than pool threads must queue and finish, not deadlock."""
+    html = HEAD + b"</p></body></html>"
+
+    async def run():
+        p = wb.WaybackClient()
+        p._client = httpx.AsyncClient(transport=httpx.MockTransport(_ok_handler(html)))
+        try:
+            return await asyncio.gather(*[
+                p.fetch_snapshot_page(timestamp="20200101000000",
+                                      url="http://example.kz/%d" % i)
+                for i in range(8)
+            ])
+        finally:
+            await p._client.aclose()
+
+    outs = asyncio.run(run())
+    assert len(outs) == 8 and all(o["title"] == "Probe Title" for o in outs)

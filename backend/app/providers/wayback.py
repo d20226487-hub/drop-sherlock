@@ -27,6 +27,7 @@ Rate limits: Wayback throttles aggressively if you fan out. Defaults in
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import random
 import re
 from html.parser import HTMLParser
@@ -239,6 +240,26 @@ _SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
 # A 503 body is only read to recognise the Archive's maintenance page,
 # which needs its first ~4 KB; never pull a large body for that.
 _OFFLINE_PROBE_BYTES = 16 * 1024
+
+# Dedicated thread pool for HTML parsing (2026-10-30).
+#
+# The API runs as ONE uvicorn worker, so a single event loop serves every
+# page request AND every running job. Parsing an archived page is
+# CPU-bound pure Python; done inline in the async fetch, it froze that
+# loop for its whole duration, so page requests queued behind a Wayback
+# run until Cloudflare gave up after 100 s and returned a 524 — which
+# looked to the operator like the server rebooting.
+#
+# Why a dedicated pool rather than `asyncio.to_thread`: html.parser holds
+# the GIL, so parse threads never run in parallel and extra threads add no
+# throughput. What a thread buys is letting the event loop take turns on
+# the GIL — and the fewer parse threads compete, the larger the loop's
+# share, so requests stay responsive. It also keeps a burst of parses off
+# the loop's default executor, which the job runner uses for its database
+# writes.
+_PARSE_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="wb-parse",
+)
 # HTML elements whose text content should not contribute to ANY extracted
 # field — they're non-visible noise (scripts, styles) we never want.
 # Note: `<head>` is deliberately NOT in this set even though we don't want
@@ -619,7 +640,10 @@ class WaybackClient(BaseProvider):
                 out["redirect_to"] = _unwrap_archive_url(location.strip())
                 return out
 
-            parsed = parse_snapshot_html(body_text)
+            # Off the event loop — see _PARSE_POOL.
+            parsed = await asyncio.get_running_loop().run_in_executor(
+                _PARSE_POOL, parse_snapshot_html, body_text,
+            )
             out = {
                 "timestamp": timestamp,
                 "url": url,
