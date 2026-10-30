@@ -128,18 +128,59 @@ _IA_OFFLINE_MSG = (
 )
 
 
-def _is_ia_offline(resp: httpx.Response) -> bool:
+def _is_ia_offline(resp: httpx.Response, text: str | None = None) -> bool:
     """True when this 503 is the Archive's global maintenance page rather than
     a real per-request server error. Deliberately narrow: 503 + HTML +the
-    page's own wording, so a genuine 503 from a busy backend still retries."""
+    page's own wording, so a genuine 503 from a busy backend still retries.
+
+    `text` lets a STREAMED caller pass the body it already read — a
+    streamed response has no `.text` until fully read, and the snapshot
+    path deliberately never reads it fully. CDX passes nothing and keeps
+    using `resp.text`, unchanged."""
     if resp.status_code != 503:
         return False
     if "html" not in (resp.headers.get("content-type") or "").lower():
         return False
     try:
-        return "temporarily offline" in resp.text[:4000].lower()
+        body = text if text is not None else resp.text
+        return "temporarily offline" in body[:4000].lower()
     except Exception:  # noqa: BLE001
         return False
+
+
+async def _read_capped(resp: httpx.Response, limit: int) -> tuple[bytes, bool]:
+    """Read at most `limit` decoded bytes from a STREAMED response.
+
+    Returns (data, truncated). `truncated` means we hit the cap and stopped
+    reading — the rest of the body is never pulled, and leaving the
+    `client.stream()` block closes the connection instead of draining it.
+    """
+    buf = bytearray()
+    async for chunk in resp.aiter_bytes():
+        room = limit - len(buf)
+        if len(chunk) >= room:
+            buf.extend(chunk[:room])
+            return bytes(buf), True
+        buf.extend(chunk)
+    return bytes(buf), False
+
+
+def _decode_body(resp: httpx.Response, data: bytes) -> str:
+    """Decode exactly as httpx 0.28's `Response.text` would have.
+
+    Our clients never set `default_encoding`, so it is the string "utf-8",
+    which means `resp.encoding` resolves WITHOUT needing the body: the
+    Content-Type charset when present and known, else UTF-8. httpx then
+    decodes with errors="replace". Matching that precisely matters — the
+    operator's .kz/.ru drops are Cyrillic, and a different fallback would
+    change what language detection sees.
+
+    A cap landing mid-way through a multi-byte character yields one U+FFFD
+    at the very end, which is harmless.
+    """
+    if not data:
+        return ""
+    return data.decode(resp.encoding or "utf-8", errors="replace")
 
 
 def _acquire_egress(phase: str):
@@ -163,7 +204,41 @@ async def _note_throttle(egress: str, reason: str) -> None:
 # blow up the AI prompt or the persisted JSON. Body excerpt is also capped
 # downstream (150 chars) but headings can repeat — limit each list length.
 _MAX_HEADINGS_PER_LEVEL = 12
-_BODY_EXCERPT_CHARS = 150
+# Whitespace-collapsed body excerpt length. Raised 150 -> 300 (2026-10-30):
+# the first ~150 characters of a page body are very often navigation
+# boilerplate ("Home | About | Contact | Login ..."), so the excerpt said
+# little about the site. It feeds the Wayback AI judge, the classifier's
+# AI prompt, and library-mode language detection (lingua), which is
+# noticeably more reliable on longer text.
+#
+# Deliberately NOT part of the Wayback data cache key: putting it there
+# would force every already-analysed domain to re-download its samples
+# from archive.org. Domains cached before this change keep their
+# 150-character excerpts until re-analysed without the cache.
+_BODY_EXCERPT_CHARS = 300
+# Hard cap on how much of an archived page V2 downloads (2026-10-30).
+#
+# The download used to buffer the WHOLE body (`client.get` + `r.text`).
+# `id_` mode replays the original archived bytes, so a parked or spam
+# domain's root can be a multi-megabyte keyword-stuffed page, and a
+# redirect target can turn out to be a binary. Every byte landed in RAM,
+# then again on decode — roughly doubling for Cyrillic, which CPython
+# stores at 2 bytes/char. With several downloads in flight and glibc
+# keeping the high-water mark instead of returning memory, a long Wayback
+# run ratcheted the API up until the deployment server ran out and
+# rebooted.
+#
+# 2 MB is generous for what we actually use: title, `lang`, up to
+# _MAX_HEADINGS_PER_LEVEL headings per level and a _BODY_EXCERPT_CHARS
+# excerpt — all of which live at the TOP of a page. A capped page loses
+# only headings deep in an enormous document.
+#
+# Applies to DECODED bytes (`aiter_bytes`), so it also bounds a gzip
+# response by its expanded size, not its wire size.
+_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
+# A 503 body is only read to recognise the Archive's maintenance page,
+# which needs its first ~4 KB; never pull a large body for that.
+_OFFLINE_PROBE_BYTES = 16 * 1024
 # HTML elements whose text content should not contribute to ANY extracted
 # field — they're non-visible noise (scripts, styles) we never want.
 # Note: `<head>` is deliberately NOT in this set even though we don't want
@@ -482,7 +557,26 @@ class WaybackClient(BaseProvider):
                 client = self.client
                 await _wb_wait_for_cooldown()
             try:
-                r = await client.get(snapshot_url)
+                # STREAMED, not `client.get()` — that buffered the whole
+                # archived page. Bodies are read only where they're used:
+                # 2xx (to parse, capped) and 503 (offline probe, tiny).
+                # 3xx needs just the Location header; other errors need
+                # nothing. A failure mid-body is a network error like any
+                # other, so the read sits inside this same try.
+                body_text = ""
+                truncated = False
+                offline = False
+                async with client.stream("GET", snapshot_url) as r:
+                    status = r.status_code
+                    headers = r.headers
+                    if 200 <= status < 300:
+                        data, truncated = await _read_capped(
+                            r, _SNAPSHOT_MAX_BYTES
+                        )
+                        body_text = _decode_body(r, data)
+                    elif status == 503:
+                        data, _ = await _read_capped(r, _OFFLINE_PROBE_BYTES)
+                        offline = _is_ia_offline(r, _decode_body(r, data))
             except Exception as e:  # noqa: BLE001
                 last_exc = e
                 await _note_throttle(egress, f"network {type(e).__name__}")
@@ -492,24 +586,24 @@ class WaybackClient(BaseProvider):
                 return _empty(0, error=f"network: {e}")
 
             # Throttle / server errors get the same retry treatment as CDX.
-            if r.status_code == 429 or 500 <= r.status_code < 600:
+            if status == 429 or 500 <= status < 600:
                 # Archive-wide outage — same fast-fail as CDX. Samples are
                 # best-effort, so this returns rather than raising.
-                if _is_ia_offline(r):
-                    return _empty(r.status_code, error=_IA_OFFLINE_MSG)
-                await _note_throttle(egress, f"http {r.status_code}")
+                if offline:
+                    return _empty(status, error=_IA_OFFLINE_MSG)
+                await _note_throttle(egress, f"http {status}")
                 if attempt < retry_max:
                     await asyncio.sleep(_backoff(attempt))
                     continue
                 return _empty(
-                    r.status_code,
-                    error=f"http {r.status_code} after retries",
+                    status,
+                    error=f"http {status} after retries",
                 )
 
-            if r.status_code >= 400:
+            if status >= 400:
                 # 404 here usually means archive.org doesn't have a usable
                 # snapshot at that exact (ts, url). Surface but don't retry.
-                return _empty(r.status_code, error=f"http {r.status_code}")
+                return _empty(status, error=f"http {status}")
 
             # 3xx: the original site served a redirect at this snapshot.
             # We deliberately don't follow (`follow_redirects=False` is the
@@ -519,21 +613,27 @@ class WaybackClient(BaseProvider):
             # noise without new info. Instead surface the `Location`
             # header as a structured `redirect_to` field so the AI can
             # reason about migration targets cleanly.
-            if 300 <= r.status_code < 400:
-                location = r.headers.get("location") or r.headers.get("Location") or ""
-                out = _empty(r.status_code)
+            if 300 <= status < 400:
+                location = headers.get("location") or headers.get("Location") or ""
+                out = _empty(status)
                 out["redirect_to"] = _unwrap_archive_url(location.strip())
                 return out
 
-            parsed = parse_snapshot_html(r.text)
-            return {
+            parsed = parse_snapshot_html(body_text)
+            out = {
                 "timestamp": timestamp,
                 "url": url,
                 "snapshot_url": snapshot_url,
-                "http_status": r.status_code,
+                "http_status": status,
                 "redirect_to": "",
                 **parsed,
             }
+            # Persisted for debugging only ("why so few headings?"). The
+            # prompt builder and classifier read samples by explicit key,
+            # so this never reaches the AI or changes a verdict.
+            if truncated:
+                out["truncated"] = True
+            return out
 
         # Retry exhausted with `last_exc` set.
         return _empty(0, error=f"unreachable: {last_exc!r}")
