@@ -2603,7 +2603,42 @@ async def process_run(run_id: int) -> None:
 
     async def _run_one(rd_id: int) -> None:
         async with outer_sem:
-            await _process_domain(rd_id, spec, run_id)
+            try:
+                await _process_domain(rd_id, spec, run_id)
+            except Exception as e:  # noqa: BLE001
+                # Contain a single domain's failure (2026-10-30). The
+                # gather below uses return_exceptions=False, so before this
+                # guard the FIRST exception from ANY domain failed the
+                # whole run — and gather does not cancel the siblings, so
+                # thousands of domains kept fetching and spending quota
+                # into a run already marked failed. Observed on run 186:
+                # one domain's `status='running'` write hit "database is
+                # locked" and took the entire run down.
+                #
+                # `_process_domain` already contains per-criterion fetch
+                # and AI failures; what escaped was its own DB
+                # bookkeeping. Now that marks just this domain failed —
+                # same philosophy as criterion failures — and the run
+                # finishes normally, with the domain retryable via
+                # "Retry failed".
+                #
+                # `except Exception` deliberately: CancelledError is a
+                # BaseException, so pause/cancel still propagate untouched.
+                log.exception(
+                    "domain rd=%s failed in run %s; continuing the run",
+                    rd_id, run_id,
+                )
+                try:
+                    await _offload(
+                        _fail_domain, rd_id, f"{type(e).__name__}: {e}"
+                    )
+                except Exception:  # noqa: BLE001
+                    # If even marking it failed hits the same lock, leave
+                    # it: startup reconciliation already repairs RunDomains
+                    # left "running". The run must still carry on.
+                    log.exception(
+                        "could not mark rd=%s failed in run %s", rd_id, run_id,
+                    )
 
     domain_ids = _get_domain_ids(run_id)
     try:
@@ -5983,6 +6018,37 @@ def _finish_domain(run_domain_id: int, success: bool) -> None:
             return
         rd.status = "done" if success else "failed"
         rd.finished_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _fail_domain(run_domain_id: int, error: str) -> None:
+    """Mark ONE domain failed with its error, leaving the run alone.
+
+    Used by `process_run` when an exception escapes `_process_domain`, so a
+    single domain's failure no longer fails the whole run.
+
+    Only moves a domain out of pending/running: a domain that already
+    reached a terminal state keeps it — in particular a user's "canceled"
+    is never overwritten. The exception is logged either way.
+
+    Stamps `started_at` when it is missing, because the worker genuinely
+    attempted the domain. Without that, a run in which EVERY domain failed
+    at its first write would trip `_any_domain_made_progress` and be
+    reported as a stale Cancel/Pause flag — a misleading diagnosis.
+    """
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None or rd.status not in ("pending", "running"):
+            return
+        now = datetime.utcnow()
+        rd.status = "failed"
+        rd.error = (error or "")[:2000]
+        if rd.started_at is None:
+            rd.started_at = now
+        rd.finished_at = now
         db.commit()
     finally:
         db.close()
