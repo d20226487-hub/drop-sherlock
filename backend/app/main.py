@@ -894,6 +894,11 @@ async def lifespan(_: FastAPI):
     # Phase 2 — start capturing every error from any logger into error_log.
     # Idempotent so reload-on-edit dev scenarios don't double-attach.
     install_db_log_handler()
+    # Event-loop stall watchdog (2026-10-30): logs the loop's stack to
+    # error_log whenever it stops answering. See loop_watchdog.py.
+    import asyncio as _asyncio
+    from . import loop_watchdog as _loop_watchdog
+    _loop_watchdog.start(_asyncio.get_running_loop())
     db = SessionLocal()
     try:
         n = mark_orphaned_runs_paused(db)
@@ -931,6 +936,7 @@ async def lifespan(_: FastAPI):
     finally:
         db.close()
     sched = get_scheduler()
+    _loop_watchdog.watch_scheduler(sched)
     sched.start()
 
     # Webshare rotating-proxy list (added 2026-07-27). Webshare rotates the
@@ -1273,6 +1279,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        _loop_watchdog.stop()
         sched.shutdown(wait=False)
 
 
