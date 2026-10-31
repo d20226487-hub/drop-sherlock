@@ -867,7 +867,10 @@ async def _availability_auto_retry_loop(run_id: int, cfg: dict) -> None:
             # cycle at module load time.
             from .tasks import _REANALYZING_RUN_DOMAINS
 
-            candidates = _collect_availability_retry_candidates(
+            # Off the loop (2026-10-31): the scan walks every RD of a
+            # run that can be 60k domains; inline it froze page-serving.
+            candidates = await asyncio.to_thread(
+                _collect_availability_retry_candidates,
                 run_id, retry_providers,
             )
             if not candidates:

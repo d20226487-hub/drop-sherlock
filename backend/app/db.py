@@ -1,3 +1,5 @@
+import asyncio
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -38,6 +40,31 @@ if _is_sqlite:
             # a chance to finish before the reader gives up with
             # "database is locked".
             cur.execute("PRAGMA busy_timeout=5000")
+        finally:
+            cur.close()
+
+    # Busy timeout per checkout, by thread (2026-10-31). On the event-loop
+    # thread, waiting out the write lock freezes every request, so keep the
+    # 5 s cap there. Worker threads (asyncio.to_thread offloads, threadpool
+    # endpoints) block nothing while they wait, so give them 30 s: with the
+    # runners and retry path offloaded, dozens of threads queue for SQLite's
+    # one writer, and at 5 s some gave up with "database is locked" — a
+    # synthetic 1,000-domain Wayback retry pass under a competing writer
+    # dropped 18-25 retries, some after their fetch, leaving the CR row
+    # half-updated. The same error failed run 186 on 2026-10-27.
+    LOOP_BUSY_TIMEOUT_MS = 5_000
+    THREAD_BUSY_TIMEOUT_MS = 30_000
+
+    @event.listens_for(engine, "checkout")
+    def _sqlite_busy_timeout(dbapi_conn, _conn_record, _conn_proxy):
+        try:
+            asyncio.get_running_loop()
+            ms = LOOP_BUSY_TIMEOUT_MS
+        except RuntimeError:
+            ms = THREAD_BUSY_TIMEOUT_MS
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute(f"PRAGMA busy_timeout={ms}")
         finally:
             cur.close()
 

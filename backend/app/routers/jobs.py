@@ -2813,9 +2813,9 @@ async def retry_failed_run_route(
     parallel across RDs. Reuses the per-criterion reanalyze infrastructure
     (refetch-on-no-data + re-judge), so the existing per-domain
     `reanalyzing` polling state surfaces progress without UI changes."""
-    from ..tasks import retry_failed_run_now
+    from ..tasks import retry_failed_run
     override = body.model_dump() if body else None
-    result = retry_failed_run_now(run_id, ai_override=override)
+    result = await retry_failed_run(run_id, ai_override=override)
     if result.get("found") is False:
         raise HTTPException(404, "run not found")
     if "error" in result:
@@ -2882,7 +2882,7 @@ async def retry_batch_route(run_id: int, body: RetryBatchIn) -> dict:
         considered; the rest are left alone even if they failed.
       - Same terminal-status + busy-RD guards as `/retry-failed`.
     """
-    from ..tasks import retry_run_batch_now
+    from ..tasks import retry_run_batch
     if not body.run_domain_ids:
         raise HTTPException(400, "no run_domain_ids provided")
     override = (
@@ -2890,7 +2890,7 @@ async def retry_batch_route(run_id: int, body: RetryBatchIn) -> dict:
         if body.provider or body.model
         else None
     )
-    result = retry_run_batch_now(
+    result = await retry_run_batch(
         run_id=run_id,
         run_domain_ids=body.run_domain_ids,
         criteria=body.criteria,

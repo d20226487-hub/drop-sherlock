@@ -1174,7 +1174,7 @@ def _cascade_wayback_classify(
             crits.append("wayback_classify")
 
 
-def _retry_ahrefs_batch_failed(
+def _reset_ahrefs_batch_failed(
     run_id: int, db: Session, rd_ids: set[int] | None = None
 ) -> dict:
     """Retry-failed for an `ahrefs_batch_analysis` run. That kind has no AI
@@ -1184,7 +1184,9 @@ def _retry_ahrefs_batch_failed(
     reset the failed/orphaned RDs (or a caller-supplied subset) back to
     pending, flip the run to pending, and re-dispatch the runner. Mirrors
     `resume_run_now`, scoped to failures. `db` is the caller's OPEN session
-    — we commit into it, then dispatch (the caller closes it afterward)."""
+    — we commit into it (the caller closes it afterward). Does NOT dispatch:
+    it runs in the retry's DB phase, possibly in a worker thread, and flags
+    `_dispatch_run` so `_dispatch_retry_plan` starts the runner on the loop."""
     conds = [
         RunDomain.run_id == run_id,
         RunDomain.status.in_(("failed", "running", "pending")),
@@ -1213,43 +1215,25 @@ def _retry_ahrefs_batch_failed(
         run.finished_at = None
         run.error = ""
     db.commit()
-    # Re-dispatch the idempotent runner: it re-fetches only the now-pending
-    # (previously failed) RDs and leaves the ones still 'done' alone.
-    dispatch_run(run_id)
+    # `_dispatch_run` → `_dispatch_retry_plan` re-dispatches the idempotent
+    # runner: it re-fetches only the now-pending (previously failed) RDs
+    # and leaves the ones still 'done' alone.
     return {
         "id": run_id, "found": True, "status": "started",
-        "domains": n, "criteria": n,
+        "domains": n, "criteria": n, "_dispatch_run": True,
     }
 
 
-def retry_run_batch_now(
+def _plan_retry_batch(
     run_id: int,
     run_domain_ids: list[int],
-    criteria: list[str] | None = None,
-    ai_override: dict | None = None,
-    wayback_resample_only: bool = False,
+    criteria: list[str] | None,
+    ai_override: dict | None,
+    wayback_resample_only: bool,
 ) -> dict:
-    """Retry failed criteria on a subset of RDs, optionally narrowed to
-    a criterion allow-list. Sibling of `retry_failed_run_now` — same
-    guards, same per-RD plumbing, narrower scope.
-
-    `criteria=None` → every enabled criterion on the run (= same as
-    retry_failed_run_now's behavior, just scoped to the picked RDs).
-    `criteria=["wayback"]` → only retry wayback, even if classify also
-    failed on a given RD (drives the "refetch wayback without
-    re-running classify" use case).
-
-    `wayback_resample_only=True` → instead of selecting "failed"
-    criteria, target wayback CRs that have V1 rows and need V2
-    re-sampling (samples missing, stale, or partial). Skips the CDX
-    refetch entirely — re-samples V2 against the existing rows, then
-    re-judges the wayback verdict. The classify cascade still applies,
-    so classify gets re-judged off the fresh samples. Use case: the
-    cohort identified by the Wayback CDX ≥1 filter + classify failed.
-    Caller MUST include `"wayback"` in `criteria` (or pass `None` for
-    all) — otherwise this flag has nothing to act on and we error.
-
-    Returns the same envelope shape as retry_failed_run_now."""
+    """DB phase of `retry_run_batch_now`: guards + the scan of the picked
+    RDs. Synchronous; returns a finished envelope, or a `_plan` for
+    `_dispatch_retry_plan`."""
     if _REANALYZING_RUNS.is_active(run_id):
         return {
             "id": run_id, "found": True,
@@ -1295,7 +1279,7 @@ def retry_run_batch_now(
         # selected failed/orphaned RDs and re-dispatch the idempotent runner
         # instead of the Quality per-criterion pool. Must precede the AI gate.
         if job_kind == "ahrefs_batch_analysis":
-            return _retry_ahrefs_batch_failed(run_id, db, rd_ids=rd_id_set)
+            return _reset_ahrefs_batch_failed(run_id, db, rd_ids=rd_id_set)
         if job_kind != "availability" and (
             not spec.ai or not spec.ai.provider
         ):
@@ -1334,43 +1318,62 @@ def retry_run_batch_now(
                 "(selected rds × allowed criteria)"
             ),
         }
-    busy = [
-        rd_id for rd_id in failed_per_rd
-        if _REANALYZING_RUN_DOMAINS.is_active(rd_id)
-    ]
-    if busy:
-        return {
-            "id": run_id, "found": True,
-            "error": (
-                f"reanalysis already in progress on {len(busy)} domain(s) — "
-                "wait for it to finish"
-            ),
-        }
-    # Bounded pool (2026-06-17) — see retry_failed_run_now / _run_retry_pool.
-    task = asyncio.create_task(
-        _run_retry_pool(
-            run_id, failed_per_rd, spec,
-            resample_only=wayback_resample_only,
-        )
-    )
-    _REANALYZING_RUNS.add_task(run_id, task)
-    _track(task)
-    return {
-        "id": run_id, "found": True, "status": "started",
-        "domains": len(failed_per_rd),
-        "criteria": sum(len(v) for v in failed_per_rd.values()),
-    }
+    return {"_plan": (failed_per_rd, spec, wayback_resample_only)}
 
 
-def retry_failed_run_now(
-    run_id: int, ai_override: dict | None = None
+def retry_run_batch_now(
+    run_id: int,
+    run_domain_ids: list[int],
+    criteria: list[str] | None = None,
+    ai_override: dict | None = None,
+    wayback_resample_only: bool = False,
 ) -> dict:
-    """Retry every failed criterion across every domain in a terminal run.
-    A "failed criterion" means a fetch that errored, an AI verdict that
-    errored, or a never-created CR row for an enabled criterion. Each RD
-    runs its retries sequentially under one `_REANALYZING_RUN_DOMAINS`
-    lock so the existing per-domain `reanalyzing` polling state covers
-    progress without UI plumbing changes."""
+    """Retry failed criteria on a subset of RDs, optionally narrowed to
+    a criterion allow-list. Sibling of `retry_failed_run_now` — same
+    guards, same per-RD plumbing, narrower scope.
+
+    `criteria=None` → every enabled criterion on the run (= same as
+    retry_failed_run_now's behavior, just scoped to the picked RDs).
+    `criteria=["wayback"]` → only retry wayback, even if classify also
+    failed on a given RD (drives the "refetch wayback without
+    re-running classify" use case).
+
+    `wayback_resample_only=True` → instead of selecting "failed"
+    criteria, target wayback CRs that have V1 rows and need V2
+    re-sampling (samples missing, stale, or partial). Skips the CDX
+    refetch entirely — re-samples V2 against the existing rows, then
+    re-judges the wayback verdict. The classify cascade still applies,
+    so classify gets re-judged off the fresh samples. Use case: the
+    cohort identified by the Wayback CDX ≥1 filter + classify failed.
+    Caller MUST include `"wayback"` in `criteria` (or pass `None` for
+    all) — otherwise this flag has nothing to act on and we error.
+
+    Returns the same envelope shape as retry_failed_run_now."""
+    return _dispatch_retry_plan(run_id, _plan_retry_batch(
+        run_id, run_domain_ids, criteria, ai_override, wayback_resample_only,
+    ))
+
+
+async def retry_run_batch(
+    run_id: int,
+    run_domain_ids: list[int],
+    criteria: list[str] | None = None,
+    ai_override: dict | None = None,
+    wayback_resample_only: bool = False,
+) -> dict:
+    """`retry_run_batch_now` for the route: the DB phase runs in a worker
+    thread so a large selection's scan can't freeze the event loop."""
+    plan = await _offload(
+        _plan_retry_batch,
+        run_id, run_domain_ids, criteria, ai_override, wayback_resample_only,
+    )
+    return _dispatch_retry_plan(run_id, plan)
+
+
+def _plan_retry_failed(run_id: int, ai_override: dict | None) -> dict:
+    """DB phase of `retry_failed_run_now`: guards + the scan of every RD in
+    the run (60k on a big availability run). Synchronous; returns a
+    finished envelope, or a `_plan` for `_dispatch_retry_plan`."""
     if _REANALYZING_RUNS.is_active(run_id):
         return {
             "id": run_id, "found": True,
@@ -1405,7 +1408,7 @@ def retry_failed_run_now(
         # per-criterion retry machinery — reset failed/orphaned RDs to
         # pending and re-dispatch its idempotent runner. Precede the gate.
         if job_kind == "ahrefs_batch_analysis":
-            return _retry_ahrefs_batch_failed(run_id, db)
+            return _reset_ahrefs_batch_failed(run_id, db)
         if job_kind != "availability" and (
             not spec.ai or not spec.ai.provider
         ):
@@ -1434,7 +1437,51 @@ def retry_failed_run_now(
             "id": run_id, "found": True,
             "error": "no failed criteria to retry",
         }
+    return {"_plan": (failed_per_rd, spec, False)}
 
+
+def retry_failed_run_now(
+    run_id: int, ai_override: dict | None = None
+) -> dict:
+    """Retry every failed criterion across every domain in a terminal run.
+    A "failed criterion" means a fetch that errored, an AI verdict that
+    errored, or a never-created CR row for an enabled criterion. Each RD
+    runs its retries sequentially under one `_REANALYZING_RUN_DOMAINS`
+    lock so the existing per-domain `reanalyzing` polling state covers
+    progress without UI plumbing changes."""
+    return _dispatch_retry_plan(run_id, _plan_retry_failed(run_id, ai_override))
+
+
+async def retry_failed_run(
+    run_id: int, ai_override: dict | None = None
+) -> dict:
+    """`retry_failed_run_now` for the route (2026-10-31): the DB phase runs
+    in a worker thread. Inline, the click itself walked every RD of the run
+    on the event loop before anything started — on a 60k-domain
+    availability run, a server-wide freeze."""
+    plan = await _offload(_plan_retry_failed, run_id, ai_override)
+    return _dispatch_retry_plan(run_id, plan)
+
+
+def _dispatch_retry_plan(run_id: int, plan: dict) -> dict:
+    """Loop phase of Retry failed / Retry selected: the busy guards and the
+    pool start touch in-process asyncio state, so this must run on the
+    event loop. `plan` comes from `_plan_retry_failed` / `_plan_retry_batch`:
+    either a finished envelope (error, not found, an ahrefs-batch reset to
+    re-dispatch) or a `_plan` to start."""
+    if "_plan" not in plan:
+        if plan.pop("_dispatch_run", False):
+            dispatch_run(run_id)
+        return plan
+    failed_per_rd, spec, resample_only = plan["_plan"]
+
+    # Re-checked here: when the DB phase ran in a worker thread, another
+    # retry could have started meanwhile.
+    if _REANALYZING_RUNS.is_active(run_id):
+        return {
+            "id": run_id, "found": True,
+            "error": "a run-level reanalysis is already in progress",
+        }
     # Refuse if any candidate RD is already in flight — partial dispatch
     # would leave the user wondering which domains were skipped.
     busy = [
@@ -1453,15 +1500,27 @@ def retry_failed_run_now(
     # Bounded pool (2026-06-17) instead of one fire-and-forget task per RD
     # — caps concurrent retries (and their per-RD httpx clients) so a big
     # Retry-failed can't balloon the API to OOM.
-    task = asyncio.create_task(_run_retry_pool(run_id, failed_per_rd, spec))
+    task = asyncio.create_task(
+        _run_retry_pool(
+            run_id, failed_per_rd, spec, resample_only=resample_only,
+        )
+    )
     _REANALYZING_RUNS.add_task(run_id, task)
     _track(task)
-
-    total_criteria = sum(len(v) for v in failed_per_rd.values())
     return {
         "id": run_id, "found": True, "status": "started",
-        "domains": len(failed_per_rd), "criteria": total_criteria,
+        "domains": len(failed_per_rd),
+        "criteria": sum(len(v) for v in failed_per_rd.values()),
     }
+
+
+def _run_id_of_run_domain(run_domain_id: int) -> int | None:
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        return rd.run_id if rd is not None else None
+    finally:
+        db.close()
 
 
 async def _retry_failed_run_domain(
@@ -1494,13 +1553,7 @@ async def _retry_failed_run_domain(
     # need an extra DB hit per iteration.
     parent_run_id: int | None = None
     try:
-        db_lookup = SessionLocal()
-        try:
-            rd = db_lookup.get(RunDomain, run_domain_id)
-            if rd is not None:
-                parent_run_id = rd.run_id
-        finally:
-            db_lookup.close()
+        parent_run_id = await _offload(_run_id_of_run_domain, run_domain_id)
     except Exception:  # noqa: BLE001
         # Don't fail the whole retry just because the cancel check
         # couldn't initialize. Workers will still respect task.cancel().
@@ -1533,9 +1586,15 @@ async def _run_retry_pool(
     spec: AnalyzeSpec,
     *,
     resample_only: bool = False,
+    resample_only_rds: frozenset[int] = frozenset(),
+    concurrency: int | None = None,
 ) -> None:
     """Run per-RD retries through a BOUNDED worker pool instead of spawning
     one `_retry_failed_run_domain` task per RD up front (2026-06-17).
+
+    `resample_only` applies to every RD; `resample_only_rds` to just those
+    ids (the Wayback auto-retry decides it per RD). `concurrency` overrides
+    the default worker count (the availability outer-concurrency knob).
 
     Why this exists: the old dispatch did `for rd_id: asyncio.create_task(...)`
     over the whole failed set. On a large run that's thousands of concurrent
@@ -1579,15 +1638,16 @@ async def _run_retry_pool(
             try:
                 await _retry_failed_run_domain(
                     rd_id, crits, spec, track_set=False,
-                    resample_only=resample_only,
+                    resample_only=resample_only or rd_id in resample_only_rds,
                 )
             finally:
                 _REANALYZING_RUN_DOMAINS.discard(rd_id)
                 queue.task_done()
 
     try:
-        concurrency = max(1, get_availability_outer_concurrency())
-        n_workers = min(concurrency, queue.qsize()) or 1
+        if concurrency is None:
+            concurrency = get_availability_outer_concurrency()
+        n_workers = min(max(1, concurrency), queue.qsize()) or 1
         await asyncio.gather(*(_worker() for _ in range(n_workers)))
     finally:
         _REANALYZING_RUNS.discard(run_id)
@@ -1989,14 +2049,23 @@ async def _wayback_auto_retry_loop(
 
             # Bail if the user re-ran / canceled / paused this run while
             # we were sleeping — they're driving now, get out of the way.
-            if _read_run_status(run_id) not in ("done", "failed"):
+            if await _offload(_read_run_status, run_id) not in ("done", "failed"):
                 return
             # Bail if a manual run-level retry is in flight; that path
             # owns the retries from here.
             if _REANALYZING_RUNS.is_active(run_id):
                 continue
+            # Bail if the operator pressed "Cancel retry" (it leaves the
+            # cancel flag set). Checked explicitly because `_run_retry_pool`
+            # clears the flag when it starts.
+            if is_canceled(run_id):
+                return
 
-            candidates = _collect_wayback_retry_candidates(run_id, spec)
+            # Off the loop (2026-10-31): the scan walks every RD of the run
+            # and parses each wayback CR's JSON.
+            candidates = await _offload(
+                _collect_wayback_retry_candidates, run_id, spec,
+            )
             if not candidates:
                 return  # nothing left to fix
 
@@ -2019,19 +2088,28 @@ async def _wayback_auto_retry_loop(
             retry_spec = spec.model_copy(deep=True)
             retry_spec.use_cache = False
 
-            tasks: list[asyncio.Task] = []
-            for rd_id, (criteria, resample_only) in candidates.items():
-                t = asyncio.create_task(
-                    _retry_failed_run_domain(
-                        rd_id, criteria, retry_spec,
-                        track_set=True,
-                        resample_only=resample_only,
-                    ),
-                )
-                _REANALYZING_RUN_DOMAINS.add_task(rd_id, t)
-                _track(t)
-                tasks.append(t)
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Bounded pool (2026-10-31), as the manual Retry-failed and the
+            # availability auto-retry already do. This used to start one
+            # task per candidate at once; each ran its DB setup before
+            # reaching the Wayback rate limiter, so the whole batch's
+            # commits hit the event loop back to back. The pool registers
+            # this task under `_REANALYZING_RUNS`, so "Cancel retry" now
+            # cancels the watcher itself — the CancelledError skips the
+            # `except Exception` below and ends the loop.
+            await _run_retry_pool(
+                run_id,
+                {rd_id: crits for rd_id, (crits, _) in candidates.items()},
+                retry_spec,
+                resample_only_rds=frozenset(
+                    rd_id for rd_id, (_, resample) in candidates.items()
+                    if resample
+                ),
+                # Same cap as the main runner: the `wayback` /
+                # `wayback_snapshot` rate limits do the real throttling,
+                # and the availability knob (default 8) would starve them
+                # when an operator raises those limits.
+                concurrency=QUALITY_OUTER_CAP,
+            )
     except Exception:  # noqa: BLE001
         log.exception("wayback auto-retry loop crashed for run %s", run_id)
     finally:
@@ -2111,6 +2189,81 @@ async def _reanalyze_run(run_id: int, spec: AnalyzeSpec) -> None:
         _REANALYZING_RUNS.discard(run_id)
 
 
+def _prep_criterion_retry(
+    run_domain_id: int, criterion: str,
+) -> tuple[str, int, dict[str, list[dict]]] | None:
+    """Wipe `criterion`'s AI verdict and the domain's final assessment,
+    then return `(domain, run_id, fetched_rows)`, where `fetched_rows`
+    maps each completed criterion to its parsed rows. None when the
+    RunDomain is gone. Synchronous: run it via `_offload`."""
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None:
+            return None
+        domain = rd.domain
+        run_id = rd.run_id
+        for cr in rd.results:
+            if cr.criterion != criterion:
+                continue
+            cr.ai_verdict_json = ""
+            cr.ai_verdict_error = ""
+            cr.ai_cached_from_run_id = None
+            cr.prompt_hash = ""
+        # Final aggregates all criteria — must be recomputed.
+        rd.final_assessment_json = ""
+        rd.final_summary = ""
+        db.commit()
+
+        fetched_rows: dict[str, list[dict]] = {}
+        for cr in rd.results:
+            if cr.status != "done" or not cr.data_json:
+                continue
+            try:
+                body = json.loads(cr.data_json)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(body, dict):
+                for v in body.values():
+                    if isinstance(v, list):
+                        fetched_rows[cr.criterion] = v
+                        break
+        return domain, run_id, fetched_rows
+    finally:
+        db.close()
+
+
+def _reset_run_domain_for_pillar_retry(
+    run_domain_id: int, criterion: str, *, clear_final: bool,
+) -> bool:
+    """Delete `criterion`'s CR rows and reset the RunDomain to pending so a
+    pillar runner (whois_history / availability) can redo it from scratch.
+    False when the RunDomain is gone. Synchronous: run it via `_offload`."""
+    db = SessionLocal()
+    try:
+        rd = db.get(RunDomain, run_domain_id)
+        if rd is None:
+            return False
+        for cr in list(rd.results):
+            if cr.criterion == criterion:
+                db.delete(cr)
+        # Reset rd to pristine — the pillar runner stamps these itself but
+        # we clear them first so the in-flight state is visible immediately
+        # and a partial cascade can't leave stale 'done' timestamps.
+        rd.status = "pending"
+        rd.error = ""
+        rd.finished_at = None
+        rd.started_at = None
+        rd.last_analyzed_at = None
+        if clear_final:
+            rd.final_assessment_json = ""
+            rd.final_summary = ""
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
 async def _reanalyze_run_domain_criterion(
     run_domain_id: int,
     criterion: str,
@@ -2134,42 +2287,19 @@ async def _reanalyze_run_domain_criterion(
     its result from the wayback CR's V2 samples. We skip the refetch path
     entirely and call `_run_wayback_classify_for_domain` after wiping the
     targeted verdict; the function handles the rest (sample loading,
-    AI calls, status flipping)."""
-    try:
-        db = SessionLocal()
-        try:
-            rd = db.get(RunDomain, run_domain_id)
-            if rd is None:
-                return
-            domain = rd.domain
-            run_id = rd.run_id
-            for cr in rd.results:
-                if cr.criterion != criterion:
-                    continue
-                cr.ai_verdict_json = ""
-                cr.ai_verdict_error = ""
-                cr.ai_cached_from_run_id = None
-                cr.prompt_hash = ""
-            # Final aggregates all criteria — must be recomputed.
-            rd.final_assessment_json = ""
-            rd.final_summary = ""
-            db.commit()
+    AI calls, status flipping).
 
-            fetched_rows: dict[str, list[dict]] = {}
-            for cr in rd.results:
-                if cr.status != "done" or not cr.data_json:
-                    continue
-                try:
-                    body = json.loads(cr.data_json)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(body, dict):
-                    for v in body.values():
-                        if isinstance(v, list):
-                            fetched_rows[cr.criterion] = v
-                            break
-        finally:
-            db.close()
+    Every synchronous DB helper here runs through `_offload` (2026-10-31),
+    like the main runner since 2026-06-21. Inline, each commit ran ON the
+    event loop, and the Wayback auto-retry starts a whole batch of these
+    at once: measured on a 1,000-domain run, the loop froze 2.9 s with no
+    other writer and 29 s with a competing one, during which no page or
+    API request was served (the 524s during Wayback runs)."""
+    try:
+        prep = await _offload(_prep_criterion_retry, run_domain_id, criterion)
+        if prep is None:
+            return
+        domain, run_id, fetched_rows = prep
 
         # Special case: whois_history lives in the whois_history pillar
         # runner, not the Quality runner. The pillar's `_process_whois_domain`
@@ -2184,27 +2314,14 @@ async def _reanalyze_run_domain_criterion(
             wh_cfg = _cfg_for_criterion(spec, "whois_history")
             if wh_cfg is None or not getattr(wh_cfg, "enabled", False):
                 return
-            db2 = SessionLocal()
-            try:
-                rd2 = db2.get(RunDomain, run_domain_id)
-                if rd2 is None:
-                    return
-                for cr in list(rd2.results):
-                    if cr.criterion == "whois_history":
-                        db2.delete(cr)
-                # Reset rd to a pristine state so the pillar runner
-                # flips it correctly. Don't touch other criteria — none
-                # exist on a whois-kind run, but be defensive anyway.
-                rd2.status = "pending"
-                rd2.error = ""
-                rd2.finished_at = None
-                rd2.started_at = None
-                rd2.last_analyzed_at = None
-                rd2.final_assessment_json = ""
-                rd2.final_summary = ""
-                db2.commit()
-            finally:
-                db2.close()
+            # Reset rd to a pristine state so the pillar runner flips it
+            # correctly. Don't touch other criteria — none exist on a
+            # whois-kind run, but be defensive anyway.
+            if not await _offload(
+                _reset_run_domain_for_pillar_retry,
+                run_domain_id, "whois_history", clear_final=True,
+            ):
+                return
             # Import inline to keep tasks.py decoupled from the pillar
             # module at import time (the pillar module already imports
             # from app_settings/models/ai_judge — adding a top-level
@@ -2222,7 +2339,7 @@ async def _reanalyze_run_domain_criterion(
             # bookkeeping the wayback_classify branch does — the pillar
             # runner sets rd.status itself, but the parent Run's status
             # is owned by this re-evaluator.
-            _reevaluate_domain_and_run_status(run_domain_id)
+            await _offload(_reevaluate_domain_and_run_status, run_domain_id)
             return
 
         # Special case: availability (2026-05-16). Mirrors whois_history
@@ -2237,26 +2354,11 @@ async def _reanalyze_run_domain_criterion(
             av_cfg = _cfg_for_criterion(spec, "availability")
             if av_cfg is None or not getattr(av_cfg, "enabled", False):
                 return
-            db_av = SessionLocal()
-            try:
-                rd_av = db_av.get(RunDomain, run_domain_id)
-                if rd_av is None:
-                    return
-                for cr in list(rd_av.results):
-                    if cr.criterion == "availability":
-                        db_av.delete(cr)
-                # Reset rd to pristine — the pillar runner stamps these
-                # itself but we clear them first so the in-flight state
-                # is visible immediately and a partial cascade can't
-                # leave stale 'done' timestamps.
-                rd_av.status = "pending"
-                rd_av.error = ""
-                rd_av.finished_at = None
-                rd_av.started_at = None
-                rd_av.last_analyzed_at = None
-                db_av.commit()
-            finally:
-                db_av.close()
+            if not await _offload(
+                _reset_run_domain_for_pillar_retry,
+                run_domain_id, "availability", clear_final=False,
+            ):
+                return
             # Inline import (avoids a top-level cycle with
             # availability_runner, which imports from .models /
             # .app_settings — same pattern as the whois_history retry).
@@ -2266,7 +2368,7 @@ async def _reanalyze_run_domain_criterion(
                 await _process_availability_domain(
                     run_domain_id, run_id, client,
                 )
-            _reevaluate_domain_and_run_status(run_domain_id)
+            await _offload(_reevaluate_domain_and_run_status, run_domain_id)
             return
 
         # Special case: wayback_classify has no fetch step. Drive it
@@ -2297,7 +2399,7 @@ async def _reanalyze_run_domain_criterion(
                 sub_verdicts=sub_verdicts,
                 run_id=run_id,
             )
-            _reevaluate_domain_and_run_status(run_domain_id)
+            await _offload(_reevaluate_domain_and_run_status, run_domain_id)
             return
 
         # Refetch path: criterion had no usable data (fetch had failed, or
@@ -2340,7 +2442,8 @@ async def _reanalyze_run_domain_criterion(
             if target_req is None:
                 return
             params_hash = compute_params_hash(criterion, cfg)
-            cr_id = _reset_or_create_criterion_row(
+            cr_id = await _offload(
+                _reset_or_create_criterion_row,
                 run_domain_id=run_domain_id,
                 criterion=criterion,
                 url=target_req.url,
@@ -2349,7 +2452,9 @@ async def _reanalyze_run_domain_criterion(
             ok, http_status, body, err, units = await _fetch_criterion(
                 target_req.url, criterion=criterion,
             )
-            _finish_criterion_row(cr_id, ok, http_status, body, err, units)
+            await _offload(
+                _finish_criterion_row, cr_id, ok, http_status, body, err, units,
+            )
             if ok and isinstance(body, dict):
                 for v in body.values():
                     if isinstance(v, list):
@@ -2381,7 +2486,7 @@ async def _reanalyze_run_domain_criterion(
                     )
                     if picks:
                         samples = await _fetch_wayback_samples(samples=picks)
-                        _attach_wayback_samples(cr_id, samples)
+                        await _offload(_attach_wayback_samples, cr_id, samples)
 
         # Resample-only branch (added 2026-05-13). The refetch path above
         # didn't run because wayback's CR was already `status=done` with
@@ -2394,7 +2499,7 @@ async def _reanalyze_run_domain_criterion(
         # own re-judge pass.
         elif resample_only and criterion == "wayback":
             wb_cfg = getattr(spec.criteria, "wayback", None)
-            cr_id = _criterion_row_ids(run_domain_id).get("wayback")
+            cr_id = (await _offload(_criterion_row_ids, run_domain_id)).get("wayback")
             if (
                 cr_id is not None
                 and wb_cfg is not None
@@ -2410,7 +2515,7 @@ async def _reanalyze_run_domain_criterion(
                 )
                 if picks:
                     samples = await _fetch_wayback_samples(samples=picks)
-                    _attach_wayback_samples(cr_id, samples)
+                    await _offload(_attach_wayback_samples, cr_id, samples)
 
         await _run_ai_for_domain(
             run_domain_id=run_domain_id,
@@ -2422,7 +2527,7 @@ async def _reanalyze_run_domain_criterion(
         # Refresh rd.status / run.status — refetch may have flipped a
         # previously-failed criterion to done, so the stale "failed" pill
         # would otherwise stick around until the next full rerun.
-        _reevaluate_domain_and_run_status(run_domain_id)
+        await _offload(_reevaluate_domain_and_run_status, run_domain_id)
     except Exception:  # noqa: BLE001
         log.exception(
             "reanalyze criterion %s for run_domain %s failed",
@@ -2570,6 +2675,11 @@ def cancel_run_now(run_id: int) -> dict:
 
 # --- The worker -------------------------------------------------------------
 
+# Max `_process_domain` coroutines in flight per quality run (see the comment
+# in `process_run`). The Wayback auto-retry pool uses the same cap.
+QUALITY_OUTER_CAP = 32
+
+
 async def process_run(run_id: int) -> None:
     """Top-level coroutine for a Run. Each step in its own DB session — no
     long-held transactions across awaits."""
@@ -2598,8 +2708,7 @@ async def process_run(run_id: int) -> None:
     #    still saturating the per-provider rate limits (Wayback default
     #    max_concurrent=1; Ahrefs ~4; Gemini RPM 60). Each completed
     #    domain releases a slot for the next.
-    OUTER_CAP = 32
-    outer_sem = asyncio.Semaphore(OUTER_CAP)
+    outer_sem = asyncio.Semaphore(QUALITY_OUTER_CAP)
 
     async def _run_one(rd_id: int) -> None:
         async with outer_sem:
