@@ -680,8 +680,11 @@ const messagesEn = {
         archiveHttp429: "throttled (429)",
         archiveNetwork: "network/timeout",
         archiveDomainsAffected: "domains affected",
+        // n = DOMAINS with a retryable failure (2026-10-31; was criteria).
         retryFailed: (n: number) =>
-          n > 0 ? `Retry ${n} failed` : "Retry failed",
+          n > 0
+            ? `Retry ${n} failed domain${n === 1 ? "" : "s"}`
+            : "Retry failed",
         retryFailedHint:
           "Re-run every failed Ahrefs/Wayback fetch and every failed AI verdict in this run. Refetches data where missing; re-judges where data exists. Disabled criteria are left alone.",
         retryFailedConfirm: (criteria: number, domains: number) =>
@@ -761,12 +764,13 @@ const messagesEn = {
           "Nothing to retry — none of the selected domains have failed criteria in the picked set.",
         bulkRetryResult: (domains: number, criteria: number) =>
           `Retrying ${criteria} criteria across ${domains} domain${domains === 1 ? "" : "s"}.`,
+        // Counts are DOMAINS (2026-10-31; were criteria).
         retryOutcomeAllRecovered: (n: number) =>
-          `All ${n} criteria recovered after retry.`,
+          `All ${n} domain${n === 1 ? "" : "s"} recovered after retry.`,
         retryOutcomePartial: (recovered: number, stillFailed: number) =>
-          `Recovered ${recovered}; ${stillFailed} criteria still failed.`,
+          `Recovered ${recovered} domain${recovered === 1 ? "" : "s"}; ${stillFailed} still failed.`,
         retryOutcomeAllStillFailed: (n: number) =>
-          `All ${n} criteria still failed after retry.`,
+          `All ${n} domain${n === 1 ? "" : "s"} still failed after retry.`,
         retryOutcomeViewErrors: "View on Errors page",
         exportVisible: (n: number) => `Export visible (${n})`,
         exportAll: (n: number) => `Export all (${n})`,
@@ -3564,7 +3568,8 @@ const messagesRu: Messages = {
         archiveHttp429: "троттлинг (429)",
         archiveNetwork: "сеть/таймаут",
         archiveDomainsAffected: "доменов затронуто",
-        retryFailed: (n) => (n > 0 ? `Повторить ${n} с ошибкой` : "Повторить с ошибкой"),
+        retryFailed: (n) =>
+          n > 0 ? `Повторить домены с ошибкой (${n})` : "Повторить с ошибкой",
         retryFailedHint:
           "Перезапустить каждую неудачную загрузку Ahrefs/Wayback и каждый неудачный AI-вердикт в этом запуске. Перезагружает данные где их нет; пере-судит где данные есть. Отключённые критерии не трогает.",
         retryFailedConfirm: (criteria, domains) =>
@@ -3631,11 +3636,11 @@ const messagesRu: Messages = {
         bulkRetryResult: (domains: number, criteria: number) =>
           `Повтор: ${criteria} критериев на ${domains} домене(ах).`,
         retryOutcomeAllRecovered: (n) =>
-          `Все ${n} критериев восстановлены после повтора.`,
+          `Все домены восстановлены после повтора (${n}).`,
         retryOutcomePartial: (recovered, stillFailed) =>
-          `Восстановлено: ${recovered}; ${stillFailed} критериев всё ещё с ошибкой.`,
+          `Восстановлено доменов: ${recovered}; всё ещё с ошибкой: ${stillFailed}.`,
         retryOutcomeAllStillFailed: (n) =>
-          `Все ${n} критериев всё ещё с ошибкой после повтора.`,
+          `Все домены всё ещё с ошибкой после повтора (${n}).`,
         retryOutcomeViewErrors: "Открыть на странице Ошибок",
         exportVisible: (n) => `Экспорт видимых (${n})`,
         exportAll: (n) => `Экспорт всех (${n})`,

@@ -1356,8 +1356,10 @@ export default function RunDetailPage({
       return;
     }
     if (pendingRetry.sawInFlight && !anyReanalyzing) {
+      // Counted in DOMAINS, like the button (2026-10-31): a domain can
+      // carry several failed criteria, and the operator thinks in domains.
       const before = pendingRetry.failedBefore;
-      const after = failedCount.criteria;
+      const after = failedCount.domains;
       const recovered = Math.max(before - after, 0);
       let outcome: { tone: "success" | "partial" | "fail"; text: string };
       if (after === 0) {
@@ -1382,7 +1384,7 @@ export default function RunDetailPage({
   }, [
     anyReanalyzing,
     pendingRetry,
-    failedCount.criteria,
+    failedCount.domains,
     ts,
   ]);
 
@@ -1402,15 +1404,15 @@ export default function RunDetailPage({
     setRetryError(null);
     setRetryOutcome(null);
     // Snapshot before dispatch — the outcome banner compares this against
-    // the post-batch failed count to compute recovered/still-failing.
-    const failedBefore = failedCount.criteria;
+    // the post-batch failed-domain count to compute recovered/still-failing.
+    const failedBefore = failedCount.domains;
     try {
       const r = await api.retryFailedRun(runId, {
         provider: specAi.provider || undefined,
         model: specAi.model || undefined,
       });
       setPendingRetry({
-        criteria: r.criteria ?? failedBefore,
+        criteria: r.criteria ?? failedCount.criteria,
         domains: r.domains ?? failedCount.domains,
         failedBefore,
         sawInFlight: false,
@@ -1642,7 +1644,7 @@ export default function RunDetailPage({
                         reanalyzingCount,
                         pendingRetry.domains,
                       )
-                    : ts.retryFailed(failedCount.criteria)}
+                    : ts.retryFailed(failedCount.domains)}
               </button>
               {/* Cancel-retry (added 2026-05-24). Renders only while a
                   Retry-failed dispatch is in flight — outside that window
