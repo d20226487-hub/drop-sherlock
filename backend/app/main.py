@@ -159,6 +159,11 @@ def _migrate_sqlite_columns() -> None:
         ("ix_backlog_domains_desired_price", "backlog_domains", "desired_price"),
         ("ix_backlog_domains_max_price", "backlog_domains", "max_price"),
         ("ix_backlog_domains_created_at", "backlog_domains", "created_at"),
+        # Added 2026-11-01: serves the newest-import-first Source lists
+        # (Backlog + Database filters: MAX(created_at) per registrar) from
+        # the index alone — 0.10 s → 0.06 s at 500k rows.
+        ("ix_backlog_domains_registrar_created_at", "backlog_domains",
+         "registrar, created_at"),
         # Added 2026-05-10: drives the IN-list join in /database/domains
         # so the Notes lookup is index-served instead of full-scanning
         # domain_notes. See notes_by_domain in routers/database.py.

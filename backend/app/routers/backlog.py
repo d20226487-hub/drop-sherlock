@@ -670,14 +670,12 @@ def list_backlog(
     if include_options:
         # Distinct registrars across the FULL table (not the filtered set) so
         # the registrar filter's options stay stable as the user toggles other
-        # filters. Empty-string registrar is excluded.
-        registrar_rows = (
-            db.query(distinct(BacklogDomain.registrar))
-            .filter(BacklogDomain.registrar != "")
-            .order_by(BacklogDomain.registrar.asc())
-            .all()
-        )
-        registrar_options = [r[0] for r in registrar_rows]
+        # filters. Empty-string registrar is excluded. Newest import first
+        # (2026-11-01; was A→Z), the same order as the Database page's
+        # Source filter.
+        from .database import _sources_newest_first
+
+        registrar_options = _sources_newest_first(db, set())
 
     analyzed_links = _resolve_analyzed_links(db, [r.domain for r in rows])
 
