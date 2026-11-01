@@ -1416,6 +1416,15 @@ const messagesEn = {
       refresh: "Refresh",
       refreshing: "Refreshing…",
       refreshedAt: (time: string) => `Updated ${time}`,
+      // Slow-refresh banner (2026-11-01): shown while Wayback / Availability
+      // checks run and the snapshot refreshes less often to spare the server.
+      slowRefreshTitle: (min: number) =>
+        `Wayback / Availability checks are running, so this page now refreshes every ${min} minutes instead of every 5 to keep the server responsive.`,
+      slowRefreshTimes: (asOf: string, next: string) =>
+        `Data as of ${asOf} · next refresh by ${next}.`,
+      slowRefreshNote:
+        "Edits to individual domains still show immediately. New check results, run pins and the Source filter list update at the next refresh; Refresh reloads this snapshot until then.",
+      slowRefreshRunning: "Running:",
       exportVisible: (n: number) => `Export visible (${n})`,
       exportAll: (n: number) => `Export all (${n})`,
       exportVisibleHelp:
@@ -4305,6 +4314,13 @@ const messagesRu: Messages = {
       refresh: "Обновить",
       refreshing: "Обновление…",
       refreshedAt: (time) => `Обновлено ${time}`,
+      slowRefreshTitle: (min) =>
+        `Идут проверки Wayback / Availability, поэтому страница сейчас обновляется раз в ${min} минут вместо 5, чтобы сервер не тормозил.`,
+      slowRefreshTimes: (asOf, next) =>
+        `Данные на ${asOf} · следующее обновление до ${next}.`,
+      slowRefreshNote:
+        "Правки отдельных доменов по-прежнему видны сразу. Новые результаты проверок, закрепления запусков и список источников обновятся при следующем обновлении; до тех пор «Обновить» перезагружает текущий снимок.",
+      slowRefreshRunning: "Идут:",
       exportVisible: (n) => `Экспорт видимых (${n})`,
       exportAll: (n) => `Экспорт всех (${n})`,
       exportVisibleHelp:

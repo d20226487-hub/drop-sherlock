@@ -1934,6 +1934,52 @@ export default function DatabasePage() {
         </div>
       </div>
 
+      {/* Slow-refresh banner (2026-11-01). While Wayback / Availability
+          checks run, the backend refreshes this page's snapshot every 30
+          min instead of 5 (a full rebuild costs ~2 GB at 100k domains and
+          competes with the checks); say so, and when the data is from. */}
+      {data?.slow_refresh && (() => {
+        const interval = data.refresh_interval_min ?? 30;
+        const built = data.snapshot_built_at
+          ? new Date(data.snapshot_built_at)
+          : null;
+        const hhmm = (d: Date) =>
+          d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        return (
+          <div
+            role="status"
+            className="rounded-lg border border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800/60 dark:bg-amber-950/40 dark:text-amber-200 px-4 py-3 text-sm space-y-1"
+          >
+            <p className="font-medium">{ts.slowRefreshTitle(interval)}</p>
+            {built && (
+              <p>
+                {ts.slowRefreshTimes(
+                  hhmm(built),
+                  hhmm(new Date(built.getTime() + interval * 60_000)),
+                )}
+              </p>
+            )}
+            <p className="text-xs opacity-80">{ts.slowRefreshNote}</p>
+            {(data.slow_refresh_checks ?? []).length > 0 && (
+              <p className="text-xs">
+                <span className="opacity-80 mr-1">{ts.slowRefreshRunning}</span>
+                {(data.slow_refresh_checks ?? []).map((c, i) => (
+                  <span key={c.run_id}>
+                    {i > 0 && " · "}
+                    <Link
+                      href={`/jobs/${c.job_id}/runs/${c.run_id}`}
+                      className="underline hover:no-underline"
+                    >
+                      {c.kind === "wayback" ? "Wayback" : "Availability"} #{c.run_id}
+                    </Link>
+                  </span>
+                ))}
+              </p>
+            )}
+          </div>
+        );
+      })()}
+
       <section className="rounded-lg border dark:border-neutral-800 bg-white dark:bg-neutral-900 p-4 space-y-3">
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <h2 className="text-sm font-semibold">{ts.filters.heading}</h2>

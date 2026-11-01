@@ -1307,6 +1307,17 @@ export type DatabaseDomainList = {
   // populated when include_options=true). Drives the "show taken" toggle
   // label + prevents a misleading empty screen.
   hidden_total: number;
+  // Slow-refresh mode (2026-11-01): true while Wayback / Availability checks
+  // run and the snapshot refreshes every `refresh_interval_min` instead of 5.
+  slow_refresh?: boolean;
+  slow_refresh_checks?: {
+    run_id: number;
+    job_id: number;
+    kind: "availability" | "wayback";
+  }[];
+  refresh_interval_min?: number;
+  // When the shown data was aggregated (UTC ISO, "Z"-suffixed).
+  snapshot_built_at?: string | null;
 };
 
 // Server-side filter/sort/pagination params for listDatabaseDomains

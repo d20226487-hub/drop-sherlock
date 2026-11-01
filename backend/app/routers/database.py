@@ -295,6 +295,15 @@ class DomainListResponse(BaseModel):
     # taken" toggle and avoid a misleading "database empty" screen when
     # everything is merely hidden. Only populated when include_options.
     hidden_total: int = 0
+    # Slow-refresh mode (2026-11-01): true while Wayback / Availability
+    # checks run, listed in `slow_refresh_checks` ({run_id, job_id, kind}).
+    # `refresh_interval_min` is the current automatic refresh cadence and
+    # `snapshot_built_at` (UTC, ISO with Z) when the shown data was built —
+    # together they drive the page's banner.
+    slow_refresh: bool = False
+    slow_refresh_checks: list[dict] = []
+    refresh_interval_min: int = 5
+    snapshot_built_at: str | None = None
 
 
 # --- Helpers ----------------------------------------------------------------
@@ -1891,14 +1900,104 @@ _EMPTY_FILTER_OPTIONS: dict[str, list[str]] = {
 }
 
 
+# Slow refresh while Wayback / Availability checks run (2026-11-01). A full
+# rebuild is the heaviest thing the API does — measured on a production-
+# shaped DB, ~2 GB of extra memory at ~100k domains — and it competes for
+# the single Python process those checks run in, during the server's
+# busiest, most memory-hungry stretches. So while such a check is running
+# (or being retried) the snapshot refreshes at most every
+# `_SLOW_REFRESH_SEC` instead of `_ROWS_CACHE_TTL_SEC`: the TTL stretches,
+# and rebuild requests (bulk edits, run pins, the Refresh button) fold into
+# ONE deferred rebuild at the end of the window. Per-row patches
+# (`_patch_domains_in_cache`) stay instant. The list response reports the
+# mode so the page can explain it in a banner.
+_SLOW_REFRESH_SEC = 1800.0
+# How long `active_heavy_checks()` reuses its answer (it's asked on cache
+# reads and rebuild triggers, i.e. per Database request).
+_CHECKS_PROBE_TTL_SEC = 15.0
+_checks_probe: tuple[float, list[dict]] = (0.0, [])  # (expires, checks)
+_checks_probe_lock = threading.Lock()
+# Monotonic time the last full build was stored (0 = never), and the wall
+# clock (UTC) of the data on screen — patches don't move either.
+_last_build_done = 0.0
+_snapshot_built_at: datetime | None = None
+_deferred_rebuild: threading.Timer | None = None
+
+
+def active_heavy_checks() -> list[dict]:
+    """Wayback / Availability runs that are working right now — running, or
+    being retried (manual Retry failed, auto-retry) — as
+    `[{"run_id", "job_id", "kind"}]`, kind "availability" or "wayback".
+    Cached for `_CHECKS_PROBE_TTL_SEC`."""
+    global _checks_probe
+    now = time.monotonic()
+    with _checks_probe_lock:
+        if _checks_probe[0] > now:
+            return _checks_probe[1]
+    checks = _probe_heavy_checks()
+    with _checks_probe_lock:
+        _checks_probe = (now + _CHECKS_PROBE_TTL_SEC, checks)
+    return checks
+
+
+def _probe_heavy_checks() -> list[dict]:
+    from sqlalchemy import or_
+
+    from ..models import Job, Run
+    from ..tasks import _REANALYZING_RUNS
+
+    try:
+        retrying = [
+            rid for rid, task in list(_REANALYZING_RUNS.items())
+            if task is not None and not task.done()
+        ]
+    except RuntimeError:
+        # Mutated by the event loop mid-copy; the next probe catches it.
+        retrying = []
+    cond = Run.status == "running"
+    if retrying:
+        cond = or_(cond, Run.id.in_(retrying))
+    db = SessionLocal()
+    try:
+        found = (
+            db.query(Run.id, Run.job_id, Run.spec_json, Job.kind)
+            .join(Job, Job.id == Run.job_id)
+            .filter(cond)
+            .order_by(Run.id)
+            .all()
+        )
+    finally:
+        db.close()
+    checks: list[dict] = []
+    for run_id, job_id, spec_json, kind in found:
+        if kind == "availability":
+            checks.append({"run_id": run_id, "job_id": job_id, "kind": "availability"})
+        elif kind in (None, "", "quality"):
+            try:
+                criteria = json.loads(spec_json or "{}").get("criteria") or {}
+                wayback = bool((criteria.get("wayback") or {}).get("enabled"))
+            except (ValueError, AttributeError):
+                wayback = False
+            if wayback:
+                checks.append({"run_id": run_id, "job_id": job_id, "kind": "wayback"})
+    return checks
+
+
 def _read_rows_cache(
     now: float,
 ) -> tuple[list[DomainRow], dict[str, list[str]], set[str]] | None:
-    """Return the UNEXPIRED snapshot, or None on miss/expiry."""
+    """Return the snapshot while it's fresh, or None on miss/expiry. Fresh =
+    within the normal TTL or, while Wayback / Availability checks run,
+    within the slow-refresh window."""
     with _rows_cache_lock:
         ent = _rows_cache.get("all")
-        if ent is not None and ent[0] > now:
-            return ent[1], ent[2], ent[3]
+    if ent is None:
+        return None
+    if ent[0] > now:
+        return ent[1], ent[2], ent[3]
+    built = ent[0] - _ROWS_CACHE_TTL_SEC
+    if now - built < _SLOW_REFRESH_SEC and active_heavy_checks():
+        return ent[1], ent[2], ent[3]
     return None
 
 
@@ -1919,13 +2018,17 @@ def _store_rows_cache(
     options: dict[str, list[str]],
     hide_candidates: set[str],
 ) -> None:
+    global _last_build_done, _snapshot_built_at
     with _rows_cache_lock:
+        now = time.monotonic()
         _rows_cache["all"] = (
-            time.monotonic() + _ROWS_CACHE_TTL_SEC,
+            now + _ROWS_CACHE_TTL_SEC,
             rows,
             options,
             hide_candidates,
         )
+        _last_build_done = now
+        _snapshot_built_at = datetime.utcnow()
 
 
 def _build_and_store_rows() -> None:
@@ -1970,8 +2073,12 @@ def _build_and_store_rows() -> None:
 def _trigger_background_rebuild() -> None:
     """Spawn ONE background thread to rebuild the snapshot, unless one is
     already pending. Non-blocking — the caller keeps serving the stale
-    snapshot. The thread uses its own session (never the request's)."""
+    snapshot. The thread uses its own session (never the request's).
+    While Wayback / Availability checks run, a request inside the slow-
+    refresh window is deferred instead (`_defer_rebuild_for_checks`)."""
     global _rebuild_pending
+    if _defer_rebuild_for_checks():
+        return
     with _rebuild_flag_lock:
         if _rebuild_pending:
             return
@@ -1990,6 +2097,35 @@ def _trigger_background_rebuild() -> None:
     threading.Thread(
         target=_worker, name="rows-cache-rebuild", daemon=True,
     ).start()
+
+
+def _defer_rebuild_for_checks() -> bool:
+    """While Wayback / Availability checks run, hold full rebuilds to one per
+    `_SLOW_REFRESH_SEC`. A request inside the window schedules ONE rebuild
+    for when the window ends — later requests fold into it — and returns
+    True. Never defers the first build (no snapshot yet), and stops
+    deferring as soon as the checks are over."""
+    global _deferred_rebuild
+    if _peek_rows_cache() is None:
+        return False
+    wait = _SLOW_REFRESH_SEC - (time.monotonic() - _last_build_done)
+    if wait <= 0 or not active_heavy_checks():
+        return False
+    with _rebuild_flag_lock:
+        if _deferred_rebuild is None or not _deferred_rebuild.is_alive():
+            timer = threading.Timer(wait, _run_deferred_rebuild)
+            timer.daemon = True
+            timer.name = "rows-cache-deferred-rebuild"
+            _deferred_rebuild = timer
+            timer.start()
+    return True
+
+
+def _run_deferred_rebuild() -> None:
+    global _deferred_rebuild
+    with _rebuild_flag_lock:
+        _deferred_rebuild = None
+    _trigger_background_rebuild()
 
 
 def _invalidate_rows_cache() -> None:
@@ -2450,6 +2586,8 @@ def list_domains(
         sliced = filtered
     per_page = limit if limit is not None else filtered_total
     page = (offset // limit + 1) if (limit and limit > 0) else 1
+    checks = active_heavy_checks()
+    built_at = _snapshot_built_at
     return DomainListResponse(
         rows=sliced,
         filter_options=filter_options if include_options else {},
@@ -2458,6 +2596,14 @@ def list_domains(
         page=page,
         per_page=per_page,
         hidden_total=len(hide_candidates) if include_options else 0,
+        slow_refresh=bool(checks),
+        slow_refresh_checks=checks,
+        refresh_interval_min=int(
+            (_SLOW_REFRESH_SEC if checks else _ROWS_CACHE_TTL_SEC) // 60
+        ),
+        snapshot_built_at=(
+            built_at.strftime("%Y-%m-%dT%H:%M:%SZ") if built_at else None
+        ),
     )
 
 
@@ -3358,6 +3504,9 @@ def bulk_set_source(
     updated, created, skipped_banned = _upsert_source_for_domains(
         db, normalized, source,
     )
+    # Rows show their new source at once; the full rebuild (for the Source
+    # filter list) may be deferred while Wayback / Availability checks run.
+    _patch_domains_in_cache(db, normalized)
     _invalidate_rows_cache()
     return BulkSetSourceOut(
         updated=updated,
@@ -3441,6 +3590,7 @@ def bulk_set_source_filtered(
     updated, created, skipped_banned = _upsert_source_for_domains(
         db, domains, source,
     )
+    _patch_domains_in_cache(db, domains)  # see bulk_set_source
     _invalidate_rows_cache()
     return BulkSetSourceOut(
         updated=updated,
