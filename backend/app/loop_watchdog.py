@@ -223,6 +223,10 @@ class _Watchdog:
         # One ping in flight at most, so a long stall doesn't queue
         # a callback per second on the loop.
         self.pending = False
+        # When the in-flight ping was sent and how late the last one ran:
+        # the loop's actual queueing delay, fed to resource_guard.
+        self.ping_sent = time.monotonic()
+        self.last_delay = 0.0
         self.stop_event = threading.Event()
         self.report_times: list[float] = []
         self.next_mem_mark = float(_MEM_FLOOR_MB)
@@ -232,6 +236,7 @@ class _Watchdog:
 
     def _beat(self) -> None:
         self.last_beat = time.monotonic()
+        self.last_delay = self.last_beat - self.ping_sent
         self.pending = False
 
     def _check_memory(self, now: float) -> None:
@@ -255,11 +260,14 @@ class _Watchdog:
         return True
 
     def _run(self) -> None:
+        from . import resource_guard  # here, not at import: it imports us
+
         stall_start: float | None = None  # last beat before the stall
         reported = False
         while not self.stop_event.is_set():
             if not self.pending:
                 self.pending = True
+                self.ping_sent = time.monotonic()
                 try:
                     self.loop.call_soon_threadsafe(self._beat)
                 except RuntimeError:  # loop closed
@@ -268,6 +276,9 @@ class _Watchdog:
                 return
             now = time.monotonic()
             self._check_memory(now)
+            resource_guard.note_tick(
+                now, now - self.ping_sent if self.pending else self.last_delay,
+            )
             lag = now - self.last_beat
             if lag >= self.stall_sec:
                 if stall_start is None:

@@ -2083,16 +2083,24 @@ def _trigger_background_rebuild() -> None:
         if _rebuild_pending:
             return
         _rebuild_pending = True
+    # Resource check before a REbuild (the first build always runs). Log-only
+    # for now: it records when it would have postponed and what the rebuild
+    # then cost, and never blocks. See resource_guard.py.
+    from .. import resource_guard
+    guard = resource_guard.before_rebuild() if _peek_rows_cache() is not None else None
 
     def _worker() -> None:
         global _rebuild_pending
+        ok = False
         try:
             _build_and_store_rows()
+            ok = True
         except Exception:  # noqa: BLE001
             log.exception("background rows-cache rebuild failed")
         finally:
             with _rebuild_flag_lock:
                 _rebuild_pending = False
+            resource_guard.after_rebuild(guard, ok)
 
     threading.Thread(
         target=_worker, name="rows-cache-rebuild", daemon=True,
