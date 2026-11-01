@@ -1306,6 +1306,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Slow-request log (2026-11-01): off unless SLOW_REQUEST_LOG_SEC is set.
+# Added last so it is the outermost layer and times the whole request.
+# See slow_requests.py.
+from . import slow_requests as _slow_requests
+
+_slow_requests.install(app, engine, Base)
+
 app.include_router(dashboard.router)
 app.include_router(analyze.router)
 # job_io must register BEFORE jobs_router so `/jobs/import` (literal)
