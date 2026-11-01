@@ -57,6 +57,7 @@ const messagesEn = {
       label: "Database",
       analyzeList: "Analyze List",
       banList: "Ban List",
+      cleanup: "Cleanup",
       toggleAria: "Open Database menu",
     },
     // Wave 1 (2026-05-15) — Check / Jobs split into 3-pillar dropdowns.
@@ -2136,6 +2137,107 @@ const messagesEn = {
       errorCatNetwork: "Network",
       errorCatParse: "Parse",
     },
+    // Database ▸ Cleanup (2026-11-01).
+    cleanup: {
+      title: "Cleanup",
+      intro:
+        "Delete taken domains and orphaned rows in one place. Each cleanup shows exactly what it will delete, asks you to type the count to confirm, and backs up the database before deleting anything.",
+      notAffected: (n: number) =>
+        `Not affected: ${n.toLocaleString()} Backlog domain(s) uploaded but never analyzed — no cleanup touches them.`,
+      checksRunning:
+        "A Wayback / Availability check is running, so cleanup is disabled until it finishes:",
+      refresh: "Refresh preview",
+      loading: "Loading preview…",
+      takenTitle: "Taken domains",
+      takenHint:
+        "Domains checked only by Availability jobs whose every verdict is registered (not supported, unknown and error count only if ticked below). Never touched: domains with any other analysis (so nothing on the Database page, in Linked Domains or SERP Overview), and domains with an available verdict, a note, a per-domain pin, a check still in progress, or an expiry date inside the window below. A pinned Availability run doesn't protect its domains.",
+      includeLabel: "Also delete domains with these verdicts:",
+      statusLabels: {
+        not_supported: "not supported",
+        unknown: "unknown",
+        error: "error",
+      } as Record<string, string>,
+      expiryLabel: "Keep domains expiring within (days)",
+      expiryHint:
+        "Already-expired domains are kept too: they're the drop candidates. 0 keeps none for this reason.",
+      deleteBacklog: "Also delete their Backlog rows",
+      ban: "Add them to the ban list, so re-imports skip them",
+      banHint:
+        "As on the Ban List page, banning moves the Backlog row into the ban, so unbanning restores it.",
+      takenCount: (n: number) => `${n.toLocaleString()} domain(s) will be deleted`,
+      withBacklog: (n: number) => `${n.toLocaleString()} of them have a Backlog row`,
+      keptTitle: "Kept:",
+      keptNote: (n: number) => `${n} with a note`,
+      keptPinned: (n: number) => `${n} pinned`,
+      keptInProgress: (n: number) => `${n} with a check in progress`,
+      keptExpiring: (n: number) => `${n} expiring soon`,
+      takenDeletes:
+        "Deletes their Availability checks and results, their availability history and share links. Runs left empty are kept.",
+      sampleTitle: (shown: number, total: number) =>
+        `First ${shown} of ${total.toLocaleString()}`,
+      colDomain: "Domain",
+      colStatus: "Verdict",
+      colExpires: "Expires",
+      colSource: "Source",
+      downloadCsv: "Download the full list (CSV)",
+      deleteTaken: (n: number) => `Delete ${n.toLocaleString()} domain(s)`,
+      orphansTitle: "Orphaned rows",
+      orphansHint:
+        "Rows whose parent no longer exists and that nothing reads. They can't belong to anything on the Database page, in Linked Domains or SERP Overview.",
+      orphanLabels: {
+        share_links: "Share links to a deleted check",
+        results_without_check: "Results without a check",
+        checks_without_run: "Checks without a run",
+        runs_without_job: "Runs without a job",
+        pins_to_missing: "Pins to a missing run or job",
+        sparkline_without_job: "Sparkline results without a job",
+      } as Record<string, string>,
+      orphanHelp: {
+        share_links:
+          "A share link opens one domain's check. That check has been deleted, so the link now leads to an empty page. Only the dead link is removed.",
+        results_without_check:
+          "A domain check stores its results (Ahrefs, Wayback, Availability…) as separate rows. These rows belong to a check that no longer exists, so no page can show them.",
+        checks_without_run:
+          "A check of one domain whose run was deleted. No page lists it. Checks that Linked Domains or SERP rows still rely on are never counted here.",
+        runs_without_job:
+          "A run whose job was deleted. It has no domain checks left and Linked Domains / SERP don't use it, so it's invisible everywhere.",
+        pins_to_missing:
+          "A job setting that says “take this criterion's results from run X” (the Database page uses it). The run or job it points to was deleted, so the setting does nothing.",
+        sparkline_without_job:
+          "Results from Tools ▸ Wayback (sparkline) whose job was deleted. That page shows results by job, so these can't be opened anymore.",
+      } as Record<string, string>,
+      keptOrphansTitle: "Never deleted, shown for transparency:",
+      keptOrphanLabels: {
+        linked_rows: "Linked Domains rows without a check (their exports still read them)",
+        serp_rows: "SERP rows without a check (their exports still read them)",
+        notes: "Notes on domains found nowhere else (your content)",
+        empty_runs: "Runs with no checks (kept as history)",
+      } as Record<string, string>,
+      keptOrphanHelp: {
+        linked_rows:
+          "Linked Domains results whose domain check is gone. Kept on purpose: the Linked Domains CSV export still reads them by run.",
+        serp_rows:
+          "The same for SERP Overview: the check is gone, but the SERP export still reads them by run.",
+        notes:
+          "Notes on domains that are no longer in any run or in the Backlog. It's your own text, so it's never deleted automatically.",
+        empty_runs:
+          "Runs that still belong to a job but have no domain checks (for example after a cleanup). They stay in the job's history.",
+      } as Record<string, string>,
+      deleteOrphans: (n: number) => `Delete ${n.toLocaleString()} orphaned row(s)`,
+      nothing: "Nothing to delete.",
+      confirmPrompt: (n: number) =>
+        `This permanently deletes ${n.toLocaleString()} item(s). A backup is taken first.\n\nType ${n} to confirm:`,
+      confirmMismatch: "The number didn't match, so nothing was deleted.",
+      phaseBackup: "Backing up the database…",
+      phaseDeleting: (done: number, total: number) =>
+        `Deleting… ${done.toLocaleString()} / ${total.toLocaleString()}`,
+      doneTaken: (domains: number, checks: number, history: number, backlog: number, banned: number) =>
+        `Deleted ${domains.toLocaleString()} domain(s): ${checks.toLocaleString()} checks, ${history.toLocaleString()} history rows, ${backlog.toLocaleString()} Backlog rows, ${banned.toLocaleString()} banned.`,
+      doneOrphans: (n: number) => `Deleted ${n.toLocaleString()} orphaned row(s).`,
+      backupNote: (file: string) =>
+        `Backup: ${file} (restore it from Settings → Database backups).`,
+      failed: (msg: string) => `Cleanup failed: ${msg}`,
+    },
     banlist: {
       title: "Ban List",
       hint:
@@ -2961,6 +3063,7 @@ const messagesRu: Messages = {
       label: "База",
       analyzeList: "Список для анализа",
       banList: "Бан-лист",
+      cleanup: "Чистка",
       toggleAria: "Открыть меню Базы",
     },
     checkDropdown: {
@@ -5054,6 +5157,105 @@ const messagesRu: Messages = {
       errorCatQuota: "Квота",
       errorCatNetwork: "Сеть",
       errorCatParse: "Разбор",
+    },
+    cleanup: {
+      title: "Чистка",
+      intro:
+        "Удаление занятых доменов и осиротевших записей в одном месте. Каждая чистка сначала показывает, что именно будет удалено, просит ввести количество для подтверждения и делает резервную копию базы до удаления.",
+      notAffected: (n) =>
+        `Не затрагиваются: ${n.toLocaleString()} домен(ов) в Очереди, загруженных, но ещё не проверенных — ни одна чистка их не трогает.`,
+      checksRunning:
+        "Идёт проверка Wayback / Availability, поэтому чистка недоступна до её окончания:",
+      refresh: "Обновить предпросмотр",
+      loading: "Загрузка предпросмотра…",
+      takenTitle: "Занятые домены",
+      takenHint:
+        "Домены, проверенные только задачами Availability, у которых каждый вердикт — registered (not supported, unknown и error — только если отмечены ниже). Не затрагиваются никогда: домены с любым другим анализом (то есть всё, что есть на странице Базы, в Linked Domains и SERP Overview), а также домены с вердиктом available, заметкой, закреплением домена, незавершённой проверкой или датой истечения в пределах окна ниже. Закреплённый запуск Availability свои домены не защищает.",
+      includeLabel: "Также удалять домены с вердиктами:",
+      statusLabels: {
+        not_supported: "not supported",
+        unknown: "unknown",
+        error: "error",
+      } as Record<string, string>,
+      expiryLabel: "Оставлять домены, истекающие в течение (дней)",
+      expiryHint:
+        "Уже истёкшие тоже остаются — это кандидаты на дроп. 0 — не оставлять по этой причине.",
+      deleteBacklog: "Также удалить их строки в Очереди",
+      ban: "Добавить их в бан-лист, чтобы повторный импорт их пропускал",
+      banHint:
+        "Как и на странице Бан-листа, бан переносит строку из Очереди в бан, и при разбане она вернётся.",
+      takenCount: (n) => `Будет удалено доменов: ${n.toLocaleString()}`,
+      withBacklog: (n) => `из них со строкой в Очереди: ${n.toLocaleString()}`,
+      keptTitle: "Останутся:",
+      keptNote: (n) => `с заметкой: ${n}`,
+      keptPinned: (n) => `закреплённые: ${n}`,
+      keptInProgress: (n) => `с незавершённой проверкой: ${n}`,
+      keptExpiring: (n) => `скоро истекают: ${n}`,
+      takenDeletes:
+        "Удаляются их проверки и результаты Availability, история доступности и ссылки для расшаривания. Опустевшие запуски остаются.",
+      sampleTitle: (shown, total) => `Первые ${shown} из ${total.toLocaleString()}`,
+      colDomain: "Домен",
+      colStatus: "Вердикт",
+      colExpires: "Истекает",
+      colSource: "Источник",
+      downloadCsv: "Скачать полный список (CSV)",
+      deleteTaken: (n) => `Удалить доменов: ${n.toLocaleString()}`,
+      orphansTitle: "Осиротевшие записи",
+      orphansHint:
+        "Записи, родитель которых уже удалён и которые ничем не используются. Они не могут относиться ни к чему на странице Базы, в Linked Domains или SERP Overview.",
+      orphanLabels: {
+        share_links: "Ссылки для расшаривания на удалённую проверку",
+        results_without_check: "Результаты без проверки",
+        checks_without_run: "Проверки без запуска",
+        runs_without_job: "Запуски без задачи",
+        pins_to_missing: "Закрепления несуществующего запуска или задачи",
+        sparkline_without_job: "Результаты sparkline без задачи",
+      } as Record<string, string>,
+      orphanHelp: {
+        share_links:
+          "Ссылка для расшаривания открывает проверку одного домена. Эта проверка уже удалена, поэтому ссылка ведёт на пустую страницу. Удаляется только нерабочая ссылка.",
+        results_without_check:
+          "Проверка домена хранит свои результаты (Ahrefs, Wayback, Availability…) отдельными записями. Эти записи принадлежат проверке, которой больше нет, поэтому их не показывает ни одна страница.",
+        checks_without_run:
+          "Проверка одного домена, чей запуск удалён. Её не видно ни на одной странице. Проверки, на которые ещё опираются строки Linked Domains или SERP, сюда никогда не попадают.",
+        runs_without_job:
+          "Запуск, чья задача удалена. В нём не осталось проверок доменов, и Linked Domains / SERP его не используют — он нигде не виден.",
+        pins_to_missing:
+          "Настройка задачи «брать результаты этого критерия из запуска X» (её использует страница Базы). Запуск или задача, на которые она указывает, удалены, поэтому настройка ничего не делает.",
+        sparkline_without_job:
+          "Результаты из Tools ▸ Wayback (sparkline), чья задача удалена. Та страница показывает результаты по задачам, поэтому открыть их уже нельзя.",
+      } as Record<string, string>,
+      keptOrphansTitle: "Не удаляются никогда, показаны для наглядности:",
+      keptOrphanLabels: {
+        linked_rows: "Строки Linked Domains без проверки (их по-прежнему читает экспорт)",
+        serp_rows: "Строки SERP без проверки (их по-прежнему читает экспорт)",
+        notes: "Заметки к доменам, которых больше нигде нет (ваш контент)",
+        empty_runs: "Запуски без проверок (остаются как история)",
+      } as Record<string, string>,
+      keptOrphanHelp: {
+        linked_rows:
+          "Результаты Linked Domains, чья проверка домена удалена. Оставлены намеренно: CSV-экспорт Linked Domains всё ещё читает их по запуску.",
+        serp_rows:
+          "То же для SERP Overview: проверки нет, но экспорт SERP всё ещё читает их по запуску.",
+        notes:
+          "Заметки к доменам, которых больше нет ни в одном запуске и в Очереди. Это ваш текст, поэтому он никогда не удаляется автоматически.",
+        empty_runs:
+          "Запуски, которые принадлежат задаче, но не содержат проверок доменов (например, после чистки). Они остаются в истории задачи.",
+      } as Record<string, string>,
+      deleteOrphans: (n) => `Удалить осиротевших записей: ${n.toLocaleString()}`,
+      nothing: "Удалять нечего.",
+      confirmPrompt: (n) =>
+        `Будет безвозвратно удалено: ${n.toLocaleString()}. Сначала делается резервная копия.\n\nВведите ${n} для подтверждения:`,
+      confirmMismatch: "Число не совпало — ничего не удалено.",
+      phaseBackup: "Резервное копирование базы…",
+      phaseDeleting: (done, total) =>
+        `Удаление… ${done.toLocaleString()} / ${total.toLocaleString()}`,
+      doneTaken: (domains, checks, history, backlog, banned) =>
+        `Удалено доменов: ${domains.toLocaleString()} — проверок ${checks.toLocaleString()}, строк истории ${history.toLocaleString()}, строк Очереди ${backlog.toLocaleString()}, в бан-лист: ${banned.toLocaleString()}.`,
+      doneOrphans: (n) => `Удалено осиротевших записей: ${n.toLocaleString()}.`,
+      backupNote: (file) =>
+        `Резервная копия: ${file} (восстановить можно в Настройки → Бэкапы базы).`,
+      failed: (msg) => `Чистка не удалась: ${msg}`,
     },
     banlist: {
       title: "Бан-лист",

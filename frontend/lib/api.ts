@@ -1390,7 +1390,78 @@ export interface WaybackProxiesStatus {
   refresh_day_of_month: number;
 }
 
+// ---- Cleanup (Database ▸ Чистка, 2026-11-01) --------------------------------
+
+export type CleanupStatus = {
+  running: boolean;
+  kind: "taken" | "orphans" | null;
+  phase: "backup" | "deleting" | null;
+  done: number;
+  total: number;
+  result: Record<string, unknown> | null;
+  error: string | null;
+};
+
+export type CleanupCheck = { run_id: number; job_id: number; kind: string };
+
+export type CleanupTakenPreview = {
+  count: number;
+  sample: { domain: string; status: string; expires_on: string | null; source: string }[];
+  kept: { note: number; pinned: number; in_progress: number; expiring: number };
+  with_backlog_row: number;
+  never_analyzed: number;
+  checks_running: CleanupCheck[];
+  status: CleanupStatus;
+};
+
+export type CleanupOrphansPreview = {
+  delete: Record<string, number>;
+  kept: Record<string, number>;
+  total: number;
+  checks_running: CleanupCheck[];
+  status: CleanupStatus;
+};
+
+// Registered is always "taken"; these count only when ticked.
+export const CLEANUP_OPTIONAL_STATUSES = ["not_supported", "unknown", "error"] as const;
+export type CleanupOptionalStatus = (typeof CLEANUP_OPTIONAL_STATUSES)[number];
+
+export type CleanupTakenOptions = {
+  include: CleanupOptionalStatus[];
+  protect_expiry_days: number;
+};
+
+function cleanupTakenQuery(o: CleanupTakenOptions): string {
+  const q = new URLSearchParams();
+  for (const s of o.include) q.append("include", s);
+  q.set("protect_expiry_days", String(o.protect_expiry_days));
+  return q.toString();
+}
+
 export const api = {
+  cleanupTakenPreview: (o: CleanupTakenOptions) =>
+    request<CleanupTakenPreview>(`/cleanup/taken?${cleanupTakenQuery(o)}`),
+  cleanupTakenCsvUrl: (o: CleanupTakenOptions) =>
+    `${BASE}/cleanup/taken.csv?${cleanupTakenQuery(o)}`,
+  runCleanupTaken: (
+    body: CleanupTakenOptions & {
+      delete_backlog: boolean;
+      ban: boolean;
+      expected_count: number;
+    },
+  ) =>
+    request<{ started: boolean; total: number }>(`/cleanup/taken`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  cleanupOrphansPreview: () => request<CleanupOrphansPreview>(`/cleanup/orphans`),
+  runCleanupOrphans: (expected_count: number) =>
+    request<{ started: boolean; total: number }>(`/cleanup/orphans`, {
+      method: "POST",
+      body: JSON.stringify({ expected_count }),
+    }),
+  cleanupStatus: () => request<CleanupStatus>(`/cleanup/status`),
+
   getSettings: () => request<SettingsPayload>("/settings/"),
 
   listDatabaseDomains: (opts: DatabaseListOpts = {}) => {

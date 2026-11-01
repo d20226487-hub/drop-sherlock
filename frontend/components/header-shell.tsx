@@ -367,6 +367,10 @@ export function HeaderShell() {
                 label: t.nav.databaseDropdown.analyzeList,
               },
               { href: "/banlist", label: t.nav.databaseDropdown.banList },
+              {
+                href: "/database/cleanup",
+                label: t.nav.databaseDropdown.cleanup,
+              },
             ]}
           />
           <Link href="/shares" className={linkClass("/shares")}>

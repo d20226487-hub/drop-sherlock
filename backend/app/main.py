@@ -12,6 +12,7 @@ from .routers import (
     backlog as backlog_router,
     backups as backups_router,
     banlist as banlist_router,
+    cleanup as cleanup_router,
     dashboard,
     database as database_router,
     errors as errors_router,
@@ -1336,6 +1337,7 @@ app.include_router(backlog_router.router)
 app.include_router(backups_router.router)
 app.include_router(availability_router.router)
 app.include_router(banlist_router.router)
+app.include_router(cleanup_router.router)
 app.include_router(shares_router.router)
 app.include_router(tools_router.router)
 # Public router — Caddy bypasses basic-auth for `/api/public/*`. The
