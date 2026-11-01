@@ -502,6 +502,68 @@ def _sources_newest_first(db: Session, extra: set[str]) -> list[str]:
     return ordered + sorted(s for s in extra if s and s not in known)
 
 
+def _taken_availability_only_domains():
+    """SQL subquery of domains the Database page never shows: Availability
+    checks only, every verdict taken (2026-11-01).
+
+    These were built into every snapshot and then hidden by the "show
+    taken" rule — on the VPS most of ~100k domains, the bulk of each
+    rebuild's memory. Skipped up front, they're never loaded at all.
+
+    Conservative on purpose: it matches only domains the in-loop hide rule
+    (see "Availability-only-taken hide rule" in `_build_all_rows`) is
+    GUARANTEED to hide, so nothing that rule would show disappears:
+      - every RunDomain belongs to an Availability job (no Quality,
+        Wayback, Whois or Batch analysis) — so no pillar but availability;
+      - none of those runs is pinned — so the verdict comes from the
+        latest-populated-CR fallback, never a pinned run lacking a result;
+      - at least one populated availability CR, and EVERY populated one
+        has a verdict status that isn't "available" — so whichever CR the
+        fallback picks is taken, and the inline-recheck history fallback
+        (only used when no CR verdict exists) never applies;
+      - no note on the domain.
+    Anything less clear-cut is loaded as before and the in-loop rule
+    decides."""
+    from sqlalchemy import and_, case, func as sqla_func, select
+
+    cr = CriterionResult
+    status = sqla_func.coalesce(
+        sqla_func.json_extract(cr.data_json, "$.verdict.status"), "",
+    )
+    unusable_verdict = case(
+        (cr.id.is_(None), 0),
+        (sqla_func.json_valid(cr.data_json) == 0, 1),
+        (status.in_(("", "available")), 1),
+        else_=0,
+    )
+    other_kind = case(
+        (sqla_func.coalesce(Job.kind, "quality") != "availability", 1), else_=0,
+    )
+    pinned = case(
+        (RunDomain.run_id.in_(select(JobCriterionPin.run_id)), 1), else_=0,
+    )
+    return (
+        select(RunDomain.domain)
+        .outerjoin(Run, Run.id == RunDomain.run_id)
+        .outerjoin(Job, Job.id == Run.job_id)
+        .outerjoin(cr, and_(
+            cr.run_domain_id == RunDomain.id,
+            cr.criterion == "availability",
+            cr.data_json != "",
+        ))
+        .where(~RunDomain.domain.in_(
+            select(DomainNote.domain).where(DomainNote.note != "")
+        ))
+        .group_by(RunDomain.domain)
+        .having(and_(
+            sqla_func.sum(other_kind) == 0,
+            sqla_func.sum(pinned) == 0,
+            sqla_func.count(cr.id) > 0,
+            sqla_func.sum(unusable_verdict) == 0,
+        ))
+    )
+
+
 def _build_all_rows(
     db: Session, *, only_domains: set[str] | None = None,
 ) -> tuple[list[DomainRow], dict[str, list[str]], set[str]]:
@@ -529,7 +591,11 @@ def _build_all_rows(
     `list_domains`; a short-TTL snapshot cache (`_get_all_rows`) absorbs
     page-flip + filter-toggle bursts so this doesn't re-run every
     request."""
-    rd_q = db.query(RunDomain)
+    # Availability-only taken domains are never loaded (2026-11-01) — see
+    # `_taken_availability_only_domains`. Applied in patch mode too, so a
+    # patch can't bring one back.
+    taken_only = _taken_availability_only_domains()
+    rd_q = db.query(RunDomain).filter(~RunDomain.domain.in_(taken_only))
     if only_domains is not None:
         rd_q = rd_q.filter(RunDomain.domain.in_(only_domains))
     all_rds: list[RunDomain] = rd_q.all()
@@ -734,6 +800,14 @@ def _build_all_rows(
     if scoped_rd_ids is not None:
         _av_fallback_q = _av_fallback_q.filter(
             CriterionResult.run_domain_id.in_(scoped_rd_ids)
+        )
+    else:
+        # Full build: this was every availability CR in the DB; skip the
+        # taken-only domains' ones like `rd_q` above.
+        _av_fallback_q = (
+            _av_fallback_q
+            .join(RunDomain, CriterionResult.run_domain_id == RunDomain.id)
+            .filter(~RunDomain.domain.in_(taken_only))
         )
     availability_crs_by_rd_id: dict[int, CriterionResult] = {
         cr.run_domain_id: cr for cr in _av_fallback_q.all()

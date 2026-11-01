@@ -439,7 +439,10 @@ export default function DatabasePage() {
   // are never hidden — see hide_candidates in routers/database.py.) This
   // is a visibility toggle, not a narrowing filter, so it's deliberately
   // excluded from `filtersActive` / `clearFilters`.
-  const [showTaken, setShowTaken] = useState<boolean>(false);
+  // Availability-only taken domains are no longer loaded by the backend
+  // at all (2026-11-01), so the old "Show taken" toggle is gone; requests
+  // keep sending show_taken=false for the few edge cases it still hides.
+  const showTaken = false;
 
   // Persistent filters (2026-05-18). Each browser keeps its own copy in
   // localStorage so two operators on the same /database page don't
@@ -516,7 +519,6 @@ export default function DatabasePage() {
         ) {
           setMaxPriceMax(v.maxPriceMax);
         }
-        if (typeof v.showTaken === "boolean") setShowTaken(v.showTaken);
       }
     } catch {
       // Corrupt / inaccessible localStorage — fall through to defaults.
@@ -1984,23 +1986,6 @@ export default function DatabasePage() {
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <h2 className="text-sm font-semibold">{ts.filters.heading}</h2>
           <div className="flex items-center gap-3 flex-wrap">
-            {/* Show-taken toggle — only meaningful when there ARE hidden
-                availability-only-taken domains (or it's already on, so the
-                user can switch it back off). */}
-            {(cachedHiddenTotal > 0 || showTaken) && (
-              <label
-                className="text-xs inline-flex items-center gap-1.5 cursor-pointer text-neutral-600 dark:text-neutral-400"
-                title={ts.filters.showTakenHelp}
-              >
-                <input
-                  type="checkbox"
-                  checked={showTaken}
-                  onChange={(e) => setShowTaken(e.target.checked)}
-                  className="cursor-pointer"
-                />
-                {ts.filters.showTaken(cachedHiddenTotal)}
-              </label>
-            )}
             {filtersActive && (
               <button
                 type="button"
