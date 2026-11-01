@@ -798,8 +798,16 @@ def _build_all_rows(
     # fall through to the latest-of-any-status row for domains that
     # have never had a terminal answer. Same definitive-preferred
     # semantic as /availability/latest + the Backlog filter.
+    #
+    # `raw_response` is deferred (2026-11-01): it holds up to 8 KB of RDAP
+    # JSON per check and nothing here reads it (only status / provider /
+    # registrar / expires_on / checked_at, see the fallback below), yet
+    # it was ~90% of all the text a build loaded — ~480 MB per build at
+    # 100k domains, measured on a production-shaped DB.
     from ..models import AvailabilityCheck
     from sqlalchemy import and_, func as sqla_func
+    from sqlalchemy.orm import defer
+    no_raw = defer(AvailabilityCheck.raw_response)
     latest_av_by_domain: dict[str, AvailabilityCheck] = {}
     if domain_keys:
         term_sub = (
@@ -816,6 +824,7 @@ def _build_all_rows(
         )
         for r in (
             db.query(AvailabilityCheck)
+            .options(no_raw)
             .join(term_sub, and_(
                 AvailabilityCheck.domain == term_sub.c.d,
                 AvailabilityCheck.checked_at == term_sub.c.max_t,
@@ -840,6 +849,7 @@ def _build_all_rows(
             )
             for r in (
                 db.query(AvailabilityCheck)
+                .options(no_raw)
                 .join(any_sub, and_(
                     AvailabilityCheck.domain == any_sub.c.d,
                     AvailabilityCheck.checked_at == any_sub.c.max_t,
