@@ -2502,8 +2502,15 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
     if run is None:
         raise HTTPException(404, "run not found")
 
-    rd_ids = [rd.id for rd in run.domains]
-    if not rd_ids:
+    # Aggregated in SQL (2026-11-01). The run page polls this every 2 s,
+    # and it used to hydrate EVERY RunDomain + CriterionResult of the run
+    # (data_json included) only to add up numeric columns: 0.56 s and 36k
+    # ORM objects per tick on an 18k-domain availability run, 35 MB of
+    # JSON per tick on a 1k-domain Wayback run. Same rules as before, now
+    # as SUM/COUNT over the indexed run_id join; only final_assessment_json
+    # is still read row by row (for the model names), and only where set.
+    in_run = RunDomain.run_id == run_id
+    if db.query(RunDomain.id).filter(in_run).first() is None:
         return {
             "total_cost_usd": 0.0,
             "total_input_tokens": 0,
@@ -2517,24 +2524,12 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
             "ahrefs_cached_calls": 0,
         }
 
-    crs = (
-        db.query(CriterionResult)
-        .filter(CriterionResult.run_domain_id.in_(rd_ids))
-        .all()
-    )
-
-    total_cost = 0.0
-    total_in = 0
-    total_out = 0
-    fresh_calls = 0
-    cache_hits = 0
-    seen_models: set[tuple[str, str]] = set()
     # Ahrefs unit accounting (added 2026-05-13). Sums over B/D/A/K only
     # — wayback uses the free CDX endpoint, its CRs always have NULL
     # units_cost_*. We filter by criterion explicitly rather than
     # relying on NULL-units, because that's clearer + future-proof
     # against accidentally counting some non-Ahrefs criterion.
-    AHREFS_CRITERIA = frozenset(
+    AHREFS_CRITERIA = (
         # linked_domains added 2026-07-02, serp_overview 2026-07-10 — their
         # per-target CRs carry units_cost_* exactly like B/D/A/K
         # (cached_from_run_id always NULL, so every one counts as a fresh
@@ -2543,91 +2538,120 @@ def get_run_cost(run_id: int, db: Session = Depends(get_db)) -> dict:
         # (anchors + organic-keywords, x term chunks) and its CR carries
         # the SUMMED units_cost_* across all of them — so it belongs in
         # the run's Ahrefs spend exactly like B/D/A/K.
-        ("backlinks", "refdomains", "anchors", "keywords", "stop_words",
-         "linked_domains", "serp_overview")
+        "backlinks", "refdomains", "anchors", "keywords", "stop_words",
+        "linked_domains", "serp_overview",
     )
-    ahrefs_units_billed = 0
-    ahrefs_units_list = 0
-    ahrefs_fresh_calls = 0
-    ahrefs_cached_calls = 0
-    # WhoisFreaks request accounting (Wave 2b, 2026-05-15). One
-    # whois_history CR = one WhoisFreaks API request (the provider
-    # bills per request, not per record returned, so no "units" math
-    # like Ahrefs — just a count). `whois_cached_calls` is wired as 0
-    # today; reserved for a future cache-pre-check optimisation.
-    whois_fresh_calls = 0
-    whois_cached_calls = 0
-    for cr in crs:
-        if cr.ai_input_tokens:
-            total_in += int(cr.ai_input_tokens)
-        if cr.ai_output_tokens:
-            total_out += int(cr.ai_output_tokens)
-        if cr.ai_cost_usd is not None:
-            total_cost += float(cr.ai_cost_usd)
-        if cr.ai_cached_from_run_id is not None:
-            cache_hits += 1
-        elif cr.ai_verdict_json:
-            fresh_calls += 1
-        if cr.ai_provider and cr.ai_model:
-            seen_models.add((cr.ai_provider, cr.ai_model))
-        # Ahrefs units: only for B/D/A/K. units_cost_actual is non-null
-        # only on rows where an actual Ahrefs API call landed (fresh
-        # fetch). cached_from_run_id is non-null on rows served from
-        # our local cross-run cache (no Ahrefs call). The two are
-        # mutually exclusive in practice — _create_cached_criterion_row
-        # leaves units_cost_* NULL while setting cached_from_run_id.
-        if cr.criterion in AHREFS_CRITERIA:
-            if cr.units_cost_actual is not None:
-                ahrefs_units_billed += int(cr.units_cost_actual)
-                ahrefs_fresh_calls += 1
-            elif cr.cached_from_run_id is not None:
-                ahrefs_cached_calls += 1
-            if cr.units_cost_total is not None:
-                ahrefs_units_list += int(cr.units_cost_total)
-        # WhoisFreaks: 1 CR = 1 request. We count CRs that landed
-        # results in data_json — a CR with status=failed AND no
-        # fetched_at represents a request that bailed before reaching
-        # the provider (missing API key / config error) and didn't
-        # touch quota. Anything with fetched_at set + no fetch error
-        # hit the provider successfully (records may be empty but the
-        # call was billed). Failed fetches (cr.error non-empty) raised
-        # before producing a billable response, so don't count them.
-        elif cr.criterion == "whois_history":
-            if (
-                cr.fetched_at is not None
-                and cr.cached_from_run_id is None
-                and not (cr.error or "")
-            ):
-                whois_fresh_calls += 1
-            elif cr.cached_from_run_id is not None:
-                whois_cached_calls += 1
 
-    # Final-synth tokens land on RunDomain.
-    for rd in run.domains:
-        if rd.final_input_tokens:
-            total_in += int(rd.final_input_tokens)
-        if rd.final_output_tokens:
-            total_out += int(rd.final_output_tokens)
-        if rd.final_cost_usd is not None:
-            total_cost += float(rd.final_cost_usd)
-            if rd.final_cost_usd or rd.final_input_tokens or rd.final_output_tokens:
-                # Synth ran fresh on this domain — count it. (Cache for
-                # final synth doesn't exist; resume idempotency just
-                # short-circuits and writes nothing new.)
-                fresh_calls += 1
+    def total(col):
+        return sqla_func.coalesce(sqla_func.sum(col), 0)
+
+    def count(cond):
+        return sqla_func.coalesce(sqla_func.sum(case((cond, 1), else_=0)), 0)
+
+    cr = CriterionResult
+    is_ahrefs = cr.criterion.in_(AHREFS_CRITERIA)
+    is_whois = cr.criterion == "whois_history"
+    (
+        cr_in, cr_out, cr_cost, cache_hits, cr_fresh,
+        ahrefs_units_billed, ahrefs_units_list,
+        ahrefs_fresh_calls, ahrefs_cached_calls,
+        whois_fresh_calls, whois_cached_calls,
+    ) = (
+        db.query(
+            total(cr.ai_input_tokens),
+            total(cr.ai_output_tokens),
+            total(cr.ai_cost_usd),
+            count(cr.ai_cached_from_run_id.isnot(None)),
+            # A fresh AI call: a verdict that wasn't copied from the cache.
+            count(and_(
+                cr.ai_cached_from_run_id.is_(None),
+                cr.ai_verdict_json.isnot(None), cr.ai_verdict_json != "",
+            )),
+            # Ahrefs units: units_cost_actual is non-null only on rows
+            # where an actual Ahrefs API call landed (fresh fetch);
+            # cached_from_run_id marks rows served from our local
+            # cross-run cache (no Ahrefs call, units_cost_* left NULL).
+            total(case((is_ahrefs, cr.units_cost_actual))),
+            total(case((is_ahrefs, cr.units_cost_total))),
+            count(and_(is_ahrefs, cr.units_cost_actual.isnot(None))),
+            count(and_(
+                is_ahrefs, cr.units_cost_actual.is_(None),
+                cr.cached_from_run_id.isnot(None),
+            )),
+            # WhoisFreaks (Wave 2b, 2026-05-15): one whois_history CR = one
+            # request, billed when it reached the provider (fetched_at set)
+            # without a fetch error and wasn't served from cache.
+            count(and_(
+                is_whois, cr.fetched_at.isnot(None),
+                cr.cached_from_run_id.is_(None),
+                or_(cr.error.is_(None), cr.error == ""),
+            )),
+            count(and_(is_whois, cr.cached_from_run_id.isnot(None))),
+        )
+        .join(RunDomain, cr.run_domain_id == RunDomain.id)
+        .filter(in_run)
+        .one()
+    )
+
+    # Final-synth tokens land on RunDomain. A synth counts as a fresh call
+    # when it has a cost row and any non-zero cost/tokens (cache for final
+    # synth doesn't exist; resume idempotency just writes nothing new).
+    rd_in, rd_out, rd_cost, rd_fresh = (
+        db.query(
+            total(RunDomain.final_input_tokens),
+            total(RunDomain.final_output_tokens),
+            total(RunDomain.final_cost_usd),
+            count(and_(
+                RunDomain.final_cost_usd.isnot(None),
+                or_(
+                    RunDomain.final_cost_usd != 0,
+                    RunDomain.final_input_tokens != 0,
+                    RunDomain.final_output_tokens != 0,
+                ),
+            )),
+        )
+        .filter(in_run)
+        .one()
+    )
+    total_in = int(cr_in) + int(rd_in)
+    total_out = int(cr_out) + int(rd_out)
+    total_cost = float(cr_cost) + float(rd_cost)
+    fresh_calls = int(cr_fresh) + int(rd_fresh)
+    cache_hits = int(cache_hits)
+    ahrefs_units_billed = int(ahrefs_units_billed)
+    ahrefs_units_list = int(ahrefs_units_list)
+    ahrefs_fresh_calls = int(ahrefs_fresh_calls)
+    ahrefs_cached_calls = int(ahrefs_cached_calls)
+    whois_fresh_calls = int(whois_fresh_calls)
+    whois_cached_calls = int(whois_cached_calls)
 
     # Identify (provider, model) pairs we charged calls under but lack a
     # price row for — those contributed 0 and the totals are incomplete by
     # that amount. We also include final-synth model pairs.
-    for rd in run.domains:
-        if rd.final_assessment_json:
-            try:
-                fa = json.loads(rd.final_assessment_json)
-            except json.JSONDecodeError:
-                fa = {}
-            p, m = (fa.get("provider") or ""), (fa.get("model") or "")
-            if p and m:
-                seen_models.add((p, m))
+    seen_models: set[tuple[str, str]] = {
+        (p, m)
+        for p, m in db.query(cr.ai_provider, cr.ai_model)
+        .join(RunDomain, cr.run_domain_id == RunDomain.id)
+        .filter(in_run)
+        .filter(cr.ai_provider.isnot(None), cr.ai_provider != "")
+        .filter(cr.ai_model.isnot(None), cr.ai_model != "")
+        .distinct()
+    }
+    for (fa_json,) in (
+        db.query(RunDomain.final_assessment_json)
+        .filter(in_run)
+        .filter(RunDomain.final_assessment_json.isnot(None))
+        .filter(RunDomain.final_assessment_json != "")
+    ):
+        try:
+            fa = json.loads(fa_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(fa, dict):
+            continue
+        p, m = (fa.get("provider") or ""), (fa.get("model") or "")
+        if p and m:
+            seen_models.add((p, m))
 
     from ..app_settings import get_model_price
     missing_pricing: list[dict] = []

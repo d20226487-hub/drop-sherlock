@@ -928,7 +928,11 @@ export default function RunDetailPage({
       const [d, s, c] = await Promise.all([
         api.getRun(runId, opts),
         api.getRunStatus(runId).catch(() => null),
-        api.getRunCost(runId).catch(() => null),
+        // Availability runs never spend AI/Ahrefs/Whois, so their cost
+        // pills can't render: skip the fetch (2026-11-01).
+        jobKind === "availability"
+          ? Promise.resolve(null)
+          : api.getRunCost(runId).catch(() => null),
       ]);
       setRun(d);
       // Learn the kind from the payload. Setting it flips serverPaginated;
@@ -980,7 +984,11 @@ export default function RunDetailPage({
       const [p, s, c] = await Promise.all([
         api.getRunProgress(runId, opts),
         api.getRunStatus(runId).catch(() => null),
-        api.getRunCost(runId).catch(() => null),
+        // Skipped for availability runs, as in reload() above: on a 60k-
+        // domain run this poll was the heaviest request of every tick.
+        jobKind === "availability"
+          ? Promise.resolve(null)
+          : api.getRunCost(runId).catch(() => null),
       ]);
       if (s) setStatus(s);
       if (c) setCost(c);
