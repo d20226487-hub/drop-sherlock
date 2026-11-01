@@ -362,51 +362,78 @@ def _apply_backlog_filters(
                 latest_def_row.c.def_dom == BacklogDomain.domain,
             )
 
-        if inconclusive_wanted or include_never:
-            # Latest row of ANY status per domain. MAX(id) is fine here
-            # because we use it only to (a) detect "never checked"
-            # (NULL after outer join) and (b) read the latest status
-            # for domains with no definitive row.
-            latest_any_t = (
-                select(
-                    AvailabilityCheck.domain.label("any_dom"),
-                    func.max(AvailabilityCheck.id).label("any_id"),
-                )
-                .group_by(AvailabilityCheck.domain)
-                .subquery()
+        # Latest history row of ANY status per domain. MAX(id) is fine here
+        # because we use it only to read the latest status for domains with
+        # no definitive row (the unknown/error bucket).
+        latest_any_t = (
+            select(
+                AvailabilityCheck.domain.label("any_dom"),
+                func.max(AvailabilityCheck.id).label("any_id"),
             )
-            latest_any_row = (
-                select(
-                    AvailabilityCheck.domain.label("any_dom"),
-                    AvailabilityCheck.status.label("any_status"),
-                )
-                .join(
-                    latest_any_t,
-                    AvailabilityCheck.id == latest_any_t.c.any_id,
-                )
-                .subquery()
+            .group_by(AvailabilityCheck.domain)
+            .subquery()
+        )
+        latest_any_row = (
+            select(
+                AvailabilityCheck.domain.label("any_dom"),
+                AvailabilityCheck.status.label("any_status"),
             )
+            .join(
+                latest_any_t,
+                AvailabilityCheck.id == latest_any_t.c.any_id,
+            )
+            .subquery()
+        )
+        if inconclusive_wanted:
             q = q.outerjoin(
                 latest_any_row,
                 latest_any_row.c.any_dom == BacklogDomain.domain,
             )
 
+        # Run-result fallback (2026-11-01): a domain with NO history row at
+        # all — usually because the retention prune trimmed it — takes its
+        # status from its Availability run results instead, by the same
+        # definitive-first rule. See availability/run_verdicts.py.
+        # Used as non-correlated IN (SELECT ...) sets, NOT outer joins:
+        # SQLite evaluates each once into a temp index, whereas joining the
+        # window subqueries let the planner re-run them per backlog row
+        # (measured: >600 s on 99k rows once an extra index changed the plan).
+        from ..availability.run_verdicts import run_verdict_subqueries
+        run_def, run_any = run_verdict_subqueries()
+        # "No history row at all": a NOT IN over the indexed domain column,
+        # far cheaper than joining the latest-row subquery just for this.
+        no_history = ~BacklogDomain.domain.in_(select(AvailabilityCheck.domain))
+
+        def run_verdict_in(sq, statuses=None):
+            pick = select(sq.c.domain)
+            if statuses is not None:
+                pick = pick.where(sq.c.status.in_(statuses))
+            return BacklogDomain.domain.in_(pick)
+
         conds = []
         if definitive_wanted and latest_def_row is not None:
-            conds.append(
-                latest_def_row.c.def_status.in_(definitive_wanted)
-            )
+            conds.append(or_(
+                latest_def_row.c.def_status.in_(definitive_wanted),
+                and_(no_history, run_verdict_in(run_def, definitive_wanted)),
+            ))
         if inconclusive_wanted and latest_any_row is not None:
-            # Inconclusive = no definitive answer ever AND latest-by-id
-            # row matches the requested status (unknown/error).
-            conds.append(
+            # Inconclusive = no definitive answer ever AND the latest
+            # row matches the requested status (unknown/error) — from the
+            # history, or from the run results when there's no history.
+            conds.append(or_(
                 and_(
                     latest_def_row.c.def_dom.is_(None),
                     latest_any_row.c.any_status.in_(inconclusive_wanted),
-                )
-            )
-        if include_never and latest_any_row is not None:
-            conds.append(latest_any_row.c.any_dom.is_(None))
+                ),
+                and_(
+                    no_history,
+                    ~run_verdict_in(run_def),
+                    run_verdict_in(run_any, inconclusive_wanted),
+                ),
+            ))
+        if include_never:
+            # Never checked = no history AND no run verdict either.
+            conds.append(and_(no_history, ~run_verdict_in(run_any)))
         if conds:
             q = q.filter(or_(*conds))
     # Max-price range (mirrors Database). NULL max_price excluded once a

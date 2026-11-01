@@ -13,6 +13,14 @@ caps daily (APScheduler) + once at boot:
      `per_domain_keep` remain. `per_domain_keep = 0` means "no
      per-domain cap."
 
+Neither pass deletes a domain's LATEST ANSWER (2026-11-01): its most
+recent definitive check (available / registered / not supported) and its
+most recent check of any status. The Backlog's Availability column and
+filter read this table, so before this a domain whose last check was older
+than the window lost its status entirely and read as "never checked".
+Kept rows past the window have `raw_response` (up to 8 KB of provider
+JSON) emptied, so keeping them costs ~1-2 small rows per domain.
+
 Both passes are bounded and use single SQL statements (the per-domain
 sweep is one IN-list DELETE built from a Python-side pick) so the prune
 finishes in milliseconds even on millions of rows.
@@ -22,12 +30,35 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from ..models import AvailabilityCheck
+from .common import TERMINAL_STATUSES
 
 log = logging.getLogger(__name__)
+
+
+def _latest_answer_ids():
+    """SELECT of the ids neither prune pass may delete: per domain, the
+    newest definitive check and the newest check of any status."""
+    newest_first = (AvailabilityCheck.checked_at.desc(), AvailabilityCheck.id.desc())
+    definitive = AvailabilityCheck.status.in_(TERMINAL_STATUSES)
+    ranked = select(
+        AvailabilityCheck.id.label("id"),
+        definitive.label("definitive"),
+        func.row_number().over(
+            partition_by=AvailabilityCheck.domain, order_by=newest_first,
+        ).label("rank_any"),
+        func.row_number().over(
+            partition_by=(AvailabilityCheck.domain, definitive),
+            order_by=newest_first,
+        ).label("rank_in_group"),
+    ).subquery()
+    return select(ranked.c.id).where(or_(
+        ranked.c.rank_any == 1,
+        and_(ranked.c.definitive, ranked.c.rank_in_group == 1),
+    ))
 
 
 def prune_availability_checks(
@@ -48,7 +79,16 @@ def prune_availability_checks(
         deleted_by_age = (
             db.query(AvailabilityCheck)
             .filter(AvailabilityCheck.checked_at < cutoff)
+            .filter(~AvailabilityCheck.id.in_(_latest_answer_ids()))
             .delete(synchronize_session=False)
+        )
+        # What's left past the window is only latest answers: keep the
+        # verdict, drop the bulky provider payload.
+        db.query(AvailabilityCheck).filter(
+            AvailabilityCheck.checked_at < cutoff,
+            AvailabilityCheck.raw_response != "",
+        ).update(
+            {AvailabilityCheck.raw_response: ""}, synchronize_session=False,
         )
         if deleted_by_age:
             log.info(
@@ -70,6 +110,7 @@ def prune_availability_checks(
             .all()
         )
         ids_to_delete: list[int] = []
+        protected = {int(i) for (i,) in db.execute(_latest_answer_ids())} if over else set()
         for domain, _count in over:
             # For each over-cap domain, pick the IDs to drop: everything
             # except the most-recent `per_domain_keep`. ORDER BY id DESC
@@ -83,7 +124,9 @@ def prune_availability_checks(
                 .offset(per_domain_keep)
                 .all()
             )
-            ids_to_delete.extend(int(r[0]) for r in stale)
+            ids_to_delete.extend(
+                int(r[0]) for r in stale if int(r[0]) not in protected
+            )
         if ids_to_delete:
             deleted_by_per_domain = (
                 db.query(AvailabilityCheck)

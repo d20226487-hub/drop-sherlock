@@ -41,7 +41,8 @@ def fresh_db(monkeypatch):
             pass
 
 
-def _add_check(session, domain: str, days_ago: float) -> int:
+def _add_check(session, domain: str, days_ago: float, status: str = "registered",
+               raw: str = "") -> int:
     """Insert one AvailabilityCheck with `checked_at` shifted by N days
     into the past. Returns the row id so tests can assert on specific
     rows surviving / being deleted."""
@@ -49,13 +50,14 @@ def _add_check(session, domain: str, days_ago: float) -> int:
     row = AvailabilityCheck(
         domain=domain,
         provider="rdap",
-        status="registered",
+        status=status,
         checked_at=datetime.utcnow() - timedelta(days=days_ago),
         latency_ms=10,
         registrar="",
         expires_on=None,
         error_message="",
         error_category="",
+        raw_response=raw,
         run_id=None,
     )
     session.add(row)
@@ -64,10 +66,13 @@ def _add_check(session, domain: str, days_ago: float) -> int:
 
 
 def test_age_prune_deletes_older_rows(fresh_db):
-    """Rows older than `retention_days` are deleted; younger rows stay."""
+    """Rows older than `retention_days` are deleted; younger rows stay —
+    except a domain's latest answer (2026-11-01: old.kz's newer 45-day
+    check is its only remaining answer, so it survives)."""
     from app.availability.retention import prune_availability_checks
     from app.models import AvailabilityCheck
 
+    older_id = _add_check(fresh_db, "old.kz", days_ago=60)
     old_id = _add_check(fresh_db, "old.kz", days_ago=45)
     middle_id = _add_check(fresh_db, "middle.kz", days_ago=20)
     fresh_id = _add_check(fresh_db, "fresh.kz", days_ago=1)
@@ -78,12 +83,13 @@ def test_age_prune_deletes_older_rows(fresh_db):
     fresh_db.commit()
     assert result["deleted_by_age"] == 1
     assert result["deleted_by_per_domain"] == 0
-    assert result["total_after"] == 2
+    assert result["total_after"] == 3
 
     survivors = {
         r.id for r in fresh_db.query(AvailabilityCheck).all()
     }
-    assert old_id not in survivors
+    assert older_id not in survivors
+    assert old_id in survivors
     assert middle_id in survivors
     assert fresh_id in survivors
 
@@ -202,3 +208,67 @@ def test_settings_clamp_negative_values(fresh_db):
     fresh_db.commit()
     assert get_availability_retention_days() == 0
     assert get_availability_per_domain_keep() == 0
+
+
+# --- Latest answer is never pruned (2026-11-01) -----------------------------
+#
+# The Backlog's Availability column and filter read this table. Before this,
+# a domain whose last check was older than the window lost its status and
+# read as "never checked".
+
+
+def test_age_prune_keeps_a_lone_old_answer_and_strips_its_payload(fresh_db):
+    from app.availability.retention import prune_availability_checks
+    from app.models import AvailabilityCheck
+
+    lone = _add_check(fresh_db, "lone.kz", days_ago=200, raw="x" * 8000)
+    recent = _add_check(fresh_db, "recent.kz", days_ago=1, raw="y" * 500)
+    prune_availability_checks(fresh_db, retention_days=30, per_domain_keep=0)
+    fresh_db.commit()
+
+    kept = {r.id: r for r in fresh_db.query(AvailabilityCheck).all()}
+    assert set(kept) == {lone, recent}
+    assert kept[lone].status == "registered" and kept[lone].raw_response == ""
+    assert kept[recent].raw_response == "y" * 500     # inside the window: untouched
+
+
+def test_latest_definitive_survives_newer_inconclusive_checks(fresh_db):
+    """registered 40 days ago, then two unknown checks (35 and 33 days):
+    the registered answer is what the Backlog shows, so it stays, and so
+    does the latest check of any status."""
+    from app.availability.retention import prune_availability_checks
+    from app.models import AvailabilityCheck
+
+    answer = _add_check(fresh_db, "flaky.kz", days_ago=40, status="registered")
+    _add_check(fresh_db, "flaky.kz", days_ago=35, status="unknown")
+    latest = _add_check(fresh_db, "flaky.kz", days_ago=33, status="unknown")
+    prune_availability_checks(fresh_db, retention_days=30, per_domain_keep=0)
+    fresh_db.commit()
+    assert {r.id for r in fresh_db.query(AvailabilityCheck)} == {answer, latest}
+
+
+def test_per_domain_cap_never_drops_the_latest_answer(fresh_db):
+    """Five newer error checks would push the only definitive answer past
+    per_domain_keep=3; it's kept anyway (one row over the cap)."""
+    from app.availability.retention import prune_availability_checks
+    from app.models import AvailabilityCheck
+
+    answer = _add_check(fresh_db, "noisy.kz", days_ago=10, status="available")
+    errors = [_add_check(fresh_db, "noisy.kz", days_ago=9 - i, status="error")
+              for i in range(5)]
+    result = prune_availability_checks(fresh_db, retention_days=0, per_domain_keep=3)
+    fresh_db.commit()
+    survivors = {r.id for r in fresh_db.query(AvailabilityCheck)}
+    assert survivors == {answer, *errors[-3:]}
+    assert result["deleted_by_per_domain"] == 2
+
+
+def test_domain_without_a_definitive_answer_keeps_its_latest_check(fresh_db):
+    from app.availability.retention import prune_availability_checks
+    from app.models import AvailabilityCheck
+
+    _add_check(fresh_db, "never-sure.kz", days_ago=90, status="error")
+    latest = _add_check(fresh_db, "never-sure.kz", days_ago=80, status="unknown")
+    prune_availability_checks(fresh_db, retention_days=30, per_domain_keep=0)
+    fresh_db.commit()
+    assert [r.id for r in fresh_db.query(AvailabilityCheck)] == [latest]

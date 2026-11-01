@@ -9,7 +9,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from ..availability import check_availability_async
 from ..availability.common import (
@@ -184,6 +184,7 @@ def latest_for_domains(
     )
     rows = (
         db.query(AvailabilityCheck)
+        .options(defer(AvailabilityCheck.raw_response))  # up to 8 KB, unused
         .join(
             sub,
             (AvailabilityCheck.domain == sub.c.d)
@@ -191,7 +192,7 @@ def latest_for_domains(
         )
         .all()
     )
-    return [
+    out = [
         LatestRow(
             domain=r.domain,
             status=r.status,
@@ -202,6 +203,17 @@ def latest_for_domains(
         )
         for r in rows
     ]
+    # Run-result fallback (2026-11-01): a domain with no terminal history
+    # row (usually because the retention prune trimmed it) shows its newest
+    # definitive Availability run verdict instead of reading as never
+    # checked. See availability/run_verdicts.py.
+    have = {r.domain for r in out}
+    missing = [d for d in dict.fromkeys(domains) if d not in have]
+    if missing:
+        from ..availability.run_verdicts import latest_run_verdicts
+        for domain, v in latest_run_verdicts(db, missing).items():
+            out.append(LatestRow(domain=domain, **v))
+    return out
 
 
 # --- Recent check log (Errors page) ----------------------------------------
