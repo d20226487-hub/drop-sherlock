@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 from ..availability import check_availability_async
 from ..availability.common import (
     STATUS_AVAILABLE,
-    STATUS_ERROR,
     STATUS_REGISTERED,
     TERMINAL_STATUSES,
     normalize_domain,
@@ -205,50 +204,7 @@ def latest_for_domains(
     ]
 
 
-# --- Stats + recent log (Settings tab) -------------------------------------
-
-class ProviderStats(BaseModel):
-    provider: str
-    sent: int = 0
-    succeeded: int = 0
-    failed: int = 0
-
-
-class StatsOut(BaseModel):
-    period_start: datetime
-    providers: list[ProviderStats]
-
-
-@router.get("/stats", response_model=StatsOut)
-def monthly_stats(db: Session = Depends(get_db)) -> StatsOut:
-    """Per-provider counts since the 1st of the current month."""
-    now = datetime.utcnow()
-    period_start = datetime(now.year, now.month, 1)
-    rows = (
-        db.query(
-            AvailabilityCheck.provider,
-            AvailabilityCheck.status,
-            func.count(AvailabilityCheck.id),
-        )
-        .filter(AvailabilityCheck.checked_at >= period_start)
-        .group_by(
-            AvailabilityCheck.provider, AvailabilityCheck.status,
-        )
-        .all()
-    )
-    by_prov: dict[str, ProviderStats] = {}
-    for provider, status, count in rows:
-        s = by_prov.setdefault(provider, ProviderStats(provider=provider))
-        s.sent += count
-        if status == STATUS_ERROR:
-            s.failed += count
-        else:
-            s.succeeded += count
-    return StatsOut(
-        period_start=period_start,
-        providers=sorted(by_prov.values(), key=lambda p: p.provider),
-    )
-
+# --- Recent check log (Errors page) ----------------------------------------
 
 class RecentRow(BaseModel):
     id: int

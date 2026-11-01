@@ -2127,8 +2127,6 @@ const messagesEn = {
       settingsApiKeyHeading: "Domainr — Fastly API token",
       settingsApiKeyHint:
         "Domainr runs on Fastly's Domain Research API. Paste a Fastly API token (control panel → Account → API tokens); the Domain Research API product must be enabled and the token needs at least read access. Encrypted at rest.",
-      settingsStatsHeading: "Usage this month",
-      settingsRecentHeading: "Recent checks",
       // Error categories
       errorCatDns: "DNS",
       errorCatRdap: "RDAP",
@@ -5049,8 +5047,6 @@ const messagesRu: Messages = {
       settingsApiKeyHeading: "Domainr — токен Fastly API",
       settingsApiKeyHint:
         "Domainr работает через Fastly Domain Research API. Вставьте токен Fastly API (панель Fastly → Account → API tokens); продукт Domain Research API должен быть включён, токену нужен хотя бы доступ на чтение. Шифруется в БД.",
-      settingsStatsHeading: "Использование в этом месяце",
-      settingsRecentHeading: "Недавние проверки",
       errorCatDns: "DNS",
       errorCatRdap: "RDAP",
       errorCatDomainr: "Domainr",

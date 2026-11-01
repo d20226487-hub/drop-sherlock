@@ -1622,17 +1622,6 @@ export const api = {
       body: JSON.stringify({ domains, use_cache: true }),
     }),
 
-  availabilityStats: () =>
-    request<{
-      period_start: string;
-      providers: {
-        provider: string;
-        sent: number;
-        succeeded: number;
-        failed: number;
-      }[];
-    }>("/availability/stats"),
-
   availabilityRecent: (limit: number = 100, runId?: number) =>
     request<
       {
