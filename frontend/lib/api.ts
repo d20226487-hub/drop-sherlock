@@ -179,6 +179,142 @@ export type AhrefsUnits = {
   units_remaining?: number | null;
   usage_reset_date?: string | null;
   api_key_expiration_date?: string | null;
+  // Cost above the plan allowance this cycle (2026-11-09), from the
+  // account-wide usage and the prices in Settings → Other API prices.
+  included_units?: number;
+  usd_per_million?: number;
+  overage_units?: number;
+  overage_usd?: number;
+};
+
+// ---- Spend (Dashboard, 2026-11-09) ------------------------------------------
+
+export type ProjectOption = { id: number; name: string };
+export type ProjectRow = ProjectOption & { jobs: number; created_at: string | null };
+export type ProjectPage = {
+  rows: ProjectRow[];
+  total: number;
+  filtered_total: number;
+  page: number;
+  per_page: number;
+};
+
+export type SpendPeriod =
+  | "this_month"
+  | "last_month"
+  | "last_7_days"
+  | "today"
+  | "all_time";
+
+export type SpendPricing = {
+  ahrefs_included_units: number;
+  ahrefs_usd_per_million: number;
+  whoisfreaks_usd_per_credit: number;
+  domainr_usd_per_request: number;
+};
+
+export type SpendJobRow = {
+  job_id: number | null; // null = calls with no job (Tools pages)
+  name: string | null;
+  project_id: number | null;
+  project: string; // "" = no project
+  project_deleted: boolean;
+  // The Backlog Sources of the job's domains, biggest first.
+  sources: { source: string; domains: number }[];
+  job_kind: string | null;
+  deleted: boolean;
+  first_day: string;
+  last_day: string;
+  ai_usd: number;
+  ai_calls: number;
+  ai_estimated: boolean;
+  ahrefs_units: number;
+  ahrefs_usd: number | null; // share of the month's overage; null off-month
+  whois_history_credits: number;
+  whois_history_usd: number;
+  availability_calls: number;
+  availability_usd: number;
+  total_usd: number;
+};
+
+export type SpendSummary = {
+  period: string; // a SpendPeriod or a month, "2026-10"
+  start: string | null;
+  end: string | null;
+  total_usd: number;
+  ai: {
+    calls: number;
+    usd: number;
+    input_tokens: number;
+    output_tokens: number;
+    thinking_tokens: number;
+    estimated_usd: number;
+    unpriced_calls: number;
+    failed_calls: number;
+  };
+  ahrefs: {
+    calls: number;
+    units: number;
+    usd: number | null;
+    included_units: number;
+    usd_per_million: number;
+    this_month_units: number;
+  };
+  whois_history: { calls: number; units: number; usd: number; priced: boolean };
+  availability: { calls: number; units: number; usd: number; priced: boolean };
+  ai_models: {
+    provider: string;
+    model: string;
+    calls: number;
+    input_tokens: number;
+    output_tokens: number;
+    thinking_tokens: number;
+    usd: number;
+    estimated_usd: number;
+    unpriced_calls: number;
+  }[];
+  features: {
+    kind: "ai" | "ahrefs" | "whois_history" | "availability";
+    feature: string;
+    calls: number;
+    tokens: number;
+    units: number;
+    usd: number;
+    estimated_usd: number;
+    unpriced_calls: number;
+  }[];
+  months: {
+    month: string;
+    ai_usd: number;
+    ahrefs_units: number;
+    ahrefs_usd: number;
+    whois_history_credits: number;
+    whois_history_usd: number;
+    availability_calls: number;
+    availability_usd: number;
+    total_usd: number;
+  }[];
+  unpriced_models: { provider: string; model: string; calls: number }[];
+  jobs: SpendJobRow[];
+  projects: {
+    project_id: number | null; // null = no project
+    project: string;
+    deleted: boolean;
+    jobs: number;
+    ai_usd: number;
+    ahrefs_units: number;
+    ahrefs_usd: number | null;
+    whois_history_credits: number;
+    whois_history_usd: number;
+    availability_calls: number;
+    availability_usd: number;
+    total_usd: number;
+  }[];
+  months_available: string[];
+  backfill_calls: number;
+  first_day: string | null;
+  backfill: { done_at: string } | null;
+  pricing: SpendPricing;
 };
 
 // ---- Analyze flow -----------------------------------------------------------
@@ -1002,6 +1138,7 @@ export type JobSpec = {
   job_id: number;
   name: string;
   notes: string;
+  project_id?: number | null; // spend is booked to it (2026-11-09)
   spec: AnalyzeSpec;
 };
 
@@ -1784,17 +1921,48 @@ export const api = {
       `/dashboard/ahrefs-units${opts?.force ? "?force=true" : ""}`,
     ),
 
+  getSpendSummary: (period: string) =>
+    request<SpendSummary>(`/spend/summary?period=${period}`),
+  getSpendPricing: () => request<SpendPricing>(`/spend/pricing`),
+  putSpendPricing: (body: Partial<SpendPricing>) =>
+    request<SpendPricing>(`/spend/pricing`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
   previewAnalyze: (spec: AnalyzeSpec) =>
     request<PreviewResponse>("/analyze/preview", {
       method: "POST",
       body: JSON.stringify(spec),
     }),
 
-  submitJob: (spec: AnalyzeSpec, name?: string, notes?: string) =>
+  submitJob: (spec: AnalyzeSpec, name?: string, notes?: string, projectId?: number) =>
     request<SubmitJobResponse>("/analyze/jobs", {
       method: "POST",
-      body: JSON.stringify({ spec, name, notes }),
+      body: JSON.stringify({ spec, name, notes, project_id: projectId }),
     }),
+
+  // Projects (Settings → Projects, 2026-11-09).
+  listProjects: (o: { search?: string; page?: number; per_page?: number }) => {
+    const q = new URLSearchParams();
+    if (o.search) q.set("search", o.search);
+    if (o.page) q.set("page", String(o.page));
+    if (o.per_page) q.set("per_page", String(o.per_page));
+    return request<ProjectPage>(`/projects?${q.toString()}`);
+  },
+  allProjects: () => request<ProjectOption[]>("/projects/all"),
+  createProject: (name: string) =>
+    request<ProjectRow>("/projects", { method: "POST", body: JSON.stringify({ name }) }),
+  // Paste many names at once; existing / repeated names come back skipped.
+  createProjectsBulk: (names: string[]) =>
+    request<{ added: number; skipped: string[] }>("/projects/bulk", {
+      method: "POST",
+      body: JSON.stringify({ names }),
+    }),
+  renameProject: (id: number, name: string) =>
+    request<ProjectRow>(`/projects/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
+  deleteProject: (id: number) =>
+    request<{ deleted: boolean }>(`/projects/${id}`, { method: "DELETE" }),
 
   getRunStatus: (runId: number) =>
     request<RunStatus>(`/runs/${runId}/status`),
@@ -2142,10 +2310,10 @@ export const api = {
       { method: "DELETE" },
     ),
 
-  rerunJob: (jobId: number, spec: AnalyzeSpec) =>
+  rerunJob: (jobId: number, spec: AnalyzeSpec, projectId?: number) =>
     request<SubmitJobResponse>(`/jobs/${jobId}/rerun`, {
       method: "POST",
-      body: JSON.stringify({ spec }),
+      body: JSON.stringify({ spec, project_id: projectId }),
     }),
 
   reanalyzeRun: (runId: number, ai?: { provider?: string; model?: string }) =>

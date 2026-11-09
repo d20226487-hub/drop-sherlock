@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta
 import httpx
 from sqlalchemy.orm import Session
 
+from .. import spend
 from ..app_settings import (
     get_availability_cascade_order,
     get_cache_ttl_hours,
@@ -113,6 +114,15 @@ def _metered_provider_client() -> httpx.AsyncClient:
     return _metered_client
 
 
+def _metered(result: ProviderResult) -> ProviderResult:
+    """Log a paid lookup to the spend log. Only answered lookups count:
+    an error (no key, network failure, quota) isn't billed, or can't be
+    told apart from one that wasn't."""
+    if result.status != STATUS_ERROR:
+        spend.record_units("availability", result.provider)
+    return result
+
+
 async def _call_provider(
     provider: str, domain: str, client: httpx.AsyncClient,
 ) -> ProviderResult:
@@ -127,16 +137,16 @@ async def _call_provider(
         if provider == "domainr":
             # Dedicated client — isolate fast Domainr from slow RDAP (see
             # `_metered_provider_client`).
-            return await domainr_provider.check(
+            return _metered(await domainr_provider.check(
                 domain, client=_metered_provider_client(),
-            )
+            ))
         if provider == "whois":
             return await whois_provider.check(domain)
         if provider == "whoisfreaks":
             # Metered + direct, same isolation rationale as Domainr.
-            return await whoisfreaks_provider.check(
+            return _metered(await whoisfreaks_provider.check(
                 domain, client=_metered_provider_client(),
-            )
+            ))
         return ProviderResult(
             provider=provider, status=STATUS_ERROR,
             error_message=f"unknown provider: {provider}",
@@ -407,7 +417,8 @@ async def check_availability_async(
         # --- Phase 2: live cascade (NO session held across provider awaits).
         # The provider walk + verdict-building is shared with the batched
         # runner via `run_cascade_network` (no DB access inside).
-        outcome = await run_cascade_network(domain, client=client)
+        with spend.tag(feature="availability", run_id=run_id, domain=domain):
+            outcome = await run_cascade_network(domain, client=client)
 
         # --- Phase 3: persist the trace (short session, no await held).
         s, owned = _open_session()

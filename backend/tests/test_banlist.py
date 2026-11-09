@@ -48,6 +48,15 @@ def _client():
     return TestClient(app)
 
 
+def _project(session) -> int:
+    """Quality jobs must be booked to a project (2026-11-09)."""
+    from app.models import Project
+    p = Project(name="test", created_at=datetime.utcnow())
+    session.add(p)
+    session.commit()
+    return p.id
+
+
 def _ban(session, domain: str, note: str = "") -> None:
     from app.models import DomainBan
     session.add(DomainBan(domain=domain, note=note, created_at=datetime.utcnow()))
@@ -274,6 +283,7 @@ def test_analyze_submit_rejects_banned(fresh_db):
         "/analyze/jobs",
         auth=("admin", "changeme"),
         json={
+            "project_id": _project(fresh_db),
             "spec": {
                 "domains": [
                     "good.kz",
@@ -309,6 +319,7 @@ def test_analyze_submit_400_when_every_domain_banned(fresh_db):
         "/analyze/jobs",
         auth=("admin", "changeme"),
         json={
+            "project_id": _project(fresh_db),
             "spec": {
                 "domains": ["x.kz"],
                 "criteria": {

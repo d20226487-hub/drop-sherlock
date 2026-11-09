@@ -36,6 +36,7 @@ from datetime import datetime
 import httpx
 from sqlalchemy.orm import Session
 
+from . import spend
 from .app_settings import SessionLocal, get_provider_creds
 from .limits import limit
 from .models import CriterionResult, Run, RunDomain
@@ -163,9 +164,10 @@ async def process_ahrefs_batch_analysis_run(run_id: int) -> None:
                 if is_canceled(run_id) or is_paused(run_id):
                     stop["flag"] = True
                     return
-                outcome: ChunkOutcome = await fetch_batch_chunk(
-                    client, api_key, domains, select, country=country,
-                )
+                with spend.tag(feature="batch_analysis", run_id=run_id):
+                    outcome: ChunkOutcome = await fetch_batch_chunk(
+                        client, api_key, domains, select, country=country,
+                    )
 
             # Persist per-domain (short session). Upsert the latest CR per
             # RD so a resumed re-fetch overwrites the prior partial row

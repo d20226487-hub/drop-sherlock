@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import random
 
+from .. import spend
 from ..app_settings import get_provider_creds, get_rate_limits
 from .base import BaseProvider, ProviderConfigError, ProviderError
 
@@ -106,7 +107,10 @@ class AhrefsClient(BaseProvider):
                     f"Ahrefs returned {r.status_code}: {r.text[:200]}"
                 )
 
-            return r.status_code, r.json() or {}, _extract_units(r.headers)
+            units = _extract_units(r.headers)
+            spend.record_ahrefs(url, billed=units["cost_actual"],
+                                listed=units["cost_total"])
+            return r.status_code, r.json() or {}, units
 
         # Defensive — loop should exit via return or raise.
         raise ProviderError(f"unreachable: retry exhausted ({last_exc!r})")

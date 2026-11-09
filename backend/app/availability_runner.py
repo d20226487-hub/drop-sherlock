@@ -37,6 +37,7 @@ from typing import Any
 import httpx
 from sqlalchemy.orm import Session
 
+from . import spend
 from .app_settings import SessionLocal
 from .availability.cascade import (
     AvailabilityResult,
@@ -673,7 +674,8 @@ async def process_availability_run(run_id: int) -> None:
                 live = await asyncio.to_thread(_av_batch_start, chunk)
                 if not live:
                     continue
-                collected = await _run_chunk_network(live, client, concurrency)
+                with spend.tag(feature="availability", run_id=run_id):
+                    collected = await _run_chunk_network(live, client, concurrency)
                 await asyncio.to_thread(_av_batch_finish, run_id, collected)
         except Exception as e:  # noqa: BLE001
             log.exception("availability run %s failed", run_id)

@@ -766,7 +766,8 @@ def get_job_spec(job_id: int, db: Session = Depends(get_db)) -> dict:
         if isinstance(spec, dict):
             spec["domains"] = all_domains
 
-    return {"job_id": job.id, "name": job.name, "notes": job.notes, "spec": spec}
+    return {"job_id": job.id, "name": job.name, "notes": job.notes,
+            "project_id": job.project_id, "spec": spec}
 
 
 # --- Mutations -------------------------------------------------------------
@@ -925,6 +926,9 @@ def unarchive_job(job_id: int, db: Session = Depends(get_db)) -> dict:
 
 class RerunIn(BaseModel):
     spec: AnalyzeSpec
+    # Re-books the job to this project (2026-11-09). A Quality rerun must
+    # end up with one: a job from before projects gets it here.
+    project_id: int | None = None
 
 
 class RerunOut(BaseModel):
@@ -939,6 +943,12 @@ async def rerun_job(
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(404, "job not found")
+    from .projects import active_project
+    project = active_project(db, payload.project_id)
+    if project is not None:
+        job.project_id = project.id
+    elif (job.kind or "quality") == "quality" and active_project(db, job.project_id) is None:
+        raise HTTPException(400, "project is required (pick one from Settings → Projects)")
 
     cleaned = [d.strip() for d in payload.spec.domains if d.strip()]
     if not cleaned:

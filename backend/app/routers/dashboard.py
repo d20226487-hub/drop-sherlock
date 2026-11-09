@@ -256,11 +256,30 @@ async def ahrefs_units(force: bool = False):
     now = time.monotonic()
     cached = _units_cache["data"]
     if not force and cached is not None and now - _units_cache["at"] < _UNITS_TTL_SEC:
-        return cached
+        return _with_overage(cached)
     result = await _fetch_ahrefs_units()
     # Only cache good reads — a transient error / just-fixed key should
     # re-probe on the next load rather than stick around for the full TTL.
     if result.get("state") == "ok":
         _units_cache["data"] = result
         _units_cache["at"] = now
-    return result
+    return _with_overage(result)
+
+
+def _with_overage(result: dict) -> dict:
+    """Add this cycle's cost above the plan allowance (2026-11-09), from
+    Ahrefs's own account-wide usage — the figure Ahrefs bills on — and the
+    allowance + price set in Settings. Added per response, not cached, so a
+    price edit shows at once."""
+    from ..spend import ahrefs_overage_usd, get_pricing
+    if result.get("state") != "ok":
+        return result
+    pricing = get_pricing()
+    used = result.get("units_used")
+    included = pricing["ahrefs_included_units"]
+    out = {**result, "included_units": included,
+           "usd_per_million": pricing["ahrefs_usd_per_million"]}
+    if isinstance(used, (int, float)):
+        out["overage_units"] = max(0, int(used) - included)
+        out["overage_usd"] = ahrefs_overage_usd(int(used), pricing)
+    return out

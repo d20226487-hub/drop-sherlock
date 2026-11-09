@@ -25,6 +25,7 @@ from typing import Any
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, selectinload
 
+from . import spend
 from .ai_judge import AI_PROVIDERS, _resolve_model, judge
 from .ai_prompts import localize_prompt
 from .app_settings import get_ai_prompt
@@ -2264,6 +2265,7 @@ def _reset_run_domain_for_pillar_retry(
         db.close()
 
 
+@spend.tagged()
 async def _reanalyze_run_domain_criterion(
     run_domain_id: int,
     criterion: str,
@@ -2538,6 +2540,7 @@ async def _reanalyze_run_domain_criterion(
             _REANALYZING_RUN_DOMAINS.discard(run_domain_id)
 
 
+@spend.tagged()
 async def _reanalyze_run_domain(
     run_domain_id: int, spec: AnalyzeSpec, *, track_set: bool
 ) -> None:
@@ -3237,6 +3240,7 @@ def _stop_words_error(cfg) -> str:
     return ""
 
 
+@spend.tagged(feature="stop_words")
 async def _fetch_stop_words_for_domain(
     *,
     run_domain_id: int,
@@ -3364,6 +3368,7 @@ async def _fetch_stop_words_for_domain(
     return merged if ok_all else None
 
 
+@spend.tagged()
 async def _process_domain(
     run_domain_id: int, spec: AnalyzeSpec, run_id: int
 ) -> None:
@@ -3653,6 +3658,7 @@ async def _process_domain(
     await _offload(_finish_domain, run_domain_id, success=not any_failed)
 
 
+@spend.tagged(feature_from="criterion")
 async def _judge_one_criterion(
     *,
     criterion: str,
@@ -3894,6 +3900,7 @@ async def _judge_one_criterion(
         )
 
 
+@spend.tagged()
 async def _run_ai_for_domain(
     *,
     run_domain_id: int,
@@ -4104,13 +4111,14 @@ async def _run_ai_for_domain(
         parsed = {}
     else:
         try:
-            async with limit(provider):
-                parsed, _raw, final_usage = await judge(
-                    provider=provider,
-                    system_prompt=final_prompt,
-                    user_message=user_msg,
-                    model_override=final_resolved_model,
-                )
+            with spend.tag(feature="final"):
+                async with limit(provider):
+                    parsed, _raw, final_usage = await judge(
+                        provider=provider,
+                        system_prompt=final_prompt,
+                        user_message=user_msg,
+                        model_override=final_resolved_model,
+                    )
         except Exception as e:  # noqa: BLE001
             log.warning("Final AI assessment failed for run_domain=%s: %s",
                         run_domain_id, e)
@@ -4221,6 +4229,7 @@ def _build_user_message_for_final(
     )
 
 
+@spend.tagged(feature="wayback_classify")
 async def _run_wayback_classify_for_domain(
     *,
     run_domain_id: int,
@@ -5162,6 +5171,7 @@ def _cyrillic_ratio(s: str) -> float:
     return cyr / letters
 
 
+@spend.tagged(feature="translate")
 async def translate_final_for_rd(rd_id: int) -> dict:
     """Translate one rd's `final_assessment_json.summary` and
     `.recommendation` to Russian and persist in `final_assessment_ru_json`.
@@ -5285,6 +5295,7 @@ _TRANSLATE_CRITERIA_SYSTEM_PROMPT = (
 _TRANSLATABLE_CRITERION_FIELDS = ("key_findings", "red_flags")
 
 
+@spend.tagged(feature="translate")
 async def translate_criterion_verdicts_for_rd(rd_id: int) -> dict:
     """Translate per-criterion `key_findings` and `red_flags` arrays
     on every CR row of an rd. One LLM call per rd packages all six
@@ -6194,6 +6205,7 @@ _CRITERION_PROVIDER = {
 }
 
 
+@spend.tagged(feature_from="criterion")
 async def _fetch_criterion(
     url: str,
     criterion: str = "backlinks",

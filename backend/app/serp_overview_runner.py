@@ -36,6 +36,7 @@ from urllib.parse import urlencode, urlsplit
 
 from sqlalchemy.orm import Session
 
+from . import spend
 from .db import SessionLocal
 from .limits import limit
 from .models import CriterionResult, Run, RunDomain, SerpOverviewRow
@@ -168,7 +169,9 @@ async def process_serp_overview_run(run_id: int) -> None:
                     if is_canceled(run_id) or is_paused(run_id):
                         stop["flag"] = True
                         return
-                    status, body, units = await client.fetch_url(url)
+                    with spend.tag(feature="serp_overview", run_id=run_id,
+                                   run_domain_id=rd_id, domain=keyword):
+                        status, body, units = await client.fetch_url(url)
             except ProviderConfigError as e:
                 # Missing/invalid API key — fatal for the whole run.
                 err = f"{type(e).__name__}: {e}"

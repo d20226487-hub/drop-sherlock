@@ -6,6 +6,7 @@ import { useT } from "@/lib/i18n";
 import { api, DashboardStatus } from "@/lib/api";
 import { IntegrationCard } from "@/components/integration-card";
 import { AhrefsUnitsCard } from "@/components/ahrefs-units-card";
+import { SpendCard } from "@/components/spend-card";
 
 function formatChecked(iso: string): string {
   try {
@@ -166,6 +167,9 @@ export default function DashboardPage() {
           </div>
         </>
       )}
+
+      {/* Below the service statuses (2026-11-09). */}
+      <SpendCard />
     </div>
   );
 }

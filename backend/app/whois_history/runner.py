@@ -27,13 +27,14 @@ from typing import Any
 import httpx
 from sqlalchemy.orm import Session
 
-from .. import ai_judge
+from .. import ai_judge, spend
 from ..ai_prompts import localize_prompt
 from ..app_settings import (
     SessionLocal,
     get_ai_prompt,
     get_model_price,
     get_provider_creds,
+    get_whois_history_units_per_request,
 )
 from ..models import CriterionResult, Run, RunDomain
 from ..providers.base import ProviderConfigError, ProviderError
@@ -171,6 +172,16 @@ async def _process_whois_domain(
     run_id: int,
     spec_override: dict | None = None,
 ) -> None:
+    """Fetch + judge one domain's WHOIS history (spend-tagged wrapper)."""
+    with spend.tag(feature="whois_history", run_id=run_id, run_domain_id=rd_id):
+        await _process_whois_domain_inner(rd_id, run_id, spec_override)
+
+
+async def _process_whois_domain_inner(
+    rd_id: int,
+    run_id: int,
+    spec_override: dict | None = None,
+) -> None:
     """Fetch + judge one domain's WHOIS history.
 
     Each phase opens its own short-lived DB session. Sessions are NEVER
@@ -233,6 +244,10 @@ async def _process_whois_domain(
     try:
         result = await fetch_history(domain)
         provider_name = result.provider
+        # A successful Historical WHOIS request costs credits whatever the
+        # records say; a failed one raised above and isn't counted.
+        spend.record_units("whois_history", provider_name or "whoisfreaks",
+                           get_whois_history_units_per_request())
         records_json = result.records
         diff_json = result.diff
     except WhoisProviderError as e:

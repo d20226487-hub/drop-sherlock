@@ -13,6 +13,8 @@ import { PromptEditors } from "@/components/prompt-editors";
 import { StopWordsEditor } from "@/components/stop-words-editor";
 import { ScoringEditor } from "@/components/scoring-editor";
 import { PricingEditor } from "@/components/pricing-editor";
+import { ApiPricesEditor } from "@/components/api-prices-editor";
+import { ProjectsEditor } from "@/components/projects-editor";
 import { RetentionEditor } from "@/components/retention-editor";
 import { BackupsEditor } from "@/components/backups-editor";
 import { ImportLimitEditor } from "@/components/import-limit-editor";
@@ -29,6 +31,7 @@ type SettingsTab =
   | "whoisHistory"
   | "domainFilter"
   | "serpOverview"
+  | "projects"
   | "others";
 
 const TABS: SettingsTab[] = [
@@ -47,6 +50,8 @@ const TABS: SettingsTab[] = [
   "domainFilter",
   // 2026-07-10: SERP Overview tool settings (duplicate-ignore window).
   "serpOverview",
+  // 2026-11-09: Projects that jobs' API spend is booked to.
+  "projects",
   "others",
 ];
 
@@ -192,6 +197,11 @@ export default function SettingsPage() {
                 <h2 className="text-lg font-semibold">{ts.sections.pricing}</h2>
                 <PricingEditor />
               </section>
+
+              <section className="space-y-4">
+                <h2 className="text-lg font-semibold">{ts.sections.apiPrices}</h2>
+                <ApiPricesEditor />
+              </section>
             </div>
           )}
 
@@ -289,6 +299,8 @@ export default function SettingsPage() {
           )}
 
           {tab === "serpOverview" && <SerpOverviewEditor />}
+
+          {tab === "projects" && <ProjectsEditor />}
 
           {tab === "others" && (
             <div className="space-y-8">

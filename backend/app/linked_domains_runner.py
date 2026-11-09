@@ -42,6 +42,7 @@ from urllib.parse import urlencode
 
 from sqlalchemy.orm import Session
 
+from . import spend
 from .db import SessionLocal
 from .limits import limit
 from .models import CriterionResult, LinkedDomainRow, Run, RunDomain
@@ -228,7 +229,9 @@ async def process_linked_domains_run(run_id: int) -> None:
                     if is_canceled(run_id) or is_paused(run_id):
                         stop["flag"] = True
                         return
-                    status, body, units = await client.fetch_url(url)
+                    with spend.tag(feature="linked_domains", run_id=run_id,
+                                   run_domain_id=rd_id, domain=domain):
+                        status, body, units = await client.fetch_url(url)
             except ProviderConfigError as e:
                 # Missing/invalid API key — fatal for the whole run, no point
                 # hammering the remaining targets. Flag stop and record.

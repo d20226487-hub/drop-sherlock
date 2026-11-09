@@ -21,6 +21,7 @@ import re
 
 import httpx
 
+from . import spend
 from .app_settings import get_provider_creds
 from .providers.base import ProviderConfigError, ProviderError
 
@@ -67,6 +68,27 @@ def parse_json_response(text: str) -> dict:
         except json.JSONDecodeError as e:
             raise ValueError(f"could not parse JSON: {e}") from e
     raise ValueError("response did not contain a JSON object")
+
+
+def gemini_usage(meta: dict) -> dict[str, int]:
+    """Token counts from a Gemini / Vertex `usageMetadata` block.
+
+    Thinking models (Gemini 2.5+) report their reasoning separately in
+    `thoughtsTokenCount`, billed at the OUTPUT rate. Until 2026-11-09 only
+    `candidatesTokenCount` was read, so thinking was never counted or
+    priced. `output_tokens` now includes it; `thinking_tokens` keeps it
+    visible. When `totalTokenCount` says more than prompt + answer +
+    thinking (a bucket this code doesn't know yet), trust the total so an
+    unknown field can't make the count low."""
+    prompt = int(meta.get("promptTokenCount") or 0)
+    # v1beta uses `candidatesTokenCount`; older docs show `outputTokenCount`.
+    answer = int(meta.get("candidatesTokenCount") or meta.get("outputTokenCount") or 0)
+    thoughts = int(meta.get("thoughtsTokenCount") or 0)
+    output = answer + thoughts
+    total = meta.get("totalTokenCount")
+    if isinstance(total, int) and total - prompt > output:
+        output = total - prompt
+    return {"input_tokens": prompt, "output_tokens": output, "thinking_tokens": thoughts}
 
 
 # --- Resolve the model used for a given provider ---------------------------
@@ -127,18 +149,7 @@ async def _judge_gemini(
     text = "".join(p.get("text", "") for p in parts)
     if not text:
         raise ProviderError(f"Gemini candidate had no text: {payload}")
-    meta = payload.get("usageMetadata") or {}
-    usage = {
-        "input_tokens": int(meta.get("promptTokenCount") or 0),
-        # Gemini API v1beta uses `candidatesTokenCount` (older docs
-        # sometimes show `outputTokenCount`). Try both for safety.
-        "output_tokens": int(
-            meta.get("candidatesTokenCount")
-            or meta.get("outputTokenCount")
-            or 0
-        ),
-    }
-    return text, usage
+    return text, gemini_usage(payload.get("usageMetadata") or {})
 
 
 async def _judge_openai_compat(
@@ -183,9 +194,12 @@ async def _judge_openai_compat(
     if not msg:
         raise ProviderError(f"upstream message empty: {payload}")
     u = payload.get("usage") or {}
+    details = u.get("completion_tokens_details") or {}
     usage = {
         "input_tokens": int(u.get("prompt_tokens") or 0),
+        # OpenAI-shaped `completion_tokens` already include reasoning.
         "output_tokens": int(u.get("completion_tokens") or 0),
+        "thinking_tokens": int(details.get("reasoning_tokens") or 0),
     }
     return msg, usage
 
@@ -331,16 +345,7 @@ async def _judge_vertex_ai(
     text = "".join(p.get("text", "") for p in parts)
     if not text:
         raise ProviderError(f"Vertex AI candidate had no text: {payload}")
-    meta = payload.get("usageMetadata") or {}
-    usage = {
-        "input_tokens": int(meta.get("promptTokenCount") or 0),
-        "output_tokens": int(
-            meta.get("candidatesTokenCount")
-            or meta.get("outputTokenCount")
-            or 0
-        ),
-    }
-    return text, usage
+    return text, gemini_usage(payload.get("usageMetadata") or {})
 
 
 async def _judge_openrouter(
@@ -419,5 +424,12 @@ async def judge(
         )
     else:
         raise ProviderConfigError(f"unhandled AI provider: {provider}")
-    parsed = parse_json_response(text)
+    # Logged here, once per billed call, whichever feature called. A reply
+    # that isn't usable JSON was still billed, so it is logged too.
+    try:
+        parsed = parse_json_response(text)
+    except ValueError:
+        spend.record_ai(provider, model, usage, ok=False)
+        raise
+    spend.record_ai(provider, model, usage)
     return parsed, text, usage

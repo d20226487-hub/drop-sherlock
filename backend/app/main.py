@@ -21,6 +21,8 @@ from .routers import (
     public_shares as public_shares_router,
     settings as settings_router,
     shares as shares_router,
+    projects as projects_router,
+    spend as spend_router,
     tools as tools_router,
 )
 from .scheduler import get_scheduler
@@ -124,6 +126,9 @@ def _migrate_sqlite_columns() -> None:
         # (the importer looks up by this column). Plain string UUID4
         # text; not a DB-native UUID type for SQLite portability.
         ("jobs", "export_uuid", "VARCHAR(36)"),
+        # Project a job's spend is booked to (2026-11-09) — see Project.
+        ("jobs", "project_id", "INTEGER"),
+        ("usage_events", "project_id", "INTEGER"),
         # Free-form per-row "Project" label on Backlog (added 2026-05-18).
         # Sits next to `comments`; same edit affordances, no semantics
         # enforced. NOT NULL via the "" default to match comments.
@@ -905,6 +910,11 @@ async def lifespan(_: FastAPI):
     import asyncio as _asyncio
     from . import loop_watchdog as _loop_watchdog
     _loop_watchdog.start(_asyncio.get_running_loop())
+    # Spend log writer (2026-11-09): buffered paid-API events go to
+    # usage_events from a background thread; the first start also imports
+    # past jobs once. See spend.py.
+    from . import spend as _spend
+    _spend.start()
     db = SessionLocal()
     try:
         n = mark_orphaned_runs_paused(db)
@@ -1286,6 +1296,7 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         _loop_watchdog.stop()
+        _spend.stop()
         sched.shutdown(wait=False)
 
 
@@ -1338,6 +1349,8 @@ app.include_router(backups_router.router)
 app.include_router(availability_router.router)
 app.include_router(banlist_router.router)
 app.include_router(cleanup_router.router)
+app.include_router(spend_router.router)
+app.include_router(projects_router.router)
 app.include_router(shares_router.router)
 app.include_router(tools_router.router)
 # Public router — Caddy bypasses basic-auth for `/api/public/*`. The

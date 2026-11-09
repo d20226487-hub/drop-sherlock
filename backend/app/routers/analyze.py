@@ -117,6 +117,8 @@ def preview(spec: AnalyzeSpec) -> PreviewResponse:
 # --- Submit ------------------------------------------------------------------
 
 class SubmitJobIn(BaseModel):
+    # Project the job's spend is booked to (2026-11-09); required.
+    project_id: int | None = None
     spec: AnalyzeSpec
     name: str | None = None
     notes: str | None = None
@@ -192,6 +194,13 @@ async def submit_job(
     if enabled_count == 0:
         raise HTTPException(400, "at least one criterion must be enabled")
 
+    # Every Quality job is booked to a project for cost tracking (Dashboard
+    # ▸ Spend, 2026-11-09), picked from Settings → Projects.
+    from .projects import active_project
+    project = active_project(db, payload.project_id)
+    if project is None:
+        raise HTTPException(400, "project is required (pick one from Settings → Projects)")
+
     # Stop Words is meaningless without a word list, and the failure mode
     # is bad: the request builder emits nothing, so every domain in the run
     # would come back with a failed criterion. Reject at submit instead of
@@ -236,7 +245,8 @@ async def submit_job(
     # column defaults to 'quality' so this is redundant, but making it
     # explicit defends against a future schema change that drops the
     # default.
-    job = Job(name=name, notes=notes, spec_json=spec_json, kind="quality")
+    job = Job(name=name, notes=notes, spec_json=spec_json, kind="quality",
+              project_id=project.id)
     db.add(job)
     db.flush()  # assign job.id
 
@@ -1505,3 +1515,4 @@ def export_all_serp_domains_csv(
                 'attachment; filename="serp-overview-domains-all-runs.csv"',
         },
     )
+

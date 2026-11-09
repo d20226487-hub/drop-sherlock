@@ -177,6 +177,9 @@ class Job(Base):
     # Free-string column (not Enum) so migrations stay painless on
     # SQLite — the application layer enforces allowed values.
     kind: Mapped[str] = mapped_column(String(32), default="quality", index=True)
+    # Project the job's spend is booked to (added 2026-11-09, see Project).
+    # Required when a Quality job is created; NULL on older jobs.
+    project_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     # Soft-archive marker. NULL = active; non-NULL = archived at that time.
     # Active queries default to filtering archived jobs out; the Jobs UI has
     # an explicit Archived tab to bring them back into view.
@@ -668,6 +671,68 @@ class ModelPricing(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
+
+
+class Project(Base):
+    """A project a job's API spend is booked to (added 2026-11-09). Managed
+    in Settings → Projects; Quality jobs must pick one. Jobs and the spend
+    log refer to it by id, so a rename applies everywhere. Deleting sets
+    `deleted_at`: the project leaves the list and the job form, while
+    history keeps pointing at it (and showing its name)."""
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class UsageEvent(Base):
+    """Append-only spend log (added 2026-11-09): one row per billed call to
+    a paid API — AI (any provider), Ahrefs, Whois History (WhoisFreaks) and
+    the metered Availability providers. Written by app/spend.py; read by the
+    Dashboard's Spend section.
+
+    Independent of the per-check columns (criterion_results.ai_*, units_*),
+    which are overwritten on re-runs and deleted with their run: this log
+    keeps every call, survives run deletes and Cleanup, and is not copied
+    by job export/import. No foreign keys on purpose — ids are kept as plain
+    references for the breakdowns.
+
+    `cost_usd` is the AI price at call time; NULL when no price was set
+    (the summary then estimates it at the current price, flagged). Ahrefs,
+    WhoisFreaks and Domainr are priced at read time from Settings. Rows
+    from the one-time import of past jobs have source='backfill'."""
+    __tablename__ = "usage_events"
+    __table_args__ = (Index("ix_usage_events_kind_created", "kind", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    kind: Mapped[str] = mapped_column(String(16))  # ai | ahrefs | whois_history | availability
+    provider: Mapped[str] = mapped_column(String(32), default="")
+    # AI model, Ahrefs endpoint ("site-explorer/backlinks"), or "".
+    model: Mapped[str] = mapped_column(String(128), default="")
+    feature: Mapped[str] = mapped_column(String(48), default="")
+    # Several identical cheap calls can share a row (Availability lookups).
+    calls: Mapped[int] = mapped_column(Integer, default=1)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # Output INCLUDING thinking tokens (both are billed at the output rate).
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    thinking_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # Ahrefs units billed / WhoisFreaks credits / metered lookups.
+    units: Mapped[int] = mapped_column(Integer, default=0)
+    units_list: Mapped[int] = mapped_column(Integer, default=0)  # Ahrefs list price
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # False when an AI reply was billed but unusable (e.g. not JSON).
+    ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    run_domain_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    domain: Mapped[str] = mapped_column(String(255), default="")
+    # The job's project when the call was made — kept here so spend stays
+    # attributed after the job is deleted.
+    project_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), default="live")  # live | backfill
 
 
 # --- Domain ban list (added 2026-05-13 wave L) -----------------------------

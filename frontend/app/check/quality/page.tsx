@@ -2,6 +2,7 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useT } from "@/lib/i18n";
+import { ProjectSelect } from "@/components/project-select";
 import { BACKLOG_HANDOFF_KEY } from "@/lib/backlog-handoff";
 import {
   api,
@@ -252,6 +253,9 @@ function AnalyzePageInner() {
   const [domainsRaw, setDomainsRaw] = useState("");
   const [name, setName] = useState("");
   const [notes, setNotes] = useState("");
+  // Project the job's spend is booked to (2026-11-09) — required, picked
+  // from Settings → Projects.
+  const [projectId, setProjectId] = useState<number | null>(null);
   const [criteria, setCriteria] = useState<CriteriaSpec>(DEFAULT_CRITERIA);
   const [ai, setAi] = useState<AISpec>({ provider: null, model: null });
   // Cache toggle is only meaningful in rerun mode (no prior runs exist for
@@ -298,6 +302,7 @@ function AnalyzePageInner() {
         if (r.spec.ai) setAi(r.spec.ai);
         setName(r.name || "");
         setNotes(r.notes || "");
+        setProjectId(r.project_id ?? null);
         setRerunJobName(r.name || `Job #${r.job_id}`);
       })
       .catch(() => {
@@ -509,6 +514,7 @@ function AnalyzePageInner() {
   function validate(): string | null {
     if (domainCount === 0) return ts.submit.validation.noDomains;
     if (enabledCount === 0) return ts.submit.validation.noCriteria;
+    if (projectId === null) return ts.submit.validation.noProject;
     return null;
   }
 
@@ -523,11 +529,12 @@ function AnalyzePageInner() {
     try {
       const r =
         rerunJobId !== null
-          ? await api.rerunJob(rerunJobId, spec)
+          ? await api.rerunJob(rerunJobId, spec, projectId ?? undefined)
           : await api.submitJob(
               spec,
               name.trim() || undefined,
               notes.trim() || undefined,
+              projectId ?? undefined,
             );
       // Redirect to the Run page — that's the canonical surface for
       // watching a run now (Pause/Resume/Cancel + per-domain progress
@@ -682,7 +689,17 @@ function AnalyzePageInner() {
         </div>
       )}
 
-      <section className="grid gap-4 md:grid-cols-2">
+      <section className="grid gap-4 md:grid-cols-3">
+        <div className="space-y-1">
+          <label
+            htmlFor="job-project"
+            className="text-xs font-medium text-neutral-700 dark:text-neutral-300"
+          >
+            {ts.jobProject.label} <span className="text-red-600">*</span>
+          </label>
+          <ProjectSelect id="job-project" value={projectId} onChange={setProjectId} />
+          <p className="text-xs text-neutral-500">{ts.jobProject.hint}</p>
+        </div>
         <div className="space-y-1">
           <label className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
             {ts.jobName.label}

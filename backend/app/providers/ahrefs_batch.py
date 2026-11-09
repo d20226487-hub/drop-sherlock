@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from .. import spend
+
 # Allowlisted /batch-analysis metrics, in canonical display order. Maps
 # the Ahrefs `select` field id → a short human label. Field ids verified
 # against the batch-analysis OpenAPI outputSchema (2026-06-02).
@@ -118,6 +120,8 @@ async def fetch_batch_chunk(
             out.cost_billed = int(ca)
         except ValueError:
             pass
+    spend.record_ahrefs(_ENDPOINT, billed=out.cost_billed if ca is not None else None,
+                        listed=out.cost_list)
 
     try:
         body = r.json()

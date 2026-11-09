@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from .. import spend
 from ..db import get_db
 from ..models import WaybackSparklineJob, WaybackSparklineResult
 from ..providers.ahrefs import AhrefsClient
@@ -145,7 +146,8 @@ async def _probe_one(
     url = f"https://api.ahrefs.com/v3/site-explorer/keywords-history?{urlencode(params)}"
     async with sem:
         try:
-            status, body, units = await client.fetch_url(url)
+            with spend.tag(feature="tools_keywords_history", domain=domain):
+                status, body, units = await client.fetch_url(url)
         except Exception as e:  # noqa: BLE001
             return AhrefsBatchDomainResult(
                 domain=domain,
@@ -207,9 +209,10 @@ async def _probe_batch_analysis(
 
     async def _one_batch(chunk: list[str]) -> None:
         async with sem:
-            outcome: ChunkOutcome = await fetch_batch_chunk(
-                client.client, api_key, chunk, select,
-            )
+            with spend.tag(feature="tools_batch_analysis"):
+                outcome: ChunkOutcome = await fetch_batch_chunk(
+                    client.client, api_key, chunk, select,
+                )
         totals["batch_list"] += outcome.cost_list
         totals["batch_billed"] += outcome.cost_billed
         totals["batch_calls"] += 1
@@ -463,7 +466,8 @@ async def _probe_serp_one(
     )
     async with sem:
         try:
-            status, body, units = await client.fetch_url(url)
+            with spend.tag(feature="tools_serp_overview", domain=keyword):
+                status, body, units = await client.fetch_url(url)
         except Exception as e:  # noqa: BLE001
             return SerpOverviewKeywordResult(
                 keyword=keyword,

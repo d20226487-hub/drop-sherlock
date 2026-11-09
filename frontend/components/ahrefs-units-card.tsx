@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Gauge, RefreshCw } from "lucide-react";
 import { api, AhrefsUnits } from "@/lib/api";
 import { useT } from "@/lib/i18n";
+import { fmtUsd } from "@/components/spend-card";
 
 // Highlight the box red when fewer than this many Ahrefs units remain.
 const LOW_UNITS_THRESHOLD = 1_000_000;
@@ -136,6 +137,22 @@ export function AhrefsUnitsCard() {
           </span>
         )}
       </div>
+      {/* Cost above the plan allowance this cycle (2026-11-09) — from the
+          account-wide usage Ahrefs bills on; prices in Settings. */}
+      {typeof u.overage_units === "number" && typeof u.included_units === "number" && (
+        <div
+          className={
+            "mt-1 text-xs " +
+            (u.overage_units > 0
+              ? "font-semibold text-amber-800 dark:text-amber-300"
+              : "text-neutral-600 dark:text-neutral-400")
+          }
+        >
+          {u.overage_units > 0
+            ? ts.ahrefsOverage(fmtInt(u.overage_units), fmtUsd(u.overage_usd ?? 0))
+            : ts.ahrefsWithinAllowance(fmtInt(u.included_units))}
+        </div>
+      )}
     </div>
   );
 }
