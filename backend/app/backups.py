@@ -330,6 +330,38 @@ def run_backup(*, keep: int | None = None, prerestore: bool = False) -> dict:
         MAINTENANCE_LOCK.release()
 
 
+# Disk space a backup must leave free (2026-11-10). A backup first writes a
+# full uncompressed copy of the database, then gzips it. On a nearly full
+# disk that copy took it to 100% (server log 2026-11-10: "database or disk
+# is full"), and while the disk is full every other SQLite write fails too.
+# So check first and refuse, with the numbers, before writing a byte.
+BACKUP_MIN_FREE_BYTES = (
+    int(os.environ.get("DROP_SHERLOCK_BACKUP_MIN_FREE_MB", "512")) * 1024 * 1024
+)
+
+
+def _fmt_size(n: int) -> str:
+    return f"{n / 2**30:.1f} GB" if n >= 2**30 else f"{n / 2**20:.0f} MB"
+
+
+def _check_free_space(src: Path) -> None:
+    """Refuse a backup that would fill the disk. It needs room for the
+    uncompressed copy (database + WAL, which the copy folds in), the
+    compressed one (~1/5 of it; 1/4 allowed), and BACKUP_MIN_FREE_BYTES
+    left over for everything else that writes."""
+    wal = Path(str(src) + "-wal")
+    db_bytes = src.stat().st_size + (wal.stat().st_size if wal.exists() else 0)
+    need = db_bytes + db_bytes // 4 + BACKUP_MIN_FREE_BYTES
+    free = shutil.disk_usage(BACKUP_DIR).free
+    if free < need:
+        raise RuntimeError(
+            f"not enough disk space for a backup: {_fmt_size(free)} free, need "
+            f"{_fmt_size(need)} (a {_fmt_size(db_bytes)} uncompressed copy, its "
+            f"compressed version, and {_fmt_size(BACKUP_MIN_FREE_BYTES)} left free). "
+            "Nothing was written."
+        )
+
+
 def _run_backup_locked(
     *, keep: int | None, prerestore: bool,
 ) -> dict:
@@ -343,6 +375,7 @@ def _run_backup_locked(
         raise RuntimeError(f"source DB not found at {src}")
 
     _ensure_dir()
+    _check_free_space(src)
     when = datetime.now(timezone.utc)
     out_name = _snapshot_filename(when, prerestore=prerestore)
     out_path = BACKUP_DIR / out_name
