@@ -376,7 +376,7 @@ _BACKFILL_SQL = {
     "ai_checks": """
 SELECT COALESCE(rd.last_analyzed_at, cr.fetched_at, rd.finished_at, r.finished_at,
                 r.started_at),
-       'ai', cr.ai_provider, cr.ai_model, cr.criterion, 1,
+       'ai', cr.ai_provider, COALESCE(cr.ai_model, ''), cr.criterion, 1,
        COALESCE(cr.ai_input_tokens, 0), COALESCE(cr.ai_output_tokens, 0), 0, 0, 0,
        CASE WHEN cr.ai_cost_usd > 0 THEN cr.ai_cost_usd END, 1,
        r.job_id, rd.run_id, rd.id, rd.domain, 'backfill', j.project_id
@@ -396,10 +396,18 @@ SELECT ts, 'ai', prov, mdl, 'final', 1,
        job_id, run_id, id, domain, 'backfill', proj
 FROM (SELECT rd.*, r.job_id AS job_id, j.project_id AS proj,
              COALESCE(rd.last_analyzed_at, rd.finished_at, r.finished_at, r.started_at) AS ts,
-             (SELECT c.ai_provider FROM criterion_results c
-              WHERE c.run_domain_id = rd.id AND c.ai_provider != '' LIMIT 1) AS prov,
-             (SELECT c.ai_model FROM criterion_results c
-              WHERE c.run_domain_id = rd.id AND c.ai_provider != '' LIMIT 1) AS mdl
+             -- The final call used the run's AI: take it from a judged
+             -- criterion of the same domain, else from the run's spec (a
+             -- domain whose criteria were all cache copies has neither on
+             -- its rows), else "" (an unpriced call, not a failed import).
+             COALESCE((SELECT c.ai_provider FROM criterion_results c
+                       WHERE c.run_domain_id = rd.id AND c.ai_provider != '' LIMIT 1),
+                      CASE WHEN json_valid(r.spec_json)
+                           THEN json_extract(r.spec_json, '$.ai.provider') END, '') AS prov,
+             COALESCE((SELECT c.ai_model FROM criterion_results c
+                       WHERE c.run_domain_id = rd.id AND c.ai_provider != '' LIMIT 1),
+                      CASE WHEN json_valid(r.spec_json)
+                           THEN json_extract(r.spec_json, '$.ai.model') END, '') AS mdl
       FROM run_domains rd LEFT JOIN runs r ON r.id = rd.run_id
       LEFT JOIN jobs j ON j.id = r.job_id
       WHERE COALESCE(rd.final_input_tokens, 0) > 0 OR COALESCE(rd.final_output_tokens, 0) > 0)

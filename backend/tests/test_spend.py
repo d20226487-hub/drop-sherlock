@@ -336,6 +336,30 @@ def test_backfill_imports_past_spend_once(fresh_db, sp):
     assert sp.backfill_info()["ai_checks"] == 2
 
 
+def test_backfill_final_assessment_without_a_judged_criterion(fresh_db, sp):
+    """Server crash log 2026-11-10: a final assessment on a domain whose
+    criteria carry no AI provider (all cache copies) broke the import with
+    NOT NULL on usage_events.provider. It takes the run's AI instead."""
+    import json
+    from app.models import CriterionResult
+    _job, run, rd = _run(fresh_db)
+    run.spec_json = json.dumps({"ai": {"provider": "vertex_ai", "model": "gemini-3.6-flash"}})
+    rd.final_input_tokens, rd.final_output_tokens = 1034, 133
+    rd.last_analyzed_at = datetime(2026, 10, 21)
+    fresh_db.add(CriterionResult(run_domain_id=rd.id, criterion="backlinks", status="done",
+                                 request_url="", error="", data_json="{}",
+                                 ai_cached_from_run_id=run.id))       # no ai_provider
+    _job2, run2, rd2 = _run(fresh_db)                                  # spec without AI
+    rd2.final_input_tokens, rd2.final_output_tokens = 10, 1
+    rd2.last_analyzed_at = datetime(2026, 10, 21)
+    fresh_db.commit()
+    counts = sp.backfill(datetime(2026, 11, 1))
+    assert counts["ai_final"] == 2
+    finals = {e.run_domain_id: (e.provider, e.model) for e in _events(fresh_db)
+              if e.feature == "final"}
+    assert finals == {rd.id: ("vertex_ai", "gemini-3.6-flash"), rd2.id: ("", "")}
+
+
 def test_an_interrupted_import_is_redone_with_the_first_cutoff(fresh_db, sp):
     import json
     from app.app_settings import _set
