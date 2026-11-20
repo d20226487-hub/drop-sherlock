@@ -1216,3 +1216,32 @@ Output ONLY a single JSON object with this exact shape:
 No extra prose around the JSON. No markdown fences. If the history is empty (snapshot_count = 0) return dropped_confidence and transferred_confidence both at 0 with summary 'no history available'."""
     ),
 })
+
+
+# Country rules in the EFFECTIVE classify prompts (fix 2026-11-20). The
+# baked operator defaults above replace the module constants that carry
+# _CLASSIFY_COUNTRY_RULES, so the country instruction never reached the AI.
+# Splice it into all four here — after the theme_confidence bullet and the
+# theme_confidence JSON field — so Settings → Brain shows it as the default.
+def _with_country(prompt: str) -> str:
+    bullet = "- theme_confidence: 0.0–1.0.\n"
+    field = '  "theme_confidence": <0.0-1.0>,\n'
+    assert prompt.count(bullet) == 1 and prompt.count(field) == 1
+    if "- country:" in prompt:
+        return prompt
+    return prompt.replace(bullet, bullet + _CLASSIFY_COUNTRY_RULES).replace(
+        field,
+        field
+        + '  "country": <ISO 3166-1 alpha-2 or "">,\n'
+        + '  "country_confidence": <0.0-1.0>,\n'
+        + '  "country_evidence": <short string>,\n',
+    )
+
+
+for _key in (
+    "wayback_classify_combined_white",
+    "wayback_classify_combined_grey",
+    "wayback_classify_theme_only_white",
+    "wayback_classify_theme_only_grey",
+):
+    PROMPT_KEYS[_key] = _with_country(PROMPT_KEYS[_key])

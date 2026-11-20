@@ -42,15 +42,21 @@ def fresh_db(monkeypatch):
 
 def test_both_classify_prompts_ask_for_the_country():
     from app import ai_prompts as p
-    for prompt in (p.WAYBACK_CLASSIFY_COMBINED_PROMPT_WHITE,
-                   p.WAYBACK_CLASSIFY_COMBINED_PROMPT_GREY,
-                   p.WAYBACK_CLASSIFY_THEME_ONLY_PROMPT_WHITE,
-                   p.WAYBACK_CLASSIFY_THEME_ONLY_PROMPT_GREY):
+    # PROMPT_KEYS = what get_ai_prompt / Settings → Brain actually use (the
+    # baked operator defaults replaced the module constants, which is how
+    # the country rules first went missing).
+    for prompt in (p.PROMPT_KEYS["wayback_classify_combined_white"],
+                   p.PROMPT_KEYS["wayback_classify_combined_grey"],
+                   p.PROMPT_KEYS["wayback_classify_theme_only_white"],
+                   p.PROMPT_KEYS["wayback_classify_theme_only_grey"]):
         assert "- country:" in prompt and '"country":' in prompt
         assert '"country_confidence":' in prompt and '"country_evidence":' in prompt
         assert "domain name itself" in prompt          # cities in the name count
         assert "only SUPPORTS" in prompt               # a ccTLD alone is weak
         assert "language alone" in prompt              # language never decides
+        assert prompt.count("- country:") == 1
+        # the operator's own wording survived the splice
+        assert "grey primary themes" in prompt
 
 
 def test_database_row_carries_a_valid_country_only(fresh_db):
