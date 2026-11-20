@@ -345,6 +345,9 @@ export default function DatabasePage() {
   // they filter to rows missing the respective field.
   const [verdicts, setVerdicts] = useState<string[]>([]);
   const [waybackVerdicts, setWaybackVerdicts] = useState<string[]>([]);
+  // Latest Wayback snapshot year range (2026-11-20); 0 = open end.
+  const [waybackLatestFrom, setWaybackLatestFrom] = useState<number>(0);
+  const [waybackLatestTo, setWaybackLatestTo] = useState<number>(0);
   // Stop Words verdict filter (2026-08-24). Same three-value space as
   // the wayback verdict filter, plus the "__none__" sentinel for rows
   // that never ran the check.
@@ -483,6 +486,8 @@ export default function DatabasePage() {
         const v = JSON.parse(raw);
         if (Array.isArray(v.verdicts)) setVerdicts(v.verdicts);
         if (Array.isArray(v.waybackVerdicts)) setWaybackVerdicts(v.waybackVerdicts);
+        if (typeof v.waybackLatestFrom === "number") setWaybackLatestFrom(v.waybackLatestFrom);
+        if (typeof v.waybackLatestTo === "number") setWaybackLatestTo(v.waybackLatestTo);
         if (Array.isArray(v.stopWordsVerdicts))
           setStopWordsVerdicts(v.stopWordsVerdicts);
         if (Array.isArray(v.whoisBands)) setWhoisBands(v.whoisBands);
@@ -568,6 +573,8 @@ export default function DatabasePage() {
           JSON.stringify({
             verdicts,
             waybackVerdicts,
+            waybackLatestFrom,
+            waybackLatestTo,
             stopWordsVerdicts,
             whoisBands,
             availabilityFilter,
@@ -602,6 +609,8 @@ export default function DatabasePage() {
     filtersHydrated,
     verdicts,
     waybackVerdicts,
+    waybackLatestFrom,
+    waybackLatestTo,
     stopWordsVerdicts,
     whoisBands,
     availabilityFilter,
@@ -831,6 +840,8 @@ export default function DatabasePage() {
         fresh: opts.fresh ?? false,
         verdict: verdicts,
         wayback_verdict: waybackVerdicts,
+        wayback_latest_from: waybackLatestFrom,
+        wayback_latest_to: waybackLatestTo,
         stop_words_verdict: stopWordsVerdicts,
         whois_band: whoisBands,
         availability: availabilityFilter,
@@ -911,6 +922,8 @@ export default function DatabasePage() {
   }, [
     verdicts,
     waybackVerdicts,
+    waybackLatestFrom,
+    waybackLatestTo,
     stopWordsVerdicts,
     whoisBands,
     availabilityFilter,
@@ -949,6 +962,8 @@ export default function DatabasePage() {
       perPage,
       verdicts,
       waybackVerdicts,
+      waybackLatestFrom,
+      waybackLatestTo,
       stopWordsVerdicts,
       whoisBands,
       availabilityFilter,
@@ -993,6 +1008,8 @@ export default function DatabasePage() {
     perPage,
     verdicts,
     waybackVerdicts,
+    waybackLatestFrom,
+    waybackLatestTo,
     stopWordsVerdicts,
     whoisBands,
     availabilityFilter,
@@ -1198,6 +1215,8 @@ export default function DatabasePage() {
         include_options: false,
         verdict: verdicts,
         wayback_verdict: waybackVerdicts,
+        wayback_latest_from: waybackLatestFrom,
+        wayback_latest_to: waybackLatestTo,
         stop_words_verdict: stopWordsVerdicts,
         whois_band: whoisBands,
         availability: availabilityFilter,
@@ -1504,6 +1523,8 @@ export default function DatabasePage() {
       const r = await api.bulkSetDomainSourceFiltered(src, {
         verdict: verdicts,
         wayback_verdict: waybackVerdicts,
+        wayback_latest_from: waybackLatestFrom,
+        wayback_latest_to: waybackLatestTo,
         stop_words_verdict: stopWordsVerdicts,
         whois_band: whoisBands,
         availability: availabilityFilter,
@@ -1683,6 +1704,8 @@ export default function DatabasePage() {
   function clearFilters() {
     setVerdicts([]);
     setWaybackVerdicts([]);
+    setWaybackLatestFrom(0);
+    setWaybackLatestTo(0);
     setStopWordsVerdicts([]);
     setWhoisBands([]);
     setAvailabilityFilter([]);
@@ -1855,6 +1878,8 @@ export default function DatabasePage() {
               include_options: false,
               verdict: verdicts,
               wayback_verdict: waybackVerdicts,
+              wayback_latest_from: waybackLatestFrom,
+              wayback_latest_to: waybackLatestTo,
               stop_words_verdict: stopWordsVerdicts,
               whois_band: whoisBands,
               availability: availabilityFilter,
@@ -1895,6 +1920,8 @@ export default function DatabasePage() {
   const filtersActive =
     verdicts.length > 0 ||
     waybackVerdicts.length > 0 ||
+    waybackLatestFrom > 0 ||
+    waybackLatestTo > 0 ||
     stopWordsVerdicts.length > 0 ||
     whoisBands.length > 0 ||
     availabilityFilter.length > 0 ||
@@ -2149,7 +2176,49 @@ export default function DatabasePage() {
                 group: "tail" as const,
               },
             ]}
-          />
+            note={
+              waybackLatestFrom || waybackLatestTo
+                ? ts.filters.waybackLatestNote(waybackLatestFrom, waybackLatestTo)
+                : undefined
+            }
+          >
+            {/* Latest-snapshot year range (2026-11-20). */}
+            <div className="space-y-1 text-xs" title={ts.filters.waybackLatestHint}>
+              <div className="text-neutral-600 dark:text-neutral-400">
+                {ts.filters.waybackLatestLabel}
+              </div>
+              <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1">
+                <span className="text-neutral-500">{ts.filters.waybackLatestFrom}</span>
+                <input
+                  type="number"
+                  min={1996}
+                  max={2100}
+                  value={waybackLatestFrom || ""}
+                  placeholder="…"
+                  onChange={(e) =>
+                    setWaybackLatestFrom(Math.max(0, parseInt(e.target.value, 10) || 0))
+                  }
+                  className="w-16 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-1.5 py-0.5 text-xs tabular-nums outline-none"
+                />
+              </label>
+              <label className="flex items-center gap-1">
+                <span className="text-neutral-500">{ts.filters.waybackLatestTo}</span>
+                <input
+                  type="number"
+                  min={1996}
+                  max={2100}
+                  value={waybackLatestTo || ""}
+                  placeholder="…"
+                  onChange={(e) =>
+                    setWaybackLatestTo(Math.max(0, parseInt(e.target.value, 10) || 0))
+                  }
+                  className="w-16 rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-1.5 py-0.5 text-xs tabular-nums outline-none"
+                />
+              </label>
+              </div>
+            </div>
+          </MultiSelectFilter>
 
           <MultiSelectFilter
             label={ts.filters.verdictStopWordsLabel}
@@ -4021,6 +4090,14 @@ function DomainListRow({
           >
             {ts.cachedTag}
           </span>
+        )}
+        {row.is_pinned && row.wayback_latest && (
+          <div
+            className="mt-1 text-[11px] text-neutral-500 dark:text-neutral-400 tabular-nums whitespace-nowrap"
+            title={ts.waybackLatestCellHint(row.wayback_latest_exact)}
+          >
+            {ts.waybackLatestCell(row.wayback_latest, row.wayback_latest_exact)}
+          </div>
         )}
       </td>
       {/* Stop column (2026-08-24). Shows the Stop Words criterion's

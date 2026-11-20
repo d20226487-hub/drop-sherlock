@@ -19,6 +19,8 @@ export function MultiSelectFilter({
   title,
   searchable,
   searchPlaceholder,
+  note,
+  children,
 }: {
   /** Short prefix shown before the selection summary, e.g. "Verdict". */
   label: string;
@@ -36,6 +38,11 @@ export function MultiSelectFilter({
   searchable?: boolean;
   /** Placeholder for the search box; defaults to "Search…". */
   searchPlaceholder?: string;
+  /** Extra active criteria appended to the summary (e.g. a year range set
+   * in `children`), so the closed button still shows them. */
+  note?: string;
+  /** Extra controls rendered at the bottom of the popover. */
+  children?: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -101,6 +108,7 @@ export function MultiSelectFilter({
   } else {
     summary = `${label}: ${value.length} selected`;
   }
+  if (note) summary = `${summary} · ${note}`;
 
   // Apply the in-popover search (case-insensitive substring on label).
   // Search affects only the displayed list — selection state, "X selected"
@@ -210,6 +218,11 @@ export function MultiSelectFilter({
               onToggle={() => toggle(o.value)}
             />
           ))}
+          {children && (
+            <div className="mt-1 border-t dark:border-neutral-800 pt-2 px-1">
+              {children}
+            </div>
+          )}
         </div>
       )}
     </div>

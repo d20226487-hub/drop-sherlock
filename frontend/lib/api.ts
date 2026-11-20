@@ -1257,6 +1257,10 @@ export type DatabaseDomainRow = {
   // dedicated column + filter without folding wayback into the main verdict.
   wayback_assessment: string;
   wayback_confidence: number | null;
+  // Newest Wayback capture, "YYYY-MM-DD" ("" = unknown); not exact = a
+  // lower bound from an older capped result (2026-11-20).
+  wayback_latest: string;
+  wayback_latest_exact: boolean;
   wayback_samples_count: number;
   // Stop Words per-criterion AI assessment (added 2026-08-24). Same
   // sourcing rule as wayback — from whichever rd supplies the
@@ -1488,6 +1492,9 @@ export type DatabaseListOpts = {
   // backlinks, and how many of them must be in those languages.
   backlink_lang?: string[];
   backlink_lang_min?: number;
+  // Latest Wayback snapshot year range (0 = open end).
+  wayback_latest_from?: number;
+  wayback_latest_to?: number;
   category?: string[];
   criterion?: string[];
   notes?: "any" | "with" | "without";
@@ -1641,6 +1648,10 @@ export const api = {
     for (const v of opts.backlink_lang ?? []) p.append("backlink_lang", v);
     if ((opts.backlink_lang ?? []).length && (opts.backlink_lang_min ?? 1) > 1)
       p.set("backlink_lang_min", String(opts.backlink_lang_min));
+    if ((opts.wayback_latest_from ?? 0) > 0)
+      p.set("wayback_latest_from", String(opts.wayback_latest_from));
+    if ((opts.wayback_latest_to ?? 0) > 0)
+      p.set("wayback_latest_to", String(opts.wayback_latest_to));
     // Numeric thresholds — only sent when active (> 0) so an idle filter
     // never narrows the set.
     const nums: [string, number | undefined][] = [
@@ -3103,6 +3114,8 @@ export const api = {
         language_match: opts.language_match ?? "primary",
         backlink_lang: opts.backlink_lang ?? [],
         backlink_lang_min: opts.backlink_lang_min ?? 1,
+        wayback_latest_from: opts.wayback_latest_from ?? 0,
+        wayback_latest_to: opts.wayback_latest_to ?? 0,
         category: opts.category ?? null,
         criterion: opts.criterion ?? null,
         source_filter: opts.source ?? null,

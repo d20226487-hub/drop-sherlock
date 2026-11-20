@@ -1194,6 +1194,13 @@ const messagesEn = {
       },
     },
     database: {
+      // Wayback cell: newest capture date (2026-11-20).
+      waybackLatestCell: (date: string, exact: boolean) =>
+        exact ? `last ${date}` : `last ≥ ${date}`,
+      waybackLatestCellHint: (exact: boolean): string =>
+        exact
+          ? "Newest Wayback capture"
+          : "Newest capture this check stored; the history was capped, so the real latest may be later. Re-check the domain for the exact date.",
       // Theme cell: the country the site targets (2026-11-20).
       themeCountry: (name: string, code: string, evidence: string, pct: string) =>
         `Country: ${name} (${code})` + (evidence ? ` — ${evidence}` : "") + (pct ? `, ${pct}` : ""),
@@ -1388,6 +1395,13 @@ const messagesEn = {
         verdictWaybackAny: "Any Wayback verdict",
         verdictWaybackLabel: "Wayback verdict",
         verdictWaybackNone: "(no Wayback verdict)",
+        waybackLatestLabel: "Latest snapshot",
+        waybackLatestHint:
+          "Keep domains whose newest Wayback capture falls in this range of years. Blank = no limit.",
+        waybackLatestFrom: "from",
+        waybackLatestTo: "to",
+        waybackLatestNote: (from: number, to: number) =>
+          `snapshot ${from || "…"}–${to || "…"}`,
         verdictWaybackHint:
           "Filter by the Wayback judge's per-criterion assessment (separate from the aggregated final score).",
         verdictStopWordsAny: "Any Stop verdict",
@@ -4389,6 +4403,11 @@ const messagesRu: Messages = {
       },
     },
     database: {
+      waybackLatestCell: (date, exact) => (exact ? `посл. ${date}` : `посл. ≥ ${date}`),
+      waybackLatestCellHint: (exact) =>
+        exact
+          ? "Самый новый снимок Wayback"
+          : "Самый новый снимок, сохранённый проверкой; история была обрезана лимитом, поэтому настоящий последний может быть позже. Перепроверьте домен, чтобы получить точную дату.",
       themeCountry: (name, code, evidence, pct) =>
         `Страна: ${name} (${code})` + (evidence ? ` — ${evidence}` : "") + (pct ? `, ${pct}` : ""),
       title: "База",
@@ -4576,6 +4595,12 @@ const messagesRu: Messages = {
         verdictWaybackAny: "Любой вердикт Wayback",
         verdictWaybackLabel: "Вердикт Wayback",
         verdictWaybackNone: "(без вердикта Wayback)",
+        waybackLatestLabel: "Последний снимок",
+        waybackLatestHint:
+          "Оставить домены, у которых самый новый снимок Wayback попадает в этот диапазон лет. Пусто — без ограничения.",
+        waybackLatestFrom: "с",
+        waybackLatestTo: "по",
+        waybackLatestNote: (from, to) => `снимок ${from || "…"}–${to || "…"}`,
         verdictWaybackHint:
           "Фильтр по покритериальной оценке судьи Wayback (отдельно от агрегированного итогового балла).",
         verdictStopWordsAny: "Любой вердикт «Стоп»",

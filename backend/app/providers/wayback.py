@@ -31,6 +31,8 @@ import concurrent.futures
 import random
 import re
 from html.parser import HTMLParser
+from datetime import datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 
@@ -516,9 +518,59 @@ class WaybackClient(BaseProvider):
                     for i, key in enumerate(header):
                         rec[key] = row[i] if i < len(row) else None
                     rows.append(rec)
-            return r.status_code, {"wayback": rows}, {}
+            body: dict = {"wayback": rows}
+            latest = await self._latest_capture(url, rows, phase)
+            if latest:
+                body["latest_capture"] = latest
+            return r.status_code, body, {}
 
         raise ProviderError(f"unreachable: retry exhausted ({last_exc!r})")
+
+    async def _latest_capture(self, url: str, rows: list[dict], phase: str) -> str | None:
+        """Timestamp of the domain's newest capture (2026-11-20), stored as
+        `latest_capture` and shown in the Database Wayback column.
+
+        The CDX query returns the OLDEST `limit` captures, so when it comes
+        back full (about half of all domains at limit 200) — or a `to` year
+        cut it short — the newest stored row isn't the latest snapshot. Then
+        one more request asks for the homepage's newest capture: an exact-
+        URL query with limit=-1 + fastLatest is cheap and reliable, while
+        limit=-1 on a matchType=domain query returns the last URL in index
+        order, not the newest capture (measured on example.com: 2021 vs
+        today). The answer is the newer of the two. None when unknown; a
+        failed extra request leaves the stored maximum to the reader, which
+        then shows it as a lower bound."""
+        def newest(items: list[dict]) -> str:
+            stamps = [str(i.get("timestamp") or "") for i in items if isinstance(i, dict)]
+            stamps = [s for s in stamps if len(s) >= 8 and s[:8].isdigit()]
+            return max(stamps) if stamps else ""
+
+        query = dict(parse_qsl(urlsplit(url).query))
+        try:
+            limit = int(query.get("limit", "0"))
+        except ValueError:
+            limit = 0
+        stored = newest(rows)
+        if limit <= 0:                      # our own newest-capture request
+            return stored or None
+        # A `to` date only cuts the history when it's in the past (checks
+        # usually send the end of the current year).
+        cut = query.get("to", "99999999")[:8] < datetime.utcnow().strftime("%Y%m%d")
+        if len(rows) < limit and not cut:
+            return stored or None           # the whole history is here
+        domain = query.get("url", "")
+        if not domain:
+            return None
+        newest_url = f"{API_BASE}?" + urlencode({
+            "url": domain, "output": "json", "fl": "timestamp",
+            "fastLatest": "true", "limit": "-1",
+        })
+        try:
+            _status, extra, _units = await self.fetch_url(newest_url, phase=phase)
+        except ProviderError:
+            return None
+        found = newest(extra.get("wayback") or [])
+        return max(found, stored) or None
 
     async def fetch_snapshot_page(
         self, *, timestamp: str, url: str, phase: str = "v2"

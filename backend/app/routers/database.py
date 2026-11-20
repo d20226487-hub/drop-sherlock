@@ -199,6 +199,11 @@ class DomainRow(BaseModel):
     # language set, {"en": 15, "en,ru": 2}. Feeds the "Язык ссылок" filter;
     # see app/backlink_langs.py.
     backlink_langs: dict[str, int] = Field(default_factory=dict)
+    # Newest Wayback capture (2026-11-20), "YYYY-MM-DD"; "" when unknown.
+    # `wayback_latest_exact` False = a lower bound: an older result whose
+    # stored captures were capped, so the real latest may be later.
+    wayback_latest: str = ""
+    wayback_latest_exact: bool = True
     classify_drift_detected: bool = False
     category: str = ""
     category_confidence: float | None = None
@@ -469,6 +474,33 @@ def _criterion_text_blob(criterion: str, data_json: str) -> str:
             if isinstance(u, str) and u:
                 out.append(u.lower())
     return "\n".join(out)
+
+
+def _wayback_latest(body: dict, request_url: str) -> tuple[str, bool]:
+    """("YYYY-MM-DD", exact) for a wayback result (2026-11-20). Newer
+    results carry `latest_capture` (the fetch resolved it, see
+    WaybackClient._latest_capture); older ones fall back to the newest
+    stored capture — exact unless the stored list was full (the CDX query
+    returns the OLDEST `limit` captures) or a `to` year cut it."""
+    def fmt(ts: str) -> str:
+        return f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}"
+
+    lc = body.get("latest_capture")
+    if isinstance(lc, str) and len(lc) >= 8 and lc[:8].isdigit():
+        return fmt(lc), True
+    rows = body.get("wayback")
+    if not isinstance(rows, list):
+        return "", True
+    stamps = [str(r.get("timestamp") or "") for r in rows if isinstance(r, dict)]
+    stamps = [t for t in stamps if len(t) >= 8 and t[:8].isdigit()]
+    if not stamps:
+        return "", True
+    m = re.search(r"[?&]limit=(\d+)", request_url)
+    capped = bool(m) and len(rows) >= int(m.group(1))
+    # `to` only cuts when it's in the past (checks send the current year's end).
+    t = re.search(r"[?&]to=(\d{8})", request_url)
+    cut = bool(t) and t.group(1) < datetime.utcnow().strftime("%Y%m%d")
+    return fmt(max(stamps)), not (capped or cut)
 
 
 def _spec_for_run(spec_json: str) -> AnalyzeSpec | None:
@@ -1495,6 +1527,7 @@ def _build_all_rows(
         wayback_assessment = ""
         wayback_confidence: float | None = None
         wayback_samples_count = 0
+        wayback_latest, wayback_latest_exact = "", True
         wayback_src = per_crit_sources.get("wayback")
         wayback_cr = (
             crs_by_rd.get(wayback_src[0].id, {}).get("wayback")
@@ -1539,6 +1572,8 @@ def _build_all_rows(
                 samples = w_body.get("samples")
                 if isinstance(samples, list):
                     wayback_samples_count = len(samples)
+                wayback_latest, wayback_latest_exact = _wayback_latest(
+                    w_body, wayback_cr.request_url or "")
 
         # Stop Words per-criterion verdict (2026-08-24) — sourced from
         # whichever rd supplies the `stop_words` criterion, same pin-walk
@@ -1937,6 +1972,8 @@ def _build_all_rows(
             country_confidence=country_confidence,
             country_evidence=country_evidence,
             backlink_langs=backlink_langs,
+            wayback_latest=wayback_latest,
+            wayback_latest_exact=wayback_latest_exact,
             classify_drift_detected=classify_drift_detected,
             category=category,
             category_confidence=category_confidence,
@@ -2531,6 +2568,8 @@ def _apply_domain_filters(
     language_match: str,
     backlink_langs: list[str] | None = None,
     backlink_lang_min: int = 1,
+    wayback_latest_from: int = 0,
+    wayback_latest_to: int = 0,
     categories: list[str],
     criteria: list[str],
     notes: str,
@@ -2594,6 +2633,17 @@ def _apply_domain_filters(
             r.backlink_langs, backlink_langs,
         ) < max(1, backlink_lang_min):
             return False
+        # Latest Wayback snapshot year in [from, to] (2026-11-20). A lower
+        # bound (capped older result) passes "from" only if it already
+        # reaches it, and never passes "to" — the real date may be later.
+        if wayback_latest_from or wayback_latest_to:
+            if not r.wayback_latest:
+                return False
+            year = int(r.wayback_latest[:4])
+            if wayback_latest_from and year < wayback_latest_from:
+                return False
+            if wayback_latest_to and (year > wayback_latest_to or not r.wayback_latest_exact):
+                return False
         if not _match_multi(r.category, categories):
             return False
         # Source = backlog_registrar (exact membership; rows whose
@@ -2759,6 +2809,8 @@ def list_domains(
     language_match: str = "primary",
     backlink_langs: list[str] | None = None,
     backlink_lang_min: int = 1,
+    wayback_latest_from: int = 0,
+    wayback_latest_to: int = 0,
     categories: list[str] | None = None,
     criteria: list[str] | None = None,
     notes: str = "any",
@@ -2814,6 +2866,8 @@ def list_domains(
         language_match=language_match,
         backlink_langs=backlink_langs or [],
         backlink_lang_min=backlink_lang_min,
+        wayback_latest_from=wayback_latest_from,
+        wayback_latest_to=wayback_latest_to,
         categories=categories or [],
         criteria=criteria or [],
         notes=notes or "any",
@@ -2879,6 +2933,8 @@ async def _list_domains_route(
     language_match: str = "primary",
     backlink_lang: list[str] | None = Query(None),
     backlink_lang_min: int = Query(1, ge=1),
+    wayback_latest_from: int = Query(0, ge=0, le=2100),
+    wayback_latest_to: int = Query(0, ge=0, le=2100),
     category: list[str] | None = Query(None),
     criterion: list[str] | None = Query(None),
     notes: str = "any",
@@ -2939,6 +2995,8 @@ async def _list_domains_route(
         language_match,
         backlink_lang,
         backlink_lang_min,
+        wayback_latest_from,
+        wayback_latest_to,
     )
 
 
@@ -2974,6 +3032,8 @@ def _run_list_domains(
     language_match: str = "primary",
     backlink_lang: list[str] | None = None,
     backlink_lang_min: int = 1,
+    wayback_latest_from: int = 0,
+    wayback_latest_to: int = 0,
 ) -> DomainListResponse:
     db = SessionLocal()
     try:
@@ -2994,6 +3054,8 @@ def _run_list_domains(
             language_match=language_match,
             backlink_langs=backlink_lang,
             backlink_lang_min=backlink_lang_min,
+            wayback_latest_from=wayback_latest_from,
+            wayback_latest_to=wayback_latest_to,
             categories=category,
             criteria=criterion,
             notes=notes,
@@ -3801,6 +3863,8 @@ class BulkSetSourceFilteredIn(BaseModel):
     language_match: str = "primary"
     backlink_lang: list[str] | None = None
     backlink_lang_min: int = 1
+    wayback_latest_from: int = 0
+    wayback_latest_to: int = 0
     category: list[str] | None = None
     criterion: list[str] | None = None
     # Which existing sources to MATCH (the Source filter) — distinct from the
@@ -3846,6 +3910,8 @@ def bulk_set_source_filtered(
         language_match=payload.language_match,
         backlink_langs=payload.backlink_lang,
         backlink_lang_min=payload.backlink_lang_min,
+        wayback_latest_from=payload.wayback_latest_from,
+        wayback_latest_to=payload.wayback_latest_to,
         categories=payload.category,
         criteria=payload.criterion,
         notes=payload.notes,
