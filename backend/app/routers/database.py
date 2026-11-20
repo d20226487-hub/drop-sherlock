@@ -2323,11 +2323,18 @@ def _trigger_background_rebuild() -> None:
         if _rebuild_pending:
             return
         _rebuild_pending = True
-    # Resource check before a REbuild (the first build always runs). Log-only
-    # for now: it records when it would have postponed and what the rebuild
-    # then cost, and never blocks. See resource_guard.py.
+    # Resource check before a REbuild (the first build always runs). When
+    # the server is short of memory, or busy and the snapshot still fresh
+    # enough, the rebuild is postponed: the current snapshot keeps being
+    # served and the next trigger asks again. See resource_guard.py.
     from .. import resource_guard
-    guard = resource_guard.before_rebuild() if _peek_rows_cache() is not None else None
+    guard = None
+    if _peek_rows_cache() is not None:
+        go, guard = resource_guard.check_rebuild(time.monotonic() - _last_build_done)
+        if not go:
+            with _rebuild_flag_lock:
+                _rebuild_pending = False
+            return
 
     def _worker() -> None:
         global _rebuild_pending

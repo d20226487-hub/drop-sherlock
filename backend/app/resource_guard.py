@@ -25,10 +25,17 @@ rebuild is about to start (a few times an hour, ~0.3 ms). With the
 watchdog off (LOOP_WATCHDOG=0) CPU and loop readings are unknown and only
 memory is checked.
 
-Mode — REBUILD_GUARD: "log" (default) never blocks; when a rebuild WOULD
-be postponed it writes an Errors-page row with the readings, then a second
-row with what that rebuild actually cost, so the thresholds can be tuned
-on real runs before anything is enforced. "off" disables the check."""
+Mode — REBUILD_GUARD:
+  "on" (default since 2026-11-10) postpones the rebuild. Memory (working set
+    or pressure) is a hard stop: on Nov 9 a rebuild started at 3.7 / 4.0 GB
+    and the container was killed a minute later. CPU and loop delay only
+    postpone until the snapshot is MAX_POSTPONE_SEC old, then it rebuilds
+    anyway, so a long busy spell (hours of checks) can't freeze the page.
+    The page keeps serving the current snapshot meanwhile, and the next
+    request or edit asks again.
+  "log" never blocks; it writes an Errors-page row with the readings when
+    it WOULD postpone, then one with what that rebuild cost.
+  "off" disables the check."""
 from __future__ import annotations
 
 import logging
@@ -47,6 +54,8 @@ LOOP_DELAY_SEC = 1.0
 MEM_WORKING_SET_FRAC = 0.90
 MEM_PRESSURE_AVG10 = 10.0
 WINDOW_SEC = 30.0
+# Soft reasons (CPU, loop delay) give way once the snapshot is this old.
+MAX_POSTPONE_SEC = 1800.0
 # Rows the guard may write, at most one per this many seconds.
 _REPORT_EVERY_SEC = 300.0
 
@@ -57,8 +66,8 @@ _last_report = 0.0
 
 
 def mode() -> str:
-    value = os.environ.get("REBUILD_GUARD", "log").strip().lower()
-    return value if value in ("log", "off") else "log"
+    value = os.environ.get("REBUILD_GUARD", "on").strip().lower()
+    return value if value in ("on", "log", "off") else "on"
 
 
 def note_tick(now: float, loop_delay: float) -> None:
@@ -133,6 +142,7 @@ class Verdict:
     busy: bool
     reasons: list[str] = field(default_factory=list)
     readings: str = ""
+    memory: bool = False   # a memory reason: a hard stop when enforcing
 
 
 def assess() -> Verdict:
@@ -146,10 +156,13 @@ def assess() -> Verdict:
         reasons.append(f"CPU {cpu:.0f}% over the last {WINDOW_SEC:.0f} s")
     if delay is not None and delay >= LOOP_DELAY_SEC:
         reasons.append(f"event loop answered {delay:.1f} s late")
+    memory = False
     if working is not None and limit and working >= MEM_WORKING_SET_FRAC * limit:
         reasons.append(f"memory {working / 1024:.1f} / {limit / 1024:.1f} GB in use")
+        memory = True
     if pressure is not None and pressure >= MEM_PRESSURE_AVG10:
         reasons.append(f"kernel stalled on memory {pressure:.0f}% of the last 10 s")
+        memory = True
 
     def fmt(v, unit, spec=".0f"):
         return "unknown" if v is None else f"{v:{spec}}{unit}"
@@ -158,7 +171,8 @@ def assess() -> Verdict:
         f"process {fmt(rss, ' MB')}, container working set {fmt(working, ' MB')}"
         f" of {fmt(limit, ' MB')}, memory pressure {fmt(pressure, '%', '.1f')}"
     )
-    return Verdict(busy=bool(reasons), reasons=reasons, readings=readings)
+    return Verdict(busy=bool(reasons), reasons=reasons, readings=readings,
+                   memory=memory)
 
 
 def _may_report() -> bool:
@@ -171,22 +185,44 @@ def _may_report() -> bool:
         return True
 
 
-def before_rebuild() -> dict | None:
-    """Hook for the snapshot rebuild trigger. In log mode, when the server
-    looks busy, write one Errors-page row and return a token for
-    `after_rebuild`; the rebuild always goes ahead. None otherwise."""
-    if mode() == "off":
-        return None
+def check_rebuild(snapshot_age_sec: float) -> tuple[bool, dict | None]:
+    """Hook for the snapshot rebuild trigger (never the first build).
+    Returns (go ahead?, token for `after_rebuild` or None). Writes at most
+    one Errors-page row per _REPORT_EVERY_SEC."""
+    m = mode()
+    if m == "off":
+        return True, None
     verdict = assess()
-    if not verdict.busy or not _may_report():
-        return None
+    if not verdict.busy:
+        return True, None
+    why = "; ".join(verdict.reasons)
+    age_min = snapshot_age_sec / 60
+    if m == "log":
+        if not _may_report():
+            return True, None
+        log.error(
+            "rebuild guard (log-only): would postpone the Database snapshot "
+            "rebuild - %s. Readings: %s. Rebuilding anyway.",
+            why, verdict.readings,
+        )
+        return True, {"t0": time.monotonic(), "rss0": _rss_mb()}
+    if verdict.memory or snapshot_age_sec < MAX_POSTPONE_SEC:
+        if _may_report():
+            log.error(
+                "rebuild guard: postponed the Database snapshot rebuild - %s. "
+                "The page keeps showing data from %.0f min ago; the next "
+                "request or edit tries again. Readings: %s.",
+                why, age_min, verdict.readings,
+            )
+        return False, None
+    # Only CPU / loop delay, and the snapshot is old: rebuild anyway.
+    if not _may_report():
+        return True, None
     log.error(
-        "rebuild guard (log-only): would postpone the Database snapshot "
-        "rebuild - %s. Readings: %s. Rebuilding anyway; set thresholds "
-        "from these rows before enforcing.",
-        "; ".join(verdict.reasons), verdict.readings,
+        "rebuild guard: rebuilding the Database snapshot despite %s - it is "
+        "%.0f min old. Readings: %s.", why, age_min, verdict.readings,
     )
-    return {"t0": time.monotonic(), "rss0": _rss_mb()}
+    return True, {"t0": time.monotonic(), "rss0": _rss_mb()}
 
 
 def after_rebuild(token: dict | None, ok: bool) -> None:
@@ -203,7 +239,7 @@ def after_rebuild(token: dict | None, ok: bool) -> None:
         else "process memory unknown"
     )
     log.error(
-        "rebuild guard (log-only): the flagged rebuild %s after %.1f s; %s; "
+        "rebuild guard: the flagged rebuild %s after %.1f s; %s; "
         "worst event-loop delay while it ran %s.",
         "finished" if ok else "FAILED", now - token["t0"], mem,
         f"{max(delays):.1f} s" if delays else "unknown",

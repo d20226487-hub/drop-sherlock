@@ -1,9 +1,11 @@
-"""Resource check before a Database snapshot rebuild (2026-11-01), log-only.
+"""Resource check before a Database snapshot rebuild (2026-11-01; enforced
+since 2026-11-10).
 
 Before a rebuild (never the first build) it asks whether the server is
 already struggling — CPU, event-loop delay, container working set, kernel
-memory pressure — and, in log mode, writes an Errors-page row when it WOULD
-postpone, then a row with what the rebuild actually cost. It never blocks.
+memory pressure. Enforced ("on", the default): memory postpones the rebuild
+outright; CPU / loop delay postpone it until the snapshot is 30 min old.
+"log" only writes Errors-page rows; "off" skips the check.
 """
 from __future__ import annotations
 
@@ -95,27 +97,59 @@ def test_working_set_excludes_reclaimable_file_cache(monkeypatch):
 
 def test_log_mode_writes_a_row_but_never_blocks(guard, monkeypatch, caplog):
     caplog.set_level(logging.ERROR, logger="app.resource_guard")
+    monkeypatch.setenv("REBUILD_GUARD", "log")
+    monkeypatch.setattr(guard, "_cgroup_limit_mb", lambda: 5120.0)
+    monkeypatch.setattr(guard, "_working_set_mb", lambda: 4900.0)      # even memory
     _feed(guard, monkeypatch, cpu_per_sec=0.95)
-    token = guard.before_rebuild()
-    assert token is not None
+    go, token = guard.check_rebuild(60)
+    assert go and token is not None
     rows = _rows(caplog)
     assert len(rows) == 1 and "would postpone" in rows[0] and "CPU 95%" in rows[0]
     guard.after_rebuild(token, ok=True)
     assert "flagged rebuild finished after" in _rows(caplog)[1]
-    assert guard.before_rebuild() is None            # rate cap: one per 5 min
+    assert guard.check_rebuild(60) == (True, None)    # rate cap: one row per 5 min
+
+
+def test_enforced_memory_is_a_hard_stop(guard, monkeypatch, caplog):
+    """Nov 9 12:51: a rebuild started at 3.7 / 4.0 GB; the container was
+    killed a minute later. Enforced, that rebuild waits — however stale."""
+    caplog.set_level(logging.ERROR, logger="app.resource_guard")
+    assert guard.mode() == "on"                       # the default now
+    monkeypatch.setattr(guard, "_cgroup_limit_mb", lambda: 4096.0)
+    monkeypatch.setattr(guard, "_working_set_mb", lambda: 3813.0)
+    assert guard.check_rebuild(60) == (False, None)
+    assert guard.check_rebuild(10 * 3600) == (False, None)
+    (row,) = _rows(caplog)                            # one row, then rate-capped
+    assert "postponed the Database snapshot rebuild - memory 3.7 / 4.0 GB" in row
+    assert "data from 1 min ago" in row
+    monkeypatch.setattr(guard, "_working_set_mb", lambda: 2000.0)
+    monkeypatch.setattr(guard, "_memory_pressure", lambda: 15.0)
+    assert guard.check_rebuild(60) == (False, None)   # pressure counts as memory
+    monkeypatch.setattr(guard, "_memory_pressure", lambda: 0.0)
+    assert guard.check_rebuild(60) == (True, None)    # recovered: no token, no row
+
+
+def test_enforced_cpu_postpones_only_until_the_snapshot_is_old(guard, monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger="app.resource_guard")
+    _feed(guard, monkeypatch, cpu_per_sec=0.95)
+    assert guard.check_rebuild(10 * 60) == (False, None)          # 10 min old: wait
+    monkeypatch.setattr(guard, "_last_report", 0.0)
+    go, token = guard.check_rebuild(guard.MAX_POSTPONE_SEC + 1)   # 30 min: go
+    assert go and token is not None
+    assert "rebuilding the Database snapshot despite CPU 95%" in _rows(caplog)[-1]
 
 
 def test_quiet_server_and_off_switch_write_nothing(guard, monkeypatch, caplog):
     caplog.set_level(logging.ERROR, logger="app.resource_guard")
     _feed(guard, monkeypatch, cpu_per_sec=0.1)
-    assert guard.before_rebuild() is None
+    assert guard.check_rebuild(60) == (True, None)
     _feed(guard, monkeypatch, cpu_per_sec=0.99)
     monkeypatch.setenv("REBUILD_GUARD", "off")
-    assert guard.before_rebuild() is None
+    assert guard.check_rebuild(60) == (True, None)
     assert _rows(caplog) == []
 
 
-def test_rebuild_runs_anyway_and_first_build_is_not_assessed(guard, monkeypatch):
+def test_first_build_is_not_assessed_and_a_postponed_rebuild_waits(guard, monkeypatch):
     from app.routers import database as dbr
     monkeypatch.setattr(dbr, "_rows_cache", {})
     monkeypatch.setattr(dbr, "_rebuild_pending", False)
@@ -123,7 +157,12 @@ def test_rebuild_runs_anyway_and_first_build_is_not_assessed(guard, monkeypatch)
     monkeypatch.setattr(dbr, "active_heavy_checks", lambda: [])
     builds, assessed = [], []
     monkeypatch.setattr(dbr, "_build_and_store_rows", lambda: builds.append(1))
-    monkeypatch.setattr(guard, "before_rebuild", lambda: assessed.append(1) or {"t0": 0, "rss0": None})
+    answer = {"go": True}
+
+    def fake_check(age):
+        assessed.append(1)
+        return answer["go"], ({"t0": 0, "rss0": None} if answer["go"] else None)
+    monkeypatch.setattr(guard, "check_rebuild", fake_check)
     monkeypatch.setattr(guard, "after_rebuild", lambda token, ok: assessed.append(("after", ok)))
 
     def settle():
@@ -137,9 +176,17 @@ def test_rebuild_runs_anyway_and_first_build_is_not_assessed(guard, monkeypatch)
     assert builds == [1] and assessed == [("after", True)]
     dbr._store_rows_cache([], {}, set())
     assessed.clear()
-    dbr._trigger_background_rebuild()                # a REbuild: assessed, still runs
+    dbr._trigger_background_rebuild()                # a REbuild: assessed, runs
     settle()
     assert builds == [1, 1] and assessed == [1, ("after", True)]
+    assessed.clear()
+    answer["go"] = False
+    dbr._trigger_background_rebuild()                # postponed: no build, no thread
+    assert builds == [1, 1] and assessed == [1] and not dbr._rebuild_pending
+    answer["go"] = True
+    dbr._trigger_background_rebuild()                # the next trigger asks again
+    settle()
+    assert builds == [1, 1, 1]
 
 
 def test_watchdog_feeds_cpu_and_real_loop_delay(guard):

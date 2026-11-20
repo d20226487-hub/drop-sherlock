@@ -1497,8 +1497,8 @@ const messagesEn = {
           "Minimum referring domains (dofollow) from the pinned Ahrefs Batch Analysis run. Blank/0 = off; rows without the metric are hidden when set.",
         ahrefsContains: "Ahrefs contains",
         ahrefsContainsHelp:
-          "Keep domains where the CHOSEN Ahrefs criterion contains any of these terms. Pick what to search on the left, then type one or more terms separated by a pipe (casino|porn|bet) — they are OR'd, so a domain matches if any term appears in any entry. Searches the linking URL for Backlinks, the domain for Referring domains, the anchor text for Anchors, and the keyword for Keywords. Case-insensitive substring match against the quality run. Domains with no data for the chosen criterion are hidden while this is set.",
-        ahrefsContainsPlaceholder: "casino|porn|bet",
+          "Keep domains where the CHOSEN Ahrefs criterion contains any of these terms. Pick what to search on the left, then type one or more terms separated by a pipe (travel|hotel|tour) — they are OR'd, so a domain matches if any term appears in any entry. Searches the linking URL for Backlinks, the domain for Referring domains, the anchor text for Anchors, and the keyword for Keywords. Case-insensitive substring match against the quality run. Domains with no data for the chosen criterion are hidden while this is set.",
+        ahrefsContainsPlaceholder: "travel|hotel|tour",
         ahrefsContainsInAria: "Which Ahrefs criterion to search",
         ahrefsContainsIn: {
           backlinks: "Backlinks",
@@ -4692,8 +4692,8 @@ const messagesRu: Messages = {
           "Минимум ссылающихся доменов (dofollow) из закреплённого запуска Ahrefs Batch Analysis. Пусто/0 — выкл; строки без метрики скрываются.",
         ahrefsContains: "Ahrefs содержит",
         ahrefsContainsHelp:
-          "Оставить домены, у которых ВЫБРАННЫЙ критерий Ahrefs содержит любое из этих слов. Слева выберите, где искать, затем введите одно или несколько слов через вертикальную черту (casino|porn|bet) — они объединяются по ИЛИ. Для Беклинков ищет по ссылающемуся URL, для Ссылающихся доменов — по домену, для Анкоров — по тексту анкора, для Ключевых — по ключевому слову. Поиск подстроки без учёта регистра по анализу качества. Домены без данных по выбранному критерию скрываются, пока фильтр включён.",
-        ahrefsContainsPlaceholder: "casino|porn|bet",
+          "Оставить домены, у которых ВЫБРАННЫЙ критерий Ahrefs содержит любое из этих слов. Слева выберите, где искать, затем введите одно или несколько слов через вертикальную черту (travel|hotel|tour) — они объединяются по ИЛИ. Для Беклинков ищет по ссылающемуся URL, для Ссылающихся доменов — по домену, для Анкоров — по тексту анкора, для Ключевых — по ключевому слову. Поиск подстроки без учёта регистра по анализу качества. Домены без данных по выбранному критерию скрываются, пока фильтр включён.",
+        ahrefsContainsPlaceholder: "travel|hotel|tour",
         ahrefsContainsInAria: "Где искать в данных Ahrefs",
         ahrefsContainsIn: {
           backlinks: "Беклинки",
