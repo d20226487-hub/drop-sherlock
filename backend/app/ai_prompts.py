@@ -399,6 +399,29 @@ WAYBACK_PROMPT = WAYBACK_PROMPT_WHITE
 # Back-compat aliases at the bottom of this block map the original
 # names to the white variants so any caller that hasn't been updated
 # still gets the white default.
+# Country the site targets (added 2026-11-20), shared by the combined and
+# theme-only classify prompts. Places named in the snapshots or in the domain
+# name decide; a ccTLD only backs them up (or, alone, sets a low-confidence
+# answer); language alone never does.
+_CLASSIFY_COUNTRY_RULES = (
+    "- country: the country the site is about or serves, as an ISO 3166-1 "
+    "alpha-2 UPPERCASE code (e.g. 'KZ', 'AR', 'US'), or '' when there is no "
+    "geographic signal. Look for cities, regions, street addresses, phone "
+    "country codes and currency in the most recent snapshots' titles, "
+    "headings and body text, and for a city or region name inside the "
+    "domain name itself (e.g. 'almaty-dental.com' -> 'KZ'). A country-code "
+    "domain ending (.kz, .com.ar) only SUPPORTS that evidence: on its own, "
+    "with nothing contradicting it, use it with country_confidence 0.5 at "
+    "most. Do NOT infer the country from the language alone (Spanish is not "
+    "Spain). For a city name several countries share (Valencia, Paris), "
+    "decide from the surrounding context and lower the confidence; if it "
+    "stays unclear, use ''.\n"
+    "- country_confidence: 0.0–1.0 (0 when country is '').\n"
+    "- country_evidence: at most 12 words naming the signal, e.g. \"city "
+    "'Almaty' in titles\" or \"'almaty' in the domain name\". Empty when "
+    "country is ''.\n"
+)
+
 WAYBACK_CLASSIFY_COMBINED_PROMPT_WHITE = (
     "You are an SEO analyst classifying the LANGUAGE and THEME of a "
     "domain from its archived Wayback Machine page samples. You'll receive "
@@ -424,6 +447,7 @@ WAYBACK_CLASSIFY_COMBINED_PROMPT_WHITE = (
     "- secondary_themes: array of additional themes consistently present "
     "in the recent window. Empty if single-theme.\n"
     "- theme_confidence: 0.0–1.0.\n"
+    + _CLASSIFY_COUNTRY_RULES +
     "- drift_detected: boolean — true ONLY for sequential drift (see "
     "rules below).\n"
     "- history: array of {from_year, to_year, language, theme} entries "
@@ -441,6 +465,9 @@ WAYBACK_CLASSIFY_COMBINED_PROMPT_WHITE = (
     '  "primary_theme": <short string>,\n'
     '  "secondary_themes": [<string>, ...],\n'
     '  "theme_confidence": <0.0-1.0>,\n'
+    '  "country": <ISO 3166-1 alpha-2 or "">,\n'
+    '  "country_confidence": <0.0-1.0>,\n'
+    '  "country_evidence": <short string>,\n'
     '  "drift_detected": <bool>,\n'
     '  "history": [{"from_year": <int>, "to_year": <int>, '
     '"language": <ISO 639-1>, "theme": <string>}, ...],\n'
@@ -470,6 +497,7 @@ WAYBACK_CLASSIFY_THEME_ONLY_PROMPT_WHITE = (
     "- secondary_themes: array of themes consistently present in "
     "parallel in the recent window. Empty if single-theme.\n"
     "- theme_confidence: 0.0–1.0.\n"
+    + _CLASSIFY_COUNTRY_RULES +
     "- drift_detected: boolean — true ONLY for sequential drift.\n"
     "- history: array of {from_year, to_year, theme} ONLY when "
     "drift_detected=true. Otherwise omit or pass empty array.\n"
@@ -482,6 +510,9 @@ WAYBACK_CLASSIFY_THEME_ONLY_PROMPT_WHITE = (
     '  "primary_theme": <short string>,\n'
     '  "secondary_themes": [<string>, ...],\n'
     '  "theme_confidence": <0.0-1.0>,\n'
+    '  "country": <ISO 3166-1 alpha-2 or "">,\n'
+    '  "country_confidence": <0.0-1.0>,\n'
+    '  "country_evidence": <short string>,\n'
     '  "drift_detected": <bool>,\n'
     '  "history": [{"from_year": <int>, "to_year": <int>, '
     '"theme": <string>}, ...],\n'

@@ -1279,6 +1279,11 @@ export type DatabaseDomainRow = {
   primary_theme: string;
   secondary_themes: string[];
   theme_confidence: number | null;
+  // Country the site targets (ISO 3166-1 alpha-2, "" = no signal), from the
+  // same classify verdict; shown inside the Theme cell (2026-11-20).
+  country: string;
+  country_confidence: number | null;
+  country_evidence: string;
   classify_drift_detected: boolean;
   category: string;
   category_confidence: number | null;
@@ -1418,6 +1423,8 @@ export type DatabaseDomainList = {
     // codes seen on pinned rds; categories = the user-defined category
     // names actually assigned by the AI.
     languages: string[];
+    // Backlink donor-page languages seen, most common first (2026-11-20).
+    backlink_languages?: string[];
     categories: string[];
     // Whois drop-confidence bands seen across pinned rds (added
     // 2026-05-15). Subset of {dropped, mixed, insufficient, stable}.
@@ -1477,6 +1484,10 @@ export type DatabaseListOpts = {
   // the dominant language only; "any" also matches secondary/tertiary
   // languages from wayback_classify.
   language_match?: "primary" | "any";
+  // "Язык ссылок" (2026-11-20): donor-page languages of the fetched
+  // backlinks, and how many of them must be in those languages.
+  backlink_lang?: string[];
+  backlink_lang_min?: number;
   category?: string[];
   criterion?: string[];
   notes?: "any" | "with" | "without";
@@ -1486,6 +1497,8 @@ export type DatabaseListOpts = {
   ahrefs_conf_min?: number;
   dr_min?: number;
   ref_domains_min?: number;
+  ahrefs_contains?: string;
+  ahrefs_contains_in?: string;
   whois_cycles_max?: number;
   max_price_min?: number;
   max_price_max?: number;
@@ -1625,6 +1638,9 @@ export const api = {
     }
     if (opts.notes && opts.notes !== "any") p.set("notes", opts.notes);
     if (opts.language_match === "any") p.set("language_match", "any");
+    for (const v of opts.backlink_lang ?? []) p.append("backlink_lang", v);
+    if ((opts.backlink_lang ?? []).length && (opts.backlink_lang_min ?? 1) > 1)
+      p.set("backlink_lang_min", String(opts.backlink_lang_min));
     // Numeric thresholds — only sent when active (> 0) so an idle filter
     // never narrows the set.
     const nums: [string, number | undefined][] = [
@@ -1638,6 +1654,15 @@ export const api = {
     ];
     for (const [key, val] of nums) {
       if (typeof val === "number" && val > 0) p.set(key, String(val));
+    }
+    // Free-text, not numeric — has its own send rule (any non-blank
+    // value is active, unlike the "> 0" thresholds above).
+    if (opts.ahrefs_contains && opts.ahrefs_contains.trim()) {
+      p.set("ahrefs_contains", opts.ahrefs_contains.trim());
+      // Only meaningful alongside a query; sending it alone would be noise.
+      if (opts.ahrefs_contains_in) {
+        p.set("ahrefs_contains_in", opts.ahrefs_contains_in);
+      }
     }
     if (opts.search && opts.search.trim()) p.set("search", opts.search.trim());
     if (opts.sort) {
@@ -3076,6 +3101,8 @@ export const api = {
         availability: opts.availability ?? null,
         language: opts.language ?? null,
         language_match: opts.language_match ?? "primary",
+        backlink_lang: opts.backlink_lang ?? [],
+        backlink_lang_min: opts.backlink_lang_min ?? 1,
         category: opts.category ?? null,
         criterion: opts.criterion ?? null,
         source_filter: opts.source ?? null,
@@ -3085,6 +3112,8 @@ export const api = {
         ahrefs_conf_min: opts.ahrefs_conf_min ?? 0,
         dr_min: opts.dr_min ?? 0,
         ref_domains_min: opts.ref_domains_min ?? 0,
+        ahrefs_contains: opts.ahrefs_contains ?? "",
+        ahrefs_contains_in: opts.ahrefs_contains_in ?? "backlinks",
         whois_cycles_max: opts.whois_cycles_max ?? 0,
         max_price_min: opts.max_price_min ?? 0,
         max_price_max: opts.max_price_max ?? 0,
@@ -3365,6 +3394,15 @@ export const api = {
 // Canonical Ahrefs batch-analysis metric ids + labels — mirror of the
 // backend providers/ahrefs_batch.BATCH_METRICS (same ids + order). Drives
 // the setup-page checkboxes and the run-page metric columns.
+// Which Ahrefs criterion the Database page's "contains" filter searches,
+// and the row field behind each (mirrors AHREFS_TEXT_SOURCES server-side).
+export const AHREFS_CONTAINS_SOURCES: { id: string; field: string }[] = [
+  { id: "backlinks", field: "url_from" },
+  { id: "refdomains", field: "domain" },
+  { id: "anchors", field: "anchor" },
+  { id: "keywords", field: "keyword" },
+];
+
 export const AHREFS_BATCH_METRICS: { id: string; label: string }[] = [
   { id: "domain_rating", label: "DR" },
   { id: "refdomains_dofollow", label: "Ref domains (follow)" },

@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useT } from "@/lib/i18n";
 import {
+  AHREFS_CONTAINS_SOURCES,
   api,
   AvailabilityStatus,
   BACKLOG_STATUSES,
@@ -389,6 +390,10 @@ export default function DatabasePage() {
   const [languageMatch, setLanguageMatch] = useState<"primary" | "any">(
     "primary",
   );
+  // "Язык ссылок" (2026-11-20): backlink donor-page languages + the minimum
+  // number of fetched backlinks in them.
+  const [backlinkLangs, setBacklinkLangs] = useState<string[]>([]);
+  const [backlinkLangMin, setBacklinkLangMin] = useState<number>(1);
   const [categories, setCategories] = useState<string[]>([]);
   // Whois ownership-cycles filter (added 2026-05-21). 0 = off; >=1
   // shows only rows where the deterministic cycle counter from the
@@ -419,6 +424,20 @@ export default function DatabasePage() {
   // 0 = off. Rows lacking the value are excluded when the filter is on.
   const [drMin, setDrMin] = useState<number>(0);
   const [refDomainsMin, setRefDomainsMin] = useState<number>(0);
+  const [ahrefsContains, setAhrefsContains] = useState<string>("");
+  // Debounced so typing doesn't fire a request per keystroke; the
+  // numeric filters above are click-driven and don't need this.
+  const [ahrefsQuery, setAhrefsQuery] = useState<string>("");
+  // Which Ahrefs criterion the query searches. Not debounced —
+  // changing it is a deliberate click, so it should apply at once.
+  const [ahrefsIn, setAhrefsIn] = useState<string>("backlinks");
+  useEffect(() => {
+    const h = window.setTimeout(
+      () => setAhrefsQuery(ahrefsContains),
+      300,
+    );
+    return () => window.clearTimeout(h);
+  }, [ahrefsContains]);
   // Max price range filter (added 2026-05-23, iterated to a paired
   // min/max input the same day after the slider proved unusable — a
   // step-50 slider can't express "between $1 and $20" cleanly, which
@@ -487,11 +506,17 @@ export default function DatabasePage() {
         if (Array.isArray(v.languages)) setLanguages(v.languages);
         if (v.languageMatch === "any" || v.languageMatch === "primary")
           setLanguageMatch(v.languageMatch);
+        if (Array.isArray(v.backlinkLangs)) setBacklinkLangs(v.backlinkLangs);
+        if (typeof v.backlinkLangMin === "number" && v.backlinkLangMin >= 1)
+          setBacklinkLangMin(v.backlinkLangMin);
         if (Array.isArray(v.categories)) setCategories(v.categories);
         if (typeof v.waybackConfMin === "number") setWaybackConfMin(v.waybackConfMin);
         if (typeof v.ahrefsConfMin === "number") setAhrefsConfMin(v.ahrefsConfMin);
         if (typeof v.drMin === "number") setDrMin(v.drMin);
         if (typeof v.refDomainsMin === "number") setRefDomainsMin(v.refDomainsMin);
+        if (typeof v.ahrefsContains === "string")
+          setAhrefsContains(v.ahrefsContains);
+        if (typeof v.ahrefsIn === "string") setAhrefsIn(v.ahrefsIn);
         if (
           typeof v.whoisCyclesMax === "number" &&
           v.whoisCyclesMax >= 0 &&
@@ -552,11 +577,15 @@ export default function DatabasePage() {
             statusFilter,
             languages,
             languageMatch,
+            backlinkLangs,
+            backlinkLangMin,
             categories,
             waybackConfMin,
             ahrefsConfMin,
             drMin,
             refDomainsMin,
+            ahrefsContains,
+            ahrefsIn,
             whoisCyclesMax,
             maxPriceMin,
             maxPriceMax,
@@ -582,11 +611,15 @@ export default function DatabasePage() {
     statusFilter,
     languages,
     languageMatch,
+    backlinkLangs,
+    backlinkLangMin,
     categories,
     waybackConfMin,
     ahrefsConfMin,
     drMin,
     refDomainsMin,
+    ahrefsQuery,
+    ahrefsIn,
     whoisCyclesMax,
     maxPriceMin,
     maxPriceMax,
@@ -643,6 +676,7 @@ export default function DatabasePage() {
     verdicts: [],
     wayback_verdicts: [],
     languages: [],
+    backlink_languages: [],
     categories: [],
     whois_bands: [],
     availability_statuses: [],
@@ -802,6 +836,8 @@ export default function DatabasePage() {
         availability: availabilityFilter,
         language: languages,
         language_match: languageMatch,
+        backlink_lang: backlinkLangs,
+        backlink_lang_min: backlinkLangMin,
         category: categories,
         criterion: criteria,
         notes: notesFilter,
@@ -811,6 +847,8 @@ export default function DatabasePage() {
         ahrefs_conf_min: ahrefsConfMin,
         dr_min: drMin,
         ref_domains_min: refDomainsMin,
+        ahrefs_contains: ahrefsQuery,
+        ahrefs_contains_in: ahrefsIn,
         whois_cycles_max: whoisCyclesMax,
         max_price_min: maxPriceMin,
         max_price_max: maxPriceMax,
@@ -878,6 +916,8 @@ export default function DatabasePage() {
     availabilityFilter,
     languages,
     languageMatch,
+    backlinkLangs,
+    backlinkLangMin,
     categories,
     criteria,
     notesFilter,
@@ -887,6 +927,8 @@ export default function DatabasePage() {
     ahrefsConfMin,
     drMin,
     refDomainsMin,
+    ahrefsQuery,
+    ahrefsIn,
     whoisCyclesMax,
     maxPriceMin,
     maxPriceMax,
@@ -912,6 +954,8 @@ export default function DatabasePage() {
       availabilityFilter,
       languages,
       languageMatch,
+      backlinkLangs,
+      backlinkLangMin,
       categories,
       criteria,
       notesFilter,
@@ -921,6 +965,8 @@ export default function DatabasePage() {
       ahrefsConfMin,
       drMin,
       refDomainsMin,
+      ahrefsQuery,
+      ahrefsIn,
       whoisCyclesMax,
       maxPriceMin,
       maxPriceMax,
@@ -952,6 +998,8 @@ export default function DatabasePage() {
     availabilityFilter,
     languages,
     languageMatch,
+    backlinkLangs,
+    backlinkLangMin,
     categories,
     criteria,
     notesFilter,
@@ -961,6 +1009,8 @@ export default function DatabasePage() {
     ahrefsConfMin,
     drMin,
     refDomainsMin,
+    ahrefsQuery,
+    ahrefsIn,
     whoisCyclesMax,
     maxPriceMin,
     maxPriceMax,
@@ -1153,6 +1203,8 @@ export default function DatabasePage() {
         availability: availabilityFilter,
         language: languages,
         language_match: languageMatch,
+        backlink_lang: backlinkLangs,
+        backlink_lang_min: backlinkLangMin,
         category: categories,
         criterion: criteria,
         notes: notesFilter,
@@ -1162,6 +1214,8 @@ export default function DatabasePage() {
         ahrefs_conf_min: ahrefsConfMin,
         dr_min: drMin,
         ref_domains_min: refDomainsMin,
+        ahrefs_contains: ahrefsQuery,
+        ahrefs_contains_in: ahrefsIn,
         whois_cycles_max: whoisCyclesMax,
         max_price_min: maxPriceMin,
         max_price_max: maxPriceMax,
@@ -1455,6 +1509,8 @@ export default function DatabasePage() {
         availability: availabilityFilter,
         language: languages,
         language_match: languageMatch,
+        backlink_lang: backlinkLangs,
+        backlink_lang_min: backlinkLangMin,
         category: categories,
         criterion: criteria,
         notes: notesFilter,
@@ -1464,6 +1520,8 @@ export default function DatabasePage() {
         ahrefs_conf_min: ahrefsConfMin,
         dr_min: drMin,
         ref_domains_min: refDomainsMin,
+        ahrefs_contains: ahrefsQuery,
+        ahrefs_contains_in: ahrefsIn,
         whois_cycles_max: whoisCyclesMax,
         max_price_min: maxPriceMin,
         max_price_max: maxPriceMax,
@@ -1630,6 +1688,8 @@ export default function DatabasePage() {
     setAvailabilityFilter([]);
     setLanguages([]);
     setLanguageMatch("primary");
+    setBacklinkLangs([]);
+    setBacklinkLangMin(1);
     setCategories([]);
     setCriteria([]);
     // setCache + setPinFilter removed (controls deleted 2026-05-23).
@@ -1640,6 +1700,8 @@ export default function DatabasePage() {
     setAhrefsConfMin(0);
     setDrMin(0);
     setRefDomainsMin(0);
+    setAhrefsContains("");
+    setAhrefsIn("backlinks");
     setWhoisCyclesMax(0);
     setMaxPriceMin(0);
     setMaxPriceMax(0);
@@ -1798,6 +1860,8 @@ export default function DatabasePage() {
               availability: availabilityFilter,
               language: languages,
               language_match: languageMatch,
+              backlink_lang: backlinkLangs,
+              backlink_lang_min: backlinkLangMin,
               category: categories,
               criterion: criteria,
               notes: notesFilter,
@@ -1807,6 +1871,8 @@ export default function DatabasePage() {
               ahrefs_conf_min: ahrefsConfMin,
               dr_min: drMin,
               ref_domains_min: refDomainsMin,
+              ahrefs_contains: ahrefsQuery,
+              ahrefs_contains_in: ahrefsIn,
               whois_cycles_max: whoisCyclesMax,
               max_price_min: maxPriceMin,
               max_price_max: maxPriceMax,
@@ -1842,6 +1908,7 @@ export default function DatabasePage() {
     ahrefsConfMin > 0 ||
     drMin > 0 ||
     refDomainsMin > 0 ||
+    ahrefsQuery.trim() !== "" ||
     whoisCyclesMax > 0 ||
     maxPriceMin > 0 ||
     maxPriceMax > 0;
@@ -2221,6 +2288,40 @@ export default function DatabasePage() {
             </label>
           )}
 
+          {/* "Язык ссылок" (2026-11-20): languages of the pages the
+              backlinks come from, plus a minimum count once one is chosen. */}
+          <MultiSelectFilter
+            label={ts.filters.backlinkLangLabel}
+            anyLabel={ts.filters.backlinkLangAny}
+            value={backlinkLangs}
+            onChange={setBacklinkLangs}
+            title={ts.filters.backlinkLangHint}
+            disabled={(opts.backlink_languages || []).length === 0}
+            options={(opts.backlink_languages || []).map((v) => ({ value: v, label: v }))}
+            searchable
+            searchPlaceholder={ts.filters.languageSearchPlaceholder}
+          />
+          {backlinkLangs.length > 0 && (
+            <label className="flex flex-col gap-1 text-xs">
+              <span
+                className="text-neutral-600 dark:text-neutral-400"
+                title={ts.filters.backlinkLangMinHint}
+              >
+                {ts.filters.backlinkLangMinLabel}
+              </span>
+              <input
+                type="number"
+                min={1}
+                value={backlinkLangMin}
+                onChange={(e) =>
+                  setBacklinkLangMin(Math.max(1, parseInt(e.target.value, 10) || 1))
+                }
+                title={ts.filters.backlinkLangMinHint}
+                className="w-20 rounded-md border dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-sm outline-none"
+              />
+            </label>
+          )}
+
           <MultiSelectFilter
             label={ts.filters.categoryLabel}
             anyLabel={ts.filters.categoryAny}
@@ -2349,6 +2450,41 @@ export default function DatabasePage() {
               }
               className="px-2 py-1.5 text-sm rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 outline-none focus:ring-2 focus:ring-blue-500/40 tabular-nums"
             />
+          </label>
+
+          {/* Backlink-URL "contains" (2026-09-29). Free-text, pipe =
+              OR. Searches the linking URLs (`url_from`) of the quality
+              run's backlinks criterion, so it answers "which of my
+              domains are linked FROM sites whose URL contains X".
+              Wider than the numeric filters, hence the col-span. */}
+          <label
+            className="flex flex-col gap-1 min-w-0 sm:col-span-2"
+            title={ts.filters.ahrefsContainsHelp}
+          >
+            <span className="text-xs text-neutral-500 dark:text-neutral-400">
+              {ts.filters.ahrefsContains}
+            </span>
+            <div className="flex items-stretch gap-1 min-w-0">
+              <select
+                value={ahrefsIn}
+                onChange={(e) => setAhrefsIn(e.target.value)}
+                aria-label={ts.filters.ahrefsContainsInAria}
+                className="px-2 py-1.5 text-sm rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 outline-none focus:ring-2 focus:ring-blue-500/40 shrink-0"
+              >
+                {AHREFS_CONTAINS_SOURCES.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {ts.filters.ahrefsContainsIn[o.id] ?? o.id}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="text"
+                value={ahrefsContains}
+                placeholder={ts.filters.ahrefsContainsPlaceholder}
+                onChange={(e) => setAhrefsContains(e.target.value)}
+                className="flex-1 min-w-0 px-2 py-1.5 text-sm rounded border dark:border-neutral-700 bg-white dark:bg-neutral-950 outline-none focus:ring-2 focus:ring-blue-500/40"
+              />
+            </div>
           </label>
 
           {/* Max price range — paired number inputs (replaced the
@@ -3194,7 +3330,7 @@ function DomainListRow({
   recheckBusy: boolean;
   onRecheck: () => void;
 }) {
-  const { t } = useT();
+  const { t, lang: uiLang } = useT();
   const ts = t.pages.database;
 
   // Per-criterion → rd link. Each verdict cell navigates to the rd
@@ -4058,6 +4194,15 @@ function DomainListRow({
                     ⚠
                   </span>
                 )}
+                {row.country && (
+                  <CountryBadge
+                    code={row.country}
+                    confidence={row.country_confidence}
+                    evidence={row.country_evidence}
+                    lang={uiLang}
+                    label={ts.themeCountry}
+                  />
+                )}
               </div>
               </MaybeLink>
             );
@@ -4248,3 +4393,42 @@ function AvailabilityCell({
 // source attribution via cell tooltips. Pin management now happens on
 // the Run page's "Per-criterion pins" panel and the Job page's read-
 // only pins widget.
+
+// Country the site targets, inside the Theme cell (2026-11-20): the ISO
+// code as a small badge, muted like the theme when the AI was unsure; the
+// country's name (in the UI language) and the AI's evidence on hover.
+function CountryBadge({
+  code,
+  confidence,
+  evidence,
+  lang,
+  label,
+}: {
+  code: string;
+  confidence: number | null;
+  evidence: string;
+  lang: string;
+  label: (name: string, code: string, evidence: string, pct: string) => string;
+}) {
+  let name = code;
+  try {
+    name = new Intl.DisplayNames([lang], { type: "region" }).of(code) || code;
+  } catch {
+    // unknown code or no Intl support: keep the code
+  }
+  const low = confidence == null || isLowConfidence(confidence);
+  const pct = confidence != null ? `${Math.round(confidence * 100)}%` : "";
+  return (
+    <span
+      title={label(name, code, evidence, pct)}
+      className={
+        "ml-1.5 inline-block align-middle rounded border px-1 text-[10px] font-semibold leading-4 not-italic " +
+        (low
+          ? "border-neutral-300 text-neutral-400 dark:border-neutral-700 dark:text-neutral-500"
+          : "border-sky-300 bg-sky-50 text-sky-800 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-300")
+      }
+    >
+      {code}
+    </span>
+  );
+}

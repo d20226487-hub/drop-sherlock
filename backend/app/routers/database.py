@@ -35,6 +35,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from ..backlink_langs import count_matching as backlink_count_matching
+from ..backlink_langs import language_sets as backlink_language_sets
+from ..backlink_langs import languages_in as backlink_languages_in
 from ..db import SessionLocal, get_db
 
 log = logging.getLogger(__name__)
@@ -145,6 +148,22 @@ class DomainRow(BaseModel):
     # Per-criterion summary, all from the pinned rd's CRs only. Empty cell
     # for a criterion that didn't run on the pinned rd.
     criteria: dict[str, CriterionSummary] = Field(default_factory=dict)
+    # Lowercased searchable text per Ahrefs criterion, newline-joined —
+    # backs the "Ahrefs contains" filter (2026-09-29). See
+    # AHREFS_TEXT_SOURCES for which field feeds each one.
+    #
+    # `exclude=True` keeps these SERVER-SIDE: they are only ever filter
+    # inputs, and shipping them would add megabytes to every
+    # /database/domains response for data the UI never renders.
+    #
+    # Four plain strings rather than one dict: an empty str is a shared
+    # singleton so rows without the criterion cost only a pointer, while
+    # a per-row dict would allocate an object for all ~142k rows — the
+    # kind of thing that OOM'd this builder before.
+    backlink_urls: str = Field(default="", exclude=True)
+    refdomain_names: str = Field(default="", exclude=True)
+    anchor_texts: str = Field(default="", exclude=True)
+    keyword_texts: str = Field(default="", exclude=True)
     # Wayback verdict — surfaced separately from the aggregated final
     # since wayback is informational (default weight=0).
     wayback_assessment: str = ""
@@ -170,6 +189,16 @@ class DomainRow(BaseModel):
     primary_theme: str = ""
     secondary_themes: list[str] = Field(default_factory=list)
     theme_confidence: float | None = None
+    # Country the site targets, from the same verdict (added 2026-11-20):
+    # ISO 3166-1 alpha-2, "" when the AI saw no geographic signal. Shown
+    # inside the Theme cell.
+    country: str = ""
+    country_confidence: float | None = None
+    country_evidence: str = ""
+    # Backlink languages (2026-11-20): fetched backlinks per donor-page
+    # language set, {"en": 15, "en,ru": 2}. Feeds the "Язык ссылок" filter;
+    # see app/backlink_langs.py.
+    backlink_langs: dict[str, int] = Field(default_factory=dict)
     classify_drift_detected: bool = False
     category: str = ""
     category_confidence: float | None = None
@@ -381,6 +410,65 @@ def _row_count(data_json: str) -> int:
             if isinstance(v, list):
                 return len(v)
     return 0
+
+
+# Which per-row field carries the searchable text for each Ahrefs
+# criterion, and which DomainRow attribute caches it. Drives the
+# "Ahrefs contains" filter (2026-09-29).
+#
+# For backlinks this is `url_from`, NOT `url_to`: url_to is the analysed
+# domain itself, so searching it would match "escort" for
+# escorts-eden.com and tell the operator nothing.
+AHREFS_TEXT_SOURCES: dict[str, tuple[str, str]] = {
+    # criterion:   (row field to read, DomainRow attribute to cache into)
+    "backlinks":  ("url_from", "backlink_urls"),
+    "refdomains": ("domain", "refdomain_names"),
+    "anchors":    ("anchor", "anchor_texts"),
+    "keywords":   ("keyword", "keyword_texts"),
+}
+
+
+def _criterion_text_blob(criterion: str, data_json: str) -> str:
+    """Lowercased searchable values from one CriterionResult body,
+    newline-joined into ONE string.
+
+    One blob rather than a list because `_build_all_rows` is memory
+    bound — materializing 9 CriterionSummary objects per row once cost
+    ~1.78 GB and OOM'd the page (see the empty-`criteria` comment
+    below). A single string per row keeps the object count flat, and
+    substring search over the joined text is exactly the query we need.
+    Lowercased once here so the hot filter loop doesn't re-lower it.
+
+    Ahrefs wraps each list under a key matching the criterion, but we
+    fall back to the first list in the body (same tolerance as
+    `_row_count`) — `keywords` has no stored results to verify against
+    yet, and a key rename upstream should degrade to "still works"
+    rather than "silently returns nothing".
+    """
+    spec = AHREFS_TEXT_SOURCES.get(criterion)
+    if not spec or not data_json:
+        return ""
+    field = spec[0]
+    try:
+        body = json.loads(data_json)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    rows = body.get(criterion)
+    if not isinstance(rows, list):
+        rows = next(
+            (v for v in body.values() if isinstance(v, list)), None
+        )
+    if not isinstance(rows, list):
+        return ""
+    out = []
+    for r in rows:
+        if isinstance(r, dict):
+            u = r.get(field)
+            if isinstance(u, str) and u:
+                out.append(u.lower())
+    return "\n".join(out)
 
 
 def _spec_for_run(spec_json: str) -> AnalyzeSpec | None:
@@ -985,6 +1073,9 @@ def _build_all_rows(
     stop_words_assessments: set[str] = set()
     # Filter universes for wayback_classify columns (added 2026-05-09).
     languages_seen: set[str] = set()
+    # Backlink-language universe: how many domains have backlinks in each
+    # language, for the "Язык ссылок" dropdown (most common first).
+    backlink_langs_seen: Counter = Counter()
     categories_seen: set[str] = set()
     # Whois-band universe for the new Whois filter dropdown (added
     # 2026-05-15). Always a subset of {dropped, mixed, insufficient,
@@ -1166,6 +1257,7 @@ def _build_all_rows(
             spec_ai_model = primary_spec.ai.model or ""
 
         criteria_summary: dict[str, CriterionSummary] = {}
+        text_blobs: dict[str, str] = {}
         any_cached = False
         # Collect per-criterion AI verdicts for synthetic-final derivation
         # below. Sourced ONLY from per_crit_sources so aux pillars cannot
@@ -1233,6 +1325,10 @@ def _build_all_rows(
                         and 0.0 <= float(_dc) <= 1.0
                     ):
                         ai_dropped_v = float(_dc)
+            if cr is not None and c in AHREFS_TEXT_SOURCES:
+                blob = _criterion_text_blob(c, cr.data_json)
+                if blob:
+                    text_blobs[AHREFS_TEXT_SOURCES[c][1]] = blob
             criteria_summary[c] = CriterionSummary(
                 enabled=enabled,
                 rows=_row_count(cr.data_json) if cr else 0,
@@ -1484,6 +1580,15 @@ def _build_all_rows(
                 if isinstance(sw_rows, list):
                     stop_words_matches = len(sw_rows)
 
+        # Backlink languages from the pinned backlinks result (2026-11-20).
+        backlink_langs: dict[str, int] = {}
+        bl_src = per_crit_sources.get("backlinks")
+        if bl_src is not None:
+            bl_cr = crs_by_rd.get(bl_src[0].id, {}).get("backlinks")
+            if bl_cr is not None and bl_cr.data_json:
+                backlink_langs = backlink_language_sets(bl_cr)
+                backlink_langs_seen.update(backlink_languages_in(backlink_langs))
+
         # wayback_classify per-criterion verdict for the pinned rd only.
         # Schema (from wayback_classify.py): {primary_language,
         # secondary_languages, language_confidence, primary_theme,
@@ -1495,6 +1600,9 @@ def _build_all_rows(
         primary_theme = ""
         secondary_themes: list[str] = []
         theme_confidence: float | None = None
+        country = ""
+        country_confidence: float | None = None
+        country_evidence = ""
         classify_drift_detected = False
         category = ""
         category_confidence: float | None = None
@@ -1531,6 +1639,18 @@ def _build_all_rows(
                 if isinstance(tc, (int, float)) and not isinstance(tc, bool):
                     if 0.0 <= float(tc) <= 1.0:
                         theme_confidence = float(tc)
+                # Only a well-formed two-letter code counts; anything else
+                # the model returns leaves the cell without a country.
+                co = wc_parsed.get("country")
+                if isinstance(co, str) and len(co.strip()) == 2 and co.strip().isalpha():
+                    country = co.strip().upper()
+                    coc = wc_parsed.get("country_confidence")
+                    if isinstance(coc, (int, float)) and not isinstance(coc, bool):
+                        if 0.0 <= float(coc) <= 1.0:
+                            country_confidence = float(coc)
+                    ev = wc_parsed.get("country_evidence")
+                    if isinstance(ev, str):
+                        country_evidence = ev.strip()[:200]
                 classify_drift_detected = bool(wc_parsed.get("drift_detected"))
                 cat = wc_parsed.get("category")
                 if isinstance(cat, str) and cat:
@@ -1794,6 +1914,7 @@ def _build_all_rows(
             final_underweight=underweight,
             missing_weighted_criteria=missing_weighted,
             pinned_criteria=pinned_criteria_list,
+            **text_blobs,
             ai_provider=ai_provider,
             ai_model=ai_model,
             spec_ai_provider=spec_ai_provider,
@@ -1812,6 +1933,10 @@ def _build_all_rows(
             primary_theme=primary_theme,
             secondary_themes=secondary_themes,
             theme_confidence=theme_confidence,
+            country=country,
+            country_confidence=country_confidence,
+            country_evidence=country_evidence,
+            backlink_langs=backlink_langs,
             classify_drift_detected=classify_drift_detected,
             category=category,
             category_confidence=category_confidence,
@@ -1865,6 +1990,10 @@ def _build_all_rows(
             "wayback_verdicts": sorted(wayback_assessments),
             "stop_words_verdicts": sorted(stop_words_assessments),
             "languages": sorted(languages_seen),
+            "backlink_languages": [
+                code for code, _n in sorted(
+                    backlink_langs_seen.items(), key=lambda kv: (-kv[1], kv[0]))
+            ],
             "categories": sorted(categories_seen),
             "whois_bands": sorted(whois_bands_seen),
             # Subset of {available, registered, unknown, error}. Frontend
@@ -2400,6 +2529,8 @@ def _apply_domain_filters(
     availability: list[str],
     languages: list[str],
     language_match: str,
+    backlink_langs: list[str] | None = None,
+    backlink_lang_min: int = 1,
     categories: list[str],
     criteria: list[str],
     notes: str,
@@ -2409,10 +2540,26 @@ def _apply_domain_filters(
     ahrefs_conf_min: float,
     dr_min: float,
     ref_domains_min: float,
+    ahrefs_contains: str,
+    ahrefs_contains_in: str,
     whois_cycles_max: int,
     max_price_min: float,
     max_price_max: float,
 ) -> list[DomainRow]:
+    # Parse the pipe-separated query once; the per-row closure below runs
+    # for every row in the snapshot.
+    ahrefs_terms = [
+        t for t in (
+            x.strip().lower() for x in (ahrefs_contains or "").split("|")
+        ) if t
+    ]
+    # Resolve the chosen source to the DomainRow attribute holding its
+    # text. An unknown value falls back to backlinks rather than matching
+    # nothing, so a stale bookmarked URL degrades usefully.
+    ahrefs_attr = AHREFS_TEXT_SOURCES.get(
+        ahrefs_contains_in, AHREFS_TEXT_SOURCES["backlinks"]
+    )[1]
+
     def keep(r: DomainRow) -> bool:
         # Verdict (final bucket) — __none__ = no bucket & not partial;
         # __partial__ = partial final.
@@ -2440,6 +2587,12 @@ def _apply_domain_filters(
         if not _match_language(
             r.primary_language, r.secondary_languages, languages, language_match,
         ):
+            return False
+        # "Язык ссылок": at least N fetched backlinks from donor pages in
+        # any of the chosen languages (a page in two of them counts once).
+        if backlink_langs and backlink_count_matching(
+            r.backlink_langs, backlink_langs,
+        ) < max(1, backlink_lang_min):
             return False
         if not _match_multi(r.category, categories):
             return False
@@ -2476,6 +2629,16 @@ def _apply_domain_filters(
         if ref_domains_min > 0:
             rd = r.batch_metrics.get("refdomains_dofollow")
             if rd is None or rd < ref_domains_min:
+                return False
+        # Ahrefs "contains" (2026-09-29). Pipe-separated terms, OR'd:
+        # keep the domain when ANY entry in the CHOSEN criterion contains
+        # ANY term. Terms are pre-lowered by the caller and the blob is
+        # stored lowercased, so this is a plain substring test per term.
+        # A domain with no data for the chosen criterion is hidden —
+        # absent is unknown, not "no match".
+        if ahrefs_terms:
+            blob = getattr(r, ahrefs_attr, "")
+            if not blob or not any(t in blob for t in ahrefs_terms):
                 return False
         # Whois ownership-cycles "< N" (null excluded when filter on).
         if whois_cycles_max > 0:
@@ -2594,6 +2757,8 @@ def list_domains(
     availability: list[str] | None = None,
     languages: list[str] | None = None,
     language_match: str = "primary",
+    backlink_langs: list[str] | None = None,
+    backlink_lang_min: int = 1,
     categories: list[str] | None = None,
     criteria: list[str] | None = None,
     notes: str = "any",
@@ -2603,6 +2768,8 @@ def list_domains(
     ahrefs_conf_min: float = 0.0,
     dr_min: float = 0.0,
     ref_domains_min: float = 0.0,
+    ahrefs_contains: str = "",
+    ahrefs_contains_in: str = "backlinks",
     whois_cycles_max: int = 0,
     max_price_min: float = 0.0,
     max_price_max: float = 0.0,
@@ -2645,6 +2812,8 @@ def list_domains(
         availability=availability or [],
         languages=languages or [],
         language_match=language_match,
+        backlink_langs=backlink_langs or [],
+        backlink_lang_min=backlink_lang_min,
         categories=categories or [],
         criteria=criteria or [],
         notes=notes or "any",
@@ -2654,6 +2823,8 @@ def list_domains(
         ahrefs_conf_min=ahrefs_conf_min,
         dr_min=dr_min,
         ref_domains_min=ref_domains_min,
+        ahrefs_contains=ahrefs_contains,
+        ahrefs_contains_in=ahrefs_contains_in,
         whois_cycles_max=whois_cycles_max,
         max_price_min=max_price_min,
         max_price_max=max_price_max,
@@ -2706,6 +2877,8 @@ async def _list_domains_route(
     availability: list[str] | None = Query(None),
     language: list[str] | None = Query(None),
     language_match: str = "primary",
+    backlink_lang: list[str] | None = Query(None),
+    backlink_lang_min: int = Query(1, ge=1),
     category: list[str] | None = Query(None),
     criterion: list[str] | None = Query(None),
     notes: str = "any",
@@ -2715,6 +2888,8 @@ async def _list_domains_route(
     ahrefs_conf_min: float = 0.0,
     dr_min: float = 0.0,
     ref_domains_min: float = 0.0,
+    ahrefs_contains: str = "",
+    ahrefs_contains_in: str = "backlinks",
     whois_cycles_max: int = 0,
     max_price_min: float = 0.0,
     max_price_max: float = 0.0,
@@ -2752,6 +2927,8 @@ async def _list_domains_route(
         ahrefs_conf_min,
         dr_min,
         ref_domains_min,
+        ahrefs_contains,
+        ahrefs_contains_in,
         whois_cycles_max,
         max_price_min,
         max_price_max,
@@ -2760,6 +2937,8 @@ async def _list_domains_route(
         direction,
         show_taken,
         language_match,
+        backlink_lang,
+        backlink_lang_min,
     )
 
 
@@ -2783,6 +2962,8 @@ def _run_list_domains(
     ahrefs_conf_min: float,
     dr_min: float,
     ref_domains_min: float,
+    ahrefs_contains: str,
+    ahrefs_contains_in: str,
     whois_cycles_max: int,
     max_price_min: float,
     max_price_max: float,
@@ -2791,6 +2972,8 @@ def _run_list_domains(
     direction: str | None,
     show_taken: bool,
     language_match: str = "primary",
+    backlink_lang: list[str] | None = None,
+    backlink_lang_min: int = 1,
 ) -> DomainListResponse:
     db = SessionLocal()
     try:
@@ -2809,6 +2992,8 @@ def _run_list_domains(
             availability=availability,
             languages=language,
             language_match=language_match,
+            backlink_langs=backlink_lang,
+            backlink_lang_min=backlink_lang_min,
             categories=category,
             criteria=criterion,
             notes=notes,
@@ -2818,6 +3003,8 @@ def _run_list_domains(
             ahrefs_conf_min=ahrefs_conf_min,
             dr_min=dr_min,
             ref_domains_min=ref_domains_min,
+            ahrefs_contains=ahrefs_contains,
+            ahrefs_contains_in=ahrefs_contains_in,
             whois_cycles_max=whois_cycles_max,
             max_price_min=max_price_min,
             max_price_max=max_price_max,
@@ -3612,6 +3799,8 @@ class BulkSetSourceFilteredIn(BaseModel):
     availability: list[str] | None = None
     language: list[str] | None = None
     language_match: str = "primary"
+    backlink_lang: list[str] | None = None
+    backlink_lang_min: int = 1
     category: list[str] | None = None
     criterion: list[str] | None = None
     # Which existing sources to MATCH (the Source filter) — distinct from the
@@ -3623,6 +3812,8 @@ class BulkSetSourceFilteredIn(BaseModel):
     ahrefs_conf_min: float = 0.0
     dr_min: float = 0.0
     ref_domains_min: float = 0.0
+    ahrefs_contains: str = ""
+    ahrefs_contains_in: str = "backlinks"
     whois_cycles_max: int = 0
     max_price_min: float = 0.0
     max_price_max: float = 0.0
@@ -3653,6 +3844,8 @@ def bulk_set_source_filtered(
         availability=payload.availability,
         languages=payload.language,
         language_match=payload.language_match,
+        backlink_langs=payload.backlink_lang,
+        backlink_lang_min=payload.backlink_lang_min,
         categories=payload.category,
         criteria=payload.criterion,
         notes=payload.notes,
@@ -3662,6 +3855,8 @@ def bulk_set_source_filtered(
         ahrefs_conf_min=payload.ahrefs_conf_min,
         dr_min=payload.dr_min,
         ref_domains_min=payload.ref_domains_min,
+        ahrefs_contains=payload.ahrefs_contains,
+        ahrefs_contains_in=payload.ahrefs_contains_in,
         whois_cycles_max=payload.whois_cycles_max,
         max_price_min=payload.max_price_min,
         max_price_max=payload.max_price_max,

@@ -1194,6 +1194,9 @@ const messagesEn = {
       },
     },
     database: {
+      // Theme cell: the country the site targets (2026-11-20).
+      themeCountry: (name: string, code: string, evidence: string, pct: string) =>
+        `Country: ${name} (${code})` + (evidence ? ` — ${evidence}` : "") + (pct ? `, ${pct}` : ""),
       title: "Database",
       intro:
         "Every domain you've analyzed. Each row's data comes from a manually-pinned run — pick a definitive run per domain (or pin an entire run from its detail page). Unpinned domains appear with empty cells until you choose a run.",
@@ -1422,6 +1425,13 @@ const messagesEn = {
           "Primary: match only the dominant language. Any: also match domains where the selected language is secondary/tertiary.",
         languageMatchPrimary: "Primary only",
         languageMatchAny: "Any (incl. secondary)",
+        backlinkLangLabel: "Link language",
+        backlinkLangAny: "Link language",
+        backlinkLangHint:
+          "Language of the pages the domain's backlinks come from (Ahrefs). Counts the backlinks the check fetched, not Ahrefs' full total.",
+        backlinkLangMinLabel: "Min. links",
+        backlinkLangMinHint:
+          "At least this many fetched backlinks from pages in the chosen language(s). A page in two chosen languages counts once.",
         categoryAny: "Any category",
         categoryLabel: "Category",
         categoryNone: "(no category)",
@@ -1471,6 +1481,17 @@ const messagesEn = {
         refDomainsMin: "RD (f) ≥",
         refDomainsMinHelp:
           "Minimum referring domains (dofollow) from the pinned Ahrefs Batch Analysis run. Blank/0 = off; rows without the metric are hidden when set.",
+        ahrefsContains: "Ahrefs contains",
+        ahrefsContainsHelp:
+          "Keep domains where the CHOSEN Ahrefs criterion contains any of these terms. Pick what to search on the left, then type one or more terms separated by a pipe (casino|porn|bet) — they are OR'd, so a domain matches if any term appears in any entry. Searches the linking URL for Backlinks, the domain for Referring domains, the anchor text for Anchors, and the keyword for Keywords. Case-insensitive substring match against the quality run. Domains with no data for the chosen criterion are hidden while this is set.",
+        ahrefsContainsPlaceholder: "casino|porn|bet",
+        ahrefsContainsInAria: "Which Ahrefs criterion to search",
+        ahrefsContainsIn: {
+          backlinks: "Backlinks",
+          refdomains: "Ref domains",
+          anchors: "Anchors",
+          keywords: "Keywords",
+        } as Record<string, string>,
         numMinPlaceholder: "any",
         // Whois ownership-cycles filter. 2026-05-23: semantic flipped
         // from ">= N" (find dropped) to "< N" (find clean history) —
@@ -4368,6 +4389,8 @@ const messagesRu: Messages = {
       },
     },
     database: {
+      themeCountry: (name, code, evidence, pct) =>
+        `Страна: ${name} (${code})` + (evidence ? ` — ${evidence}` : "") + (pct ? `, ${pct}` : ""),
       title: "База",
       intro:
         "Каждый проанализированный домен. Данные строки берутся из вручную зафиксированного запуска — выберите основной запуск на домен (или зафиксируйте весь запуск с его страницы). Незафиксированные домены показаны с пустыми ячейками, пока вы не выберете запуск.",
@@ -4590,6 +4613,13 @@ const messagesRu: Messages = {
           "Основной: только доминирующий язык. Любой: также домены, где выбранный язык вторичный/третичный.",
         languageMatchPrimary: "Только основной",
         languageMatchAny: "Любой (вкл. вторичные)",
+        backlinkLangLabel: "Язык ссылок",
+        backlinkLangAny: "Язык ссылок",
+        backlinkLangHint:
+          "Язык страниц, с которых ведут бэклинки домена (Ahrefs). Считаются бэклинки, полученные проверкой, а не весь объём в Ahrefs.",
+        backlinkLangMinLabel: "Мин. ссылок",
+        backlinkLangMinHint:
+          "Не меньше стольких полученных бэклинков со страниц на выбранных языках. Страница сразу на двух выбранных языках считается один раз.",
         categoryAny: "Любая категория",
         categoryLabel: "Категория",
         categoryNone: "(без категории)",
@@ -4635,6 +4665,17 @@ const messagesRu: Messages = {
         refDomainsMin: "RD (f) ≥",
         refDomainsMinHelp:
           "Минимум ссылающихся доменов (dofollow) из закреплённого запуска Ahrefs Batch Analysis. Пусто/0 — выкл; строки без метрики скрываются.",
+        ahrefsContains: "Ahrefs содержит",
+        ahrefsContainsHelp:
+          "Оставить домены, у которых ВЫБРАННЫЙ критерий Ahrefs содержит любое из этих слов. Слева выберите, где искать, затем введите одно или несколько слов через вертикальную черту (casino|porn|bet) — они объединяются по ИЛИ. Для Беклинков ищет по ссылающемуся URL, для Ссылающихся доменов — по домену, для Анкоров — по тексту анкора, для Ключевых — по ключевому слову. Поиск подстроки без учёта регистра по анализу качества. Домены без данных по выбранному критерию скрываются, пока фильтр включён.",
+        ahrefsContainsPlaceholder: "casino|porn|bet",
+        ahrefsContainsInAria: "Где искать в данных Ahrefs",
+        ahrefsContainsIn: {
+          backlinks: "Беклинки",
+          refdomains: "Ссыл. домены",
+          anchors: "Анкоры",
+          keywords: "Ключевые",
+        } as Record<string, string>,
         numMinPlaceholder: "любое",
         // Фильтр циклов whois — см. EN (флип "<N" вместо ">=N").
         whoisCyclesMax: "Циклы whois",
